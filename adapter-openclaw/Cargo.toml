@@ -1,0 +1,21 @@
+[package]
+name = "adapter-openclaw"
+version = "0.1.0"
+edition = "2021"
+description = "OpenClaw framework adapter for the Agent Life Format (ALF)"
+license = "MIT"
+repository = "https://github.com/agent-life/agent-life-adapters"
+
+[dependencies]
+alf-core = { path = "../alf-core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

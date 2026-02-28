@@ -3,4 +3,5 @@ resolver = "2"
 members = [
     "alf-core",
     "alf-cli",
+    "adapter-openclaw",
 ]

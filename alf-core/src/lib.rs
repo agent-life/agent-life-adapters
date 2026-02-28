@@ -19,15 +19,19 @@ pub mod memory;
 
 pub mod archive;
 pub mod credentials;
+pub mod delta;
 pub mod identity;
 pub mod manifest;
 pub mod partition;
 pub mod principals;
+pub mod validation;
 
 pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
 pub use credentials::*;
+pub use delta::{apply_delta, apply_deltas, compute_delta};
 pub use identity::*;
 pub use manifest::*;
 pub use memory::*;
 pub use partition::{PartitionAssigner, PartitionReader, PartitionWriter};
 pub use principals::*;
+pub use validation::*;

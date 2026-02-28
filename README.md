@@ -344,6 +344,14 @@ See the [ALF specification](https://github.com/agent-life/agent-life-data-format
 
 **Integration tests** (adapters): Fixture-based round-trip testing. Each adapter has fixture workspaces (`fixtures/openclaw-full/`, etc.) that are exported to `.alf`, then imported back, and the resulting workspace is diffed against the original. The diff must be empty (zero information loss).
 
+**Synthetic Integration test**: To test against perfectly valid randomized schema data, generate the synthetic test data first before running tests:
+
+```bash
+pip3 install --user -r scripts/requirements.txt
+python3 scripts/generate_synthetic_data.py
+cargo test -p alf-cli --test integration_tests
+```
+
 **Cross-runtime tests**: Export from OpenClaw fixture → import to ZeroClaw workspace → verify all data is present and correctly mapped. And vice versa. These tests validate the core migration value proposition per spec §10.3.
 
 **Schema compliance**: Every `.alf` file produced by any adapter is validated against the JSON schemas before the test passes.

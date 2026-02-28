@@ -56,6 +56,8 @@ def main():
     for c in credentials_data.get("credentials", []):
         if "encrypted_payload" in c and not c["encrypted_payload"]:
             c["encrypted_payload"] = "a"
+        if "service" in c and not c["service"]:
+            c["service"] = "test-service"
         if "encryption" in c:
             if "nonce" in c["encryption"] and not c["encryption"]["nonce"]:
                 c["encryption"]["nonce"] = "a"

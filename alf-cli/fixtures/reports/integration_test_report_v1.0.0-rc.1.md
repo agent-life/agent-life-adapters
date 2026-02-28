@@ -1,7 +1,7 @@
 # ALF CLI Integration Test Report
 
 **Schema Version:** v1.0.0-rc.1
-**Timestamp:** 2026-02-28T20:08:49.625634602+00:00
+**Timestamp:** 2026-02-28T20:53:05.658042943+00:00
 **Status:** SUCCESS
 
 ## `alf validate` Output

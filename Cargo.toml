@@ -4,4 +4,5 @@ members = [
     "alf-core",
     "alf-cli",
     "adapter-openclaw",
+    "adapter-zeroclaw",
 ]

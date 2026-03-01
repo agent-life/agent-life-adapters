@@ -4,7 +4,10 @@
 //! [`alf_core::Adapter`] trait. The CLI dispatches to the correct adapter
 //! based on the `--runtime` flag.
 
-pub use alf_core::Adapter;
+use anyhow::Result;
+use std::path::Path;
+
+pub use alf_core::{Adapter, ExportReport, ImportReport};
 
 // ---------------------------------------------------------------------------
 // Registry
@@ -13,8 +16,8 @@ pub use alf_core::Adapter;
 /// Returns the list of all available adapters.
 pub fn available_adapters() -> Vec<Box<dyn Adapter>> {
     vec![
-        Box::new(adapter_openclaw::OpenClawAdapter),
-        // Box::new(StubZeroClawAdapter), // coming later
+        Box::new(StubOpenClawAdapter),
+        Box::new(StubZeroClawAdapter),
     ]
 }
 
@@ -35,6 +38,82 @@ pub fn supported_runtimes() -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Stub OpenClaw adapter (placeholder until adapter-openclaw crate)
+// ---------------------------------------------------------------------------
+
+struct StubOpenClawAdapter;
+
+impl Adapter for StubOpenClawAdapter {
+    fn name(&self) -> &str {
+        "openclaw"
+    }
+
+    fn description(&self) -> &str {
+        "OpenClaw agent framework (file-based workspace)"
+    }
+
+    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
+        anyhow::bail!(
+            "OpenClaw adapter export is not yet implemented.\n\
+             Workspace: {}\n\
+             Output: {}\n\
+             This will be implemented in the adapter-openclaw crate.",
+            workspace.display(),
+            output.display()
+        )
+    }
+
+    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
+        anyhow::bail!(
+            "OpenClaw adapter import is not yet implemented.\n\
+             ALF file: {}\n\
+             Workspace: {}\n\
+             This will be implemented in the adapter-openclaw crate.",
+            alf_file.display(),
+            workspace.display()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stub ZeroClaw adapter (placeholder until adapter-zeroclaw crate wired in)
+// ---------------------------------------------------------------------------
+
+struct StubZeroClawAdapter;
+
+impl Adapter for StubZeroClawAdapter {
+    fn name(&self) -> &str {
+        "zeroclaw"
+    }
+
+    fn description(&self) -> &str {
+        "ZeroClaw agent framework (configurable backend workspace)"
+    }
+
+    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
+        anyhow::bail!(
+            "ZeroClaw adapter export is not yet wired into the CLI.\n\
+             Workspace: {}\n\
+             Output: {}\n\
+             This will be wired in from the adapter-zeroclaw crate.",
+            workspace.display(),
+            output.display()
+        )
+    }
+
+    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
+        anyhow::bail!(
+            "ZeroClaw adapter import is not yet wired into the CLI.\n\
+             ALF file: {}\n\
+             Workspace: {}\n\
+             This will be wired in from the adapter-zeroclaw crate.",
+            alf_file.display(),
+            workspace.display()
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -50,13 +129,21 @@ mod tests {
     }
 
     #[test]
+    fn registry_finds_zeroclaw() {
+        let adapter = get_adapter("zeroclaw");
+        assert!(adapter.is_some());
+        assert_eq!(adapter.unwrap().name(), "zeroclaw");
+    }
+
+    #[test]
     fn registry_returns_none_for_unknown() {
         assert!(get_adapter("unknown-runtime").is_none());
     }
 
     #[test]
-    fn supported_runtimes_includes_openclaw() {
+    fn supported_runtimes_includes_both() {
         let runtimes = supported_runtimes();
         assert!(runtimes.contains("openclaw"));
+        assert!(runtimes.contains("zeroclaw"));
     }
 }

@@ -61,15 +61,14 @@ agent-life-adapters/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs              # Public API surface
-│       ├── archive.rs          # ZIP archive handling (.alf is a ZIP)
-│       ├── reader.rs           # Read .alf and .alf-delta archives
-│       ├── writer.rs           # Build .alf and .alf-delta archives
-│       ├── manifest.rs         # Manifest parsing, generation, validation
+│       ├── adapter.rs           # Adapter trait (export/import interface)
+│       ├── archive.rs          # ZIP archive handling; AlfReader, AlfWriter (.alf is a ZIP)
+│       ├── manifest.rs         # Manifest parsing, generation, attachment index
 │       ├── memory.rs           # MemoryRecord types, JSONL partition I/O
 │       ├── identity.rs         # Identity layer types (structured + prose)
 │       ├── principals.rs       # Principal and communication preference types
 │       ├── credentials.rs      # Credential types (structure only, no crypto)
-│       ├── attachments.rs      # Attachment index and tier classification
+│       ├── partition.rs        # Time-based partition assignment, PartitionReader/Writer
 │       ├── delta.rs            # Delta computation and application
 │       └── validation.rs       # Schema validation (warn on unknown enums)
 │
@@ -77,12 +76,18 @@ agent-life-adapters/
 │   ├── Cargo.toml
 │   └── src/
 │       ├── main.rs             # Entrypoint (clap argument parsing)
-│       ├── export.rs           # alf export — dispatch to runtime adapter
-│       ├── import.rs           # alf import — dispatch to runtime adapter
-│       ├── sync.rs             # alf sync — push/pull to sync service API
-│       ├── restore.rs          # alf restore — download and import
-│       ├── login.rs            # alf login — authenticate with service
-│       └── config.rs           # ~/.alf/config.toml management
+│       ├── adapter.rs          # Runtime adapter selection and dispatch
+│       ├── api_client.rs       # Sync service API client
+│       ├── config.rs           # ~/.alf/config.toml management
+│       ├── state.rs            # ~/.alf/state/{agent_id}.toml sync state
+│       └── commands/
+│           ├── mod.rs          # Command dispatch
+│           ├── export.rs       # alf export — dispatch to runtime adapter
+│           ├── import.rs       # alf import — dispatch to runtime adapter
+│           ├── sync.rs         # alf sync — push/pull to sync service API
+│           ├── restore.rs      # alf restore — download and import
+│           ├── login.rs        # alf login — authenticate with service
+│           └── validate.rs     # alf validate — schema validation
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -92,28 +97,30 @@ agent-life-adapters/
 │       ├── import.rs           # ALF archive → write OpenClaw workspace
 │       ├── memory_parser.rs    # Parse MEMORY.md and daily logs → MemoryRecords
 │       ├── identity_parser.rs  # Parse SOUL.md, IDENTITY.md → Identity
+│       ├── principals_parser.rs # Parse USER.md → Principals
 │       └── credential_map.rs   # Map OpenClaw credential config → Credentials
 │
-├── adapter-zeroclaw/           # ZeroClaw adapter crate (library)
+├── adapter-zeroclaw/          # ZeroClaw adapter crate (library)
 │   ├── Cargo.toml
 │   └── src/
 │       ├── lib.rs              # Adapter trait implementation
-│       ├── export.rs           # Read ZeroClaw SQLite DB → ALF archive
-│       ├── import.rs           # ALF archive → write ZeroClaw SQLite DB
-│       ├── memory_mapper.rs    # Map ZeroClaw memory types → ALF types
-│       └── aieos_mapper.rs     # Map AIEOS identity fields → ALF identity
+│       ├── export.rs           # Read ZeroClaw workspace (SQLite + markdown) → ALF archive
+│       ├── import.rs           # ALF archive → write ZeroClaw workspace
+│       ├── config_parser.rs    # Parse config.toml (memory backend, identity, credential hints)
+│       ├── identity_parser.rs  # Parse identity (AIEOS/OpenClaw formats) → ALF Identity
+│       ├── principals_parser.rs # Parse USER.md → Principals
+│       ├── markdown_parser.rs  # Parse memory markdown files → MemoryRecords
+│       ├── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
+│       └── credential_map.rs   # Map config credential hints → Credentials (metadata only)
 │
-├── fixtures/                   # Test fixtures
-│   ├── openclaw-minimal/       # Minimal valid OpenClaw workspace
-│   ├── openclaw-full/          # Full workspace with all file types
-│   ├── zeroclaw-minimal/       # Minimal valid ZeroClaw workspace
-│   ├── zeroclaw-full/          # Full workspace with all data types
-│   └── expected-alf/           # Expected .alf outputs for diff testing
+├── scripts/                   # Optional tooling
+│   └── ...                     # e.g. generate_synthetic_data.py
 │
-└── .github/
-    └── workflows/
-        ├── ci.yml              # cargo test + clippy + fmt on every push
-        └── release.yml         # Cross-compile 5 binaries on tag push
+├── .github/
+│   └── workflows/
+│       └── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
+│
+└── tests/                      # Top-level integration tests (if present)
 ```
 
 ---
@@ -238,16 +245,16 @@ Translates between OpenClaw's native file-based workspace and the ALF format.
 
 ### `adapter-zeroclaw` — ZeroClaw Framework Adapter
 
-Translates between ZeroClaw's SQLite-based storage and the ALF format.
+Translates between ZeroClaw's SQLite-based storage, markdown memory files, and config and the ALF format.
 
 **Export reads:**
 
 | ZeroClaw Source | ALF Layer | Mapping |
 |----------------|-----------|---------|
-| SQLite `memories` table | Memory records (§3.1) | Type mapping from ZeroClaw types → ALF `memory_type` enum |
-| SQLite `identity` table | Identity (§3.2) | AIEOS structured fields → ALF promoted fields + `aieos_extensions` passthrough (§3.2.6) |
-| `config.toml` | Identity (§3.2) | Agent name, role, capabilities |
-| SQLite `credentials` table | Credentials (§3.4) | Encrypted credential entries |
+| SQLite `memories` table | Memory records (§3.1) | `sqlite_extractor`: type mapping from ZeroClaw types → ALF `memory_type`, embeddings, temporal metadata |
+| Memory markdown files (e.g. `memory/`, `archive/`) | Memory records (§3.1) | `markdown_parser`: sections → MemoryRecords with classification (session, daily, generic), observed_at from filenames |
+| `config.toml` | Identity (§3.2) | Agent name, role, capabilities; `config_parser` + `identity_parser` (AIEOS or OpenClaw format) |
+| `config.toml` credential hints | Credentials (§3.4) | `credential_map`: metadata only (service, type, label); no raw secrets exported |
 
 **AIEOS extensions.** ZeroClaw uses the AIEOS identity schema, which defines fields not present in ALF's core schema (e.g., `emotional_model`, `reasoning_style`). These are preserved in the `aieos_extensions` passthrough object, ensuring no information loss during round-trip. Promoted fields (name, role, capabilities) are mapped to ALF's first-class fields for cross-runtime compatibility.
 
@@ -342,7 +349,7 @@ See the [ALF specification](https://github.com/agent-life/agent-life-data-format
 
 **Unit tests** (`alf-core`): Writer/reader round-trip for every ALF type. Schema validation against the canonical JSON schemas. Partition logic (time-based assignment, seal status). Tier classification edge cases.
 
-**Integration tests** (adapters): Fixture-based round-trip testing. Each adapter has fixture workspaces (`fixtures/openclaw-full/`, etc.) that are exported to `.alf`, then imported back, and the resulting workspace is diffed against the original. The diff must be empty (zero information loss).
+**Integration tests** (adapters): Fixture-based round-trip testing when fixture workspaces are present (e.g. `fixtures/openclaw-full/`, `fixtures/zeroclaw-full/`). Each adapter can export to `.alf`, import back, and diff the resulting workspace against the original (zero information loss).
 
 **Synthetic Integration test**: To test against perfectly valid randomized schema data, generate the synthetic test data first before running tests:
 

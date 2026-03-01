@@ -1,0 +1,87 @@
+# Build the alf CLI for Linux (x86_64, ARM64), macOS (x86_64, ARM64), and Windows (x86_64).
+# Artifacts are named alf-<platform>-<arch> with .exe on Windows.
+
+name: Build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.bin_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin_name: alf-linux-amd64
+            use_cross: false
+          # Linux ARM64 (cross-compiled via cross)
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            bin_name: alf-linux-arm64
+            use_cross: true
+          # macOS Intel
+          - os: macos-13
+            target: x86_64-apple-darwin
+            bin_name: alf-darwin-amd64
+            use_cross: false
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin_name: alf-darwin-arm64
+            use_cross: false
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: alf-windows-amd64.exe
+            use_cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: matrix.use_cross == false
+        run: cargo build --release -p alf-cli --target ${{ matrix.target }}
+
+      - name: Install cross and build (Linux ARM64)
+        if: matrix.use_cross == true
+        run: |
+          cargo install cross
+          cross build --release -p alf-cli --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/alf ${{ matrix.bin_name }}
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: copy "target\${{ matrix.target }}\release\alf.exe" ${{ matrix.bin_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin_name }}
+          path: ${{ matrix.bin_name }}

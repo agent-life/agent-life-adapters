@@ -19,3 +19,4 @@ walkdir = "2"
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+zip = "2.2"

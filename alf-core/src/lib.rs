@@ -17,6 +17,7 @@
 #[macro_use]
 pub mod memory;
 
+pub mod adapter;
 pub mod archive;
 pub mod credentials;
 pub mod delta;
@@ -26,6 +27,7 @@ pub mod partition;
 pub mod principals;
 pub mod validation;
 
+pub use adapter::{Adapter, ExportReport, ImportReport};
 pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
 pub use credentials::*;
 pub use delta::{apply_delta, apply_deltas, compute_delta};

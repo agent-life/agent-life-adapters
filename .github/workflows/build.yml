@@ -31,8 +31,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             bin_name: alf-linux-arm64
             use_cross: true
-          # macOS Intel
-          - os: macos-13
+          # macOS Intel (use macos-15-intel; macos-13 is deprecated/unsupported)
+          - os: macos-15-intel
             target: x86_64-apple-darwin
             bin_name: alf-darwin-amd64
             use_cross: false

@@ -10,7 +10,7 @@
 //! 7. Update state with new sequence number
 
 use crate::adapter;
-use crate::api_client::{ApiClient, RegisterAgentRequest};
+use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::state::AgentState;
 
@@ -74,13 +74,14 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
 
     if !state.has_synced() {
         // First sync: upload full snapshot
-        println!("  First sync — uploading full snapshot...");
+        println!("  First sync — registering agent and uploading snapshot...");
 
-        // Register the agent first
-        let _agent_info = client.register_agent(&RegisterAgentRequest {
-            name: report.agent_name.clone(),
-            source_runtime: runtime.into(),
-        })?;
+        // Register the agent (idempotent — 409 is handled gracefully)
+        let _agent_info = client.register_agent(
+            agent_id,
+            &report.agent_name,
+            runtime,
+        )?;
 
         let upload = client.upload_snapshot(agent_id, &alf_bytes)?;
 
@@ -164,10 +165,10 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         let delta_buf = delta_writer.finish()?;
         let delta_bytes = delta_buf.into_inner();
 
-        println!("  Uploading delta...");
-        let upload = client.upload_delta(agent_id, state.last_synced_sequence, &delta_bytes)?;
+        println!("  Uploading delta ({} bytes)...", delta_bytes.len());
+        let upload = client.push_delta(agent_id, state.last_synced_sequence, &delta_bytes)?;
 
-        // Update state
+        // Update state — save the current export as the new delta base
         let new_state = AgentState {
             agent_id,
             last_synced_sequence: upload.sequence,

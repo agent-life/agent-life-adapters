@@ -13,10 +13,12 @@ path = "src/main.rs"
 [dependencies]
 alf-core = { path = "../alf-core" }
 adapter-openclaw = { path = "../adapter-openclaw" }
+adapter-zeroclaw = { path = "../adapter-zeroclaw" }
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 colored = "2"
+reqwest = { version = "0.12", features = ["blocking", "json"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"

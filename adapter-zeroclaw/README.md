@@ -7,9 +7,43 @@ Markdown with lifecycle hygiene — to ALF's portable archive format.
 
 ---
 
+## Building the alf CLI
+
+The `alf` binary is built from the **alf-cli** crate in this repository.
+From the **repository root** (not this directory):
+
+**Build (debug, fast):**
+```bash
+cargo build -p alf-cli
+```
+Binary: `target/debug/alf` (or `alf.exe` on Windows).
+
+**Run without installing:**
+```bash
+./target/debug/alf sync -r zeroclaw -w /path/to/zeroclaw-workspace
+```
+
+**Install so `alf` is on your PATH:**
+```bash
+cargo install --path alf-cli
+```
+This puts the release binary in `~/.cargo/bin/alf`. Then:
+```bash
+alf sync -r zeroclaw -w /path/to/zeroclaw-workspace
+```
+
+**Release build (optimized):**
+```bash
+cargo build -p alf-cli --release
+```
+Binary: `target/release/alf`.
+
+---
+
 ## Table of Contents
 
-1. [How ZeroClaw Stores Memory](#how-zeroclaw-stores-memory)
+1. [Building the alf CLI](#building-the-alf-cli)
+2. [How ZeroClaw Stores Memory](#how-zeroclaw-stores-memory)
    - [Architecture Overview](#architecture-overview)
    - [The Memory Trait](#the-memory-trait)
    - [MemoryEntry and MemoryCategory](#memoryentry-and-memorycategory)
@@ -18,23 +52,23 @@ Markdown with lifecycle hygiene — to ALF's portable archive format.
    - [Memory Tools](#memory-tools)
    - [Auto-Save Behavior](#auto-save-behavior)
    - [Workspace Layout](#workspace-layout)
-2. [How Memory Is Amended](#how-memory-is-amended)
+3. [How Memory Is Amended](#how-memory-is-amended)
    - [Agent-Initiated Writes via Tools](#agent-initiated-writes-via-tools)
    - [Auto-Save (Conversation Capture)](#auto-save-conversation-capture)
    - [Auto-Recall (Context Injection)](#auto-recall-context-injection)
    - [Memory Hygiene (Markdown Backend)](#memory-hygiene-markdown-backend)
    - [Migration from OpenClaw](#migration-from-openclaw)
-3. [How Memory Is Indexed](#how-memory-is-indexed)
+4. [How Memory Is Indexed](#how-memory-is-indexed)
    - [Hybrid Search (SQLite Backend)](#hybrid-search-sqlite-backend)
    - [Embedding Providers](#embedding-providers)
    - [Embedding Cache](#embedding-cache)
    - [Chunking (SQLite)](#chunking-sqlite)
    - [Markdown Backend Search](#markdown-backend-search)
-4. [Identity and Configuration](#identity-and-configuration)
+5. [Identity and Configuration](#identity-and-configuration)
    - [Identity Formats](#identity-formats)
    - [Configuration (config.toml)](#configuration-configtoml)
    - [Secrets Encryption](#secrets-encryption)
-5. [Mapping ZeroClaw Memory to ALF](#mapping-zeroclaw-memory-to-alf)
+6. [Mapping ZeroClaw Memory to ALF](#mapping-zeroclaw-memory-to-alf)
    - [Record Boundary Strategy](#record-boundary-strategy)
    - [Stable Record ID Generation](#stable-record-id-generation)
    - [Field Mapping: MemoryRecord](#field-mapping-memoryrecord)
@@ -42,20 +76,20 @@ Markdown with lifecycle hygiene — to ALF's portable archive format.
    - [Namespace Assignment](#namespace-assignment)
    - [Embedding Extraction](#embedding-extraction)
    - [Partition Assignment](#partition-assignment)
-6. [Mapping Other Layers to ALF](#mapping-other-layers-to-alf)
+7. [Mapping Other Layers to ALF](#mapping-other-layers-to-alf)
    - [Identity](#identity)
    - [Principals](#principals)
    - [Credentials](#credentials)
    - [Raw Source Preservation](#raw-source-preservation)
-7. [Gaps, Risks, and Design Decisions](#gaps-risks-and-design-decisions)
+8. [Gaps, Risks, and Design Decisions](#gaps-risks-and-design-decisions)
    - [Addressed](#addressed)
    - [Accepted Limitations](#accepted-limitations)
    - [ALF Type Fitness Assessment](#alf-type-fitness-assessment)
-8. [References](#references)
+9. [References](#references)
 
 ---
 
-## 1. How ZeroClaw Stores Memory
+## 2. How ZeroClaw Stores Memory
 
 ### Architecture Overview
 
@@ -666,7 +700,7 @@ existing type system.
 
 ---
 
-## 8. References
+## 9. References
 
 - **ZeroClaw GitHub repository**: https://github.com/zeroclaw-labs/zeroclaw
 - **Memory trait and backends**: `src/memory/traits.rs`, `src/memory/sqlite.rs`,

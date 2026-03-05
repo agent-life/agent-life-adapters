@@ -1,10 +1,11 @@
+use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
 fn alf_cmd() -> Command {
-    Command::cargo_bin("alf").expect("binary not found")
+    cargo_bin_cmd!("alf")
 }
 
 #[test]

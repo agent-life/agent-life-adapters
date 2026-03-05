@@ -2,8 +2,8 @@
 
 **Portable backup, sync, and migration for AI agents.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![ALF Spec: 1.0.0-rc.1](https://img.shields.io/badge/ALF_Spec-1.0.0--rc.1-green.svg)](https://github.com/agent-life/agent-life-data-format)
+[License: MIT](LICENSE)
+[ALF Spec: 1.0.0-rc.1](https://github.com/agent-life/agent-life-data-format)
 
 This repository contains the ALF core library and framework-specific adapters for the [agent-life](https://agent-life.ai) project. It produces the `alf` command-line tool — a single binary that can export, import, and sync AI agent data across frameworks using the [Agent Life Format (ALF)](https://github.com/agent-life/agent-life-data-format).
 
@@ -15,10 +15,12 @@ agent-life provides backup, sync, and migration for AI agents. An agent accumula
 
 The project spans four repositories:
 
-| Repository | Description | Visibility |
-|-----------|-------------|------------|
-| **[agent-life-data-format](https://github.com/agent-life/agent-life-data-format)** | ALF specification and JSON schemas | Public |
-| **agent-life-adapters** (this repo) | Core library, CLI tool, and framework adapters | Public |
+
+| Repository                                                                         | Description                                    | Visibility |
+| ---------------------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
+| **[agent-life-data-format](https://github.com/agent-life/agent-life-data-format)** | ALF specification and JSON schemas             | Public     |
+| **agent-life-adapters** (this repo)                                                | Core library, CLI tool, and framework adapters | Public     |
+
 
 ---
 
@@ -181,31 +183,37 @@ A single binary (`alf`) that provides all end-user operations. Built with `clap`
 ```
 alf export --runtime <runtime> --workspace <path> [--output <path>]
 ```
+
 Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive.
 
 ```
 alf import --runtime <runtime> --workspace <path> <alf-file>
 ```
+
 Import an `.alf` file into a framework workspace. Creates or populates the workspace with memory, identity, principals, credentials, and artifacts translated to the target runtime's native format.
 
 ```
 alf sync --runtime <runtime> --workspace <path>
 ```
+
 Incremental sync to the cloud. Computes a delta since the last sync point, pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`.
 
 ```
 alf restore --runtime <runtime> --workspace <path> --agent <agent-id>
 ```
+
 Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. Used for disaster recovery or migration to a new machine.
 
 ```
 alf login [--key <api-key>]
 ```
+
 Authenticate with the agent-life service. Without `--key`, opens a browser for interactive login that provisions an API key via a device flow callback. With `--key`, stores the provided key directly. Keys are saved to `~/.alf/config.toml`.
 
 ```
 alf validate <alf-file>
 ```
+
 Validate an `.alf` or `.alf-delta` file against the ALF JSON schemas. Reports errors and warnings. Useful for adapter developers and CI pipelines.
 
 **Configuration** (`~/.alf/config.toml`):
@@ -228,16 +236,18 @@ Translates between OpenClaw's native file-based workspace and the ALF format.
 
 **Export reads:**
 
-| OpenClaw File | ALF Layer | Mapping |
-|--------------|-----------|---------|
-| `SOUL.md` | Identity (§3.2) | Parsed into structured fields (name, role, personality) + prose blocks |
-| `IDENTITY.md` | Identity (§3.2) | Merged with SOUL.md; capabilities extracted with portability annotations |
-| `AGENTS.md` | Identity — sub-agent roster (§3.2.4) | Each agent entry → sub-agent with name, role, delegation scope |
-| `USER.md` | Principals (§3.3) | Parsed into primary principal with profile, preferences, work context |
-| `MEMORY.md` | Memory records (§3.1) | Each entry → `MemoryRecord` with type classification, entity extraction |
-| `logs/daily/*.md` | Memory records (§3.1) | Daily log entries → memory records with `observed_at` from filename |
-| Workspace files | Artifacts (§3.1.9) | Classified into tiers; Tier 1–2 included in archive, Tier 3 referenced |
-| Credential config | Credentials (§3.4) | API keys, tokens → encrypted credential entries (client-side encryption) |
+
+| OpenClaw File     | ALF Layer                            | Mapping                                                                  |
+| ----------------- | ------------------------------------ | ------------------------------------------------------------------------ |
+| `SOUL.md`         | Identity (§3.2)                      | Parsed into structured fields (name, role, personality) + prose blocks   |
+| `IDENTITY.md`     | Identity (§3.2)                      | Merged with SOUL.md; capabilities extracted with portability annotations |
+| `AGENTS.md`       | Identity — sub-agent roster (§3.2.4) | Each agent entry → sub-agent with name, role, delegation scope           |
+| `USER.md`         | Principals (§3.3)                    | Parsed into primary principal with profile, preferences, work context    |
+| `MEMORY.md`       | Memory records (§3.1)                | Each entry → `MemoryRecord` with type classification, entity extraction  |
+| `logs/daily/*.md` | Memory records (§3.1)                | Daily log entries → memory records with `observed_at` from filename      |
+| Workspace files   | Artifacts (§3.1.9)                   | Classified into tiers; Tier 1–2 included in archive, Tier 3 referenced   |
+| Credential config | Credentials (§3.4)                   | API keys, tokens → encrypted credential entries (client-side encryption) |
+
 
 **Import writes** the reverse mapping: ALF layers → OpenClaw workspace files.
 
@@ -249,12 +259,14 @@ Translates between ZeroClaw's SQLite-based storage, markdown memory files, and c
 
 **Export reads:**
 
-| ZeroClaw Source | ALF Layer | Mapping |
-|----------------|-----------|---------|
-| SQLite `memories` table | Memory records (§3.1) | `sqlite_extractor`: type mapping from ZeroClaw types → ALF `memory_type`, embeddings, temporal metadata |
+
+| ZeroClaw Source                                    | ALF Layer             | Mapping                                                                                                               |
+| -------------------------------------------------- | --------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| SQLite `memories` table                            | Memory records (§3.1) | `sqlite_extractor`: type mapping from ZeroClaw types → ALF `memory_type`, embeddings, temporal metadata               |
 | Memory markdown files (e.g. `memory/`, `archive/`) | Memory records (§3.1) | `markdown_parser`: sections → MemoryRecords with classification (session, daily, generic), observed_at from filenames |
-| `config.toml` | Identity (§3.2) | Agent name, role, capabilities; `config_parser` + `identity_parser` (AIEOS or OpenClaw format) |
-| `config.toml` credential hints | Credentials (§3.4) | `credential_map`: metadata only (service, type, label); no raw secrets exported |
+| `config.toml`                                      | Identity (§3.2)       | Agent name, role, capabilities; `config_parser` + `identity_parser` (AIEOS or OpenClaw format)                        |
+| `config.toml` credential hints                     | Credentials (§3.4)    | `credential_map`: metadata only (service, type, label); no raw secrets exported                                       |
+
 
 **AIEOS extensions.** ZeroClaw uses the AIEOS identity schema, which defines fields not present in ALF's core schema (e.g., `emotional_model`, `reasoning_style`). These are preserved in the `aieos_extensions` passthrough object, ensuring no information loss during round-trip. Promoted fields (name, role, capabilities) are mapped to ALF's first-class fields for cross-runtime compatibility.
 
@@ -266,13 +278,15 @@ Translates between ZeroClaw's SQLite-based storage, markdown memory files, and c
 
 The `alf` binary is compiled for 5 platform targets and attached to GitHub Releases:
 
-| Platform | Target Triple | Binary Name |
-|----------|--------------|-------------|
-| Linux x86_64 | `x86_64-unknown-linux-musl` | `alf-linux-amd64` |
-| Linux ARM64 | `aarch64-unknown-linux-musl` | `alf-linux-arm64` |
-| macOS ARM64 | `aarch64-apple-darwin` | `alf-darwin-arm64` |
-| macOS x86_64 | `x86_64-apple-darwin` | `alf-darwin-amd64` |
-| Windows x86_64 | `x86_64-pc-windows-msvc` | `alf-windows-amd64.exe` |
+
+| Platform       | Target Triple                | Binary Name             |
+| -------------- | ---------------------------- | ----------------------- |
+| Linux x86_64   | `x86_64-unknown-linux-musl`  | `alf-linux-amd64`       |
+| Linux ARM64    | `aarch64-unknown-linux-musl` | `alf-linux-arm64`       |
+| macOS ARM64    | `aarch64-apple-darwin`       | `alf-darwin-arm64`      |
+| macOS x86_64   | `x86_64-apple-darwin`        | `alf-darwin-amd64`      |
+| Windows x86_64 | `x86_64-pc-windows-msvc`     | `alf-windows-amd64.exe` |
+
 
 **Quick install:**
 
@@ -338,8 +352,8 @@ pub trait Adapter {
 }
 ```
 
-3. Register the adapter in `alf-cli/src/main.rs`
-4. Add fixture workspaces and round-trip tests
+1. Register the adapter in `alf-cli/src/main.rs`
+2. Add fixture workspaces and round-trip tests
 
 See the [ALF specification](https://github.com/agent-life/agent-life-data-format/blob/main/SPECIFICATION.md) §6 (Adapter Interface) for the full adapter contract, and §10 for required test cases.
 
@@ -378,3 +392,4 @@ MIT — see [LICENSE](LICENSE).
 - [ALF Specification](https://agent-life.ai/specification.html) — the full format specification
 - [agent-life-data-format](https://github.com/agent-life/agent-life-data-format) — specification source and JSON schemas
 - [agent-life.ai](https://agent-life.ai) — project website
+

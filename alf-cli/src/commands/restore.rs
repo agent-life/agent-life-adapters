@@ -3,11 +3,10 @@
 //! Flow:
 //! 1. Load config (check API key)
 //! 2. Parse agent ID
-//! 3. Download latest snapshot from service
-//! 4. List and download any deltas since the snapshot
-//! 5. Apply deltas to reconstruct current state
-//! 6. Resolve adapter, import into workspace
-//! 7. Save state with latest sequence
+//! 3. Call restore endpoint (gets snapshot URL + delta URLs in one call)
+//! 4. Download snapshot, download deltas, apply deltas
+//! 5. Resolve adapter, import into workspace
+//! 6. Save state with latest sequence
 
 use crate::adapter;
 use crate::api_client::ApiClient;
@@ -56,40 +55,49 @@ pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
     println!("  Workspace: {}", workspace.display());
     println!();
 
-    // 4. Download latest snapshot
-    println!("  Downloading snapshot...");
-    let snapshot_bytes = client.download_snapshot(agent_id)?;
+    // 4. Call restore endpoint — gets snapshot + delta URLs in one call
+    println!("  Fetching restore manifest...");
+    let restore = client.restore(agent_id)?;
 
-    // 5. Check for deltas since the snapshot
-    let snapshot_reader = AlfReader::new(Cursor::new(&snapshot_bytes))?;
-    let snapshot_sequence = snapshot_reader
-        .manifest()
-        .sync
-        .as_ref()
-        .map(|s| s.last_sequence)
-        .unwrap_or(0);
+    let snapshot_bytes = match &restore.snapshot {
+        Some(snap) => {
+            println!(
+                "  Downloading snapshot (sequence {})...",
+                snap.sequence
+            );
+            client.download_presigned(&snap.url)?
+        }
+        None => {
+            anyhow::bail!(
+                "No snapshot available for agent {}. \
+                 The agent must be synced at least once before restoring.",
+                agent_id
+            );
+        }
+    };
 
-    println!("  Checking for deltas since sequence {snapshot_sequence}...");
-    let delta_infos = client.list_deltas_since(agent_id, snapshot_sequence)?;
+    let snapshot_sequence = restore.snapshot.as_ref().map(|s| s.sequence).unwrap_or(0);
 
-    if delta_infos.is_empty() {
+    // 5. Download and apply deltas
+    let final_bytes = snapshot_bytes.clone();
+
+    if restore.deltas.is_empty() {
         println!("  No additional deltas to apply.");
     } else {
-        println!("  Found {} delta(s) to apply.", delta_infos.len());
+        println!("  Applying {} delta(s)...", restore.deltas.len());
 
-        // Download and apply each delta
         let mut current_reader = AlfReader::new(Cursor::new(&snapshot_bytes))?;
         let mut current_records = current_reader.read_all_memory()?;
 
-        for (i, delta_info) in delta_infos.iter().enumerate() {
+        for (i, delta_info) in restore.deltas.iter().enumerate() {
             println!(
                 "  Applying delta {} of {} (sequence {})...",
                 i + 1,
-                delta_infos.len(),
+                restore.deltas.len(),
                 delta_info.sequence
             );
 
-            let delta_bytes = client.download_delta(&delta_info.download_url)?;
+            let delta_bytes = client.download_presigned(&delta_info.url)?;
             let mut delta_reader = DeltaReader::new(Cursor::new(delta_bytes))?;
 
             if let Some(entries) = delta_reader.read_memory_deltas()? {
@@ -97,25 +105,23 @@ pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
             }
         }
 
-        // Rebuild the snapshot with applied deltas
-        // (The adapter import expects a .alf file, so we reconstruct one)
-        println!("  Rebuilding snapshot with applied deltas...");
-        // This would write a new .alf with the merged records.
-        // For now the flow structure is in place — the actual reconstruction
-        // will use AlfWriter once the service is available.
+        // TODO: rebuild snapshot archive with merged records using AlfWriter.
+        // For now we import the base snapshot — delta application to the
+        // workspace will be complete when AlfWriter reconstruction is added.
+        let _ = current_records; // records are computed but not yet written back
     }
 
     // 6. Write snapshot to temp file and import
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &snapshot_bytes)?;
+    fs::write(&temp_alf, &final_bytes)?;
 
     println!("  Importing into workspace...");
     let import_report = adapt.import(&temp_alf, workspace)?;
 
     // 7. Save state
-    let latest_sequence = if !delta_infos.is_empty() {
-        delta_infos.last().unwrap().sequence
+    let latest_sequence = if !restore.deltas.is_empty() {
+        restore.deltas.last().unwrap().sequence
     } else {
         snapshot_sequence
     };

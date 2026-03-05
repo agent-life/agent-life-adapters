@@ -5,6 +5,7 @@
 //! from the correct base.
 
 use anyhow::{Context, Result};
+use anyhow::bail;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -99,9 +100,59 @@ impl AgentState {
         Ok(())
     }
 
-    /// Whether this agent has been synced before.
+    /// Whether this agent has completed at least one sync (snapshot or delta).
+    /// Uses `last_synced_at` so that the first upload (sequence 0) is still
+    /// considered "synced" and the next run will upload a delta, not a second snapshot.
     pub fn has_synced(&self) -> bool {
-        self.last_synced_sequence > 0
+        self.last_synced_at.is_some()
+    }
+}
+
+/// Resolve an agent ID from an optional CLI argument or from the state directory.
+///
+/// If `agent_arg` is `Some`, this validates and parses it as a UUID.
+/// If `None`, this looks at `~/.alf/state/*.toml`:
+/// - If exactly one agent is tracked, its ID is returned.
+/// - If zero or multiple agents are tracked, an error is returned asking for `-a`.
+pub fn resolve_agent_id(agent_arg: Option<&str>) -> Result<Uuid> {
+    if let Some(id_str) = agent_arg {
+        return Uuid::parse_str(id_str)
+            .with_context(|| format!("Invalid agent ID: '{id_str}'. Expected a UUID."));
+    }
+
+    let state_dir = AgentState::state_dir()?;
+    let mut ids = Vec::new();
+
+    if state_dir.is_dir() {
+        let entries = fs::read_dir(&state_dir)
+            .with_context(|| format!("Failed to read state directory {}", state_dir.display()))?;
+
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("toml") {
+                continue;
+            }
+            if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+                if let Ok(id) = Uuid::parse_str(stem) {
+                    ids.push(id);
+                }
+            }
+        }
+    }
+
+    match ids.len() {
+        0 => bail!(
+            "No agent ID specified and no agents are tracked in {}. \
+             Run `alf sync` first or pass -a <agent-id>.",
+            state_dir.display()
+        ),
+        1 => Ok(ids[0]),
+        _ => bail!(
+            "No agent ID specified and multiple agents are tracked in {}. \
+             Pass -a <agent-id> to disambiguate.",
+            state_dir.display()
+        ),
     }
 }
 

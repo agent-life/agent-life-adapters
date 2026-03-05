@@ -24,7 +24,7 @@ use colored::Colorize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
     // 1. Load config and create API client
@@ -63,11 +63,20 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         "✓".green(),
         report.memory_records
     );
+    println!("  Temp snapshot: {}", temp_alf.display());
 
     // 4. Read the exported archive to get agent ID
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
     let reader = AlfReader::new(Cursor::new(&alf_bytes))?;
     let agent_id = reader.manifest().agent.id;
+
+    // Stable snapshot path under ~/.alf/state for future delta computation
+    let mut snapshot_path: PathBuf = AgentState::state_dir()?;
+    if !snapshot_path.exists() {
+        fs::create_dir_all(&snapshot_path)
+            .with_context(|| format!("Failed to create state directory {}", snapshot_path.display()))?;
+    }
+    snapshot_path.push(format!("{agent_id}-snapshot.alf"));
 
     // 5. Load agent state
     let state = AgentState::load(agent_id)?;
@@ -85,16 +94,23 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
 
         let upload = client.upload_snapshot(agent_id, &alf_bytes)?;
 
+        // Persist snapshot for future delta computation
+        fs::copy(&temp_alf, &snapshot_path)
+            .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
+
         // Save state
         let new_state = AgentState {
             agent_id,
             last_synced_sequence: upload.sequence,
             last_synced_at: Some(Utc::now()),
-            snapshot_path: Some(temp_alf.to_string_lossy().into()),
+            snapshot_path: Some(snapshot_path.to_string_lossy().into()),
         };
         new_state.save()?;
 
+        let state_path = AgentState::path_for(agent_id)?;
         println!("{} Snapshot uploaded (sequence: {})", "✓".green().bold(), upload.sequence);
+        println!("  Snapshot base: {}", snapshot_path.display());
+        println!("  State file:    {}", state_path.display());
     } else {
         // Subsequent sync: compute and upload delta
         println!(
@@ -103,16 +119,14 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         );
 
         // Load previous snapshot
-        let prev_path = state.snapshot_path.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No previous snapshot path in state. \
-                 Try a full re-sync by deleting ~/.alf/state/{}.toml",
-                agent_id
-            )
-        })?;
+        let prev_path: PathBuf = if let Some(p) = &state.snapshot_path {
+            p.into()
+        } else {
+            snapshot_path.clone()
+        };
 
         let prev_bytes =
-            fs::read(prev_path).context("Failed to read previous snapshot")?;
+            fs::read(&prev_path).with_context(|| format!("Failed to read previous snapshot at {}", prev_path.display()))?;
         let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
         let prev_records = prev_reader.read_all_memory()?;
 
@@ -168,20 +182,27 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         println!("  Uploading delta ({} bytes)...", delta_bytes.len());
         let upload = client.push_delta(agent_id, state.last_synced_sequence, &delta_bytes)?;
 
+        // Persist snapshot for future delta computation
+        fs::copy(&temp_alf, &snapshot_path)
+            .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
+
         // Update state — save the current export as the new delta base
         let new_state = AgentState {
             agent_id,
             last_synced_sequence: upload.sequence,
             last_synced_at: Some(Utc::now()),
-            snapshot_path: Some(temp_alf.to_string_lossy().into()),
+            snapshot_path: Some(snapshot_path.to_string_lossy().into()),
         };
         new_state.save()?;
 
+        let state_path = AgentState::path_for(agent_id)?;
         println!(
             "{} Delta uploaded (sequence: {})",
             "✓".green().bold(),
             upload.sequence
         );
+        println!("  Snapshot base: {}", snapshot_path.display());
+        println!("  State file:    {}", state_path.display());
     }
 
     Ok(())

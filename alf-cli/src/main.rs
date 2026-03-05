@@ -83,9 +83,9 @@ enum Command {
         #[arg(short, long)]
         workspace: PathBuf,
 
-        /// Agent ID to restore
+        /// Agent ID to restore (if omitted, uses the single tracked agent from ~/.alf/state/)
         #[arg(short, long)]
-        agent: String,
+        agent: Option<String>,
     },
 
     /// Authenticate with the agent-life service
@@ -123,7 +123,7 @@ fn main() {
             runtime,
             workspace,
             agent,
-        } => commands::restore::run(&runtime, &workspace, &agent),
+        } => commands::restore::run(&runtime, &workspace, agent.as_deref()),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
     };

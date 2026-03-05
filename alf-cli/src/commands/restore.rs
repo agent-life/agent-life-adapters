@@ -11,7 +11,7 @@
 use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
-use crate::state::AgentState;
+use crate::state::{AgentState, resolve_agent_id};
 
 use alf_core::archive::{AlfReader, DeltaReader};
 use alf_core::delta::apply_delta;
@@ -25,15 +25,13 @@ use std::io::Cursor;
 use std::path::Path;
 use uuid::Uuid;
 
-pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
+pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<()> {
     // 1. Load config and create API client
     let config = Config::load()?;
     let client = ApiClient::from_config(&config)?;
 
-    // 2. Parse agent ID
-    let agent_id: Uuid = agent_id_str
-        .parse()
-        .with_context(|| format!("Invalid agent ID: '{agent_id_str}'. Expected a UUID."))?;
+    // 2. Resolve agent ID (CLI arg or ~/.alf/state/*.toml)
+    let agent_id: Uuid = resolve_agent_id(agent_arg)?;
 
     // 3. Resolve adapter
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -47,7 +45,7 @@ pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
     println!(
         "{} Restoring agent {} into {} workspace...",
         "▸".blue().bold(),
-        &agent_id_str[..8.min(agent_id_str.len())],
+        &agent_id.to_string()[..8],
         adapt.name()
     );
     println!("  Agent:     {agent_id}");
@@ -115,6 +113,7 @@ pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
     fs::write(&temp_alf, &final_bytes)?;
+    println!("  Restored snapshot: {}", temp_alf.display());
 
     println!("  Importing into workspace...");
     let import_report = adapt.import(&temp_alf, workspace)?;
@@ -134,8 +133,11 @@ pub fn run(runtime: &str, workspace: &Path, agent_id_str: &str) -> Result<()> {
     };
     state.save()?;
 
+    let state_path = AgentState::path_for(agent_id)?;
+
     // 8. Print summary
     println!();
+    println!("  State file:   {}", state_path.display());
     println!("{} Restore complete", "✓".green().bold());
     println!();
     println!("  Agent:      {}", import_report.agent_name);

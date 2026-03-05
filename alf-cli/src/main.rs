@@ -6,6 +6,7 @@ mod adapter;
 mod api_client;
 mod commands;
 mod config;
+mod context;
 mod state;
 
 use clap::{Parser, Subcommand};
@@ -18,6 +19,7 @@ use std::process;
     name = "alf",
     about = "Agent Life Format — portable backup, sync, and migration for AI agents",
     version,
+    disable_help_subcommand = true,
     after_help = "Documentation: https://agent-life.ai\nSpecification: https://github.com/agent-life/agent-life-data-format"
 )]
 struct Cli {
@@ -28,6 +30,10 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Export an agent workspace to an .alf archive
+    #[command(long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
+        and writes a single .alf archive. Reads from the workspace path; writes to the given \
+        output file or ./<agent-name>.alf by default.\n\n\
+        Example: alf export -r openclaw -w ./my-agent -o backup.alf")]
     Export {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -43,6 +49,9 @@ enum Command {
     },
 
     /// Import an .alf archive into an agent workspace
+    #[command(long_about = "Import unpacks an .alf file into the given workspace directory. \
+        Reads the .alf file; writes SOUL.md, config, principals, and other files into the workspace.\n\n\
+        Example: alf import -r openclaw -w ./restored-agent archive.alf")]
     Import {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -57,12 +66,19 @@ enum Command {
     },
 
     /// Validate an .alf archive against the ALF specification
+    #[command(long_about = "Validate checks the .alf file structure and contents against the \
+        ALF spec. Does not modify any files.\n\n\
+        Example: alf validate backup.alf")]
     Validate {
         /// Path to the .alf file to validate
         alf_file: PathBuf,
     },
 
     /// Incremental sync to the cloud
+    #[command(long_about = "Sync exports the workspace to a temporary .alf, uploads it to the \
+        agent-life service, and updates ~/.alf/state/{agent_id}.toml and the snapshot file \
+        (~/.alf/state/{agent_id}-snapshot.alf). Use 'alf restore' to download later.\n\n\
+        Example: alf sync -r openclaw -w ./my-agent")]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -74,6 +90,9 @@ enum Command {
     },
 
     /// Download and restore from the cloud
+    #[command(long_about = "Restore downloads the latest snapshot from the agent-life service \
+        and imports it into the workspace. Reads state from ~/.alf/state/; writes to the workspace.\n\n\
+        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>")]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -89,10 +108,25 @@ enum Command {
     },
 
     /// Authenticate with the agent-life service
+    #[command(long_about = "Login stores your API key in ~/.alf/config.toml (service.api_key). \
+        Use -k to pass the key non-interactively.\n\n\
+        Example: alf login -k <your-api-key>")]
     Login {
         /// API key (skip interactive login)
         #[arg(short, long)]
         key: Option<String>,
+    },
+
+    /// Show help (overview, status, files, troubleshoot, or per-command)
+    #[command(long_about = "Topics: overview (default), status, files, troubleshoot, or a command name (export, import, sync, restore, validate, login). \
+        Use 'alf help status --json' for machine-readable status (config path, api_key set, tracked agents) for agents and scripts.")]
+    Help {
+        /// Topic: overview (default), status, files, troubleshoot, or export|import|sync|restore|validate|login
+        topic: Option<String>,
+
+        /// Output status as JSON (only with topic 'status'); for agents and scripts
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -126,10 +160,34 @@ fn main() {
         } => commands::restore::run(&runtime, &workspace, agent.as_deref()),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
+
+        Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
     };
 
     if let Err(err) = result {
         eprintln!("{} {err:#}", "error:".red().bold());
+        let hint = error_hint(&err);
+        if !hint.is_empty() {
+            eprintln!("{}", hint);
+        }
         process::exit(1);
     }
+}
+
+/// One-line hint for known error kinds to guide users to fix or get more help.
+fn error_hint(err: &anyhow::Error) -> String {
+    let msg = err.to_string();
+    if msg.contains("API key") || msg.contains("api_key") || msg.contains("Unauthorized") {
+        return "Run 'alf login' to set an API key, or 'alf help troubleshoot' for more.".into();
+    }
+    if msg.contains("No agent ID specified") || msg.contains("no agents are tracked") {
+        return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
+    }
+    if msg.contains("Unknown runtime") {
+        return "Supported runtimes: openclaw, zeroclaw. Run 'alf help troubleshoot' for more.".into();
+    }
+    if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
+        return "Run 'alf help troubleshoot' for workspace and path guidance.".into();
+    }
+    String::new()
 }

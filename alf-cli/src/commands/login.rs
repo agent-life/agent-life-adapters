@@ -41,8 +41,7 @@ fn login_interactive() -> Result<()> {
         "▸".blue().bold()
     );
     println!();
-    println!("  Interactive login is coming in Phase 2.");
-    println!("  For now, you can authenticate with an API key:");
+    println!("  You can authenticate with an API key:");
     println!();
     println!("    alf login --key <your-api-key>");
     println!();

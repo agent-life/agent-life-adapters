@@ -1,4 +1,5 @@
 pub mod export;
+pub mod help;
 pub mod import;
 pub mod login;
 pub mod restore;

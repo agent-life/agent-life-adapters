@@ -4,7 +4,7 @@
 //! [`alf_core::Adapter`] trait. The CLI dispatches to the correct adapter
 //! based on the `--runtime` flag.
 
-pub use alf_core::{Adapter, ExportReport, ImportReport};
+pub use alf_core::Adapter;
 
 use adapter_openclaw::OpenClawAdapter;
 use adapter_zeroclaw::ZeroClawAdapter;

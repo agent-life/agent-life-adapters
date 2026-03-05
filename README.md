@@ -81,15 +81,17 @@ agent-life-adapters/
 │       ├── adapter.rs          # Runtime adapter selection and dispatch
 │       ├── api_client.rs       # Sync service API client
 │       ├── config.rs           # ~/.alf/config.toml management
+│       ├── context.rs          # Runtime context for help (config + state summary)
 │       ├── state.rs            # ~/.alf/state/{agent_id}.toml sync state
 │       └── commands/
 │           ├── mod.rs          # Command dispatch
 │           ├── export.rs       # alf export — dispatch to runtime adapter
+│           ├── help.rs         # alf help — overview, status, files, troubleshoot
 │           ├── import.rs       # alf import — dispatch to runtime adapter
-│           ├── sync.rs         # alf sync — push/pull to sync service API
-│           ├── restore.rs      # alf restore — download and import
 │           ├── login.rs        # alf login — authenticate with service
-│           └── validate.rs     # alf validate — schema validation
+│           ├── restore.rs      # alf restore — download and import
+│           ├── sync.rs         # alf sync — push/pull to sync service API
+│           └── validate.rs      # alf validate — schema validation
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -199,13 +201,19 @@ alf sync --runtime <runtime> --workspace <path>
 Incremental sync to the cloud. Computes a delta since the last sync point, pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`.
 
 ```
-alf restore --runtime <runtime> --workspace <path> --agent <agent-id>
+alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>]
 ```
 
-Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. Used for disaster recovery or migration to a new machine.
+Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. If `--agent` is omitted and exactly one agent is tracked in `~/.alf/state/`, that agent is used. Used for disaster recovery or migration to a new machine.
 
 ```
-alf login [--key <api-key>]
+alf help [topic] [--json]
+```
+
+Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status` (full environment and service reachability), `files` (directory layout), `troubleshoot` (common fixes), or a command name for long help. Use `alf help status --json` for machine-readable status (for agents and scripts).
+
+```
+alf login [-k|--key <api-key>]
 ```
 
 Authenticate with the agent-life service. Without `--key`, opens a browser for interactive login that provisions an API key via a device flow callback. With `--key`, stores the provided key directly. Keys are saved to `~/.alf/config.toml`.
@@ -220,15 +228,14 @@ Validate an `.alf` or `.alf-delta` file against the ALF JSON schemas. Reports er
 
 ```toml
 [service]
-api_url = "https://api.agent-life.ai/v1"
+api_url = "https://api.agent-life.ai"
 api_key = "alf_..."
 
 [defaults]
-artifact_size_threshold = 10485760  # 10 MB
-
-[state.agents."<agent-id>"]
-last_synced_sequence = 42
+runtime = "openclaw"
 ```
+
+Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout.
 
 ### `adapter-openclaw` — OpenClaw Framework Adapter
 
@@ -352,7 +359,7 @@ pub trait Adapter {
 }
 ```
 
-1. Register the adapter in `alf-cli/src/main.rs`
+1. Register the adapter in `alf-cli/src/adapter.rs`
 2. Add fixture workspaces and round-trip tests
 
 See the [ALF specification](https://github.com/agent-life/agent-life-data-format/blob/main/SPECIFICATION.md) §6 (Adapter Interface) for the full adapter contract, and §10 for required test cases.
@@ -372,6 +379,46 @@ pip3 install --user -r scripts/requirements.txt
 python3 scripts/generate_synthetic_data.py
 cargo test -p alf-cli --test integration_tests
 ```
+
+**E2E integration testing with fixtures**: The `scripts/generate_fixtures.sh` script creates and mutates OpenClaw and ZeroClaw fixture workspaces under `scripts/fixtures/`. Use it to drive multi-step sync sequences and to test restore against real workspace data.
+
+**Commands:**
+
+| Invocation | Purpose |
+| ---------- | ------- |
+| `./scripts/generate_fixtures.sh` | Generate baseline (round 0) workspaces. Creates `openclaw-workspace` and `zeroclaw-workspace` with fixed agent IDs. |
+| `./scripts/generate_fixtures.sh --mutate N` | Apply mutation round 1, 2, or 3. Mutations are cumulative (round 2 includes round 1’s changes) and idempotent. |
+| `./scripts/generate_fixtures.sh --reset` | Delete fixtures and regenerate baseline from scratch. |
+| `./scripts/generate_fixtures.sh --status` | Show current mutation round and workspace stats (file counts, memory rows). |
+
+**Requirements:** `bash`, `python3` (stdlib `sqlite3` for ZeroClaw). Paths are relative to the repo root; run from the project root.
+
+**Testing multiple sync sequences:** Each sync should advance the sequence number (0 → 1 → 2 …). Use fixtures and mutations to simulate changes between syncs:
+
+1. Build the CLI: `cargo build` (or `cargo build --release`). Use `./target/debug/alf` or `./target/release/alf`, or install so `alf` is on `PATH`.
+2. Generate baseline: `./scripts/generate_fixtures.sh`.
+3. First sync (sequence 0):  
+   `alf sync -r openclaw -w scripts/fixtures/openclaw-workspace`  
+   and/or  
+   `alf sync -r zeroclaw -w scripts/fixtures/zeroclaw-workspace`.  
+   Confirm output shows “Snapshot uploaded (sequence: 0)” (or “Delta uploaded” if state already existed).
+4. Apply mutations and sync again:  
+   `./scripts/generate_fixtures.sh --mutate 1`  
+   then run the same `alf sync` commands. The second sync should upload a **delta** and report sequence 1. Repeat with `--mutate 2`, then sync again (sequence 2), and so on.
+5. Inspect state: `alf help status` shows tracked agents and `last_synced_sequence`; `~/.alf/state/{agent_id}.toml` stores the sequence and last sync time.
+
+This validates that the CLI and service advance sequences correctly and that deltas are applied between snapshots.
+
+**Testing the restore command:** After one or more successful syncs, restore downloads the latest snapshot (and any deltas) and imports into a workspace:
+
+1. Ensure at least one agent is synced (e.g. run the sync sequence above).
+2. Restore to a new directory:  
+   `alf restore -r openclaw -w /tmp/restored-openclaw`  
+   If multiple agents are tracked, pass `-a <agent-id>`. Use `alf help status` to list agent IDs.
+3. Confirm output reports “Restore complete” and the restored agent name, memory count, and sequence.
+4. Verify the restored workspace: check that `SOUL.md`, `MEMORY.md`, `memory/*.md`, and other expected files exist under the restore path and that content matches what was in the synced workspace (or diff key files).
+
+You can repeat restore to a fresh directory to simulate disaster recovery or migration to a new machine.
 
 **Cross-runtime tests**: Export from OpenClaw fixture → import to ZeroClaw workspace → verify all data is present and correctly mapped. And vice versa. These tests validate the core migration value proposition per spec §10.3.
 

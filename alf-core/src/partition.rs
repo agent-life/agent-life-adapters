@@ -7,7 +7,7 @@
 //! See §4.1.1 of the ALF specification.
 
 use crate::memory::MemoryRecord;
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use std::io::{self, BufRead, Write};
 use thiserror::Error;
 
@@ -63,6 +63,32 @@ impl PartitionAssigner {
         let year = ts.year();
         let quarter = quarter_of(ts.month());
         format!("{year}-Q{quarter}")
+    }
+
+    /// Parse a partition file path like `memory/2026-Q1.jsonl` into (from, to) dates.
+    ///
+    /// Returns `None` if the path doesn't match the expected `memory/YYYY-QN.jsonl` format.
+    pub fn date_range_for_partition(file_path: &str) -> Option<(NaiveDate, NaiveDate)> {
+        let label = file_path
+            .trim_start_matches("memory/")
+            .trim_end_matches(".jsonl");
+        let (year_str, q_str) = label.split_once("-Q")?;
+        let year: i32 = year_str.parse().ok()?;
+        let quarter: u32 = q_str.parse().ok()?;
+        if !(1..=4).contains(&quarter) {
+            return None;
+        }
+        let (start_month, end_month, end_day) = match quarter {
+            1 => (1, 3, 31),
+            2 => (4, 6, 30),
+            3 => (7, 9, 30),
+            4 => (10, 12, 31),
+            _ => unreachable!(),
+        };
+        Some((
+            NaiveDate::from_ymd_opt(year, start_month, 1)?,
+            NaiveDate::from_ymd_opt(year, end_month, end_day)?,
+        ))
     }
 }
 
@@ -428,5 +454,31 @@ mod tests {
             read_back.source.extra.get("future_field"),
             Some(&serde_json::json!("preserved"))
         );
+    }
+
+    // -- date_range_for_partition ----------------------------------------------
+
+    #[test]
+    fn date_range_all_quarters() {
+        let cases = vec![
+            ("memory/2026-Q1.jsonl", (2026, 1, 1), (2026, 3, 31)),
+            ("memory/2026-Q2.jsonl", (2026, 4, 1), (2026, 6, 30)),
+            ("memory/2026-Q3.jsonl", (2026, 7, 1), (2026, 9, 30)),
+            ("memory/2026-Q4.jsonl", (2026, 10, 1), (2026, 12, 31)),
+        ];
+        for (path, (sy, sm, sd), (ey, em, ed)) in cases {
+            let (from, to) = PartitionAssigner::date_range_for_partition(path)
+                .unwrap_or_else(|| panic!("failed to parse {path}"));
+            assert_eq!(from, NaiveDate::from_ymd_opt(sy, sm, sd).unwrap(), "{path} from");
+            assert_eq!(to, NaiveDate::from_ymd_opt(ey, em, ed).unwrap(), "{path} to");
+        }
+    }
+
+    #[test]
+    fn date_range_invalid_inputs() {
+        assert!(PartitionAssigner::date_range_for_partition("memory/2026-Q0.jsonl").is_none());
+        assert!(PartitionAssigner::date_range_for_partition("memory/2026-Q5.jsonl").is_none());
+        assert!(PartitionAssigner::date_range_for_partition("not-a-partition").is_none());
+        assert!(PartitionAssigner::date_range_for_partition("memory/bad.jsonl").is_none());
     }
 }

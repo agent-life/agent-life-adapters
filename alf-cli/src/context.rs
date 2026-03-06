@@ -111,7 +111,11 @@ mod tests {
     use super::*;
     use std::env;
     use std::io::Write;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Serialize tests that set HOME so they don't overwrite each other when run in parallel.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     /// Restore HOME when dropped (for tests that set HOME to a temp dir).
     struct RestoreHome(Option<std::ffi::OsString>);
@@ -128,6 +132,7 @@ mod tests {
 
     #[test]
     fn gather_status_no_config_uses_defaults() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let _restore = RestoreHome(env::var_os("HOME"));
         env::set_var("HOME", tmp.path());
@@ -143,6 +148,7 @@ mod tests {
 
     #[test]
     fn gather_status_with_config_and_state() {
+        let _guard = HOME_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
         let _restore = RestoreHome(env::var_os("HOME"));
         env::set_var("HOME", tmp.path());

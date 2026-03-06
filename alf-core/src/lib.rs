@@ -25,12 +25,14 @@ pub mod identity;
 pub mod manifest;
 pub mod partition;
 pub mod principals;
+pub mod rebuild;
 pub mod validation;
 
 pub use adapter::{Adapter, ExportReport, ImportReport};
 pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
 pub use credentials::*;
 pub use delta::{apply_delta, apply_deltas, compute_delta};
+pub use rebuild::rebuild_snapshot;
 pub use identity::*;
 pub use manifest::*;
 pub use memory::*;

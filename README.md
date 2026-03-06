@@ -426,6 +426,45 @@ You can repeat restore to a fresh directory to simulate disaster recovery or mig
 
 **CI**: `cargo test` + `cargo clippy` + `cargo fmt --check` on every push. Cross-compilation smoke test on release tags (build all 5 targets, verify binaries are non-zero size).
 
+### Integration Walkthrough
+
+The interactive walkthrough (`tests/integration_walkthrough.py`) is both an end-to-end functional test and an educational tool for new contributors. It walks through the complete agent lifecycle — create, snapshot, delta sync, restore, simulated data loss, recovery, and cleanup — with explanations at each step of what's happening and where data lives.
+
+Unlike the Rust E2E tests (which verify API contracts), the walkthrough also queries Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
+
+```bash
+# Install dependencies (one time)
+pip install requests psycopg2-binary boto3 python-dotenv
+
+# Interactive mode — pauses at each step with colored explanations
+python3 tests/integration_walkthrough.py
+
+# Batch mode — no pauses, for CI or scripted runs
+python3 tests/integration_walkthrough.py --no-pause
+
+# Custom report path
+python3 tests/integration_walkthrough.py --report results/report.md
+```
+
+The walkthrough reads the same `.env` variables as the Rust E2E tests (`API_BASE_URL`, `API_KEY`, `NEON_DATABASE_URL`) plus `S3_BUCKET_NAME` and `AWS_REGION` for direct infrastructure verification.
+
+**Steps:**
+
+| # | Step | What it does | What it verifies |
+|---|------|-------------|-----------------|
+| 0 | Connectivity | Pings API, Neon, and S3 | All three backends are reachable |
+| 1 | Create agent | POST /agents | Agent row exists in Neon with sequence=0 |
+| 2 | Upload snapshot | PUT /agents/:id/snapshot (3 memories) | Snapshot row in Neon, blob in S3, agent pointers updated |
+| 3 | Push delta 1 | POST /agents/:id/deltas (2 new memories) | Sequence atomically assigned, delta row + blob created |
+| 4 | Push delta 2 | POST /agents/:id/deltas (2 more memories) | Sequence incremented again, agent at sequence=2 |
+| 5 | Pull deltas | GET /agents/:id/deltas?since=0 | Both deltas returned with presigned URLs |
+| 6 | Restore | GET /agents/:id/restore | Snapshot + 2 deltas returned; snapshot downloaded and validated as a ZIP |
+| 7 | Data loss | *(conceptual pause)* | Explains what's in the cloud vs. what's local |
+| 8 | Restore after loss | GET /agents/:id/restore | Identical response — proves nothing was lost |
+| 9 | Cleanup | DELETE /agents/:id | S3 prefix empty, Neon rows CASCADE-deleted |
+
+Each step checks three layers: API response, direct Neon query (bypassing RLS), and direct S3 HEAD/LIST. On completion, a markdown report is written with pass/fail status and per-step latencies.
+
 ---
 
 ## License

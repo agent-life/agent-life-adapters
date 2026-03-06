@@ -1,1 +1,5 @@
 jsf<0.11.0
+requests 
+psycopg2-binary 
+boto3 
+python-dotenv

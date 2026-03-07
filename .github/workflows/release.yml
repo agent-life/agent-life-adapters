@@ -146,6 +146,25 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
 
+      - name: Validate and set S3 bucket name
+        run: |
+          # Use bucket name only (not ARN). Strip whitespace/newlines that can break validation.
+          BUCKET=$(echo "$AWS_S3_BUCKET" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          if [ -z "$BUCKET" ]; then
+            echo "::error::AWS_S3_BUCKET secret is empty. Set it to the bucket name only (e.g. agent-life-ai), not an ARN."
+            exit 1
+          fi
+          if [ "$BUCKET" != "${BUCKET#arn:}" ]; then
+            echo "::error::AWS_S3_BUCKET must be the bucket name only (e.g. agent-life-ai), not an ARN. Got value starting with 'arn:'"
+            exit 1
+          fi
+          # Bucket name must match [a-zA-Z0-9.\-_]{1,255}
+          if ! echo "$BUCKET" | grep -qE '^[a-zA-Z0-9.\-_]{1,255}$'; then
+            echo "::error::AWS_S3_BUCKET contains invalid characters. Use only letters, digits, period, hyphen, underscore (e.g. agent-life-ai)."
+            exit 1
+          fi
+          echo "BUCKET=$BUCKET" >> "$GITHUB_ENV"
+
       - name: Upload to S3
         run: |
           for f in release-assets/*; do
@@ -154,16 +173,16 @@ jobs:
               *.sh) ct="text/plain" ;;
               *)    ct="application/octet-stream" ;;
             esac
-            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/releases/${VERSION}/$name" \
+            aws s3 cp "$f" "s3://${BUCKET}/releases/${VERSION}/$name" \
               --acl public-read \
               --content-type "$ct"
-            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/$name" \
+            aws s3 cp "$f" "s3://${BUCKET}/$name" \
               --acl public-read \
               --content-type "$ct"
-            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/releases/latest/$name" \
+            aws s3 cp "$f" "s3://${BUCKET}/releases/latest/$name" \
               --acl public-read \
               --content-type "$ct"
           done
-          echo "Uploaded to s3://${AWS_S3_BUCKET}/releases/${VERSION}/"
-          echo "Uploaded to s3://${AWS_S3_BUCKET}/releases/latest/"
-          echo "Uploaded to s3://${AWS_S3_BUCKET}/"
+          echo "Uploaded to s3://${BUCKET}/releases/${VERSION}/"
+          echo "Uploaded to s3://${BUCKET}/releases/latest/"
+          echo "Uploaded to s3://${BUCKET}/"

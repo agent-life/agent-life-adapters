@@ -1,0 +1,169 @@
+# Build the alf CLI for all platforms and publish a GitHub Release.
+# Triggered by pushing a version tag: git tag v0.1.0 && git push origin v0.1.0
+
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write          # needed to create releases and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.bin_name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bin_name: alf-linux-amd64
+            use_cross: false
+          # Linux ARM64 (cross-compiled via cross)
+          - os: ubuntu-22.04
+            target: aarch64-unknown-linux-gnu
+            bin_name: alf-linux-arm64
+            use_cross: true
+          # macOS Intel
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            bin_name: alf-darwin-amd64
+            use_cross: false
+          # macOS Apple Silicon
+          - os: macos-14
+            target: aarch64-apple-darwin
+            bin_name: alf-darwin-arm64
+            use_cross: false
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bin_name: alf-windows-amd64.exe
+            use_cross: false
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: matrix.use_cross == false
+        run: cargo build --release -p alf-cli --target ${{ matrix.target }}
+
+      - name: Install cross and build (Linux ARM64)
+        if: matrix.use_cross == true
+        run: |
+          cargo install cross
+          cross build --release -p alf-cli --target ${{ matrix.target }}
+
+      - name: Prepare artifact (Unix)
+        if: runner.os != 'Windows'
+        run: cp target/${{ matrix.target }}/release/alf ${{ matrix.bin_name }}
+
+      - name: Prepare artifact (Windows)
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: copy "target\${{ matrix.target }}\release\alf.exe" ${{ matrix.bin_name }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.bin_name }}
+          path: ${{ matrix.bin_name }}
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect binaries and install script
+        run: |
+          mkdir release-assets
+          for dir in artifacts/*/; do
+            cp "$dir"* release-assets/
+          done
+          cp scripts/install.sh release-assets/
+          ls -lh release-assets/
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release-assets/*
+          generate_release_notes: true
+
+  upload-s3:
+    name: Upload to S3 (agent-life.ai)
+    needs: release
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ github.ref_name }}
+      AWS_S3_BUCKET: ${{ secrets.AWS_S3_BUCKET }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*/; do
+            cp "$dir"* release-assets/
+          done
+          cp scripts/install.sh release-assets/
+          ls -la release-assets/
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || 'us-east-1' }}
+
+      - name: Upload to S3
+        run: |
+          for f in release-assets/*; do
+            name=$(basename "$f")
+            case "$name" in
+              *.sh) ct="text/plain" ;;
+              *)    ct="application/octet-stream" ;;
+            esac
+            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/releases/${VERSION}/$name" \
+              --acl public-read \
+              --content-type "$ct"
+            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/$name" \
+              --acl public-read \
+              --content-type "$ct"
+            aws s3 cp "$f" "s3://${AWS_S3_BUCKET}/releases/latest/$name" \
+              --acl public-read \
+              --content-type "$ct"
+          done
+          echo "Uploaded to s3://${AWS_S3_BUCKET}/releases/${VERSION}/"
+          echo "Uploaded to s3://${AWS_S3_BUCKET}/releases/latest/"
+          echo "Uploaded to s3://${AWS_S3_BUCKET}/"

@@ -303,6 +303,12 @@ curl -sSL https://agent-life.ai/install.sh | sh
 
 The install script detects the platform and downloads the correct binary to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root).
 
+**From source (requires Rust 1.75+):**
+
+```bash
+cargo install --git https://github.com/agent-life/agent-life-adapters.git alf-cli
+```
+
 **OpenClaw skill usage:** The binary is invoked directly by the agent. No runtime dependencies, no package manager, no Node.js.
 
 ---

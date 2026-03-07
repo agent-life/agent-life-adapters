@@ -1,0 +1,51 @@
+#0 building with "default" instance using docker driver
+
+#1 [internal] load build definition from Dockerfile
+#1 transferring dockerfile: 1.42kB done
+#1 DONE 0.0s
+
+#2 [internal] load metadata for docker.io/library/node:18-alpine
+#2 DONE 0.6s
+
+#3 [internal] load .dockerignore
+#3 transferring context: 2B done
+#3 DONE 0.0s
+
+#4 [1/9] FROM docker.io/library/node:18-alpine@sha256:8d6421d663b4c28fd3ebc498332f249011d118945588d0a35cb9bc4b8ca09d9e
+#4 DONE 0.0s
+
+#5 [internal] load build context
+#5 transferring context: 338B done
+#5 DONE 0.0s
+
+#6 [3/9] RUN adduser -D -h /home/tester tester
+#6 CACHED
+
+#7 [6/9] COPY tests/installer-openclaw/scripts/run-install-and-validate.sh /opt/alf-test/
+#7 CACHED
+
+#8 [4/9] COPY scripts/install.sh /tmp/install.sh
+#8 CACHED
+
+#9 [5/9] COPY tests/installer-openclaw/scripts/setup-openclaw.sh /opt/alf-test/
+#9 CACHED
+
+#10 [7/9] RUN chmod +x /opt/alf-test/*.sh
+#10 CACHED
+
+#11 [2/9] RUN apk add --no-cache curl ca-certificates git
+#11 CACHED
+
+#12 [8/9] RUN /opt/alf-test/setup-openclaw.sh && chown -R tester:tester /home/tester/.openclaw /home/tester/openclaw
+#12 CACHED
+
+#13 [9/9] RUN echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/tester/.profile &&     echo 'export PATH="$HOME/.local/bin:$PATH"' >> /home/tester/.bashrc
+#13 DONE 0.2s
+
+#14 exporting to image
+#14 exporting layers 0.0s done
+#14 writing image sha256:feec0205b56200653dcee68c35ef46bc1a04f561b44a82b8135a136b70f7f67d done
+#14 naming to docker.io/library/alf-installer-openclaw 0.0s done
+#14 DONE 0.1s
+
+Use 'docker scan' to run Snyk tests against images to find vulnerabilities and learn how to fix them

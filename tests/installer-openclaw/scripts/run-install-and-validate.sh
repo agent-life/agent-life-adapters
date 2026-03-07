@@ -68,6 +68,21 @@ if [ ! -f "$OUT" ]; then
 fi
 
 echo "  export produced: $OUT"
+
+echo ""
+echo "=== Inspecting file structure ==="
+echo "  Listing workspace files:"
+find "$WORKSPACE" -maxdepth 2 | sed 's|^'"$WORKSPACE"'/|    |'
+
+echo ""
+echo "  Listing OpenClaw install:"
+ls -d "$HOME/openclaw" 2>/dev/null || echo "    (not found)"
+if [ -d "$HOME/openclaw/node_modules" ]; then
+    echo "    node_modules present"
+else
+    echo "    node_modules missing"
+fi
+
 echo ""
 echo "=== Install and validation complete ==="
 echo "  Container will stay running. Attach with: docker exec -it <container> sh"

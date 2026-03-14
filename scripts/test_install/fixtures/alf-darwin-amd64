@@ -1,0 +1,5 @@
+#!/bin/sh
+case "$1" in
+    --version) echo "alf 0.0.0-test" ;;
+    *)         echo "alf 0.0.0-test fake binary" ;;
+esac

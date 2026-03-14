@@ -108,6 +108,14 @@ jobs:
           cp scripts/install.sh release-assets/
           ls -lh release-assets/
 
+      - name: Generate SHA256 checksums
+        run: |
+          cd release-assets
+          for f in alf-linux-amd64 alf-linux-arm64 alf-darwin-amd64 alf-darwin-arm64 alf-windows-amd64.exe; do
+            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256" && echo "Generated ${f}.sha256"
+          done
+          ls -lh *.sha256 2>/dev/null || true
+
       - name: Create release
         uses: softprops/action-gh-release@v2
         with:
@@ -137,6 +145,12 @@ jobs:
             cp "$dir"* release-assets/
           done
           cp scripts/install.sh release-assets/
+          # Generate SHA256 checksums for binaries
+          cd release-assets
+          for f in alf-linux-amd64 alf-linux-arm64 alf-darwin-amd64 alf-darwin-arm64 alf-windows-amd64.exe; do
+            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256"
+          done
+          cd ..
           ls -la release-assets/
 
       - name: Configure AWS credentials
@@ -170,8 +184,9 @@ jobs:
           for f in release-assets/*; do
             name=$(basename "$f")
             case "$name" in
-              *.sh) ct="text/plain" ;;
-              *)    ct="application/octet-stream" ;;
+              *.sh)     ct="text/plain" ;;
+              *.sha256) ct="text/plain" ;;
+              *)        ct="application/octet-stream" ;;
             esac
             aws s3 cp "$f" "s3://${BUCKET}/releases/${VERSION}/$name" \
               --acl public-read \
@@ -186,3 +201,35 @@ jobs:
           echo "Uploaded to s3://${BUCKET}/releases/${VERSION}/"
           echo "Uploaded to s3://${BUCKET}/releases/latest/"
           echo "Uploaded to s3://${BUCKET}/"
+
+      - name: Build CLI docs
+        # Only runs if docs/cli-reference.md exists (created in a later phase).
+        # Non-fatal if pandoc fails so the release still completes.
+        run: |
+          if [ ! -f docs/cli-reference.md ]; then
+            echo "docs/cli-reference.md not found — skipping CLI docs build"
+            exit 0
+          fi
+          sudo apt-get install -y pandoc
+          pandoc docs/cli-reference.md \
+            -o docs/cli-reference.html \
+            --standalone \
+            --metadata title="alf CLI Reference" \
+            --css=style.css || echo "pandoc build failed — continuing"
+
+      - name: Upload docs to S3
+        # Only runs if the HTML was successfully built.
+        run: |
+          if [ ! -f docs/cli-reference.html ]; then
+            echo "docs/cli-reference.html not found — skipping docs upload"
+            exit 0
+          fi
+          aws s3 cp docs/cli-reference.html "s3://${BUCKET}/docs/cli/index.html" \
+            --content-type "text/html" --acl public-read
+          aws s3 cp docs/cli-reference.md "s3://${BUCKET}/docs/cli.md" \
+            --content-type "text/markdown; charset=utf-8" --acl public-read
+          if [ -f docs/style.css ]; then
+            aws s3 cp docs/style.css "s3://${BUCKET}/docs/style.css" \
+              --content-type "text/css" --acl public-read
+          fi
+          echo "Docs uploaded to s3://${BUCKET}/docs/"

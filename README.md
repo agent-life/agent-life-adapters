@@ -119,12 +119,23 @@ agent-life-adapters/
 │       ├── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
 │       └── credential_map.rs   # Map config credential hints → Credentials (metadata only)
 │
-├── scripts/                   # Optional tooling
-│   └── ...                     # e.g. generate_synthetic_data.py
+├── scripts/
+│   ├── install.sh              # Quick-install script (curl | sh)
+│   ├── test_install.sh         # Install test runner (Docker + native)
+│   ├── test_install/           # Install test infrastructure
+│   │   ├── mock_server.py      # HTTP mock server (simulates GitHub Releases)
+│   │   ├── run_tests.sh        # Core test cases (35+ tests)
+│   │   ├── Dockerfile.ubuntu   # Ubuntu 24.04 test image
+│   │   ├── Dockerfile.alpine   # Alpine 3.19 test image
+│   │   ├── Dockerfile.debian   # Debian 12 test image
+│   │   └── fixtures/           # Fake binaries + SHA256 checksums
+│   └── ...                     # generate_synthetic_data.py, generate_fixtures.sh, etc.
 │
 ├── .github/
 │   └── workflows/
-│       └── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
+│       ├── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
+│       ├── test-install.yml    # Install script tests (Linux Docker + macOS native)
+│       └── release.yml         # Build, release, upload to S3 with SHA256 checksums
 │
 └── tests/                      # Top-level integration tests (if present)
 ```
@@ -448,6 +459,56 @@ You can repeat restore to a fresh directory to simulate disaster recovery or mig
 **Schema compliance**: Every `.alf` file produced by any adapter is validated against the JSON schemas before the test passes.
 
 **CI**: `cargo test` + `cargo clippy` + `cargo fmt --check` on every push. Cross-compilation smoke test on release tags (build all 5 targets, verify binaries are non-zero size).
+
+### Install Script Tests
+
+The install script (`scripts/install.sh`) has its own isolated test suite that runs against a local mock HTTP server — no real GitHub or S3 calls, no network required.
+
+**Entry point:**
+
+```bash
+./scripts/test_install.sh              # All tests: Docker (Linux) + native (macOS if on macOS)
+./scripts/test_install.sh --linux      # Linux only, runs all three Docker containers
+./scripts/test_install.sh --macos      # macOS native only
+./scripts/test_install.sh --quick      # Ubuntu container only (fastest, ~15 seconds)
+```
+
+**Requirements:** `python3`, `docker` (for Linux tests), `curl`.
+
+**How it works:** The runner starts a Python mock server (`scripts/test_install/mock_server.py`) that simulates GitHub Releases — it serves fake `alf` binaries and `.sha256` checksum files from `scripts/test_install/fixtures/`. The fake binaries are shell scripts that respond to `--version`, so no real Rust build is needed. Install script tests run inside Docker containers (Ubuntu 24.04, Debian 12, Alpine 3.19) as a non-root user, exercising each distro's `/bin/sh` implementation (`dash` on Ubuntu/Debian, `busybox ash` on Alpine).
+
+**What is tested:**
+
+| Category | Tests |
+|---|---|
+| **Happy path** | Binary installed, stdout is valid JSON with `ok:true`, `version`, `path`, `checksum_verified` |
+| **Version resolution** | Mock GitHub API returns `v0.0.0-test`; auto-discovered without `ALF_VERSION` set |
+| **Version pin** | `ALF_VERSION=v0.0.0-test` skips API call, uses pinned tag |
+| **Custom install dir** | `ALF_INSTALL_DIR=/tmp/custom` → binary lands at the right path |
+| **Non-root install** | Runs as non-root (no writable `/usr/local/bin`) → installs to `~/.local/bin`, PATH warning in stderr |
+| **Platform detection** | `uname` shim injects Linux/x86\_64, Linux/aarch64, Darwin/x86\_64, Darwin/arm64 → correct binary name selected |
+| **Unsupported OS** | FreeBSD → exit code 2 |
+| **Unsupported arch** | Linux/riscv64 → exit code 2 |
+| **Download failure** | Version not found on mock server (HTTP 404, both primary and backup) → exit code 3 |
+| **Checksum mismatch** | Mock server returns a wrong hash → exit code 4 |
+| **Checksum missing** | Mock server 404s for `.sha256` → install proceeds with `checksum_verified:false`, exit 0 |
+| **JSON stdout** | Success: stdout is parseable JSON. Failure: stdout is also parseable JSON with `ok:false` |
+| **Stderr progress** | Progress messages (`Installing…`, `✓ Checksum verified`) go to stderr, not stdout |
+| **Quiet mode** | `ALF_QUIET=1` → stderr is completely empty, stdout still has JSON |
+| **Post-install verify** | Installed binary is executable, `alf --version` contains "alf" |
+| **Shell compat (Docker)** | Full suite passes on `dash` (Ubuntu/Debian) and `busybox ash` (Alpine) |
+
+**Manual smoke test (no Docker):**
+
+```bash
+# Start mock server
+python3 scripts/test_install/mock_server.py 18432 scripts/test_install/fixtures &
+
+# Run tests natively
+INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localhost
+```
+
+**CI:** `.github/workflows/test-install.yml` runs on every push or PR touching `scripts/install.sh`, `scripts/test_install.sh`, or `scripts/test_install/**`. Two parallel jobs: Linux (Docker, ubuntu-latest) and macOS (native, macos-latest).
 
 ### Integration Walkthrough
 

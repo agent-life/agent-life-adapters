@@ -77,21 +77,23 @@ agent-life-adapters/
 ├── alf-cli/                    # CLI binary crate
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs             # Entrypoint (clap argument parsing)
+│       ├── main.rs             # Entrypoint (clap argument parsing, --human flag)
 │       ├── adapter.rs          # Runtime adapter selection and dispatch
 │       ├── api_client.rs       # Sync service API client
 │       ├── config.rs           # ~/.alf/config.toml management
 │       ├── context.rs          # Runtime context for help (config + state summary)
+│       ├── output.rs           # JSON-first output helpers (json, progress, human_mode)
 │       ├── state.rs            # ~/.alf/state/{agent_id}.toml sync state
 │       └── commands/
 │           ├── mod.rs          # Command dispatch
+│           ├── check.rs        # alf check — environment diagnostics, workspace auto-discovery
 │           ├── export.rs       # alf export — dispatch to runtime adapter
 │           ├── help.rs         # alf help — overview, status, files, troubleshoot
 │           ├── import.rs       # alf import — dispatch to runtime adapter
 │           ├── login.rs        # alf login — authenticate with service
 │           ├── restore.rs      # alf restore — download and import
 │           ├── sync.rs         # alf sync — push/pull to sync service API
-│           └── validate.rs      # alf validate — schema validation
+│           └── validate.rs     # alf validate — schema validation
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -180,7 +182,21 @@ The foundation crate that all other components depend on. Provides:
 
 A single binary (`alf`) that provides all end-user operations. Built with `clap` for argument parsing.
 
+**JSON-first output.** All commands output structured JSON to stdout by default. Progress messages go to stderr. This makes the CLI directly consumable by agents and scripts — pipe stdout to `jq`, parse it in Python, or feed it to another tool. Use the global `--human` flag (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
+
+**Global flag:**
+
+```
+alf [--human] <command> [args...]
+```
+
 **Commands:**
+
+```
+alf check --runtime <runtime> [--workspace <path>]
+```
+
+Pre-flight environment diagnostic. Discovers the agent workspace (auto-detects from `~/.openclaw/openclaw.json` if `-w` is omitted), checks for expected resources (SOUL.md, memory files, etc.), verifies ALF config and API key, and reports readiness to sync. Outputs a structured `CheckResult` with issue codes and fix instructions. This is the recommended first command for agents to run.
 
 ```
 alf export --runtime <runtime> --workspace <path> [--output <path>]
@@ -207,10 +223,10 @@ alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>]
 Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. If `--agent` is omitted and exactly one agent is tracked in `~/.alf/state/`, that agent is used. Used for disaster recovery or migration to a new machine.
 
 ```
-alf help [topic] [--json]
+alf help [topic]
 ```
 
-Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status` (full environment and service reachability), `files` (directory layout), `troubleshoot` (common fixes), or a command name for long help. Use `alf help status --json` for machine-readable status (for agents and scripts).
+Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status` (full environment and service reachability as JSON by default), `files` (directory layout), `troubleshoot` (common fixes), or a command name for long help. The `--json` flag on `alf help status` is still accepted for backward compatibility but is now a no-op (JSON is the default).
 
 ```
 alf login [-k|--key <api-key>]
@@ -233,6 +249,7 @@ api_key = "alf_..."
 
 [defaults]
 runtime = "openclaw"
+workspace = "/home/user/.openclaw/workspace"  # optional, auto-discovered by alf check
 ```
 
 Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout.
@@ -309,7 +326,7 @@ The install script detects the platform and downloads the correct binary to `/us
 cargo install --git https://github.com/agent-life/agent-life-adapters.git alf-cli
 ```
 
-**OpenClaw skill usage:** The binary is invoked directly by the agent. No runtime dependencies, no package manager, no Node.js.
+**OpenClaw skill usage:** The binary is invoked directly by the agent. JSON-first output means agents can parse command results from stdout without scraping text. No runtime dependencies, no package manager, no Node.js.
 
 ---
 

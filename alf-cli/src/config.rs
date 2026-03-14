@@ -30,6 +30,9 @@ pub struct ServiceConfig {
 pub struct DefaultsConfig {
     #[serde(default = "default_runtime")]
     pub runtime: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
 }
 
 fn default_api_url() -> String {
@@ -62,6 +65,7 @@ impl Default for DefaultsConfig {
     fn default() -> Self {
         Self {
             runtime: default_runtime(),
+            workspace: None,
         }
     }
 }
@@ -169,6 +173,7 @@ mod tests {
             },
             defaults: DefaultsConfig {
                 runtime: "zeroclaw".into(),
+                workspace: Some("/home/user/.openclaw/workspace".into()),
             },
         };
 

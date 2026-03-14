@@ -7,6 +7,7 @@ use std::process::Command;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::context;
+use crate::output;
 
 /// JSON-serializable status (paths as strings).
 #[derive(Serialize)]
@@ -40,26 +41,21 @@ struct AgentServiceStatusJson {
     error: Option<String>,
 }
 
-pub fn run(topic: Option<&str>, json: bool) -> Result<()> {
+pub fn run(topic: Option<&str>, _json: bool) -> Result<()> {
     let topic = topic.unwrap_or("overview").trim().to_lowercase();
     let topic = if topic.is_empty() { "overview" } else { topic.as_str() };
 
-    if json && topic != "status" {
-        eprintln!("--json is only valid for 'alf help status'");
-        std::process::exit(1);
-    }
-
     match topic {
         "overview" => print_overview(),
-        "status" => print_status(json),
+        "status" => print_status(),
         "files" => print_files(),
         "troubleshoot" => print_troubleshoot(),
-        "export" | "import" | "validate" | "sync" | "restore" | "login" => {
+        "export" | "import" | "validate" | "sync" | "restore" | "login" | "check" => {
             delegate_command_help(topic)
         }
         _ => {
             eprintln!("Unknown topic: {}", topic);
-            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, sync, restore, login");
+            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, sync, restore, login, check");
             std::process::exit(1);
         }
     }
@@ -135,97 +131,97 @@ fn print_overview() -> Result<()> {
     println!("Run 'alf help files' for directory layout.");
     println!("Run 'alf help troubleshoot' for common fixes.");
     println!();
-    println!("Agent-friendly: use 'alf help status --json' for machine-readable status (config path, api_key set, tracked agents).");
+    println!("Agent-friendly: all commands output JSON by default. Use --human for text output.");
     println!();
     println!("Documentation: https://agent-life.ai");
     println!("Specification: https://github.com/agent-life/agent-life-data-format");
     Ok(())
 }
 
-fn print_status(json_output: bool) -> Result<()> {
+fn print_status() -> Result<()> {
     let status = context::gather_status()?;
     let config = Config::load()?;
     let (service_reachable, agent_service_status) = fetch_service_status(&config, &status.agents);
 
-    if json_output {
-        let json_status = StatusJson {
-            config_path: status.config_path.to_string_lossy().into_owned(),
-            config_exists: status.config_exists,
-            api_key_set: status.api_key_set,
-            state_dir: status.state_dir.to_string_lossy().into_owned(),
-            state_dir_exists: status.state_dir_exists,
-            service_reachable,
-            agents: status
-                .agents
-                .into_iter()
-                .map(|a| AgentJson {
-                    agent_id: a.agent_id.to_string(),
-                    last_synced_sequence: a.last_synced_sequence,
-                    last_synced_at: a.last_synced_at,
-                    snapshot_exists: a.snapshot_exists,
-                })
-                .collect(),
-            agent_service_status,
-        };
-        println!("{}", serde_json::to_string_pretty(&json_status)?);
+    if output::human_mode() {
+        println!("Config:");
+        println!("  Path:   {}", status.config_path.display());
+        println!("  Exists: {}", status.config_exists);
+        println!("  API key set: {}", status.api_key_set);
+        println!();
+        println!("State directory:");
+        println!("  Path:   {}", status.state_dir.display());
+        println!("  Exists: {}", status.state_dir_exists);
+        println!();
+
+        if status.agents.is_empty() {
+            println!("Tracked agents: (none)");
+        } else {
+            println!("Tracked agents:");
+            for a in &status.agents {
+                println!("  {}  sequence={}  last_synced={}  snapshot={}",
+                    a.agent_id,
+                    a.last_synced_sequence,
+                    a.last_synced_at.as_deref().unwrap_or("(never)"),
+                    if a.snapshot_exists { "yes" } else { "no" }
+                );
+            }
+        }
+
+        println!();
+        println!("Service (agent-life API):");
+        if !status.api_key_set {
+            println!("  Status: not checked (no API key)");
+        } else if status.agents.is_empty() {
+            println!("  Status: not checked (no tracked agents)");
+        } else if agent_service_status.is_empty() {
+            println!("  Status: unreachable (could not create client)");
+        } else {
+            println!(
+                "  Status: {}",
+                if service_reachable { "reachable" } else { "unreachable or auth failed" }
+            );
+            for s in &agent_service_status {
+                if s.online {
+                    println!(
+                        "  {}  online  name={}  server_sequence={}",
+                        s.agent_id,
+                        s.name.as_deref().unwrap_or("—"),
+                        s.server_latest_sequence.map(|n| n.to_string()).as_deref().unwrap_or("—")
+                    );
+                } else {
+                    println!("  {}  offline  error={}", s.agent_id, s.error.as_deref().unwrap_or("unknown"));
+                }
+            }
+        }
+
+        println!();
+        print_next_steps(&status);
+        println!();
+        println!("Tip: omit --human to get JSON output (default for agents and scripts).");
         return Ok(());
     }
 
-    println!("Config:");
-    println!("  Path:   {}", status.config_path.display());
-    println!("  Exists: {}", status.config_exists);
-    println!("  API key set: {}", status.api_key_set);
-    println!();
-    println!("State directory:");
-    println!("  Path:   {}", status.state_dir.display());
-    println!("  Exists: {}", status.state_dir_exists);
-    println!();
-
-    if status.agents.is_empty() {
-        println!("Tracked agents: (none)");
-    } else {
-        println!("Tracked agents:");
-        for a in &status.agents {
-            println!("  {}  sequence={}  last_synced={}  snapshot={}",
-                a.agent_id,
-                a.last_synced_sequence,
-                a.last_synced_at.as_deref().unwrap_or("(never)"),
-                if a.snapshot_exists { "yes" } else { "no" }
-            );
-        }
-    }
-
-    println!();
-    println!("Service (agent-life API):");
-    if !status.api_key_set {
-        println!("  Status: not checked (no API key)");
-    } else if status.agents.is_empty() {
-        println!("  Status: not checked (no tracked agents)");
-    } else if agent_service_status.is_empty() {
-        println!("  Status: unreachable (could not create client)");
-    } else {
-        println!(
-            "  Status: {}",
-            if service_reachable { "reachable" } else { "unreachable or auth failed" }
-        );
-        for s in &agent_service_status {
-            if s.online {
-                println!(
-                    "  {}  online  name={}  server_sequence={}",
-                    s.agent_id,
-                    s.name.as_deref().unwrap_or("—"),
-                    s.server_latest_sequence.map(|n| n.to_string()).as_deref().unwrap_or("—")
-                );
-            } else {
-                println!("  {}  offline  error={}", s.agent_id, s.error.as_deref().unwrap_or("unknown"));
-            }
-        }
-    }
-
-    println!();
-    print_next_steps(&status);
-    println!();
-    println!("Use 'alf help status --json' for the same information in JSON (for agents and scripts).");
+    let json_status = StatusJson {
+        config_path: status.config_path.to_string_lossy().into_owned(),
+        config_exists: status.config_exists,
+        api_key_set: status.api_key_set,
+        state_dir: status.state_dir.to_string_lossy().into_owned(),
+        state_dir_exists: status.state_dir_exists,
+        service_reachable,
+        agents: status
+            .agents
+            .into_iter()
+            .map(|a| AgentJson {
+                agent_id: a.agent_id.to_string(),
+                last_synced_sequence: a.last_synced_sequence,
+                last_synced_at: a.last_synced_at,
+                snapshot_exists: a.snapshot_exists,
+            })
+            .collect(),
+        agent_service_status,
+    };
+    output::json(&json_status);
     Ok(())
 }
 

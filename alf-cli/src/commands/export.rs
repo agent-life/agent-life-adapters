@@ -1,12 +1,25 @@
 //! `alf export` — export an agent workspace to an .alf archive.
 
 use crate::adapter;
+use crate::output;
 use anyhow::{bail, Result};
 use colored::Colorize;
+use serde::Serialize;
 use std::path::Path;
 
-pub fn run(runtime: &str, workspace: &Path, output: Option<&Path>) -> Result<()> {
-    // Resolve adapter
+#[derive(Serialize)]
+struct ExportResult {
+    ok: bool,
+    output: String,
+    agent_name: String,
+    alf_version: String,
+    memory_records: u64,
+    file_size: u64,
+}
+
+pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result<()> {
+    let human = output::human_mode();
+
     let adapter = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown runtime '{}'. Supported: {}",
@@ -15,7 +28,6 @@ pub fn run(runtime: &str, workspace: &Path, output: Option<&Path>) -> Result<()>
         )
     })?;
 
-    // Validate workspace exists
     if !workspace.exists() {
         bail!(
             "Workspace directory does not exist: {}",
@@ -29,12 +41,10 @@ pub fn run(runtime: &str, workspace: &Path, output: Option<&Path>) -> Result<()>
         );
     }
 
-    // Determine output path
     let default_output;
-    let output_path = match output {
+    let output_path = match output_arg {
         Some(p) => p,
         None => {
-            // Default: ./<workspace-dir-name>.alf
             let dir_name = workspace
                 .file_name()
                 .map(|n| n.to_string_lossy().to_string())
@@ -44,45 +54,58 @@ pub fn run(runtime: &str, workspace: &Path, output: Option<&Path>) -> Result<()>
         }
     };
 
-    println!(
-        "{} Exporting {} workspace...",
-        "▸".blue().bold(),
-        adapter.name()
-    );
-    println!("  Workspace: {}", workspace.display());
-    println!("  Output:    {}", output_path.display());
-    println!();
+    if human {
+        println!(
+            "{} Exporting {} workspace...",
+            "▸".blue().bold(),
+            adapter.name()
+        );
+        println!("  Workspace: {}", workspace.display());
+        println!("  Output:    {}", output_path.display());
+        println!();
+    } else {
+        output::progress(&format!("Exporting {} workspace...", adapter.name()));
+    }
 
-    // Run export
     let report = adapter.export(workspace, output_path)?;
 
-    // Print summary
-    println!("{} Export complete", "✓".green().bold());
-    println!();
-    println!("  Agent:       {}", report.agent_name);
-    println!("  ALF version: {}", report.alf_version);
-    println!("  Memories:    {}", report.memory_records);
+    if human {
+        println!("{} Export complete", "✓".green().bold());
+        println!();
+        println!("  Agent:       {}", report.agent_name);
+        println!("  ALF version: {}", report.alf_version);
+        println!("  Memories:    {}", report.memory_records);
 
-    if let Some(v) = report.identity_version {
-        println!("  Identity:    v{v}");
-    }
-    if report.principals_count > 0 {
-        println!("  Principals:  {}", report.principals_count);
-    }
-    if report.credentials_count > 0 {
-        println!("  Credentials: {}", report.credentials_count);
-    }
-    if report.attachments_count > 0 {
-        println!("  Attachments: {}", report.attachments_count);
-    }
-    if !report.raw_sources.is_empty() {
-        println!("  Raw sources: {}", report.raw_sources.join(", "));
-    }
+        if let Some(v) = report.identity_version {
+            println!("  Identity:    v{v}");
+        }
+        if report.principals_count > 0 {
+            println!("  Principals:  {}", report.principals_count);
+        }
+        if report.credentials_count > 0 {
+            println!("  Credentials: {}", report.credentials_count);
+        }
+        if report.attachments_count > 0 {
+            println!("  Attachments: {}", report.attachments_count);
+        }
+        if !report.raw_sources.is_empty() {
+            println!("  Raw sources: {}", report.raw_sources.join(", "));
+        }
 
-    let size = format_size(report.output_size_bytes);
-    println!("  File size:   {size}");
-    println!();
-    println!("  {}", report.output_path);
+        let size = format_size(report.output_size_bytes);
+        println!("  File size:   {size}");
+        println!();
+        println!("  {}", report.output_path);
+    } else {
+        output::json(&ExportResult {
+            ok: true,
+            output: report.output_path.clone(),
+            agent_name: report.agent_name.clone(),
+            alf_version: report.alf_version.clone(),
+            memory_records: report.memory_records,
+            file_size: report.output_size_bytes,
+        });
+    }
 
     Ok(())
 }

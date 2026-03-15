@@ -117,15 +117,30 @@ pub mod tests {
     /// Shared lock for tests that mutate the HOME env var across modules.
     pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restore HOME when dropped (for tests that set HOME to a temp dir).
-    struct RestoreHome(Option<std::ffi::OsString>);
+    /// Restore HOME and ALF_API_KEY when dropped.
+    struct RestoreEnv {
+        home: Option<std::ffi::OsString>,
+        api_key: Option<std::ffi::OsString>,
+    }
 
-    impl Drop for RestoreHome {
+    impl RestoreEnv {
+        fn snapshot() -> Self {
+            Self {
+                home: env::var_os("HOME"),
+                api_key: env::var_os("ALF_API_KEY"),
+            }
+        }
+    }
+
+    impl Drop for RestoreEnv {
         fn drop(&mut self) {
-            if let Some(ref v) = self.0 {
-                env::set_var("HOME", v);
-            } else {
-                env::remove_var("HOME");
+            match &self.home {
+                Some(v) => env::set_var("HOME", v),
+                None => env::remove_var("HOME"),
+            }
+            match &self.api_key {
+                Some(v) => env::set_var("ALF_API_KEY", v),
+                None => env::remove_var("ALF_API_KEY"),
             }
         }
     }
@@ -134,8 +149,9 @@ pub mod tests {
     fn gather_status_no_config_uses_defaults() {
         let _guard = HOME_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let _restore = RestoreHome(env::var_os("HOME"));
+        let _restore = RestoreEnv::snapshot();
         env::set_var("HOME", tmp.path());
+        env::remove_var("ALF_API_KEY");
 
         let status = gather_status().unwrap();
 
@@ -150,8 +166,9 @@ pub mod tests {
     fn gather_status_with_config_and_state() {
         let _guard = HOME_LOCK.lock().unwrap();
         let tmp = TempDir::new().unwrap();
-        let _restore = RestoreHome(env::var_os("HOME"));
+        let _restore = RestoreEnv::snapshot();
         env::set_var("HOME", tmp.path());
+        env::remove_var("ALF_API_KEY");
 
         let alf = tmp.path().join(".alf");
         let state_dir = alf.join("state");

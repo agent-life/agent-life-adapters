@@ -1,12 +1,8 @@
 ---
-
-## name: agent-life
-description: >-
-  Backup, sync, and restore agent memory and state to the cloud using the
-  Agent Life Format (ALF). Use when asked to back up agent data, sync
-  memory to the cloud, restore from a backup, or migrate between agent
-  frameworks. Requires the alf CLI binary.
-metadata: {"openclaw":{"requires":{"bins":["alf"]},"install":[{"id":"alf","kind":"binary","url":"[https://agent-life.ai/install.sh","bins":["alf"],"label":"Install](https://agent-life.ai/install.sh","bins":["alf"],"label":"Install) alf CLI (curl | sh)"}],"homepage":"[https://agent-life.ai"}}](https://agent-life.ai"}})
+name: agent-life
+description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from a backup, or migrate between agent frameworks. Requires the alf CLI binary and an API key from agent-life.ai.
+metadata: {"openclaw":{"requires":{"bins":["alf"],"env":["ALF_API_KEY"],"config":["~/.alf/config.toml","~/.openclaw/openclaw.json"]},"install":[{"id":"alf","kind":"binary","url":"https://github.com/agent-life/agent-life-adapters/releases/latest","bins":["alf"],"label":"Install alf CLI from GitHub Releases"}],"homepage":"https://agent-life.ai"}}
+---
 
 # Agent Life — Backup, Sync, and Restore
 
@@ -14,9 +10,20 @@ The `alf` CLI backs up, syncs, and restores your agent's memory, identity, crede
 
 ## Install
 
+Download and install the `alf` binary from [GitHub Releases](https://github.com/agent-life/agent-life-adapters/releases):
+
 ```sh
-curl -sSL https://agent-life.ai/install.sh | sh
+# Option 1: Download, inspect, then run the install script (recommended)
+curl -sSL https://raw.githubusercontent.com/agent-life/agent-life-adapters/main/scripts/install.sh -o install-alf.sh
+cat install-alf.sh    # inspect the script
+sh install-alf.sh     # run it
+
+# Option 2: Direct binary download (no install script)
+# See platform binaries at: https://github.com/agent-life/agent-life-adapters/releases/latest
 ```
+
+Source code: https://github.com/agent-life/agent-life-adapters (MIT license, open source)
+Install script source: https://github.com/agent-life/agent-life-adapters/blob/main/scripts/install.sh
 
 The install script detects your platform, downloads the binary, verifies the SHA256 checksum, and installs to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). Stdout is JSON:
 
@@ -192,11 +199,41 @@ For complete flag documentation, JSON output schemas, and error codes:
 - Agent-readable: [https://agent-life.ai/docs/cli.md](https://agent-life.ai/docs/cli.md)
 - Human-readable: [https://agent-life.ai/docs/cli](https://agent-life.ai/docs/cli)
 
+## Data and Privacy
+
+This skill uploads agent data to the agent-life.ai cloud service. Here is exactly what is sent:
+
+**Uploaded:** Memory records (daily logs, curated memory, project notes), identity files (SOUL.md, IDENTITY.md), principals (USER.md), workspace config files (AGENTS.md, TOOLS.md, etc.).
+
+**NOT uploaded:** Actual secrets (API keys, tokens, passwords) are **never** read or transmitted. The `alf` CLI only exports credential *metadata* — service names and labels (e.g. "GitHub API key: configured") — never the secret values themselves. Session transcripts and chat history are not uploaded.
+
+**Review before uploading:** You can inspect exactly what will be uploaded before any data leaves your machine:
+
+```sh
+alf export -r openclaw -w <workspace>   # creates a local .alf archive
+alf validate agent-export.alf           # check the archive structure
+```
+
+The `.alf` archive is a standard file you can inspect. Nothing is uploaded until you explicitly run `alf sync`.
+
+**Config files read:** The `alf` CLI reads `~/.alf/config.toml` (its own config) and `~/.openclaw/openclaw.json` (to auto-discover the workspace path). These paths are declared in the skill's `requires.config` metadata. No other files outside the workspace directory are read.
+
+**Storage:** All data is encrypted at rest (AES-256 via AWS KMS, per-tenant keys). Data is stored in AWS S3 (blobs) and Neon Postgres (metadata), both in the US.
+
+**Access:** Only the authenticated user (API key holder) can read or delete their data. There is no shared access, no analytics on user data, and no third-party data sharing.
+
+**Deletion:** Delete individual agents via the web dashboard at agent-life.ai or via `DELETE /v1/agents/:id`. Account deletion removes all data.
+
+**API key scope:** The `ALF_API_KEY` authenticates to your agent-life.ai account. It can only access data belonging to that account. Keys can be revoked and rotated at https://agent-life.ai/settings/api-keys.
+
+**Privacy policy:** https://agent-life.ai/privacy
+
 ## Environment Variables
 
 
 | Variable          | Description                                          |
 | ----------------- | ---------------------------------------------------- |
+| `ALF_API_KEY`     | API key for agent-life.ai (fallback if not in config)|
 | `ALF_HUMAN`       | Set to `1` for human-readable output instead of JSON |
 | `ALF_INSTALL_DIR` | Override install directory for install.sh            |
 | `ALF_VERSION`     | Pin install.sh to a specific release                 |

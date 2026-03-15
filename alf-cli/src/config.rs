@@ -92,15 +92,25 @@ impl Config {
     }
 
     /// Load config from a specific path. Returns defaults if the file
-    /// doesn't exist.
+    /// doesn't exist. Falls back to `ALF_API_KEY` env var if no key in file.
     pub fn load_from(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut config = if !path.exists() {
+            Self::default()
+        } else {
+            let content = fs::read_to_string(path)
+                .with_context(|| format!("Failed to read config from {}", path.display()))?;
+            toml::from_str(&content)
+                .with_context(|| format!("Failed to parse config at {}", path.display()))?
+        };
+
+        if config.service.api_key.is_empty() {
+            if let Ok(key) = std::env::var("ALF_API_KEY") {
+                if !key.is_empty() {
+                    config.service.api_key = key;
+                }
+            }
         }
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read config from {}", path.display()))?;
-        let config: Config = toml::from_str(&content)
-            .with_context(|| format!("Failed to parse config at {}", path.display()))?;
+
         Ok(config)
     }
 
@@ -151,7 +161,10 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use tempfile::TempDir;
+
+    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config() {
@@ -184,6 +197,9 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+        std::env::remove_var("ALF_API_KEY");
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
 
@@ -226,5 +242,37 @@ mod tests {
         assert!(toml_str.contains("[defaults]"));
         assert!(toml_str.contains("api_url"));
         assert!(toml_str.contains("runtime"));
+    }
+
+    #[test]
+    fn env_var_fallback_when_no_key_in_file() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        fs::write(&path, "[service]\napi_url = \"https://api.agent-life.ai\"\n").unwrap();
+
+        std::env::set_var("ALF_API_KEY", "alf_sk_from_env");
+        let config = Config::load_from(&path).unwrap();
+        std::env::remove_var("ALF_API_KEY");
+
+        assert_eq!(config.service.api_key, "alf_sk_from_env");
+    }
+
+    #[test]
+    fn file_key_takes_precedence_over_env_var() {
+        let _lock = ENV_MUTEX.lock().unwrap();
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        fs::write(&path, "[service]\napi_key = \"from_file\"\n").unwrap();
+
+        std::env::set_var("ALF_API_KEY", "from_env");
+        let config = Config::load_from(&path).unwrap();
+        std::env::remove_var("ALF_API_KEY");
+
+        assert_eq!(config.service.api_key, "from_file");
     }
 }

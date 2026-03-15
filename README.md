@@ -77,21 +77,23 @@ agent-life-adapters/
 ├── alf-cli/                    # CLI binary crate
 │   ├── Cargo.toml
 │   └── src/
-│       ├── main.rs             # Entrypoint (clap argument parsing)
+│       ├── main.rs             # Entrypoint (clap argument parsing, --human flag)
 │       ├── adapter.rs          # Runtime adapter selection and dispatch
 │       ├── api_client.rs       # Sync service API client
 │       ├── config.rs           # ~/.alf/config.toml management
 │       ├── context.rs          # Runtime context for help (config + state summary)
+│       ├── output.rs           # JSON-first output helpers (json, progress, human_mode)
 │       ├── state.rs            # ~/.alf/state/{agent_id}.toml sync state
 │       └── commands/
 │           ├── mod.rs          # Command dispatch
+│           ├── check.rs        # alf check — environment diagnostics, workspace auto-discovery
 │           ├── export.rs       # alf export — dispatch to runtime adapter
 │           ├── help.rs         # alf help — overview, status, files, troubleshoot
 │           ├── import.rs       # alf import — dispatch to runtime adapter
 │           ├── login.rs        # alf login — authenticate with service
 │           ├── restore.rs      # alf restore — download and import
 │           ├── sync.rs         # alf sync — push/pull to sync service API
-│           └── validate.rs      # alf validate — schema validation
+│           └── validate.rs     # alf validate — schema validation
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -117,12 +119,23 @@ agent-life-adapters/
 │       ├── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
 │       └── credential_map.rs   # Map config credential hints → Credentials (metadata only)
 │
-├── scripts/                   # Optional tooling
-│   └── ...                     # e.g. generate_synthetic_data.py
+├── scripts/
+│   ├── install.sh              # Quick-install script (curl | sh)
+│   ├── test_install.sh         # Install test runner (Docker + native)
+│   ├── test_install/           # Install test infrastructure
+│   │   ├── mock_server.py      # HTTP mock server (simulates GitHub Releases)
+│   │   ├── run_tests.sh        # Core test cases (35+ tests)
+│   │   ├── Dockerfile.ubuntu   # Ubuntu 24.04 test image
+│   │   ├── Dockerfile.alpine   # Alpine 3.19 test image
+│   │   ├── Dockerfile.debian   # Debian 12 test image
+│   │   └── fixtures/           # Fake binaries + SHA256 checksums
+│   └── ...                     # generate_synthetic_data.py, generate_fixtures.sh, etc.
 │
 ├── .github/
 │   └── workflows/
-│       └── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
+│       ├── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
+│       ├── test-install.yml    # Install script tests (Linux Docker + macOS native)
+│       └── release.yml         # Build, release, upload to S3 with SHA256 checksums
 │
 └── tests/                      # Top-level integration tests (if present)
 ```
@@ -180,7 +193,21 @@ The foundation crate that all other components depend on. Provides:
 
 A single binary (`alf`) that provides all end-user operations. Built with `clap` for argument parsing.
 
+**JSON-first output.** All commands output structured JSON to stdout by default. Progress messages go to stderr. This makes the CLI directly consumable by agents and scripts — pipe stdout to `jq`, parse it in Python, or feed it to another tool. Use the global `--human` flag (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
+
+**Global flag:**
+
+```
+alf [--human] <command> [args...]
+```
+
 **Commands:**
+
+```
+alf check --runtime <runtime> [--workspace <path>]
+```
+
+Pre-flight environment diagnostic. Discovers the agent workspace (auto-detects from `~/.openclaw/openclaw.json` if `-w` is omitted), checks for expected resources (SOUL.md, memory files, etc.), verifies ALF config and API key, and reports readiness to sync. Outputs a structured `CheckResult` with issue codes and fix instructions. This is the recommended first command for agents to run.
 
 ```
 alf export --runtime <runtime> --workspace <path> [--output <path>]
@@ -207,10 +234,10 @@ alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>]
 Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. If `--agent` is omitted and exactly one agent is tracked in `~/.alf/state/`, that agent is used. Used for disaster recovery or migration to a new machine.
 
 ```
-alf help [topic] [--json]
+alf help [topic]
 ```
 
-Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status` (full environment and service reachability), `files` (directory layout), `troubleshoot` (common fixes), or a command name for long help. Use `alf help status --json` for machine-readable status (for agents and scripts).
+Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status` (full environment and service reachability as JSON by default), `files` (directory layout), `troubleshoot` (common fixes), or a command name for long help. The `--json` flag on `alf help status` is still accepted for backward compatibility but is now a no-op (JSON is the default).
 
 ```
 alf login [-k|--key <api-key>]
@@ -233,6 +260,7 @@ api_key = "alf_..."
 
 [defaults]
 runtime = "openclaw"
+workspace = "/home/user/.openclaw/workspace"  # optional, auto-discovered by alf check
 ```
 
 Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout.
@@ -309,7 +337,7 @@ The install script detects the platform and downloads the correct binary to `/us
 cargo install --git https://github.com/agent-life/agent-life-adapters.git alf-cli
 ```
 
-**OpenClaw skill usage:** The binary is invoked directly by the agent. No runtime dependencies, no package manager, no Node.js.
+**OpenClaw skill usage:** The binary is invoked directly by the agent. JSON-first output means agents can parse command results from stdout without scraping text. No runtime dependencies, no package manager, no Node.js.
 
 ---
 
@@ -431,6 +459,56 @@ You can repeat restore to a fresh directory to simulate disaster recovery or mig
 **Schema compliance**: Every `.alf` file produced by any adapter is validated against the JSON schemas before the test passes.
 
 **CI**: `cargo test` + `cargo clippy` + `cargo fmt --check` on every push. Cross-compilation smoke test on release tags (build all 5 targets, verify binaries are non-zero size).
+
+### Install Script Tests
+
+The install script (`scripts/install.sh`) has its own isolated test suite that runs against a local mock HTTP server — no real GitHub or S3 calls, no network required.
+
+**Entry point:**
+
+```bash
+./scripts/test_install.sh              # All tests: Docker (Linux) + native (macOS if on macOS)
+./scripts/test_install.sh --linux      # Linux only, runs all three Docker containers
+./scripts/test_install.sh --macos      # macOS native only
+./scripts/test_install.sh --quick      # Ubuntu container only (fastest, ~15 seconds)
+```
+
+**Requirements:** `python3`, `docker` (for Linux tests), `curl`.
+
+**How it works:** The runner starts a Python mock server (`scripts/test_install/mock_server.py`) that simulates GitHub Releases — it serves fake `alf` binaries and `.sha256` checksum files from `scripts/test_install/fixtures/`. The fake binaries are shell scripts that respond to `--version`, so no real Rust build is needed. Install script tests run inside Docker containers (Ubuntu 24.04, Debian 12, Alpine 3.19) as a non-root user, exercising each distro's `/bin/sh` implementation (`dash` on Ubuntu/Debian, `busybox ash` on Alpine).
+
+**What is tested:**
+
+| Category | Tests |
+|---|---|
+| **Happy path** | Binary installed, stdout is valid JSON with `ok:true`, `version`, `path`, `checksum_verified` |
+| **Version resolution** | Mock GitHub API returns `v0.0.0-test`; auto-discovered without `ALF_VERSION` set |
+| **Version pin** | `ALF_VERSION=v0.0.0-test` skips API call, uses pinned tag |
+| **Custom install dir** | `ALF_INSTALL_DIR=/tmp/custom` → binary lands at the right path |
+| **Non-root install** | Runs as non-root (no writable `/usr/local/bin`) → installs to `~/.local/bin`, PATH warning in stderr |
+| **Platform detection** | `uname` shim injects Linux/x86\_64, Linux/aarch64, Darwin/x86\_64, Darwin/arm64 → correct binary name selected |
+| **Unsupported OS** | FreeBSD → exit code 2 |
+| **Unsupported arch** | Linux/riscv64 → exit code 2 |
+| **Download failure** | Version not found on mock server (HTTP 404, both primary and backup) → exit code 3 |
+| **Checksum mismatch** | Mock server returns a wrong hash → exit code 4 |
+| **Checksum missing** | Mock server 404s for `.sha256` → install proceeds with `checksum_verified:false`, exit 0 |
+| **JSON stdout** | Success: stdout is parseable JSON. Failure: stdout is also parseable JSON with `ok:false` |
+| **Stderr progress** | Progress messages (`Installing…`, `✓ Checksum verified`) go to stderr, not stdout |
+| **Quiet mode** | `ALF_QUIET=1` → stderr is completely empty, stdout still has JSON |
+| **Post-install verify** | Installed binary is executable, `alf --version` contains "alf" |
+| **Shell compat (Docker)** | Full suite passes on `dash` (Ubuntu/Debian) and `busybox ash` (Alpine) |
+
+**Manual smoke test (no Docker):**
+
+```bash
+# Start mock server
+python3 scripts/test_install/mock_server.py 18432 scripts/test_install/fixtures &
+
+# Run tests natively
+INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localhost
+```
+
+**CI:** `.github/workflows/test-install.yml` runs on every push or PR touching `scripts/install.sh`, `scripts/test_install.sh`, or `scripts/test_install/**`. Two parallel jobs: Linux (Docker, ubuntu-latest) and macOS (native, macos-latest).
 
 ### Integration Walkthrough
 

@@ -1,0 +1,19 @@
+FROM debian:12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl \
+        python3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN useradd -m testuser
+
+COPY scripts/install.sh /install.sh
+COPY scripts/test_install/ /test_install/
+
+RUN chmod +x /install.sh /test_install/run_tests.sh
+
+USER testuser
+WORKDIR /home/testuser
+
+ENTRYPOINT ["/bin/sh"]

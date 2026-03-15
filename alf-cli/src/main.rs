@@ -7,6 +7,7 @@ mod api_client;
 mod commands;
 mod config;
 mod context;
+pub mod output;
 mod state;
 
 use clap::{Parser, Subcommand};
@@ -23,6 +24,10 @@ use std::process;
     after_help = "Documentation: https://agent-life.ai\nSpecification: https://github.com/agent-life/agent-life-data-format"
 )]
 struct Cli {
+    /// Output human-readable text instead of JSON
+    #[arg(long, global = true, env = "ALF_HUMAN")]
+    human: bool,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -117,21 +122,42 @@ enum Command {
         key: Option<String>,
     },
 
+    /// Check the runtime environment and report readiness to sync
+    #[command(long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
+        whether alf can find the workspace, memory files, API key, and service. \
+        Use this before sync to diagnose configuration issues.\n\n\
+        Example: alf check -r openclaw\n\
+        Example: alf check -r openclaw -w ~/custom-workspace")]
+    Check {
+        /// Agent framework runtime (openclaw, zeroclaw)
+        #[arg(short, long)]
+        runtime: String,
+
+        /// Path to the agent workspace directory (auto-discovered if omitted)
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
+    },
+
     /// Show help (overview, status, files, troubleshoot, or per-command)
-    #[command(long_about = "Topics: overview (default), status, files, troubleshoot, or a command name (export, import, sync, restore, validate, login). \
-        Use 'alf help status --json' for machine-readable status (config path, api_key set, tracked agents) for agents and scripts.")]
+    #[command(long_about = "Topics: overview (default), status, files, troubleshoot, or a command name \
+        (export, import, sync, restore, validate, login, check). \
+        Status output is JSON by default; use --human for text.")]
     Help {
-        /// Topic: overview (default), status, files, troubleshoot, or export|import|sync|restore|validate|login
+        /// Topic: overview (default), status, files, troubleshoot, or a command name
         topic: Option<String>,
 
-        /// Output status as JSON (only with topic 'status'); for agents and scripts
-        #[arg(long)]
+        /// Deprecated: JSON is now the default for status. Kept for backward compatibility.
+        #[arg(long, hide = true)]
         json: bool,
     },
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    if cli.human {
+        std::env::set_var("ALF_HUMAN", "1");
+    }
 
     let result = match cli.command {
         Command::Export {
@@ -161,14 +187,23 @@ fn main() {
 
         Command::Login { key } => commands::login::run(key.as_deref()),
 
+        Command::Check {
+            runtime,
+            workspace,
+        } => commands::check::run(&runtime, workspace.as_deref()),
+
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
     };
 
     if let Err(err) = result {
-        eprintln!("{} {err:#}", "error:".red().bold());
         let hint = error_hint(&err);
-        if !hint.is_empty() {
-            eprintln!("{}", hint);
+        if output::human_mode() {
+            eprintln!("{} {err:#}", "error:".red().bold());
+            if !hint.is_empty() {
+                eprintln!("{}", hint);
+            }
+        } else {
+            output::json_error(&format!("{err:#}"), &hint);
         }
         process::exit(1);
     }

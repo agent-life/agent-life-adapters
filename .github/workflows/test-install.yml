@@ -1,0 +1,42 @@
+name: Install Script Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/test_install.sh'
+      - 'scripts/test_install/**'
+  pull_request:
+    paths:
+      - 'scripts/install.sh'
+      - 'scripts/test_install.sh'
+      - 'scripts/test_install/**'
+  workflow_dispatch:
+
+jobs:
+  linux:
+    name: Linux (Docker)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Linux install tests
+        run: ./scripts/test_install.sh --linux
+
+  macos:
+    name: macOS (native)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run macOS install tests
+        run: ./scripts/test_install.sh --macos

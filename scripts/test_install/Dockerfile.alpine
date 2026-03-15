@@ -1,0 +1,20 @@
+FROM alpine:3.19
+
+RUN apk add --no-cache \
+        curl \
+        python3 \
+        ca-certificates \
+        bash \
+        coreutils
+
+RUN adduser -D testuser
+
+COPY scripts/install.sh /install.sh
+COPY scripts/test_install/ /test_install/
+
+RUN chmod +x /install.sh /test_install/run_tests.sh
+
+USER testuser
+WORKDIR /home/testuser
+
+ENTRYPOINT ["/bin/sh"]

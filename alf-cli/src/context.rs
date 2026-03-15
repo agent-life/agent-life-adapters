@@ -107,15 +107,15 @@ pub fn gather_status() -> Result<StatusSummary> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::*;
     use std::env;
     use std::io::Write;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    /// Serialize tests that set HOME so they don't overwrite each other when run in parallel.
-    static HOME_LOCK: Mutex<()> = Mutex::new(());
+    /// Shared lock for tests that mutate the HOME env var across modules.
+    pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
     /// Restore HOME when dropped (for tests that set HOME to a temp dir).
     struct RestoreHome(Option<std::ffi::OsString>);

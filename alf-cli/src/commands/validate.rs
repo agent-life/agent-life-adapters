@@ -1,17 +1,35 @@
 //! `alf validate` — validate an .alf archive against the ALF specification.
 
+use crate::output;
+
 use alf_core::archive::AlfReader;
 use alf_core::validation::{
     self, Severity, ValidationReport,
 };
 use anyhow::{bail, Result};
 use colored::Colorize;
+use serde::Serialize;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 
+#[derive(Serialize)]
+struct ValidateResult {
+    ok: bool,
+    valid: bool,
+    errors: Vec<FindingJson>,
+    warnings: Vec<FindingJson>,
+}
+
+#[derive(Serialize)]
+struct FindingJson {
+    path: String,
+    message: String,
+}
+
 pub fn run(alf_file: &Path) -> Result<()> {
-    // Validate file exists
+    let human = output::human_mode();
+
     if !alf_file.exists() {
         bail!("ALF file does not exist: {}", alf_file.display());
     }
@@ -19,29 +37,29 @@ pub fn run(alf_file: &Path) -> Result<()> {
         bail!("ALF path is not a file: {}", alf_file.display());
     }
 
-    println!(
-        "{} Validating {}...",
-        "▸".blue().bold(),
-        alf_file.display()
-    );
-    println!();
+    if human {
+        println!(
+            "{} Validating {}...",
+            "▸".blue().bold(),
+            alf_file.display()
+        );
+        println!();
+    } else {
+        output::progress(&format!("Validating {}...", alf_file.display()));
+    }
 
-    // Open archive
     let file = File::open(alf_file)?;
     let reader = BufReader::new(file);
     let mut archive = AlfReader::new(reader)?;
 
     let mut report = ValidationReport::new();
 
-    // 1. Validate manifest
     let manifest = archive.manifest().clone();
     report.merge(validation::validate_manifest(&manifest));
 
-    // 2. Validate identity (if present)
     if let Some(identity) = archive.read_identity()? {
         report.merge(validation::validate_identity(&identity));
 
-        // Cross-check: identity agent_id matches manifest agent_id
         if identity.agent_id != manifest.agent.id {
             report.merge({
                 let mut r = ValidationReport::new();
@@ -58,22 +76,18 @@ pub fn run(alf_file: &Path) -> Result<()> {
         }
     }
 
-    // 3. Validate principals (if present)
     if let Some(principals) = archive.read_principals()? {
         report.merge(validation::validate_principals(&principals));
     }
 
-    // 4. Validate credentials (if present)
     if let Some(credentials) = archive.read_credentials()? {
         report.merge(validation::validate_credentials(&credentials));
     }
 
-    // 5. Validate memory records (all partitions)
     let all_memory = archive.read_all_memory()?;
     if !all_memory.is_empty() {
         report.merge(validation::validate_memory_records(&all_memory));
 
-        // Cross-check: actual record count matches manifest
         if let Some(mem) = &manifest.layers.memory {
             if mem.record_count != all_memory.len() as u64 {
                 report.merge({
@@ -93,25 +107,50 @@ pub fn run(alf_file: &Path) -> Result<()> {
         }
     }
 
-    // Print results
-    print_report(&report);
+    if human {
+        print_report(&report);
 
-    if report.is_valid() {
-        println!(
-            "\n{} Archive is valid",
-            "✓".green().bold()
-        );
-        Ok(())
+        if report.is_valid() {
+            println!(
+                "\n{} Archive is valid",
+                "✓".green().bold()
+            );
+            Ok(())
+        } else {
+            println!(
+                "\n{} Archive has validation errors",
+                "✗".red().bold()
+            );
+            bail!(
+                "Validation failed with {} error(s)",
+                report.errors().len()
+            )
+        }
     } else {
-        println!(
-            "\n{} Archive has validation errors",
-            "✗".red().bold()
-        );
-        // Return error to set exit code = 1
-        bail!(
-            "Validation failed with {} error(s)",
-            report.errors().len()
-        )
+        let errors: Vec<FindingJson> = report.errors().iter().map(|f| FindingJson {
+            path: f.path.clone(),
+            message: f.message.clone(),
+        }).collect();
+        let warnings: Vec<FindingJson> = report.warnings().iter().map(|f| FindingJson {
+            path: f.path.clone(),
+            message: f.message.clone(),
+        }).collect();
+        let valid = report.is_valid();
+
+        output::json(&ValidateResult {
+            ok: valid,
+            valid,
+            errors,
+            warnings,
+        });
+
+        if !valid {
+            bail!(
+                "Validation failed with {} error(s)",
+                report.errors().len()
+            )
+        }
+        Ok(())
     }
 }
 

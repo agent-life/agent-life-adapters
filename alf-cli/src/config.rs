@@ -161,10 +161,8 @@ fn home_dir() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
+    use crate::context::tests::HOME_LOCK;
     use tempfile::TempDir;
-
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
     fn default_config() {
@@ -197,7 +195,7 @@ mod tests {
 
     #[test]
     fn load_missing_file_returns_defaults() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = HOME_LOCK.lock().unwrap();
         std::env::remove_var("ALF_API_KEY");
 
         let dir = TempDir::new().unwrap();
@@ -246,7 +244,7 @@ mod tests {
 
     #[test]
     fn env_var_fallback_when_no_key_in_file() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = HOME_LOCK.lock().unwrap();
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
@@ -262,7 +260,7 @@ mod tests {
 
     #[test]
     fn file_key_takes_precedence_over_env_var() {
-        let _lock = ENV_MUTEX.lock().unwrap();
+        let _lock = HOME_LOCK.lock().unwrap();
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");

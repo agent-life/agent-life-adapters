@@ -208,17 +208,23 @@ fn help_overview() {
 
 #[test]
 fn help_status_json_default() {
-    let assert = alf_cmd()
-        .arg("help")
-        .arg("status")
-        .assert()
-        .success();
+    let assert = alf_cmd().arg("help").arg("status").assert().success();
     let out = assert.get_output().stdout.clone();
     let text = std::str::from_utf8(&out).unwrap();
-    let v: serde_json::Value = serde_json::from_str(text).expect("alf help status must output valid JSON by default");
-    assert!(v.get("config_path").is_some(), "JSON must include config_path");
-    assert!(v.get("service_reachable").is_some(), "JSON must include service_reachable");
-    assert!(v.get("agent_service_status").is_some(), "JSON must include agent_service_status");
+    let v: serde_json::Value =
+        serde_json::from_str(text).expect("alf help status must output valid JSON by default");
+    assert!(
+        v.get("config_path").is_some(),
+        "JSON must include config_path"
+    );
+    assert!(
+        v.get("service_reachable").is_some(),
+        "JSON must include service_reachable"
+    );
+    assert!(
+        v.get("agent_service_status").is_some(),
+        "JSON must include agent_service_status"
+    );
 }
 
 #[test]
@@ -244,7 +250,8 @@ fn help_status_json_flag_still_works() {
         .success();
     let out = assert.get_output().stdout.clone();
     let text = std::str::from_utf8(&out).unwrap();
-    let v: serde_json::Value = serde_json::from_str(text).expect("alf help status --json must still output valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(text).expect("alf help status --json must still output valid JSON");
     assert!(v.get("service_reachable").is_some());
 }
 

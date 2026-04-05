@@ -4,8 +4,8 @@
 //! This allows the CLI to track what has been synced and compute deltas
 //! from the correct base.
 
-use anyhow::{Context, Result};
 use anyhow::bail;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;

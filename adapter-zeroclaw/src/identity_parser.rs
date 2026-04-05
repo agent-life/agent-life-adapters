@@ -14,9 +14,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use uuid::Uuid;
 
-use alf_core::{
-    Identity, Linguistics, Names, ProseIdentity, Psychology, StructuredIdentity,
-};
+use alf_core::{Identity, Linguistics, Names, ProseIdentity, Psychology, StructuredIdentity};
 
 use crate::config_parser::{IdentityFormat, ZeroClawConfig};
 
@@ -143,16 +141,22 @@ fn parse_aieos_identity(
         }
     };
 
-    let val: serde_json::Value = serde_json::from_str(&raw_json)
-        .context("Failed to parse AIEOS identity JSON")?;
+    let val: serde_json::Value =
+        serde_json::from_str(&raw_json).context("Failed to parse AIEOS identity JSON")?;
 
     let identity_obj = val.get("identity").unwrap_or(&val);
 
     // Extract names
     let names = identity_obj.get("names").and_then(|n| {
         let primary = n.get("first")?.as_str()?.to_string();
-        let nickname = n.get("nickname").and_then(|v| v.as_str()).map(|s| s.to_string());
-        let full = n.get("full").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let nickname = n
+            .get("nickname")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let full = n
+            .get("full")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         Some(Names {
             primary,
             nickname,
@@ -298,10 +302,9 @@ fn load_aieos_json(workspace: &Path, config: &ZeroClawConfig) -> Result<Option<S
             workspace.join(path_str)
         };
         if path.is_file() {
-            return Ok(Some(
-                fs::read_to_string(&path)
-                    .with_context(|| format!("Failed to read AIEOS file: {}", path.display()))?,
-            ));
+            return Ok(Some(fs::read_to_string(&path).with_context(|| {
+                format!("Failed to read AIEOS file: {}", path.display())
+            })?));
         }
     }
 
@@ -375,10 +378,16 @@ mod tests {
         let ws = tmp.path();
         fs::write(ws.join("SOUL.md"), "# Nova\n\nA helpful assistant.\n").unwrap();
         fs::write(ws.join("IDENTITY.md"), "# Nova Identity\n\nDetails.\n").unwrap();
-        fs::write(ws.join("AGENTS.md"), "# Operating Instructions\n\nBe helpful.\n").unwrap();
+        fs::write(
+            ws.join("AGENTS.md"),
+            "# Operating Instructions\n\nBe helpful.\n",
+        )
+        .unwrap();
 
         let config = default_config();
-        let id = parse_identity(ws, &config, Uuid::new_v4()).unwrap().unwrap();
+        let id = parse_identity(ws, &config, Uuid::new_v4())
+            .unwrap()
+            .unwrap();
 
         assert_eq!(id.source_format.as_deref(), Some("openclaw"));
         let prose = id.prose.unwrap();
@@ -396,7 +405,9 @@ mod tests {
         fs::write(ws.join("SOUL.md"), "# Agent\n\nMinimal.\n").unwrap();
 
         let config = default_config();
-        let id = parse_identity(ws, &config, Uuid::new_v4()).unwrap().unwrap();
+        let id = parse_identity(ws, &config, Uuid::new_v4())
+            .unwrap()
+            .unwrap();
         assert!(id.prose.unwrap().identity_profile.is_none());
     }
 
@@ -434,7 +445,9 @@ mod tests {
         config.identity_format = IdentityFormat::Aieos;
         config.aieos_path = Some("identity.json".into());
 
-        let id = parse_identity(ws, &config, Uuid::new_v4()).unwrap().unwrap();
+        let id = parse_identity(ws, &config, Uuid::new_v4())
+            .unwrap()
+            .unwrap();
         assert_eq!(id.source_format.as_deref(), Some("aieos"));
 
         let s = id.structured.unwrap();
@@ -461,7 +474,9 @@ mod tests {
         config.identity_format = IdentityFormat::Aieos;
         config.aieos_inline = Some(r#"{"identity":{"names":{"first":"Inline"}}}"#.into());
 
-        let id = parse_identity(tmp.path(), &config, Uuid::new_v4()).unwrap().unwrap();
+        let id = parse_identity(tmp.path(), &config, Uuid::new_v4())
+            .unwrap()
+            .unwrap();
         let s = id.structured.unwrap();
         assert_eq!(s.names.unwrap().primary, "Inline");
     }
@@ -476,7 +491,9 @@ mod tests {
         config.identity_format = IdentityFormat::Aieos;
         // No aieos_path or aieos_inline — should fall back to openclaw files
 
-        let id = parse_identity(ws, &config, Uuid::new_v4()).unwrap().unwrap();
+        let id = parse_identity(ws, &config, Uuid::new_v4())
+            .unwrap()
+            .unwrap();
         assert_eq!(id.source_format.as_deref(), Some("openclaw"));
     }
 
@@ -484,7 +501,11 @@ mod tests {
     fn detect_name_aieos() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
-        fs::write(ws.join("identity.json"), r#"{"identity":{"names":{"first":"AiName"}}}"#).unwrap();
+        fs::write(
+            ws.join("identity.json"),
+            r#"{"identity":{"names":{"first":"AiName"}}}"#,
+        )
+        .unwrap();
 
         let mut config = default_config();
         config.identity_format = IdentityFormat::Aieos;

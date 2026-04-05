@@ -15,10 +15,7 @@ use adapter_zeroclaw::ZeroClawAdapter;
 
 /// Returns the list of all available adapters.
 pub fn available_adapters() -> Vec<Box<dyn Adapter>> {
-    vec![
-        Box::new(OpenClawAdapter),
-        Box::new(ZeroClawAdapter),
-    ]
+    vec![Box::new(OpenClawAdapter), Box::new(ZeroClawAdapter)]
 }
 
 /// Look up an adapter by runtime name.

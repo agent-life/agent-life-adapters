@@ -180,7 +180,8 @@ impl ApiClient {
             "source_runtime": source_runtime,
         });
 
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!("{}/agents", self.api_url))
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
@@ -189,9 +190,9 @@ impl ApiClient {
             .context("failed to contact sync service")?;
 
         match resp.status() {
-            StatusCode::CREATED => {
-                resp.json::<AgentInfo>().context("failed to parse agent response")
-            }
+            StatusCode::CREATED => resp
+                .json::<AgentInfo>()
+                .context("failed to parse agent response"),
             StatusCode::CONFLICT => {
                 // Agent already exists — fetch it instead
                 self.get_agent(agent_id)
@@ -207,17 +208,14 @@ impl ApiClient {
     pub fn get_agent(&self, agent_id: Uuid) -> Result<AgentInfo> {
         let resp = self.authed_get(&format!("/agents/{}", agent_id))?;
         check_status(&resp, StatusCode::OK, "get agent")?;
-        resp.json::<AgentInfo>().context("failed to parse agent response")
+        resp.json::<AgentInfo>()
+            .context("failed to parse agent response")
     }
 
     // ── Snapshot upload ───────────────────────────────────────────
 
     /// Upload a full snapshot. Uses direct PUT for ≤6 MB, presigned for larger.
-    pub fn upload_snapshot(
-        &self,
-        agent_id: Uuid,
-        data: &[u8],
-    ) -> Result<SnapshotUploadResponse> {
+    pub fn upload_snapshot(&self, agent_id: Uuid, data: &[u8]) -> Result<SnapshotUploadResponse> {
         if data.len() <= DIRECT_UPLOAD_LIMIT {
             self.upload_snapshot_direct(agent_id, data)
         } else {
@@ -230,7 +228,8 @@ impl ApiClient {
         agent_id: Uuid,
         data: &[u8],
     ) -> Result<SnapshotUploadResponse> {
-        let resp = self.http
+        let resp = self
+            .http
             .put(format!("{}/agents/{}/snapshot", self.api_url, agent_id))
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/octet-stream")
@@ -249,19 +248,25 @@ impl ApiClient {
         data: &[u8],
     ) -> Result<SnapshotUploadResponse> {
         // 1. Initiate — get presigned URL
-        let resp = self.http
-            .post(format!("{}/agents/{}/snapshot/upload", self.api_url, agent_id))
+        let resp = self
+            .http
+            .post(format!(
+                "{}/agents/{}/snapshot/upload",
+                self.api_url, agent_id
+            ))
             .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
             .header(CONTENT_TYPE, "application/json")
             .send()
             .context("failed to initiate snapshot upload")?;
 
         check_status(&resp, StatusCode::OK, "initiate snapshot upload")?;
-        let initiate: UploadInitiateResponse = resp.json()
+        let initiate: UploadInitiateResponse = resp
+            .json()
             .context("failed to parse upload initiate response")?;
 
         // 2. Upload directly to S3 via presigned URL
-        let resp = self.http
+        let resp = self
+            .http
             .put(&initiate.upload_url)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
@@ -273,7 +278,8 @@ impl ApiClient {
         }
 
         // 3. Confirm
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!(
                 "{}/agents/{}/snapshot/upload/{}/confirm",
                 self.api_url, agent_id, initiate.snapshot_id
@@ -298,11 +304,15 @@ impl ApiClient {
         let resp = self.authed_get(&format!("/agents/{}/snapshot", agent_id))?;
         check_status(&resp, StatusCode::OK, "download snapshot")?;
 
-        let info: SnapshotDownloadResponse = resp.json()
+        let info: SnapshotDownloadResponse = resp
+            .json()
             .context("failed to parse snapshot download response")?;
 
         // Fetch actual bytes from the presigned URL
-        let resp = self.http.get(&info.snapshot_url).send()
+        let resp = self
+            .http
+            .get(&info.snapshot_url)
+            .send()
             .context("failed to download snapshot from S3")?;
 
         if !resp.status().is_success() {
@@ -319,12 +329,16 @@ impl ApiClient {
     pub fn restore(&self, agent_id: Uuid) -> Result<RestoreResponse> {
         let resp = self.authed_get(&format!("/agents/{}/restore", agent_id))?;
         check_status(&resp, StatusCode::OK, "restore")?;
-        resp.json::<RestoreResponse>().context("failed to parse restore response")
+        resp.json::<RestoreResponse>()
+            .context("failed to parse restore response")
     }
 
     /// Download bytes from a presigned URL (for snapshot or delta).
     pub fn download_presigned(&self, url: &str) -> Result<Vec<u8>> {
-        let resp = self.http.get(url).send()
+        let resp = self
+            .http
+            .get(url)
+            .send()
             .context("failed to download from presigned URL")?;
 
         if !resp.status().is_success() {
@@ -360,7 +374,8 @@ impl ApiClient {
         base_sequence: u64,
         data: &[u8],
     ) -> Result<DeltaUploadResponse> {
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!(
                 "{}/agents/{}/deltas?base_sequence={}",
                 self.api_url, agent_id, base_sequence
@@ -383,7 +398,9 @@ impl ApiClient {
                     "Sequence conflict: your local state is at sequence {} but the \
                      server is at {}. Pull the latest changes first:\n  \
                      alf restore -r <runtime> -w <workspace> -a {}",
-                    base_sequence, seq, agent_id
+                    base_sequence,
+                    seq,
+                    agent_id
                 ),
                 None => bail!(
                     "Sequence conflict: your local state is out of date. \
@@ -404,7 +421,8 @@ impl ApiClient {
         data: &[u8],
     ) -> Result<DeltaUploadResponse> {
         // 1. Initiate
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!(
                 "{}/agents/{}/deltas/upload?base_sequence={}",
                 self.api_url, agent_id, base_sequence
@@ -425,7 +443,8 @@ impl ApiClient {
                 Some(seq) => bail!(
                     "Sequence conflict: your local state is at sequence {} but the \
                      server is at {}. Pull the latest changes first.",
-                    base_sequence, seq
+                    base_sequence,
+                    seq
                 ),
                 None => bail!(
                     "Sequence conflict: your local state is out of date. \
@@ -435,11 +454,13 @@ impl ApiClient {
         }
 
         check_status(&resp, StatusCode::OK, "initiate delta upload")?;
-        let initiate: DeltaInitiateResponse = resp.json()
+        let initiate: DeltaInitiateResponse = resp
+            .json()
             .context("failed to parse delta initiate response")?;
 
         // 2. Upload to S3
-        let resp = self.http
+        let resp = self
+            .http
             .put(&initiate.upload_url)
             .header(CONTENT_TYPE, "application/octet-stream")
             .body(data.to_vec())
@@ -451,7 +472,8 @@ impl ApiClient {
         }
 
         // 3. Confirm
-        let resp = self.http
+        let resp = self
+            .http
             .post(format!(
                 "{}/agents/{}/deltas/upload/{}/confirm",
                 self.api_url, agent_id, initiate.delta_id
@@ -470,16 +492,11 @@ impl ApiClient {
 
     /// List deltas since a given sequence number.
     #[allow(dead_code)]
-    pub fn pull_deltas(
-        &self,
-        agent_id: Uuid,
-        since: u64,
-    ) -> Result<PullDeltasResponse> {
-        let resp = self.authed_get(
-            &format!("/agents/{}/deltas?since={}", agent_id, since),
-        )?;
+    pub fn pull_deltas(&self, agent_id: Uuid, since: u64) -> Result<PullDeltasResponse> {
+        let resp = self.authed_get(&format!("/agents/{}/deltas?since={}", agent_id, since))?;
         check_status(&resp, StatusCode::OK, "pull deltas")?;
-        resp.json::<PullDeltasResponse>().context("failed to parse pull deltas response")
+        resp.json::<PullDeltasResponse>()
+            .context("failed to parse pull deltas response")
     }
 
     // ── Internal helpers ──────────────────────────────────────────

@@ -123,7 +123,11 @@ fn classify_file(relative_path: &str) -> FileClassification {
         let date_str = &caps[1];
         let observed = NaiveDate::parse_from_str(date_str, "%Y-%m-%d")
             .ok()
-            .and_then(|d| d.and_time(NaiveTime::from_hms_opt(0, 0, 0)?).and_utc().into());
+            .and_then(|d| {
+                d.and_time(NaiveTime::from_hms_opt(0, 0, 0)?)
+                    .and_utc()
+                    .into()
+            });
 
         return FileClassification {
             memory_type: MemoryType::Episodic,
@@ -320,7 +324,8 @@ mod tests {
         fs::write(
             ws.join("memory/2026-01-15.md"),
             "## Session — 10:30 AM\n\nReviewed the plan.\n\n## Session — 2:15 PM\n\nShipped v2.\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let records = collect_markdown_memory(&ws, agent_id, None).unwrap();
         assert_eq!(records.len(), 2);
@@ -339,7 +344,8 @@ mod tests {
         fs::write(
             ws.join("memory/session_abc123.md"),
             "## Turn 1\n\nUser asked about weather.\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let records = collect_markdown_memory(&ws, agent_id, None).unwrap();
         assert_eq!(records.len(), 1);
@@ -359,7 +365,8 @@ mod tests {
         fs::write(
             ws.join("memory/archive/2026-01-08.md"),
             "## Old session\n\nArchived content.\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let records = collect_markdown_memory(&ws, agent_id, None).unwrap();
         assert_eq!(records.len(), 1);

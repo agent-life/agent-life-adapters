@@ -347,10 +347,7 @@ mod tests {
     }
 
     /// Build a snapshot archive in memory from layers.
-    fn build_snapshot(
-        identity: Option<&Identity>,
-        records: &[MemoryRecord],
-    ) -> Vec<u8> {
+    fn build_snapshot(identity: Option<&Identity>, records: &[MemoryRecord]) -> Vec<u8> {
         let buf = Cursor::new(Vec::new());
         let mut writer = AlfWriter::new(buf, make_manifest()).unwrap();
 
@@ -365,8 +362,7 @@ mod tests {
             groups.entry(path).or_default().push(r.clone());
         }
         for (file_path, group_records) in &groups {
-            let (from, to) = PartitionAssigner::date_range_for_partition(file_path)
-                .unwrap();
+            let (from, to) = PartitionAssigner::date_range_for_partition(file_path).unwrap();
             let info = MemoryPartitionInfo {
                 file: file_path.clone(),
                 from,
@@ -470,7 +466,10 @@ mod tests {
         let record_a = make_record(1, "Record A", 1);
         let record_b = make_record(2, "Record B", 1);
         let record_c = make_record(3, "Record C", 1);
-        let base = build_snapshot(None, &[record_a.clone(), record_b.clone(), record_c.clone()]);
+        let base = build_snapshot(
+            None,
+            &[record_a.clone(), record_b.clone(), record_c.clone()],
+        );
 
         // Delta: create D, update B, delete A
         let record_d = make_record(4, "Record D", 1);
@@ -499,7 +498,10 @@ mod tests {
         assert_eq!(rebuilt_records.len(), 3); // B(updated) + C + D
         let contents: Vec<&str> = rebuilt_records.iter().map(|r| r.content.as_str()).collect();
         assert!(!contents.contains(&"Record A"), "A should be deleted");
-        assert!(contents.contains(&"Record B updated"), "B should be updated");
+        assert!(
+            contents.contains(&"Record B updated"),
+            "B should be updated"
+        );
         assert!(contents.contains(&"Record C"), "C should be unchanged");
         assert!(contents.contains(&"Record D"), "D should be created");
     }
@@ -529,30 +531,34 @@ mod tests {
 
         // Delta 1: add C
         let record_c = make_record(3, "Record C", 1);
-        let delta1 = build_delta(0, None, &[DeltaMemoryEntry {
-            operation: DeltaOperation::Create,
-            record: record_c.clone(),
-        }]);
+        let delta1 = build_delta(
+            0,
+            None,
+            &[DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: record_c.clone(),
+            }],
+        );
 
         // Delta 2: delete A, update B
         let mut updated_b = record_b.clone();
         updated_b.content = "Record B v2".into();
-        let delta2 = build_delta(1, None, &[
-            DeltaMemoryEntry {
-                operation: DeltaOperation::Delete,
-                record: record_a.clone(),
-            },
-            DeltaMemoryEntry {
-                operation: DeltaOperation::Update,
-                record: updated_b.clone(),
-            },
-        ]);
+        let delta2 = build_delta(
+            1,
+            None,
+            &[
+                DeltaMemoryEntry {
+                    operation: DeltaOperation::Delete,
+                    record: record_a.clone(),
+                },
+                DeltaMemoryEntry {
+                    operation: DeltaOperation::Update,
+                    record: updated_b.clone(),
+                },
+            ],
+        );
 
-        let rebuilt = rebuild_snapshot(
-            &base,
-            &[delta1.as_slice(), delta2.as_slice()],
-        )
-        .unwrap();
+        let rebuilt = rebuild_snapshot(&base, &[delta1.as_slice(), delta2.as_slice()]).unwrap();
 
         let rebuilt_records = read_all_memory(&rebuilt);
         assert_eq!(rebuilt_records.len(), 2); // B(v2) + C
@@ -574,11 +580,16 @@ mod tests {
         .unwrap();
 
         writer
-            .add_raw_source("test-runtime", "config.toml", b"[settings]\nkey = \"value\"")
+            .add_raw_source(
+                "test-runtime",
+                "config.toml",
+                b"[settings]\nkey = \"value\"",
+            )
             .unwrap();
 
         let record = make_record(1, "Memory", 1);
-        let (from, to) = PartitionAssigner::date_range_for_partition("memory/2026-Q1.jsonl").unwrap();
+        let (from, to) =
+            PartitionAssigner::date_range_for_partition("memory/2026-Q1.jsonl").unwrap();
         writer
             .add_memory_partition(
                 MemoryPartitionInfo {
@@ -597,10 +608,14 @@ mod tests {
 
         // Apply a memory-only delta
         let new_record = make_record(2, "New memory", 1);
-        let delta = build_delta(0, None, &[DeltaMemoryEntry {
-            operation: DeltaOperation::Create,
-            record: new_record,
-        }]);
+        let delta = build_delta(
+            0,
+            None,
+            &[DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: new_record,
+            }],
+        );
 
         let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
 
@@ -608,11 +623,15 @@ mod tests {
         let mut reader = AlfReader::new(Cursor::new(&rebuilt)).unwrap();
         let files = reader.file_names();
         assert!(
-            files.iter().any(|f| f.contains("raw/test-runtime/config.toml")),
+            files
+                .iter()
+                .any(|f| f.contains("raw/test-runtime/config.toml")),
             "raw source should be preserved. Files: {:?}",
             files
         );
-        let raw_data = reader.read_raw_entry("raw/test-runtime/config.toml").unwrap();
+        let raw_data = reader
+            .read_raw_entry("raw/test-runtime/config.toml")
+            .unwrap();
         assert_eq!(raw_data, b"[settings]\nkey = \"value\"");
 
         // Verify memory has both records
@@ -632,16 +651,20 @@ mod tests {
         // Delta adds records in Q2 (month=4) and Q3 (month=7)
         let record_q2 = make_record(3, "Q2 record", 4);
         let record_q3 = make_record(4, "Q3 record", 7);
-        let delta = build_delta(0, None, &[
-            DeltaMemoryEntry {
-                operation: DeltaOperation::Create,
-                record: record_q2,
-            },
-            DeltaMemoryEntry {
-                operation: DeltaOperation::Create,
-                record: record_q3,
-            },
-        ]);
+        let delta = build_delta(
+            0,
+            None,
+            &[
+                DeltaMemoryEntry {
+                    operation: DeltaOperation::Create,
+                    record: record_q2,
+                },
+                DeltaMemoryEntry {
+                    operation: DeltaOperation::Create,
+                    record: record_q3,
+                },
+            ],
+        );
 
         let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
         let reader = AlfReader::new(Cursor::new(&rebuilt)).unwrap();
@@ -650,9 +673,14 @@ mod tests {
         let manifest = reader.manifest().clone();
         let memory = manifest.layers.memory.unwrap();
         assert_eq!(memory.record_count, 4);
-        assert_eq!(memory.partitions.len(), 3, "Should have Q1, Q2, Q3 partitions");
+        assert_eq!(
+            memory.partitions.len(),
+            3,
+            "Should have Q1, Q2, Q3 partitions"
+        );
 
-        let partition_files: Vec<&str> = memory.partitions.iter().map(|p| p.file.as_str()).collect();
+        let partition_files: Vec<&str> =
+            memory.partitions.iter().map(|p| p.file.as_str()).collect();
         assert!(partition_files.contains(&"memory/2026-Q1.jsonl"));
         assert!(partition_files.contains(&"memory/2026-Q2.jsonl"));
         assert!(partition_files.contains(&"memory/2026-Q3.jsonl"));

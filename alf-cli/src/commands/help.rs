@@ -43,7 +43,11 @@ struct AgentServiceStatusJson {
 
 pub fn run(topic: Option<&str>, _json: bool) -> Result<()> {
     let topic = topic.unwrap_or("overview").trim().to_lowercase();
-    let topic = if topic.is_empty() { "overview" } else { topic.as_str() };
+    let topic = if topic.is_empty() {
+        "overview"
+    } else {
+        topic.as_str()
+    };
 
     match topic {
         "overview" => print_overview(),
@@ -119,7 +123,11 @@ fn print_overview() -> Result<()> {
     println!("Current status:");
     println!(
         "  Config file:  {}",
-        if status.config_exists { "present" } else { "missing" }
+        if status.config_exists {
+            "present"
+        } else {
+            "missing"
+        }
     );
     println!(
         "  API key set:  {}",
@@ -159,7 +167,8 @@ fn print_status() -> Result<()> {
         } else {
             println!("Tracked agents:");
             for a in &status.agents {
-                println!("  {}  sequence={}  last_synced={}  snapshot={}",
+                println!(
+                    "  {}  sequence={}  last_synced={}  snapshot={}",
                     a.agent_id,
                     a.last_synced_sequence,
                     a.last_synced_at.as_deref().unwrap_or("(never)"),
@@ -179,7 +188,11 @@ fn print_status() -> Result<()> {
         } else {
             println!(
                 "  Status: {}",
-                if service_reachable { "reachable" } else { "unreachable or auth failed" }
+                if service_reachable {
+                    "reachable"
+                } else {
+                    "unreachable or auth failed"
+                }
             );
             for s in &agent_service_status {
                 if s.online {
@@ -187,10 +200,17 @@ fn print_status() -> Result<()> {
                         "  {}  online  name={}  server_sequence={}",
                         s.agent_id,
                         s.name.as_deref().unwrap_or("—"),
-                        s.server_latest_sequence.map(|n| n.to_string()).as_deref().unwrap_or("—")
+                        s.server_latest_sequence
+                            .map(|n| n.to_string())
+                            .as_deref()
+                            .unwrap_or("—")
                     );
                 } else {
-                    println!("  {}  offline  error={}", s.agent_id, s.error.as_deref().unwrap_or("unknown"));
+                    println!(
+                        "  {}  offline  error={}",
+                        s.agent_id,
+                        s.error.as_deref().unwrap_or("unknown")
+                    );
                 }
             }
         }
@@ -251,11 +271,26 @@ fn print_files() -> Result<()> {
 
     println!("alf file layout (no sensitive data):");
     println!();
-    println!("  {}          Config directory", status.config_dir.display());
-    println!("  {}/config.toml   User config (API URL, API key)", status.config_dir.display());
-    println!("  {}/state/        Per-agent sync state", status.config_dir.display());
-    println!("  {}/state/{{agent-id}}.toml       Agent sync cursor (sequence, last sync time)", status.config_dir.display());
-    println!("  {}/state/{{agent-id}}-snapshot.alf   Last exported snapshot (delta base)", status.config_dir.display());
+    println!(
+        "  {}          Config directory",
+        status.config_dir.display()
+    );
+    println!(
+        "  {}/config.toml   User config (API URL, API key)",
+        status.config_dir.display()
+    );
+    println!(
+        "  {}/state/        Per-agent sync state",
+        status.config_dir.display()
+    );
+    println!(
+        "  {}/state/{{agent-id}}.toml       Agent sync cursor (sequence, last sync time)",
+        status.config_dir.display()
+    );
+    println!(
+        "  {}/state/{{agent-id}}-snapshot.alf   Last exported snapshot (delta base)",
+        status.config_dir.display()
+    );
     println!();
     println!("Config and state are created when you run 'alf login' and 'alf sync'.");
     Ok(())
@@ -282,11 +317,7 @@ fn print_troubleshoot() -> Result<()> {
 }
 
 fn delegate_command_help(cmd: &str) -> Result<()> {
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("alf"));
-    let status = Command::new(&exe)
-        .arg(cmd)
-        .arg("--help")
-        .status()?;
+    let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("alf"));
+    let status = Command::new(&exe).arg(cmd).arg("--help").status()?;
     std::process::exit(status.code().unwrap_or(1));
 }

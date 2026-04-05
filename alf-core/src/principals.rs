@@ -394,7 +394,10 @@ mod tests {
         // Round-trip
         let serialized = serde_json::to_value(&doc).unwrap();
         assert_eq!(serialized["future_doc_field"], "also kept");
-        assert_eq!(serialized["principals"][0]["future_principal_field"], "kept");
+        assert_eq!(
+            serialized["principals"][0]["future_principal_field"],
+            "kept"
+        );
     }
 
     #[test]

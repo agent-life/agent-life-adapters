@@ -268,7 +268,8 @@ impl<W: Write + Seek> AlfWriter<W> {
     }
 
     fn write_entry(&mut self, path: &str, data: &[u8]) -> Result<(), ArchiveError> {
-        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         self.zip.start_file(path, options)?;
         self.zip.write_all(data)?;
         Ok(())
@@ -326,10 +327,7 @@ impl<R: Read + Seek> AlfReader<R> {
     }
 
     /// Read a single memory partition, returning all records.
-    pub fn read_memory_partition(
-        &mut self,
-        file: &str,
-    ) -> Result<Vec<MemoryRecord>, ArchiveError> {
+    pub fn read_memory_partition(&mut self, file: &str) -> Result<Vec<MemoryRecord>, ArchiveError> {
         let bytes = self.read_raw_entry(file)?;
         let buf_reader = BufReader::new(Cursor::new(bytes));
         let mut pr = PartitionReader::new(buf_reader);
@@ -476,10 +474,7 @@ impl<W: Write + Seek> DeltaWriter<W> {
     /// type (create/update/delete). Since `MemoryRecord` doesn't have an
     /// `operation` field, the caller wraps records using
     /// [`DeltaMemoryEntry`].
-    pub fn add_memory_deltas(
-        &mut self,
-        entries: &[DeltaMemoryEntry],
-    ) -> Result<(), ArchiveError> {
+    pub fn add_memory_deltas(&mut self, entries: &[DeltaMemoryEntry]) -> Result<(), ArchiveError> {
         let path = "memory/delta.jsonl";
         let mut buf = Vec::new();
         for entry in entries {
@@ -513,7 +508,8 @@ impl<W: Write + Seek> DeltaWriter<W> {
     }
 
     fn write_entry(&mut self, path: &str, data: &[u8]) -> Result<(), ArchiveError> {
-        let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+        let options =
+            SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
         self.zip.start_file(path, options)?;
         self.zip.write_all(data)?;
         Ok(())
@@ -861,10 +857,12 @@ mod tests {
         let manifest = base_manifest();
         let agent_id = manifest.agent.id;
 
-        let records_q4: Vec<MemoryRecord> =
-            (0..3).map(|i| make_record(&format!("Q4 memory {i}"))).collect();
-        let records_q1: Vec<MemoryRecord> =
-            (0..2).map(|i| make_record(&format!("Q1 memory {i}"))).collect();
+        let records_q4: Vec<MemoryRecord> = (0..3)
+            .map(|i| make_record(&format!("Q4 memory {i}")))
+            .collect();
+        let records_q1: Vec<MemoryRecord> = (0..2)
+            .map(|i| make_record(&format!("Q1 memory {i}")))
+            .collect();
 
         let identity = make_identity(agent_id);
         let principals = make_principals(agent_id);
@@ -961,7 +959,9 @@ mod tests {
         assert_eq!(all_memory[3].content, "Q1 memory 0");
 
         // Read individual partition
-        let q4 = reader.read_memory_partition("memory/2025-Q4.jsonl").unwrap();
+        let q4 = reader
+            .read_memory_partition("memory/2025-Q4.jsonl")
+            .unwrap();
         assert_eq!(q4.len(), 3);
 
         // Read raw artifacts
@@ -1102,9 +1102,7 @@ mod tests {
 
         let buf = Cursor::new(Vec::new());
         let mut writer = AlfWriter::new(buf, manifest).unwrap();
-        writer
-            .set_identity(&make_identity(agent_id))
-            .unwrap();
+        writer.set_identity(&make_identity(agent_id)).unwrap();
         writer
             .add_memory_partition(
                 MemoryPartitionInfo {
@@ -1250,10 +1248,7 @@ mod tests {
         let mut reader = DeltaReader::new(Cursor::new(buf.into_inner())).unwrap();
         let dm = reader.manifest();
 
-        assert_eq!(
-            dm.changes.identity.as_ref().unwrap().new_version,
-            Some(2)
-        );
+        assert_eq!(dm.changes.identity.as_ref().unwrap().new_version, Some(2));
         assert_eq!(
             dm.changes.principals.as_ref().unwrap().changed_ids,
             vec![changed_principal_id]

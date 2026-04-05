@@ -212,9 +212,15 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
                 } else if let Some(observed) = record.temporal.observed_at {
                     format!("memory/{}.md", observed.format("%Y-%m-%d"))
                 } else {
-                    format!("memory/{}.md", record.temporal.created_at.format("%Y-%m-%d"))
+                    format!(
+                        "memory/{}.md",
+                        record.temporal.created_at.format("%Y-%m-%d")
+                    )
                 };
-                daily_groups.entry(key).or_default().push(record.content.clone());
+                daily_groups
+                    .entry(key)
+                    .or_default()
+                    .push(record.content.clone());
             }
             "conversation" => {
                 // Conversation records grouped by date
@@ -222,7 +228,10 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
                     "memory/{}.md",
                     record.temporal.created_at.format("%Y-%m-%d")
                 );
-                daily_groups.entry(key).or_default().push(record.content.clone());
+                daily_groups
+                    .entry(key)
+                    .or_default()
+                    .push(record.content.clone());
             }
             "session" => {
                 let key = if !origin_file.is_empty() {
@@ -231,7 +240,10 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
                     let short_id = &record.id.to_string()[..8];
                     format!("memory/session_{short_id}.md")
                 };
-                other_files.entry(key).or_default().push(record.content.clone());
+                other_files
+                    .entry(key)
+                    .or_default()
+                    .push(record.content.clone());
             }
             _ => {
                 let key = if !origin_file.is_empty() {
@@ -239,7 +251,10 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
                 } else {
                     format!("memory/{}.md", record.namespace)
                 };
-                other_files.entry(key).or_default().push(record.content.clone());
+                other_files
+                    .entry(key)
+                    .or_default()
+                    .push(record.content.clone());
             }
         }
     }
@@ -325,7 +340,8 @@ mod tests {
                 timestamp TEXT NOT NULL,
                 embedding BLOB
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             rusqlite::params![
@@ -335,16 +351,20 @@ mod tests {
                 "core",
                 "2026-01-15T10:00:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
     fn round_trip_sqlite_workspace() {
         let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
-        let (dir, ws) = create_zeroclaw_home(config, &[
-            ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
-            ("USER.md", "# Alice\n\n## Timezone\n\nAmerica/New_York\n"),
-        ]);
+        let (dir, ws) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
+                ("USER.md", "# Alice\n\n## Timezone\n\nAmerica/New_York\n"),
+            ],
+        );
         create_test_db(dir.path());
 
         // Export
@@ -376,10 +396,13 @@ mod tests {
     #[test]
     fn import_creates_workspace_dirs() {
         let config = "[memory]\nbackend = \"markdown\"";
-        let (dir, ws) = create_zeroclaw_home(config, &[
-            ("SOUL.md", "# DirTest\n\nTest.\n"),
-            ("memory/2026-01-15.md", "## Entry\n\nContent.\n"),
-        ]);
+        let (dir, ws) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# DirTest\n\nTest.\n"),
+                ("memory/2026-01-15.md", "## Entry\n\nContent.\n"),
+            ],
+        );
 
         let alf_file = dir.path().join("export.alf");
         export::export(&ws, &alf_file).unwrap();

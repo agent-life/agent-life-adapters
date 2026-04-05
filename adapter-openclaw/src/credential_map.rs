@@ -124,11 +124,7 @@ mod tests {
 
     fn create_state_dir(agent_id_str: &str, json: &str) -> TempDir {
         let dir = TempDir::new().unwrap();
-        let profile_dir = dir
-            .path()
-            .join("agents")
-            .join(agent_id_str)
-            .join("agent");
+        let profile_dir = dir.path().join("agents").join(agent_id_str).join("agent");
         fs::create_dir_all(&profile_dir).unwrap();
         fs::write(profile_dir.join("auth-profiles.json"), json).unwrap();
         dir

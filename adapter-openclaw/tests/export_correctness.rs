@@ -1,8 +1,8 @@
+use adapter_openclaw::OpenClawAdapter;
+use alf_core::{Adapter, AlfReader, MemoryType};
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use adapter_openclaw::OpenClawAdapter;
-use alf_core::{Adapter, AlfReader, MemoryType};
 use uuid::Uuid;
 
 #[test]
@@ -20,7 +20,7 @@ fn manifest_metadata() {
     let manifest = reader.manifest().clone();
 
     assert_eq!(manifest.agent.source_runtime, "openclaw");
-    assert_eq!(manifest.agent.name, "Core Directives");
+    assert_eq!(manifest.agent.name, "Standard Agent");
 }
 
 #[test]
@@ -48,7 +48,10 @@ fn memory_record_classification() {
             "daily" => {
                 has_daily = true;
                 assert_eq!(r.memory_type, MemoryType::Episodic);
-                assert!(r.temporal.observed_at.is_some(), "Daily log should have observed_at");
+                assert!(
+                    r.temporal.observed_at.is_some(),
+                    "Daily log should have observed_at"
+                );
             }
             "curated" => {
                 has_semantic = true;
@@ -84,18 +87,30 @@ fn identity_and_principals_populated() {
     let file = std::fs::File::open(&alf_path).unwrap();
     let buf_reader = std::io::BufReader::new(file);
     let mut reader = AlfReader::new(buf_reader).expect("open failed");
-    
-    let identity = reader.read_identity().expect("read identity failed").expect("missing identity");
+
+    let identity = reader
+        .read_identity()
+        .expect("read identity failed")
+        .expect("missing identity");
     assert!(identity.prose.is_some());
     let prose = identity.prose.unwrap();
     assert!(prose.soul.is_some(), "SOUL.md should map to soul");
-    assert!(prose.identity_profile.is_some(), "IDENTITY.md should map to identity_profile");
+    assert!(
+        prose.identity_profile.is_some(),
+        "IDENTITY.md should map to identity_profile"
+    );
 
-    let principals = reader.read_principals().expect("read principals failed").expect("missing principals");
+    let principals = reader
+        .read_principals()
+        .expect("read principals failed")
+        .expect("missing principals");
     let profile = &principals.principals[0].profile;
     assert!(profile.prose.is_some());
     let p_prose = profile.prose.as_ref().unwrap();
-    assert!(p_prose.user_profile.is_some(), "USER.md should map to user_profile");
+    assert!(
+        p_prose.user_profile.is_some(),
+        "USER.md should map to user_profile"
+    );
 }
 
 #[test]
@@ -110,7 +125,7 @@ fn raw_sources_included() {
     let file = std::fs::File::open(&alf_path).unwrap();
     let buf_reader = std::io::BufReader::new(file);
     let reader = AlfReader::new(buf_reader).expect("open failed");
-    
+
     // Check if raw/openclaw/ files are correctly saved
     let raw_files = reader.file_names();
     assert!(raw_files.contains(&"raw/openclaw/SOUL.md".to_string()));
@@ -128,7 +143,9 @@ fn agent_id_persisted() {
     let alf_path = tmp.path().join("export.alf");
 
     let adapter = OpenClawAdapter;
-    adapter.export(&workspace, &alf_path).expect("export failed");
+    adapter
+        .export(&workspace, &alf_path)
+        .expect("export failed");
 
     let id_file = workspace.join(".alf-agent-id");
     assert!(id_file.exists(), ".alf-agent-id should be created");
@@ -140,7 +157,10 @@ fn agent_id_persisted() {
     let buf_reader = std::io::BufReader::new(file);
     let reader = AlfReader::new(buf_reader).expect("open failed");
     let manifest = reader.manifest();
-    assert_eq!(manifest.agent.id, uuid, "Manifest UUID should match generated UUID");
+    assert_eq!(
+        manifest.agent.id, uuid,
+        "Manifest UUID should match generated UUID"
+    );
 }
 
 #[test]
@@ -165,5 +185,8 @@ fn importance_tags_extracted() {
             assert_eq!(r.confidence, Some(0.9));
         }
     }
-    assert!(found_decision, "Should have extracted the decision tag and confidence");
+    assert!(
+        found_decision,
+        "Should have extracted the decision tag and confidence"
+    );
 }

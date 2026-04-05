@@ -120,7 +120,7 @@ The `workspace.source` field in the output reports which method was used: `"flag
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
 | `workspace_empty` | warning | No `.md` files in workspace root | Workspace may not be initialized |
-| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; will export with fallback name |
+| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; display name still comes from `IDENTITY.md` `Name` when present, else the workspace folder name |
 | `no_memory_content` | warning | No `MEMORY.md` and no `memory/` directory | Nothing to sync yet |
 | `memory_dir_empty` | warning | `memory/` exists but has no `.md` files | No daily logs yet |
 | `no_api_key` | error | No API key in `~/.alf/config.toml` | `alf login --key <key>` |

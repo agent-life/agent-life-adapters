@@ -13,8 +13,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{
-    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, ProseProfile,
-    StructuredProfile,
+    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, ProseProfile, StructuredProfile,
 };
 
 // ---------------------------------------------------------------------------

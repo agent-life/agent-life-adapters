@@ -346,7 +346,8 @@ mod tests {
                 "core",
                 "2026-01-15T10:30:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         conn.execute(
             "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
@@ -357,7 +358,8 @@ mod tests {
                 "daily",
                 "2026-01-15T14:00:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         drop(conn);
 
@@ -387,7 +389,8 @@ mod tests {
                 "conversation",
                 "2026-01-15T10:00:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let config = test_config();
@@ -413,7 +416,8 @@ mod tests {
         conn.execute(
             "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             rusqlite::params![expected_id, "k", "content", "core", "2026-01-01T00:00:00Z"],
-        ).unwrap();
+        )
+        .unwrap();
         drop(conn);
 
         let config = test_config();

@@ -230,9 +230,7 @@ mod tests {
                     capabilities_granted: vec![],
                     updated_at: None,
                     last_rotated_at: None,
-                    expires_at: Some(
-                        Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap(),
-                    ),
+                    expires_at: Some(Utc.with_ymd_and_hms(2026, 8, 15, 0, 0, 0).unwrap()),
                     tags: vec![],
                     extra: HashMap::new(),
                 },

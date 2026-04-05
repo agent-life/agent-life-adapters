@@ -106,17 +106,20 @@ struct ResolvedWorkspace {
 
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
-    { std::env::var_os("HOME").map(PathBuf::from) }
+    {
+        std::env::var_os("HOME").map(PathBuf::from)
+    }
     #[cfg(windows)]
-    { std::env::var_os("USERPROFILE").map(PathBuf::from) }
+    {
+        std::env::var_os("USERPROFILE").map(PathBuf::from)
+    }
     #[cfg(not(any(unix, windows)))]
-    { None }
+    {
+        None
+    }
 }
 
-fn resolve_workspace(
-    flag: Option<&Path>,
-    config: &Config,
-) -> ResolvedWorkspace {
+fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace {
     // Priority 1: -w flag
     if let Some(ws) = flag {
         return ResolvedWorkspace {
@@ -258,7 +261,8 @@ fn collect_issues(
             severity: "error".into(),
             code: "workspace_not_found".into(),
             message: format!("Workspace directory not found at {}", ws.path),
-            fix: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace".into(),
+            fix: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
+                .into(),
         });
         return issues; // no point checking resources if workspace doesn't exist
     }
@@ -297,8 +301,7 @@ fn collect_issues(
     }
 
     let has_memory_content = resources.memory_md
-        || resources.memory_dir
-        && resources.daily_logs.as_ref().is_some_and(|d| d.count > 0);
+        || resources.memory_dir && resources.daily_logs.as_ref().is_some_and(|d| d.count > 0);
     if !has_memory_content {
         issues.push(Issue {
             severity: "warning".into(),
@@ -386,7 +389,11 @@ fn build_suggestions(result: &CheckResult) -> Vec<String> {
         if result.issues.iter().any(|i| i.code == "no_api_key") {
             suggestions.push("Get an API key at https://agent-life.ai/settings/api-keys".into());
         }
-        if result.issues.iter().any(|i| i.code == "workspace_not_found") {
+        if result
+            .issues
+            .iter()
+            .any(|i| i.code == "workspace_not_found")
+        {
             suggestions.push(
                 "The workspace path may be customized in ~/.openclaw/openclaw.json under agents.defaults.workspace".into()
             );
@@ -538,7 +545,11 @@ fn print_human(result: &CheckResult) {
     println!(
         "  Exists:    {}  Writable: {}",
         if result.workspace.exists { "yes" } else { "no" },
-        if result.workspace.writable { "yes" } else { "no" }
+        if result.workspace.writable {
+            "yes"
+        } else {
+            "no"
+        }
     );
     println!();
 
@@ -573,7 +584,10 @@ fn print_human(result: &CheckResult) {
                 "warning" => "WARN".yellow().bold().to_string(),
                 _ => "INFO".dimmed().to_string(),
             };
-            println!("    [{}] {} ({})", severity_label, issue.message, issue.code);
+            println!(
+                "    [{}] {} ({})",
+                severity_label, issue.message, issue.code
+            );
             println!("      Fix: {}", issue.fix);
         }
         println!();
@@ -588,7 +602,11 @@ fn print_human(result: &CheckResult) {
 }
 
 fn yn(b: bool) -> &'static str {
-    if b { "yes" } else { "no" }
+    if b {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 // ---------------------------------------------------------------------------

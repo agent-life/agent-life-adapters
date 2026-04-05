@@ -17,7 +17,7 @@ use crate::state::AgentState;
 
 use alf_core::archive::{AlfReader, DeltaWriter};
 use alf_core::delta::compute_delta;
-use alf_core::manifest::{DeltaManifest, DeltaAgentRef, DeltaSyncCursor, ChangeInventory};
+use alf_core::manifest::{ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaSyncCursor};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -63,7 +63,10 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
     })?;
 
     if !workspace.exists() {
-        bail!("Workspace directory does not exist: {}", workspace.display());
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
     }
 
     if human {
@@ -85,7 +88,10 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
 
     output::progress("  Exporting workspace...");
     let report = adapt.export(workspace, &temp_alf)?;
-    output::progress(&format!("  Exported {} memory records", report.memory_records));
+    output::progress(&format!(
+        "  Exported {} memory records",
+        report.memory_records
+    ));
 
     // 4. Read the exported archive to get agent ID
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
@@ -95,8 +101,12 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
     // Stable snapshot path under ~/.alf/state for future delta computation
     let mut snapshot_path: PathBuf = AgentState::state_dir()?;
     if !snapshot_path.exists() {
-        fs::create_dir_all(&snapshot_path)
-            .with_context(|| format!("Failed to create state directory {}", snapshot_path.display()))?;
+        fs::create_dir_all(&snapshot_path).with_context(|| {
+            format!(
+                "Failed to create state directory {}",
+                snapshot_path.display()
+            )
+        })?;
     }
     snapshot_path.push(format!("{agent_id}-snapshot.alf"));
 
@@ -107,16 +117,13 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         // First sync: upload full snapshot
         output::progress("  First sync — registering agent and uploading snapshot...");
 
-        let _agent_info = client.register_agent(
-            agent_id,
-            &report.agent_name,
-            runtime,
-        )?;
+        let _agent_info = client.register_agent(agent_id, &report.agent_name, runtime)?;
 
         let upload = client.upload_snapshot(agent_id, &alf_bytes)?;
 
-        fs::copy(&temp_alf, &snapshot_path)
-            .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
+        fs::copy(&temp_alf, &snapshot_path).with_context(|| {
+            format!("Failed to persist snapshot at {}", snapshot_path.display())
+        })?;
 
         let new_state = AgentState {
             agent_id,
@@ -128,7 +135,11 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
 
         if human {
             let state_path = AgentState::path_for(agent_id)?;
-            println!("{} Snapshot uploaded (sequence: {})", "✓".green().bold(), upload.sequence);
+            println!(
+                "{} Snapshot uploaded (sequence: {})",
+                "✓".green().bold(),
+                upload.sequence
+            );
             println!("  Snapshot base: {}", snapshot_path.display());
             println!("  State file:    {}", state_path.display());
         } else {
@@ -154,8 +165,12 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
             snapshot_path.clone()
         };
 
-        let prev_bytes =
-            fs::read(&prev_path).with_context(|| format!("Failed to read previous snapshot at {}", prev_path.display()))?;
+        let prev_bytes = fs::read(&prev_path).with_context(|| {
+            format!(
+                "Failed to read previous snapshot at {}",
+                prev_path.display()
+            )
+        })?;
         let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
         let prev_records = prev_reader.read_all_memory()?;
 
@@ -166,7 +181,10 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
 
         if delta_entries.is_empty() {
             if human {
-                println!("{} No changes detected — already up to date", "✓".green().bold());
+                println!(
+                    "{} No changes detected — already up to date",
+                    "✓".green().bold()
+                );
             } else {
                 output::json(&SyncResult {
                     ok: true,
@@ -180,11 +198,22 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
             return Ok(());
         }
 
-        let creates = delta_entries.iter().filter(|e| e.operation == alf_core::manifest::DeltaOperation::Create).count();
-        let updates = delta_entries.iter().filter(|e| e.operation == alf_core::manifest::DeltaOperation::Update).count();
-        let deletes = delta_entries.iter().filter(|e| e.operation == alf_core::manifest::DeltaOperation::Delete).count();
+        let creates = delta_entries
+            .iter()
+            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Create)
+            .count();
+        let updates = delta_entries
+            .iter()
+            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Update)
+            .count();
+        let deletes = delta_entries
+            .iter()
+            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Delete)
+            .count();
 
-        output::progress(&format!("  Delta: {creates} creates, {updates} updates, {deletes} deletes"));
+        output::progress(&format!(
+            "  Delta: {creates} creates, {updates} updates, {deletes} deletes"
+        ));
 
         let delta_manifest = DeltaManifest {
             alf_version: "1.0.0".into(),
@@ -217,11 +246,15 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         let delta_buf = delta_writer.finish()?;
         let delta_bytes = delta_buf.into_inner();
 
-        output::progress(&format!("  Uploading delta ({} bytes)...", delta_bytes.len()));
+        output::progress(&format!(
+            "  Uploading delta ({} bytes)...",
+            delta_bytes.len()
+        ));
         let upload = client.push_delta(agent_id, state.last_synced_sequence, &delta_bytes)?;
 
-        fs::copy(&temp_alf, &snapshot_path)
-            .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
+        fs::copy(&temp_alf, &snapshot_path).with_context(|| {
+            format!("Failed to persist snapshot at {}", snapshot_path.display())
+        })?;
 
         let new_state = AgentState {
             agent_id,
@@ -245,7 +278,11 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
                 ok: true,
                 sequence: upload.sequence,
                 delta: true,
-                changes: Some(SyncChanges { creates, updates, deletes }),
+                changes: Some(SyncChanges {
+                    creates,
+                    updates,
+                    deletes,
+                }),
                 snapshot_path: snapshot_path.to_string_lossy().into(),
                 no_changes: false,
             });

@@ -105,12 +105,24 @@ struct RawSecretsSection {
     encrypt: bool,
 }
 
-fn default_backend() -> String { "sqlite".into() }
-fn default_true() -> bool { true }
-fn default_embedding() -> String { "none".into() }
-fn default_vector_weight() -> f64 { 0.7 }
-fn default_keyword_weight() -> f64 { 0.3 }
-fn default_identity_format() -> String { "openclaw".into() }
+fn default_backend() -> String {
+    "sqlite".into()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_embedding() -> String {
+    "none".into()
+}
+fn default_vector_weight() -> f64 {
+    0.7
+}
+fn default_keyword_weight() -> f64 {
+    0.3
+}
+fn default_identity_format() -> String {
+    "openclaw".into()
+}
 
 // ---------------------------------------------------------------------------
 // Credential scanning
@@ -118,7 +130,12 @@ fn default_identity_format() -> String { "openclaw".into() }
 
 /// Well-known field names that indicate a secret value in config.toml.
 const SECRET_FIELD_PATTERNS: &[&str] = &[
-    "api_key", "bot_token", "token", "secret", "access_token", "password",
+    "api_key",
+    "bot_token",
+    "token",
+    "secret",
+    "access_token",
+    "password",
 ];
 
 /// Check whether a field name looks like it holds a secret.
@@ -291,7 +308,9 @@ mod tests {
     #[test]
     fn parse_valid_sqlite_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_config(tmp.path(), r#"
+        let path = write_config(
+            tmp.path(),
+            r#"
 [memory]
 backend = "sqlite"
 auto_save = true
@@ -304,7 +323,8 @@ format = "openclaw"
 
 [secrets]
 encrypt = true
-"#);
+"#,
+        );
         let cfg = parse_config(&path).unwrap().unwrap();
         assert_eq!(cfg.memory_backend, MemoryBackend::Sqlite);
         assert!(cfg.auto_save);
@@ -317,11 +337,14 @@ encrypt = true
     #[test]
     fn parse_aieos_identity() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_config(tmp.path(), r#"
+        let path = write_config(
+            tmp.path(),
+            r#"
 [identity]
 format = "aieos"
 aieos_path = "identity.json"
-"#);
+"#,
+        );
         let cfg = parse_config(&path).unwrap().unwrap();
         assert_eq!(cfg.identity_format, IdentityFormat::Aieos);
         assert_eq!(cfg.aieos_path.as_deref(), Some("identity.json"));
@@ -337,14 +360,17 @@ aieos_path = "identity.json"
     #[test]
     fn scan_credentials_from_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_config(tmp.path(), r#"
+        let path = write_config(
+            tmp.path(),
+            r#"
 api_key = "sk-test123"
 default_provider = "openrouter"
 
 [channels_config.telegram]
 bot_token = "123456:ABC"
 allowed_users = ["*"]
-"#);
+"#,
+        );
         let cfg = parse_config(&path).unwrap().unwrap();
         assert!(cfg.credential_hints.len() >= 2);
         let has_api_key = cfg.credential_hints.iter().any(|h| h.field == "api_key");

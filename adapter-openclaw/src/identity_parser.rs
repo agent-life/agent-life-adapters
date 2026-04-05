@@ -34,13 +34,10 @@ pub fn build_identity(workspace: &Path, agent_id: Uuid) -> Result<Option<Identit
         return Ok(None);
     }
 
-    // Extract agent name from the first H1 heading in SOUL.md, then
-    // IDENTITY.md, then fall back to "Unknown".
-    let agent_name = soul_content
-        .as_deref()
-        .and_then(extract_h1_heading)
-        .or_else(|| identity_content.as_deref().and_then(extract_h1_heading))
-        .unwrap_or_else(|| "Unknown".to_string());
+    // OpenClaw's canonical display name lives in IDENTITY.md. If it is
+    // missing or unparseable, fall back to the workspace folder name.
+    let agent_name =
+        resolve_agent_display_name_from_identity(identity_content.as_deref(), workspace);
 
     let prose = ProseIdentity {
         soul: soul_content,
@@ -84,6 +81,15 @@ pub fn build_identity(workspace: &Path, agent_id: Uuid) -> Result<Option<Identit
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Resolve the agent display name for an OpenClaw workspace.
+///
+/// Prefers the structured `Name` field from `IDENTITY.md`. If that field is
+/// absent or cannot be parsed, falls back to the workspace directory basename.
+pub fn resolve_agent_display_name(workspace: &Path) -> String {
+    let identity_content = read_optional(workspace, "IDENTITY.md").ok().flatten();
+    resolve_agent_display_name_from_identity(identity_content.as_deref(), workspace)
+}
+
 /// Read a file from the workspace, returning `None` if it doesn't exist.
 fn read_optional(workspace: &Path, filename: &str) -> Result<Option<String>> {
     let path = workspace.join(filename);
@@ -99,15 +105,61 @@ fn read_optional(workspace: &Path, filename: &str) -> Result<Option<String>> {
     }
 }
 
-/// Extract the text of the first `# ` (H1) heading in Markdown content.
-fn extract_h1_heading(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("# ") && !trimmed.starts_with("## ") {
-            return Some(trimmed.trim_start_matches("# ").trim().to_string());
-        }
+fn resolve_agent_display_name_from_identity(
+    identity_content: Option<&str>,
+    workspace: &Path,
+) -> String {
+    identity_content
+        .and_then(extract_identity_name_field)
+        .unwrap_or_else(|| workspace_basename(workspace))
+}
+
+fn extract_identity_name_field(content: &str) -> Option<String> {
+    content.lines().find_map(extract_identity_name_line)
+}
+
+fn extract_identity_name_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
     }
-    None
+
+    let without_bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim();
+    let normalized = without_bullet.to_ascii_lowercase();
+
+    let name = if normalized.starts_with("**name:**") {
+        &without_bullet["**name:**".len()..]
+    } else if normalized.starts_with("**name**:") {
+        &without_bullet["**name**:".len()..]
+    } else if normalized.starts_with("name:") {
+        &without_bullet["name:".len()..]
+    } else {
+        return None;
+    };
+
+    normalize_name_value(name)
+}
+
+fn normalize_name_value(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_matches('*').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn workspace_basename(workspace: &Path) -> String {
+    workspace
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -118,39 +170,94 @@ fn extract_h1_heading(content: &str) -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn setup_workspace(files: &[(&str, &str)]) -> TempDir {
+    fn setup_named_workspace(name: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join(name);
+        fs::create_dir_all(&workspace).unwrap();
         for (name, content) in files {
-            let path = dir.path().join(name);
+            let path = workspace.join(name);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&path, content).unwrap();
         }
-        dir
+        (dir, workspace)
+    }
+
+    fn setup_workspace(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        setup_named_workspace("workspace", files)
     }
 
     #[test]
-    fn soul_only() {
-        let ws = setup_workspace(&[("SOUL.md", "# Clawd\n\nA helpful assistant.")]);
-        let id = build_identity(ws.path(), Uuid::nil()).unwrap().unwrap();
-        assert_eq!(id.structured.as_ref().unwrap().names.as_ref().unwrap().primary, "Clawd");
-        assert!(id.prose.as_ref().unwrap().soul.as_ref().unwrap().contains("helpful assistant"));
+    fn parses_markdown_name_bullet() {
+        let content = "# IDENTITY.md - Who Am I?\n\n- **Name:** Kleo\n- **Vibe:** Direct";
+        assert_eq!(
+            extract_identity_name_field(content).as_deref(),
+            Some("Kleo")
+        );
+    }
+
+    #[test]
+    fn parses_plain_name_line() {
+        let content = "# Identity\nRole: Assistant\nName: Standard Agent";
+        assert_eq!(
+            extract_identity_name_field(content).as_deref(),
+            Some("Standard Agent")
+        );
+    }
+
+    #[test]
+    fn soul_only_falls_back_to_workspace_basename() {
+        let (_dir, workspace) = setup_named_workspace(
+            "clawd-workspace",
+            &[("SOUL.md", "# Clawd\n\nA helpful assistant.")],
+        );
+        let id = build_identity(&workspace, Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            id.structured
+                .as_ref()
+                .unwrap()
+                .names
+                .as_ref()
+                .unwrap()
+                .primary,
+            "clawd-workspace"
+        );
+        assert!(id
+            .prose
+            .as_ref()
+            .unwrap()
+            .soul
+            .as_ref()
+            .unwrap()
+            .contains("helpful assistant"));
         assert!(id.prose.as_ref().unwrap().operating_instructions.is_none());
     }
 
     #[test]
-    fn all_three_files() {
-        let ws = setup_workspace(&[
+    fn identity_name_field_wins_over_soul_heading() {
+        let (_dir, workspace) = setup_workspace(&[
             ("SOUL.md", "# Samantha\n\nPersonality here."),
-            ("IDENTITY.md", "# Identity\n\n## Role\nAssistant"),
+            (
+                "IDENTITY.md",
+                "# Identity\n\n- **Name:** Kleo\n\n## Role\nAssistant",
+            ),
             ("AGENTS.md", "# Instructions\n\nDo good things."),
         ]);
-        let id = build_identity(ws.path(), Uuid::nil()).unwrap().unwrap();
-        // Name comes from SOUL.md (priority)
-        assert_eq!(id.structured.as_ref().unwrap().names.as_ref().unwrap().primary, "Samantha");
+        let id = build_identity(&workspace, Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            id.structured
+                .as_ref()
+                .unwrap()
+                .names
+                .as_ref()
+                .unwrap()
+                .primary,
+            "Kleo"
+        );
         assert!(id.prose.as_ref().unwrap().soul.is_some());
         assert!(id.prose.as_ref().unwrap().identity_profile.is_some());
         assert!(id.prose.as_ref().unwrap().operating_instructions.is_some());
@@ -158,32 +265,68 @@ mod tests {
 
     #[test]
     fn no_files_returns_none() {
-        let ws = TempDir::new().unwrap();
-        let result = build_identity(ws.path(), Uuid::nil()).unwrap();
+        let (_dir, workspace) = setup_workspace(&[]);
+        let result = build_identity(&workspace, Uuid::nil()).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
-    fn no_h1_heading_falls_back_to_unknown() {
-        let ws = setup_workspace(&[("SOUL.md", "Just some text without a heading.")]);
-        let id = build_identity(ws.path(), Uuid::nil()).unwrap().unwrap();
-        assert_eq!(id.structured.as_ref().unwrap().names.as_ref().unwrap().primary, "Unknown");
+    fn unparseable_identity_falls_back_to_workspace_basename() {
+        let (_dir, workspace) = setup_named_workspace(
+            "fallback-agent",
+            &[(
+                "IDENTITY.md",
+                "# Identity\n\nStructured identity without a name line.",
+            )],
+        );
+        let id = build_identity(&workspace, Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            id.structured
+                .as_ref()
+                .unwrap()
+                .names
+                .as_ref()
+                .unwrap()
+                .primary,
+            "fallback-agent"
+        );
     }
 
     #[test]
-    fn identity_md_provides_name_when_soul_has_none() {
-        let ws = setup_workspace(&[
+    fn identity_md_name_line_provides_name() {
+        let (_dir, workspace) = setup_workspace(&[
             ("SOUL.md", "Personality text only."),
-            ("IDENTITY.md", "# WorkBot\n\nStructured identity."),
+            (
+                "IDENTITY.md",
+                "# Identity\n\nName: WorkBot\n\nStructured identity.",
+            ),
         ]);
-        let id = build_identity(ws.path(), Uuid::nil()).unwrap().unwrap();
-        assert_eq!(id.structured.as_ref().unwrap().names.as_ref().unwrap().primary, "WorkBot");
+        let id = build_identity(&workspace, Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            id.structured
+                .as_ref()
+                .unwrap()
+                .names
+                .as_ref()
+                .unwrap()
+                .primary,
+            "WorkBot"
+        );
     }
 
     #[test]
     fn empty_file_treated_as_absent() {
-        let ws = setup_workspace(&[("SOUL.md", "   \n  \n")]);
-        let result = build_identity(ws.path(), Uuid::nil()).unwrap();
+        let (_dir, workspace) = setup_workspace(&[("SOUL.md", "   \n  \n")]);
+        let result = build_identity(&workspace, Uuid::nil()).unwrap();
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_agent_display_name_uses_workspace_basename_without_identity_name() {
+        let (_dir, workspace) = setup_named_workspace(
+            "basename-fallback",
+            &[("SOUL.md", "# Template\n\nPersona text.")],
+        );
+        assert_eq!(resolve_agent_display_name(&workspace), "basename-fallback");
     }
 }

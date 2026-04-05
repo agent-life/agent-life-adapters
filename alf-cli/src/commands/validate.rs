@@ -3,9 +3,7 @@
 use crate::output;
 
 use alf_core::archive::AlfReader;
-use alf_core::validation::{
-    self, Severity, ValidationReport,
-};
+use alf_core::validation::{self, Severity, ValidationReport};
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -38,11 +36,7 @@ pub fn run(alf_file: &Path) -> Result<()> {
     }
 
     if human {
-        println!(
-            "{} Validating {}...",
-            "▸".blue().bold(),
-            alf_file.display()
-        );
+        println!("{} Validating {}...", "▸".blue().bold(), alf_file.display());
         println!();
     } else {
         output::progress(&format!("Validating {}...", alf_file.display()));
@@ -111,30 +105,29 @@ pub fn run(alf_file: &Path) -> Result<()> {
         print_report(&report);
 
         if report.is_valid() {
-            println!(
-                "\n{} Archive is valid",
-                "✓".green().bold()
-            );
+            println!("\n{} Archive is valid", "✓".green().bold());
             Ok(())
         } else {
-            println!(
-                "\n{} Archive has validation errors",
-                "✗".red().bold()
-            );
-            bail!(
-                "Validation failed with {} error(s)",
-                report.errors().len()
-            )
+            println!("\n{} Archive has validation errors", "✗".red().bold());
+            bail!("Validation failed with {} error(s)", report.errors().len())
         }
     } else {
-        let errors: Vec<FindingJson> = report.errors().iter().map(|f| FindingJson {
-            path: f.path.clone(),
-            message: f.message.clone(),
-        }).collect();
-        let warnings: Vec<FindingJson> = report.warnings().iter().map(|f| FindingJson {
-            path: f.path.clone(),
-            message: f.message.clone(),
-        }).collect();
+        let errors: Vec<FindingJson> = report
+            .errors()
+            .iter()
+            .map(|f| FindingJson {
+                path: f.path.clone(),
+                message: f.message.clone(),
+            })
+            .collect();
+        let warnings: Vec<FindingJson> = report
+            .warnings()
+            .iter()
+            .map(|f| FindingJson {
+                path: f.path.clone(),
+                message: f.message.clone(),
+            })
+            .collect();
         let valid = report.is_valid();
 
         output::json(&ValidateResult {
@@ -145,10 +138,7 @@ pub fn run(alf_file: &Path) -> Result<()> {
         });
 
         if !valid {
-            bail!(
-                "Validation failed with {} error(s)",
-                report.errors().len()
-            )
+            bail!("Validation failed with {} error(s)", report.errors().len())
         }
         Ok(())
     }
@@ -238,9 +228,7 @@ mod tests {
 
         let records: Vec<MemoryRecord> = (0u32..3)
             .map(|i| {
-                let ts = Utc
-                    .with_ymd_and_hms(2026, 1, 15 + i, 10, 0, 0)
-                    .unwrap();
+                let ts = Utc.with_ymd_and_hms(2026, 1, 15 + i, 10, 0, 0).unwrap();
                 MemoryRecord {
                     id: Uuid::now_v7(),
                     agent_id,
@@ -304,8 +292,7 @@ mod tests {
     #[test]
     fn valid_archive_passes_validation() {
         let bytes = build_valid_alf();
-        let mut reader =
-            alf_core::archive::AlfReader::new(Cursor::new(bytes)).unwrap();
+        let mut reader = alf_core::archive::AlfReader::new(Cursor::new(bytes)).unwrap();
 
         let mut report = validation::ValidationReport::new();
         let manifest = reader.manifest().clone();

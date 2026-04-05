@@ -12,7 +12,7 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{AgentState, resolve_agent_id};
+use crate::state::{resolve_agent_id, AgentState};
 
 use alf_core::archive::{AlfReader, DeltaReader};
 use alf_core::delta::apply_delta;
@@ -71,7 +71,10 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
         println!("  Workspace: {}", workspace.display());
         println!();
     } else {
-        output::progress(&format!("Restoring agent {}...", &agent_id.to_string()[..8]));
+        output::progress(&format!(
+            "Restoring agent {}...",
+            &agent_id.to_string()[..8]
+        ));
     }
 
     // 4. Call restore endpoint — gets snapshot + delta URLs in one call

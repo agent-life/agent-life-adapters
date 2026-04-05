@@ -607,10 +607,7 @@ mod tests {
             record.memory_type,
             MemoryType::Unknown("future_cognitive_type".into())
         );
-        assert_eq!(
-            record.status,
-            MemoryStatus::Unknown("future_status".into())
-        );
+        assert_eq!(record.status, MemoryStatus::Unknown("future_status".into()));
 
         // Effective types fall back to defaults
         assert_eq!(*record.memory_type.effective(), MemoryType::Semantic);

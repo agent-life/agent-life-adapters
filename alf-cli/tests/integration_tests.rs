@@ -1,7 +1,7 @@
+use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use chrono::Utc;
 
 #[test]
 fn test_synthetic_data_validation() {
@@ -15,7 +15,7 @@ fn test_synthetic_data_validation() {
     );
 
     let bin_path = env!("CARGO_BIN_EXE_alf");
-    
+
     let output = Command::new(bin_path)
         .arg("validate")
         .arg(&fixture_path)
@@ -39,7 +39,11 @@ fn test_synthetic_data_validation() {
 
         let stdout_str = String::from_utf8_lossy(&output.stdout);
         let stderr_str = String::from_utf8_lossy(&output.stderr);
-        let status_str = if output.status.success() { "SUCCESS" } else { "FAILED" };
+        let status_str = if output.status.success() {
+            "SUCCESS"
+        } else {
+            "FAILED"
+        };
         let timestamp = Utc::now().to_rfc3339();
 
         let report_content = format!(

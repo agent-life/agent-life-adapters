@@ -1,20 +1,17 @@
 # ALF CLI Integration Test Report
 
 **Schema Version:** v1.0.0-rc.1
-**Timestamp:** 2026-02-28T20:53:05.658042943+00:00
+**Timestamp:** 2026-04-05T23:29:52.097087531+00:00
 **Status:** SUCCESS
 
 ## `alf validate` Output
 ```
-▸ Validating /home/johan/wa/personal/agent-life-adapters/alf-cli/fixtures/synthetic-agent.alf...
-
-  No issues found.
-
-✓ Archive is valid
+{"ok":true,"valid":true,"errors":[],"warnings":[]}
 
 ```
 
 ## `alf validate` Errors
 ```
+Validating /home/johan/wa/personal/agent-life-adapters/alf-cli/fixtures/synthetic-agent.alf...
 
 ```

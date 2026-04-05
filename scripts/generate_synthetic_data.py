@@ -3,26 +3,83 @@ import os
 import zipfile
 from jsf import JSF
 
-SCHEMAS_DIR = "/tmp/agent-life-data-format/schemas"
-FIXTURES_DIR = "alf-cli/fixtures"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+FIXTURES_DIR = os.path.join(REPO_ROOT, "alf-cli", "fixtures")
 OUTPUT_ALF = os.path.join(FIXTURES_DIR, "synthetic-agent.alf")
+TEMP_OUTPUT_ALF = OUTPUT_ALF + ".tmp"
 
-def load_schema(name):
-    with open(os.path.join(SCHEMAS_DIR, name)) as f:
+def iter_schema_dir_candidates():
+    candidates = [
+        os.environ.get("ALF_SCHEMA_DIR"),
+        os.path.join(REPO_ROOT, "..", "agent-life-data-format"),
+        "/tmp/agent-life-data-format",
+    ]
+    seen = set()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for path in (os.path.abspath(candidate), os.path.abspath(os.path.join(candidate, "schemas"))):
+            if path in seen:
+                continue
+            seen.add(path)
+            yield path
+
+def resolve_schemas_dir():
+    checked = []
+    for candidate in iter_schema_dir_candidates():
+        checked.append(candidate)
+        if os.path.isfile(os.path.join(candidate, "manifest.schema.json")):
+            return candidate
+
+    raise FileNotFoundError(
+        "Could not locate ALF schemas. Checked:\n"
+        + "\n".join(f"  - {path}" for path in checked)
+        + "\nSet ALF_SCHEMA_DIR to the schema directory, clone agent-life-data-format next to this repo, "
+          "or run scripts/run_integration_tests.sh to bootstrap /tmp/agent-life-data-format."
+    )
+
+def load_schema(schemas_dir, name):
+    with open(os.path.join(schemas_dir, name)) as f:
         return json.load(f)
 
+def cleanup_previous_output():
+    for path in (OUTPUT_ALF, TEMP_OUTPUT_ALF):
+        if os.path.exists(path):
+            print(f"Removing stale archive at {path}")
+            os.remove(path)
+
+class DeepcopyableCounter:
+    def __init__(self, start=1):
+        self.current = start
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        value = self.current
+        self.current += 1
+        return value
+
 def generate_data(schema):
-    return JSF(schema).generate()
+    generator = JSF(schema)
+    # jsf stores itertools.count() in base_state, which Python 3.14 can no
+    # longer deepcopy. Swap in a simple Python counter object instead.
+    generator.base_state["__counter__"] = DeepcopyableCounter(start=1)
+    return generator.generate()
 
 def main():
     os.makedirs(FIXTURES_DIR, exist_ok=True)
+    cleanup_previous_output()
+    schemas_dir = resolve_schemas_dir()
+    print(f"Using schemas from {schemas_dir}")
     
-    manifest_schema = load_schema("manifest.schema.json")
-    identity_schema = load_schema("identity.schema.json")
-    principals_schema = load_schema("principals.schema.json")
-    credentials_schema = load_schema("credentials.schema.json")
-    attachments_schema = load_schema("attachments.schema.json")
-    memory_record_schema = load_schema("memory-record.schema.json")
+    manifest_schema = load_schema(schemas_dir, "manifest.schema.json")
+    identity_schema = load_schema(schemas_dir, "identity.schema.json")
+    principals_schema = load_schema(schemas_dir, "principals.schema.json")
+    credentials_schema = load_schema(schemas_dir, "credentials.schema.json")
+    attachments_schema = load_schema(schemas_dir, "attachments.schema.json")
+    memory_record_schema = load_schema(schemas_dir, "memory-record.schema.json")
     
     manifest_data = generate_data(manifest_schema)
     identity_data = generate_data(identity_schema)
@@ -121,21 +178,27 @@ def main():
         schema_version = "unknown"
         
     print(f"Creating archive at {OUTPUT_ALF} (schema version: {schema_version})...")
-    with zipfile.ZipFile(OUTPUT_ALF, 'w', zipfile.ZIP_DEFLATED) as zf:
-        zfile_write = lambda name, data: zf.writestr(name, json.dumps(data, indent=2))
-        zfile_write("manifest.json", manifest_data)
-        zfile_write("identity.json", identity_data)
-        zfile_write("principals.json", principals_data)
-        zfile_write("credentials.json", credentials_data)
-        zfile_write("attachments.json", attachments_data)
-        zfile_write("memory/index.json", memory_index_data)
-        
-        jsonl_content = "\n".join(json.dumps(r) for r in memory_records) + "\n"
-        zf.writestr(partition_file, jsonl_content)
-        
-        zf.writestr("raw/openclaw/.keep", "")
-        zf.writestr("artifacts/.keep", "")
-        
+    try:
+        with zipfile.ZipFile(TEMP_OUTPUT_ALF, 'w', zipfile.ZIP_DEFLATED) as zf:
+            zfile_write = lambda name, data: zf.writestr(name, json.dumps(data, indent=2))
+            zfile_write("manifest.json", manifest_data)
+            zfile_write("identity.json", identity_data)
+            zfile_write("principals.json", principals_data)
+            zfile_write("credentials.json", credentials_data)
+            zfile_write("attachments.json", attachments_data)
+            zfile_write("memory/index.json", memory_index_data)
+            
+            jsonl_content = "\n".join(json.dumps(r) for r in memory_records) + "\n"
+            zf.writestr(partition_file, jsonl_content)
+            
+            zf.writestr("raw/openclaw/.keep", "")
+            zf.writestr("artifacts/.keep", "")
+        os.replace(TEMP_OUTPUT_ALF, OUTPUT_ALF)
+    except Exception:
+        if os.path.exists(TEMP_OUTPUT_ALF):
+            os.remove(TEMP_OUTPUT_ALF)
+        raise
+
     print("Done!")
 
 if __name__ == "__main__":

@@ -42,10 +42,8 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
 fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
-        let raw = fs::read_to_string(&id_file)
-            .context("Failed to read .alf-agent-id")?;
-        let id = Uuid::parse_str(raw.trim())
-            .context("Invalid UUID in .alf-agent-id")?;
+        let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
+        let id = Uuid::parse_str(raw.trim()).context("Invalid UUID in .alf-agent-id")?;
         return Ok(id);
     }
 
@@ -59,42 +57,6 @@ fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
     let _ = fs::write(&id_file, id.to_string());
 
     Ok(id)
-}
-
-// ---------------------------------------------------------------------------
-// Agent name detection
-// ---------------------------------------------------------------------------
-
-/// Try to detect the agent's display name from workspace files.
-fn detect_agent_name(workspace: &Path) -> String {
-    // Try SOUL.md first
-    if let Ok(content) = fs::read_to_string(workspace.join("SOUL.md")) {
-        if let Some(name) = extract_h1(&content) {
-            return name;
-        }
-    }
-    // Then IDENTITY.md
-    if let Ok(content) = fs::read_to_string(workspace.join("IDENTITY.md")) {
-        if let Some(name) = extract_h1(&content) {
-            return name;
-        }
-    }
-    // Fall back to directory name
-    workspace
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn extract_h1(content: &str) -> Option<String> {
-    for line in content.lines() {
-        let t = line.trim();
-        if t.starts_with("# ") && !t.starts_with("## ") {
-            return Some(t.trim_start_matches("# ").trim().to_string());
-        }
-    }
-    None
 }
 
 // ---------------------------------------------------------------------------
@@ -216,7 +178,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
 
     // 1. Agent ID
     let agent_id = resolve_agent_id(workspace)?;
-    let agent_name = detect_agent_name(workspace);
+    let agent_name = identity_parser::resolve_agent_display_name(workspace);
     let runtime_version = detect_openclaw_version();
 
     // 2. Collect memory records
@@ -242,12 +204,12 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         let (from, to) = if parts.len() == 2 {
             let year: i32 = parts[0].parse().unwrap_or(2026);
             let quarter: u32 = parts[1].parse().unwrap_or(1);
-            (quarter_start(year, quarter), Some(quarter_end(year, quarter)))
-        } else {
             (
-                NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
-                None,
+                quarter_start(year, quarter),
+                Some(quarter_end(year, quarter)),
             )
+        } else {
+            (NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None)
         };
 
         let info = MemoryPartitionInfo {
@@ -326,7 +288,10 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
             memory: Some(MemoryInventory {
                 record_count: total_records,
                 index_file: "memory/index.json".to_string(),
-                partitions: partition_infos.iter().map(|(info, _)| info.clone()).collect(),
+                partitions: partition_infos
+                    .iter()
+                    .map(|(info, _)| info.clone())
+                    .collect(),
                 has_embeddings: Some(false),
                 has_raw_source: Some(true),
                 extra: std::collections::HashMap::new(),
@@ -402,30 +367,40 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
     use tempfile::TempDir;
 
-    fn create_workspace(files: &[(&str, &str)]) -> TempDir {
+    fn create_named_workspace(name: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
         let dir = TempDir::new().unwrap();
+        let workspace = dir.path().join(name);
+        fs::create_dir_all(&workspace).unwrap();
         for (name, content) in files {
-            let path = dir.path().join(name);
+            let path = workspace.join(name);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&path, content).unwrap();
         }
-        dir
+        (dir, workspace)
+    }
+
+    fn create_workspace(files: &[(&str, &str)]) -> (TempDir, PathBuf) {
+        create_named_workspace("workspace", files)
     }
 
     #[test]
-    fn export_minimal_workspace() {
-        let ws = create_workspace(&[
-            ("SOUL.md", "# TestAgent\n\nA test agent."),
-            ("MEMORY.md", "## Facts\n\nThe sky is blue."),
-        ]);
-        let output = ws.path().join("test.alf");
+    fn export_uses_workspace_basename_when_identity_name_is_missing() {
+        let (_dir, workspace) = create_named_workspace(
+            "test-agent",
+            &[
+                ("SOUL.md", "# TestAgent\n\nA test agent."),
+                ("MEMORY.md", "## Facts\n\nThe sky is blue."),
+            ],
+        );
+        let output = workspace.join("test.alf");
 
-        let report = export(ws.path(), &output).unwrap();
-        assert_eq!(report.agent_name, "TestAgent");
+        let report = export(&workspace, &output).unwrap();
+        assert_eq!(report.agent_name, "test-agent");
         assert_eq!(report.memory_records, 1);
         assert!(report.identity_version.is_some());
         assert!(output.is_file());
@@ -433,8 +408,24 @@ mod tests {
     }
 
     #[test]
+    fn export_uses_identity_name_field_when_present() {
+        let (_dir, workspace) = create_workspace(&[
+            ("SOUL.md", "# SOUL.md - Who You Are\n\nTemplate soul text."),
+            (
+                "IDENTITY.md",
+                "# IDENTITY.md - Who Am I?\n\n- **Name:** Kleo\n- **Creature:** Cyberhuman",
+            ),
+            ("MEMORY.md", "## Facts\n\nThe sky is blue."),
+        ]);
+        let output = workspace.join("test.alf");
+
+        let report = export(&workspace, &output).unwrap();
+        assert_eq!(report.agent_name, "Kleo");
+    }
+
+    #[test]
     fn export_with_daily_logs() {
-        let ws = create_workspace(&[
+        let (_dir, workspace) = create_workspace(&[
             ("SOUL.md", "# Agent\n\nHello."),
             (
                 "memory/2026-01-15.md",
@@ -442,23 +433,23 @@ mod tests {
             ),
             ("memory/2026-01-16.md", "## All day\n\nBusy day."),
         ]);
-        let output = ws.path().join("test.alf");
+        let output = workspace.join("test.alf");
 
-        let report = export(ws.path(), &output).unwrap();
+        let report = export(&workspace, &output).unwrap();
         // 2 sections from Jan 15 + 1 from Jan 16
         assert_eq!(report.memory_records, 3);
     }
 
     #[test]
     fn export_preserves_raw_sources() {
-        let ws = create_workspace(&[
+        let (_dir, workspace) = create_workspace(&[
             ("SOUL.md", "# Bot\n\nSoul."),
             ("USER.md", "# Alice\n\nProfile."),
             ("TOOLS.md", "Tool notes."),
         ]);
-        let output = ws.path().join("test.alf");
+        let output = workspace.join("test.alf");
 
-        let report = export(ws.path(), &output).unwrap();
+        let report = export(&workspace, &output).unwrap();
         assert!(report.raw_sources.contains(&"SOUL.md".to_string()));
         assert!(report.raw_sources.contains(&"USER.md".to_string()));
         assert!(report.raw_sources.contains(&"TOOLS.md".to_string()));
@@ -466,15 +457,15 @@ mod tests {
 
     #[test]
     fn agent_id_is_stable() {
-        let ws = create_workspace(&[("SOUL.md", "# X\n\nTest.")]);
-        let output1 = ws.path().join("test1.alf");
-        let output2 = ws.path().join("test2.alf");
+        let (_dir, workspace) = create_workspace(&[("SOUL.md", "# X\n\nTest.")]);
+        let output1 = workspace.join("test1.alf");
+        let output2 = workspace.join("test2.alf");
 
-        export(ws.path(), &output1).unwrap();
-        export(ws.path(), &output2).unwrap();
+        export(&workspace, &output1).unwrap();
+        export(&workspace, &output2).unwrap();
 
         // .alf-agent-id should have been written
-        let id_file = ws.path().join(".alf-agent-id");
+        let id_file = workspace.join(".alf-agent-id");
         assert!(id_file.is_file());
     }
 

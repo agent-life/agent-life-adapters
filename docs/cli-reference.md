@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.2.0 | Updated: 2026-03-14
+> Version: 0.2.1 | Updated: 2026-04-05
 > HTML: https://agent-life.ai/docs/cli
 > Markdown: https://agent-life.ai/docs/cli.md
 
@@ -26,6 +26,7 @@ Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable col
 | `alf export` | Workspace → .alf archive | No |
 | `alf sync` | Incremental sync to cloud | Yes |
 | `alf restore` | Download and restore from cloud | Yes |
+| `alf purge` | Delete cloud sync data and agent registration | Yes |
 | `alf import` | .alf archive → workspace | No |
 | `alf validate` | Validate .alf archive | No |
 | `alf help` | Help topics and status | No |
@@ -120,7 +121,7 @@ The `workspace.source` field in the output reports which method was used: `"flag
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
 | `workspace_empty` | warning | No `.md` files in workspace root | Workspace may not be initialized |
-| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; will export with fallback name |
+| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; display name still comes from `IDENTITY.md` `Name` when present, else the workspace folder name |
 | `no_memory_content` | warning | No `MEMORY.md` and no `memory/` directory | Nothing to sync yet |
 | `memory_dir_empty` | warning | `memory/` exists but has no `.md` files | No daily logs yet |
 | `no_api_key` | error | No API key in `~/.alf/config.toml` | `alf login --key <key>` |
@@ -273,6 +274,33 @@ Download the latest snapshot (plus uncompacted deltas) from the service and impo
       "memory_records": 47,
       "workspace": "/home/user/.openclaw/workspace",
       "warnings": []
+    }
+
+---
+
+## alf purge
+
+Remove all cloud-backed snapshot and delta blobs for an agent and delete the agent registration on the service (`DELETE /v1/agents/:id`). Does not modify files under the workspace. Deletes `~/.alf/state/{agent-id}.toml` and `~/.alf/state/{agent-id}-snapshot.alf` so the next `alf sync` uploads a full snapshot again.
+
+### Usage
+
+    alf purge -r <runtime> -w <workspace> [-a <agent-id>]
+
+### Flags
+
+| Flag | Short | Required | Description |
+|---|---|---|---|
+| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | Yes | Path to the agent workspace directory (validated; not modified) |
+| `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
+
+### JSON Output (success)
+
+    {
+      "ok": true,
+      "agent_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "deleted": true,
+      "objects_removed": 123
     }
 
 ---

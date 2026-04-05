@@ -285,8 +285,8 @@ ALF memory records are stored in time-partitioned JSONL files. The adapter assig
 
 | OpenClaw File | ALF Field | Mapping |
 |---------------|-----------|---------|
-| `SOUL.md` | `identity.prose.soul` | Entire file content. Agent name extracted from first `# heading`. |
-| `IDENTITY.md` | `identity.prose.identity_profile` | Entire file content as prose. Future: parse structured sections. |
+| `SOUL.md` | `identity.prose.soul` | Entire file content. Preserved as persona prose; not used as the canonical display name. |
+| `IDENTITY.md` | `identity.prose.identity_profile` | Entire file content as prose. A parseable `Name:` or `**Name:**` line sets the canonical display name; otherwise the workspace folder basename is used. |
 | `AGENTS.md` | `identity.prose.operating_instructions` | Entire file content. Sub-agent entries (if any `## SubAgent` sections) parsed into `identity.structured.sub_agents`. |
 
 All three files are also preserved verbatim in `raw/openclaw/` for lossless round-trip.

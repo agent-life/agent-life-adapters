@@ -369,8 +369,7 @@ pub fn collect_all_memory(workspace: &Path, agent_id: Uuid) -> Result<Vec<Memory
     // 1. MEMORY.md at workspace root
     let memory_md = workspace.join("MEMORY.md");
     if memory_md.is_file() {
-        let content =
-            fs::read_to_string(&memory_md).context("Failed to read MEMORY.md")?;
+        let content = fs::read_to_string(&memory_md).context("Failed to read MEMORY.md")?;
         let mtime = file_mtime(&memory_md);
         records.extend(parse_memory_file("MEMORY.md", &content, mtime, agent_id));
     }
@@ -397,8 +396,8 @@ pub fn collect_all_memory(workspace: &Path, agent_id: Uuid) -> Result<Vec<Memory
                 .to_string_lossy()
                 .replace('\\', "/"); // normalize Windows paths
 
-            let content = fs::read_to_string(path)
-                .with_context(|| format!("Failed to read {relative}"))?;
+            let content =
+                fs::read_to_string(path).with_context(|| format!("Failed to read {relative}"))?;
             let mtime = file_mtime(path);
             records.extend(parse_memory_file(&relative, &content, mtime, agent_id));
         }
@@ -531,7 +530,10 @@ Text.
             classify_memory_type("memory/active-context.md"),
             MemoryType::Summary
         );
-        assert_eq!(classify_namespace("memory/active-context.md"), "active-context");
+        assert_eq!(
+            classify_namespace("memory/active-context.md"),
+            "active-context"
+        );
     }
 
     #[test]
@@ -540,7 +542,10 @@ Text.
             classify_memory_type("memory/gating-policies.md"),
             MemoryType::Procedural
         );
-        assert_eq!(classify_namespace("memory/gating-policies.md"), "procedural");
+        assert_eq!(
+            classify_namespace("memory/gating-policies.md"),
+            "procedural"
+        );
     }
 
     #[test]

@@ -485,9 +485,10 @@ mod tests {
                 soul: Some("You are a thoughtful assistant...".into()),
                 operating_instructions: Some("Follow these rules...".into()),
                 identity_profile: Some("Alf was created to help...".into()),
-                custom_blocks: HashMap::from([
-                    ("boot_checklist".into(), "1. Load memory\n2. Check goals".into()),
-                ]),
+                custom_blocks: HashMap::from([(
+                    "boot_checklist".into(),
+                    "1. Load memory\n2. Check goals".into(),
+                )]),
                 extra: HashMap::new(),
             }),
             source_format: Some("openclaw".into()),
@@ -589,10 +590,7 @@ mod tests {
         }))
         .unwrap();
 
-        assert_eq!(
-            sub.status,
-            SubAgentStatus::Unknown("deprecated".into())
-        );
+        assert_eq!(sub.status, SubAgentStatus::Unknown("deprecated".into()));
 
         let value = serde_json::to_value(&sub).unwrap();
         assert_eq!(value["status"], "deprecated");
@@ -602,10 +600,7 @@ mod tests {
     fn personality_traits_round_trip() {
         let traits = PersonalityTraits {
             framework: "OCEAN".into(),
-            scores: HashMap::from([
-                ("openness".into(), 0.85),
-                ("neuroticism".into(), 0.2),
-            ]),
+            scores: HashMap::from([("openness".into(), 0.85), ("neuroticism".into(), 0.2)]),
             extra: HashMap::new(),
         };
 

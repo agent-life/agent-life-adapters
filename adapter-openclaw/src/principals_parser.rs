@@ -13,8 +13,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{
-    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, ProseProfile,
-    StructuredProfile,
+    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, ProseProfile, StructuredProfile,
 };
 
 // ---------------------------------------------------------------------------
@@ -35,7 +34,9 @@ pub fn build_principals(workspace: &Path, agent_id: Uuid) -> Result<Option<Princ
         return Ok(None);
     }
 
-    let principal_name = extract_h1_heading(&content).unwrap_or_else(|| "User".to_string());
+    let principal_name = extract_name_field(&content)
+        .or_else(|| extract_h1_heading(&content))
+        .unwrap_or_else(|| "User".to_string());
     let principal_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
     let profile_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
 
@@ -92,6 +93,46 @@ fn extract_h1_heading(content: &str) -> Option<String> {
     None
 }
 
+/// Extract the user's name from a structured `Name` line in `USER.md`.
+fn extract_name_field(content: &str) -> Option<String> {
+    content.lines().find_map(extract_name_line)
+}
+
+fn extract_name_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim();
+    let normalized = without_bullet.to_ascii_lowercase();
+
+    let name = if normalized.starts_with("**name:**") {
+        &without_bullet["**name:**".len()..]
+    } else if normalized.starts_with("**name**:") {
+        &without_bullet["**name**:".len()..]
+    } else if normalized.starts_with("name:") {
+        &without_bullet["name:".len()..]
+    } else {
+        return None;
+    };
+
+    normalize_name_value(name)
+}
+
+fn normalize_name_value(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_matches('*').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Try to extract a timezone from a `## Timezone` section in USER.md.
 /// Looks for a line under `## Timezone` that resembles an IANA timezone.
 fn extract_timezone(content: &str) -> Option<String> {
@@ -124,6 +165,59 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    #[test]
+    fn markdown_name_field_wins_over_heading() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("USER.md"),
+            "\
+# USER.md - About Johan
+
+- **Name:** Johan
+- **Timezone:** PST (US West Coast)
+",
+        )
+        .unwrap();
+
+        let doc = build_principals(dir.path(), Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            doc.principals[0]
+                .profile
+                .structured
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Johan")
+        );
+    }
+
+    #[test]
+    fn plain_name_field_wins_over_heading() {
+        let dir = TempDir::new().unwrap();
+        fs::write(
+            dir.path().join("USER.md"),
+            "\
+# User Profile
+Name: Human User
+Timezone: UTC
+",
+        )
+        .unwrap();
+
+        let doc = build_principals(dir.path(), Uuid::nil()).unwrap().unwrap();
+        assert_eq!(
+            doc.principals[0]
+                .profile
+                .structured
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Human User")
+        );
+    }
 
     #[test]
     fn full_user_md() {

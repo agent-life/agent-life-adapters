@@ -37,7 +37,11 @@ fn login_with_key(api_key: &str) -> Result<()> {
     let masked = mask_key(trimmed);
 
     if human {
-        println!("{} API key saved to {}", "✓".green().bold(), config_path.display());
+        println!(
+            "{} API key saved to {}",
+            "✓".green().bold(),
+            config_path.display()
+        );
         println!("  Key: {masked}");
         println!();
         println!("  You can now use `alf sync` and `alf restore`.");
@@ -58,10 +62,7 @@ fn login_interactive() -> Result<()> {
     let human = output::human_mode();
 
     if human {
-        println!(
-            "{} Interactive login (device flow)",
-            "▸".blue().bold()
-        );
+        println!("{} Interactive login (device flow)", "▸".blue().bold());
         println!();
         println!("  You can authenticate with an API key:");
         println!();

@@ -1,8 +1,8 @@
+use adapter_openclaw::OpenClawAdapter;
+use alf_core::Adapter;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use adapter_openclaw::OpenClawAdapter;
-use alf_core::Adapter;
 
 fn assert_files_match(src: &Path, dst: &Path, files: &[&str]) {
     for file in files {
@@ -19,7 +19,11 @@ fn assert_files_match(src: &Path, dst: &Path, files: &[&str]) {
                 file
             );
         } else {
-            assert!(!dst_path.exists(), "Unexpected file created in destination: {}", file);
+            assert!(
+                !dst_path.exists(),
+                "Unexpected file created in destination: {}",
+                file
+            );
         }
     }
 }

@@ -553,8 +553,8 @@ The check command verifies every resource the adapter reads during export:
 
 | Resource | File/Path | Required | Used For |
 |---|---|---|---|
-| Agent persona | `SOUL.md` | Recommended | Name detection, identity layer |
-| Structured identity | `IDENTITY.md` | No | Identity layer (fallback for name) |
+| Agent persona | `SOUL.md` | Recommended | Identity prose / persona layer |
+| Structured identity | `IDENTITY.md` | No | Canonical display name (`Name` / `**Name:**`) + identity layer |
 | Operating instructions | `AGENTS.md` | No | Identity layer |
 | User profile | `USER.md` | No | Principals layer |
 | Tool notes | `TOOLS.md` | No | Raw source preservation |
@@ -668,7 +668,7 @@ Structured issue codes allow agents to match on specific problems programmatical
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
 | `workspace_empty` | warning | No `.md` files in workspace root | Workspace may not be initialized |
-| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; will export with fallback name |
+| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; display name still comes from `IDENTITY.md` `Name` when present, else the workspace folder name |
 | `no_memory_content` | warning | No `MEMORY.md` and no `memory/` directory | Nothing to sync — agent has no memories yet |
 | `memory_dir_empty` | warning | `memory/` exists but has no `.md` files | No daily logs yet |
 | `no_api_key` | error | `~/.alf/config.toml` missing or no `api_key` set | `alf login --key <key>` |

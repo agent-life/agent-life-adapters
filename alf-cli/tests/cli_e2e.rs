@@ -203,22 +203,29 @@ fn help_overview() {
         .stdout(predicate::str::contains("alf — Agent Life Format"))
         .stdout(predicate::str::contains("Commands:"))
         .stdout(predicate::str::contains("export"))
+        .stdout(predicate::str::contains("purge"))
         .stdout(predicate::str::contains("Current status:"));
 }
 
 #[test]
 fn help_status_json_default() {
-    let assert = alf_cmd()
-        .arg("help")
-        .arg("status")
-        .assert()
-        .success();
+    let assert = alf_cmd().arg("help").arg("status").assert().success();
     let out = assert.get_output().stdout.clone();
     let text = std::str::from_utf8(&out).unwrap();
-    let v: serde_json::Value = serde_json::from_str(text).expect("alf help status must output valid JSON by default");
-    assert!(v.get("config_path").is_some(), "JSON must include config_path");
-    assert!(v.get("service_reachable").is_some(), "JSON must include service_reachable");
-    assert!(v.get("agent_service_status").is_some(), "JSON must include agent_service_status");
+    let v: serde_json::Value =
+        serde_json::from_str(text).expect("alf help status must output valid JSON by default");
+    assert!(
+        v.get("config_path").is_some(),
+        "JSON must include config_path"
+    );
+    assert!(
+        v.get("service_reachable").is_some(),
+        "JSON must include service_reachable"
+    );
+    assert!(
+        v.get("agent_service_status").is_some(),
+        "JSON must include agent_service_status"
+    );
 }
 
 #[test]
@@ -244,7 +251,8 @@ fn help_status_json_flag_still_works() {
         .success();
     let out = assert.get_output().stdout.clone();
     let text = std::str::from_utf8(&out).unwrap();
-    let v: serde_json::Value = serde_json::from_str(text).expect("alf help status --json must still output valid JSON");
+    let v: serde_json::Value =
+        serde_json::from_str(text).expect("alf help status --json must still output valid JSON");
     assert!(v.get("service_reachable").is_some());
 }
 
@@ -279,4 +287,15 @@ fn help_export_delegates() {
         .success()
         .stdout(predicate::str::contains("Export reads"))
         .stdout(predicate::str::contains("Usage: alf export"));
+}
+
+#[test]
+fn help_purge_delegates() {
+    alf_cmd()
+        .arg("help")
+        .arg("purge")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DELETE /v1/agents"))
+        .stdout(predicate::str::contains("Usage: alf purge"));
 }

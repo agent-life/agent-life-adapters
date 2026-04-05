@@ -35,10 +35,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Export an agent workspace to an .alf archive
-    #[command(long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
+    #[command(
+        long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
         and writes a single .alf archive. Reads from the workspace path; writes to the given \
         output file or ./<agent-name>.alf by default.\n\n\
-        Example: alf export -r openclaw -w ./my-agent -o backup.alf")]
+        Example: alf export -r openclaw -w ./my-agent -o backup.alf"
+    )]
     Export {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -54,9 +56,11 @@ enum Command {
     },
 
     /// Import an .alf archive into an agent workspace
-    #[command(long_about = "Import unpacks an .alf file into the given workspace directory. \
+    #[command(
+        long_about = "Import unpacks an .alf file into the given workspace directory. \
         Reads the .alf file; writes SOUL.md, config, principals, and other files into the workspace.\n\n\
-        Example: alf import -r openclaw -w ./restored-agent archive.alf")]
+        Example: alf import -r openclaw -w ./restored-agent archive.alf"
+    )]
     Import {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -71,19 +75,23 @@ enum Command {
     },
 
     /// Validate an .alf archive against the ALF specification
-    #[command(long_about = "Validate checks the .alf file structure and contents against the \
+    #[command(
+        long_about = "Validate checks the .alf file structure and contents against the \
         ALF spec. Does not modify any files.\n\n\
-        Example: alf validate backup.alf")]
+        Example: alf validate backup.alf"
+    )]
     Validate {
         /// Path to the .alf file to validate
         alf_file: PathBuf,
     },
 
     /// Incremental sync to the cloud
-    #[command(long_about = "Sync exports the workspace to a temporary .alf, uploads it to the \
+    #[command(
+        long_about = "Sync exports the workspace to a temporary .alf, uploads it to the \
         agent-life service, and updates ~/.alf/state/{agent_id}.toml and the snapshot file \
         (~/.alf/state/{agent_id}-snapshot.alf). Use 'alf restore' to download later.\n\n\
-        Example: alf sync -r openclaw -w ./my-agent")]
+        Example: alf sync -r openclaw -w ./my-agent"
+    )]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -95,9 +103,11 @@ enum Command {
     },
 
     /// Download and restore from the cloud
-    #[command(long_about = "Restore downloads the latest snapshot from the agent-life service \
+    #[command(
+        long_about = "Restore downloads the latest snapshot from the agent-life service \
         and imports it into the workspace. Reads state from ~/.alf/state/; writes to the workspace.\n\n\
-        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>")]
+        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>"
+    )]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -112,10 +122,34 @@ enum Command {
         agent: Option<String>,
     },
 
+    /// Remove cloud sync data and agent registration (does not delete local workspace files)
+    #[command(
+        long_about = "Purge calls DELETE /v1/agents/:id on the agent-life service: it removes all \
+        snapshot and delta blobs in storage for this agent and deletes the agent row. It does not \
+        delete files under the workspace. It resets ~/.alf/state/ for this agent so the next \
+        `alf sync` uploads a full snapshot again.\n\n\
+        Example: alf purge -r openclaw -w ./my-agent"
+    )]
+    Purge {
+        /// Agent framework runtime (openclaw, zeroclaw)
+        #[arg(short, long)]
+        runtime: String,
+
+        /// Path to the agent workspace directory (used for CLI consistency; not modified)
+        #[arg(short, long)]
+        workspace: PathBuf,
+
+        /// Agent ID to purge (if omitted, uses the single tracked agent from ~/.alf/state/)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+
     /// Authenticate with the agent-life service
-    #[command(long_about = "Login stores your API key in ~/.alf/config.toml (service.api_key). \
+    #[command(
+        long_about = "Login stores your API key in ~/.alf/config.toml (service.api_key). \
         Use -k to pass the key non-interactively.\n\n\
-        Example: alf login -k <your-api-key>")]
+        Example: alf login -k <your-api-key>"
+    )]
     Login {
         /// API key (skip interactive login)
         #[arg(short, long)]
@@ -123,11 +157,13 @@ enum Command {
     },
 
     /// Check the runtime environment and report readiness to sync
-    #[command(long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
+    #[command(
+        long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
         whether alf can find the workspace, memory files, API key, and service. \
         Use this before sync to diagnose configuration issues.\n\n\
         Example: alf check -r openclaw\n\
-        Example: alf check -r openclaw -w ~/custom-workspace")]
+        Example: alf check -r openclaw -w ~/custom-workspace"
+    )]
     Check {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
@@ -139,9 +175,11 @@ enum Command {
     },
 
     /// Show help (overview, status, files, troubleshoot, or per-command)
-    #[command(long_about = "Topics: overview (default), status, files, troubleshoot, or a command name \
-        (export, import, sync, restore, validate, login, check). \
-        Status output is JSON by default; use --human for text.")]
+    #[command(
+        long_about = "Topics: overview (default), status, files, troubleshoot, or a command name \
+        (export, import, sync, restore, purge, validate, login, check). \
+        Status output is JSON by default; use --human for text."
+    )]
     Help {
         /// Topic: overview (default), status, files, troubleshoot, or a command name
         topic: Option<String>,
@@ -174,10 +212,7 @@ fn main() {
 
         Command::Validate { alf_file } => commands::validate::run(&alf_file),
 
-        Command::Sync {
-            runtime,
-            workspace,
-        } => commands::sync::run(&runtime, &workspace),
+        Command::Sync { runtime, workspace } => commands::sync::run(&runtime, &workspace),
 
         Command::Restore {
             runtime,
@@ -185,12 +220,17 @@ fn main() {
             agent,
         } => commands::restore::run(&runtime, &workspace, agent.as_deref()),
 
-        Command::Login { key } => commands::login::run(key.as_deref()),
-
-        Command::Check {
+        Command::Purge {
             runtime,
             workspace,
-        } => commands::check::run(&runtime, workspace.as_deref()),
+            agent,
+        } => commands::purge::run(&runtime, &workspace, agent.as_deref()),
+
+        Command::Login { key } => commands::login::run(key.as_deref()),
+
+        Command::Check { runtime, workspace } => {
+            commands::check::run(&runtime, workspace.as_deref())
+        }
 
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
     };
@@ -219,7 +259,8 @@ fn error_hint(err: &anyhow::Error) -> String {
         return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
     }
     if msg.contains("Unknown runtime") {
-        return "Supported runtimes: openclaw, zeroclaw. Run 'alf help troubleshoot' for more.".into();
+        return "Supported runtimes: openclaw, zeroclaw. Run 'alf help troubleshoot' for more."
+            .into();
     }
     if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
         return "Run 'alf help troubleshoot' for workspace and path guidance.".into();

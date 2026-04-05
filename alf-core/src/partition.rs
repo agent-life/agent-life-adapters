@@ -309,9 +309,7 @@ mod tests {
         ];
 
         for (month, expected_q) in cases {
-            let ts = Utc
-                .with_ymd_and_hms(2026, month, 15, 0, 0, 0)
-                .unwrap();
+            let ts = Utc.with_ymd_and_hms(2026, month, 15, 0, 0, 0).unwrap();
             assert_eq!(
                 PartitionAssigner::partition_for_timestamp(ts),
                 format!("memory/2026-Q{expected_q}.jsonl"),
@@ -469,8 +467,16 @@ mod tests {
         for (path, (sy, sm, sd), (ey, em, ed)) in cases {
             let (from, to) = PartitionAssigner::date_range_for_partition(path)
                 .unwrap_or_else(|| panic!("failed to parse {path}"));
-            assert_eq!(from, NaiveDate::from_ymd_opt(sy, sm, sd).unwrap(), "{path} from");
-            assert_eq!(to, NaiveDate::from_ymd_opt(ey, em, ed).unwrap(), "{path} to");
+            assert_eq!(
+                from,
+                NaiveDate::from_ymd_opt(sy, sm, sd).unwrap(),
+                "{path} from"
+            );
+            assert_eq!(
+                to,
+                NaiveDate::from_ymd_opt(ey, em, ed).unwrap(),
+                "{path} to"
+            );
         }
     }
 

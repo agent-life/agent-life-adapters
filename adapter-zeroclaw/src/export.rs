@@ -40,10 +40,8 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
 fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
-        let raw = fs::read_to_string(&id_file)
-            .context("Failed to read .alf-agent-id")?;
-        let id = Uuid::parse_str(raw.trim())
-            .context("Invalid UUID in .alf-agent-id")?;
+        let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
+        let id = Uuid::parse_str(raw.trim()).context("Invalid UUID in .alf-agent-id")?;
         return Ok(id);
     }
 
@@ -74,10 +72,7 @@ fn zeroclaw_home(workspace: &Path) -> std::path::PathBuf {
         return workspace.to_path_buf();
     }
     // Best guess
-    workspace
-        .parent()
-        .unwrap_or(workspace)
-        .to_path_buf()
+    workspace.parent().unwrap_or(workspace).to_path_buf()
 }
 
 /// Try to detect ZeroClaw version from workspace files or environment.
@@ -110,7 +105,11 @@ const ROOT_FILES: &[&str] = &[
 
 /// Collect all raw source files from a ZeroClaw workspace.
 /// Returns `(relative_path, data)` pairs.
-fn collect_raw_sources(workspace: &Path, _zc_home: &Path, config: &ZeroClawConfig) -> Vec<(String, Vec<u8>)> {
+fn collect_raw_sources(
+    workspace: &Path,
+    _zc_home: &Path,
+    config: &ZeroClawConfig,
+) -> Vec<(String, Vec<u8>)> {
     let mut sources = Vec::new();
 
     // config.toml (redacted)
@@ -205,24 +204,23 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
 
     // 1. Parse config
     let config_path = zc_home.join("config.toml");
-    let config = config_parser::parse_config(&config_path)?
-        .unwrap_or_else(|| {
-            // No config.toml — use defaults with heuristic backend detection
-            let backend = config_parser::detect_backend_heuristic(&zc_home);
-            ZeroClawConfig {
-                memory_backend: backend,
-                auto_save: true,
-                embedding_provider: "none".into(),
-                vector_weight: 0.7,
-                keyword_weight: 0.3,
-                identity_format: config_parser::IdentityFormat::OpenClaw,
-                aieos_path: None,
-                aieos_inline: None,
-                secrets_encrypt: true,
-                credential_hints: Vec::new(),
-                raw_toml: String::new(),
-            }
-        });
+    let config = config_parser::parse_config(&config_path)?.unwrap_or_else(|| {
+        // No config.toml — use defaults with heuristic backend detection
+        let backend = config_parser::detect_backend_heuristic(&zc_home);
+        ZeroClawConfig {
+            memory_backend: backend,
+            auto_save: true,
+            embedding_provider: "none".into(),
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
+            identity_format: config_parser::IdentityFormat::OpenClaw,
+            aieos_path: None,
+            aieos_inline: None,
+            secrets_encrypt: true,
+            credential_hints: Vec::new(),
+            raw_toml: String::new(),
+        }
+    });
 
     // 2. Agent ID + name
     let agent_id = resolve_agent_id(workspace)?;
@@ -249,13 +247,11 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
                 )?
             }
         }
-        MemoryBackend::Markdown => {
-            markdown_parser::collect_markdown_memory(
-                workspace,
-                agent_id,
-                runtime_version.as_deref(),
-            )?
-        }
+        MemoryBackend::Markdown => markdown_parser::collect_markdown_memory(
+            workspace,
+            agent_id,
+            runtime_version.as_deref(),
+        )?,
         MemoryBackend::None | MemoryBackend::Unsupported => Vec::new(),
     };
     let total_records = records.len() as u64;
@@ -279,7 +275,10 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         let (from, to) = if parts.len() == 2 {
             let year: i32 = parts[0].parse().unwrap_or(2026);
             let quarter: u32 = parts[1].parse().unwrap_or(1);
-            (quarter_start(year, quarter), Some(quarter_end(year, quarter)))
+            (
+                quarter_start(year, quarter),
+                Some(quarter_end(year, quarter)),
+            )
         } else {
             (NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(), None)
         };
@@ -353,7 +352,10 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
             memory: Some(MemoryInventory {
                 record_count: total_records,
                 index_file: "memory/index.json".to_string(),
-                partitions: partition_infos.iter().map(|(info, _)| info.clone()).collect(),
+                partitions: partition_infos
+                    .iter()
+                    .map(|(info, _)| info.clone())
+                    .collect(),
                 has_embeddings: Some(has_embeddings),
                 has_raw_source: Some(true),
                 extra: std::collections::HashMap::new(),
@@ -460,7 +462,8 @@ mod tests {
                 timestamp TEXT NOT NULL,
                 embedding BLOB
             );",
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             rusqlite::params![
@@ -470,7 +473,8 @@ mod tests {
                 "core",
                 "2026-01-15T10:00:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
         conn.execute(
             "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
             rusqlite::params![
@@ -480,7 +484,8 @@ mod tests {
                 "daily",
                 "2026-02-20T14:00:00Z",
             ],
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     #[test]
@@ -493,9 +498,10 @@ embedding_provider = "none"
 [identity]
 format = "openclaw"
 "#;
-        let (dir, ws) = create_zeroclaw_home(config, &[
-            ("SOUL.md", "# ZCAgent\n\nA test ZeroClaw agent.\n"),
-        ]);
+        let (dir, ws) = create_zeroclaw_home(
+            config,
+            &[("SOUL.md", "# ZCAgent\n\nA test ZeroClaw agent.\n")],
+        );
         create_test_db(dir.path());
 
         let output = dir.path().join("test.alf");
@@ -515,10 +521,16 @@ format = "openclaw"
 [memory]
 backend = "markdown"
 "#;
-        let (dir, ws) = create_zeroclaw_home(config, &[
-            ("SOUL.md", "# MdAgent\n\nMarkdown backend.\n"),
-            ("memory/2026-02-15.md", "## Morning\n\nDid stuff.\n\n## Evening\n\nMore stuff.\n"),
-        ]);
+        let (dir, ws) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# MdAgent\n\nMarkdown backend.\n"),
+                (
+                    "memory/2026-02-15.md",
+                    "## Morning\n\nDid stuff.\n\n## Evening\n\nMore stuff.\n",
+                ),
+            ],
+        );
 
         let output = dir.path().join("test.alf");
         let report = export(&ws, &output).unwrap();
@@ -530,9 +542,7 @@ backend = "markdown"
     #[test]
     fn agent_id_stability() {
         let config = "[memory]\nbackend = \"sqlite\"";
-        let (dir, ws) = create_zeroclaw_home(config, &[
-            ("SOUL.md", "# Stable\n\nTest.\n"),
-        ]);
+        let (dir, ws) = create_zeroclaw_home(config, &[("SOUL.md", "# Stable\n\nTest.\n")]);
         create_test_db(dir.path());
 
         let out1 = dir.path().join("out1.alf");

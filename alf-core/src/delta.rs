@@ -76,16 +76,10 @@ pub fn compute_delta(old: &[MemoryRecord], new: &[MemoryRecord]) -> Vec<DeltaMem
 ///
 /// Returns the resulting set of records. Order is preserved for existing
 /// records; new records are appended at the end.
-pub fn apply_delta(
-    base: &[MemoryRecord],
-    entries: &[DeltaMemoryEntry],
-) -> Vec<MemoryRecord> {
+pub fn apply_delta(base: &[MemoryRecord], entries: &[DeltaMemoryEntry]) -> Vec<MemoryRecord> {
     let mut records: Vec<MemoryRecord> = base.to_vec();
-    let mut index: HashMap<Uuid, usize> = records
-        .iter()
-        .enumerate()
-        .map(|(i, r)| (r.id, i))
-        .collect();
+    let mut index: HashMap<Uuid, usize> =
+        records.iter().enumerate().map(|(i, r)| (r.id, i)).collect();
 
     // Track which indices have been deleted so we can remove them at the end
     let mut deleted: Vec<bool> = vec![false; records.len()];
@@ -540,8 +534,12 @@ mod tests {
         // After delta1: [id1("updated in delta 1"), id2("added in delta 1")]
         // After delta2: [id2("added in delta 1"), id3("added in delta 2")]
         assert_eq!(result.len(), 2);
-        assert!(result.iter().any(|r| r.id == id2 && r.content == "added in delta 1"));
-        assert!(result.iter().any(|r| r.id == id3 && r.content == "added in delta 2"));
+        assert!(result
+            .iter()
+            .any(|r| r.id == id2 && r.content == "added in delta 1"));
+        assert!(result
+            .iter()
+            .any(|r| r.id == id3 && r.content == "added in delta 2"));
         assert!(!result.iter().any(|r| r.id == id1));
     }
 

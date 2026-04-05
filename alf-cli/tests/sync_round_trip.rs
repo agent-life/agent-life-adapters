@@ -71,11 +71,7 @@ fn read_identity_version(alf_bytes: &[u8]) -> Option<u32> {
 }
 
 /// Build a delta archive from delta entries with the given base_sequence.
-fn build_delta(
-    agent_id: uuid::Uuid,
-    base_sequence: u64,
-    entries: &[DeltaMemoryEntry],
-) -> Vec<u8> {
+fn build_delta(agent_id: uuid::Uuid, base_sequence: u64, entries: &[DeltaMemoryEntry]) -> Vec<u8> {
     let manifest = DeltaManifest {
         alf_version: "1.0.0".into(),
         created_at: Utc::now(),
@@ -108,7 +104,10 @@ fn build_delta(
             .add_memory_deltas(entries)
             .expect("failed to add memory deltas");
     }
-    writer.finish().expect("failed to finish delta").into_inner()
+    writer
+        .finish()
+        .expect("failed to finish delta")
+        .into_inner()
 }
 
 /// Compare two sets of memory records by (id → content), order-independent.
@@ -122,8 +121,10 @@ fn compare_records(expected: &[MemoryRecord], actual: &[MemoryRecord]) -> Option
         ));
     }
 
-    let expected_map: HashMap<uuid::Uuid, &str> =
-        expected.iter().map(|r| (r.id, r.content.as_str())).collect();
+    let expected_map: HashMap<uuid::Uuid, &str> = expected
+        .iter()
+        .map(|r| (r.id, r.content.as_str()))
+        .collect();
     let actual_map: HashMap<uuid::Uuid, &str> =
         actual.iter().map(|r| (r.id, r.content.as_str())).collect();
 
@@ -186,7 +187,11 @@ fn snapshot_round_trip() {
 
     let records = read_records(&alf_bytes);
     // 2 from MEMORY.md + 2 from Jan 15 + 1 from Jan 16 = 5
-    assert_eq!(records.len(), 5, "expected 5 records from baseline workspace");
+    assert_eq!(
+        records.len(),
+        5,
+        "expected 5 records from baseline workspace"
+    );
 
     let identity_version = read_identity_version(&alf_bytes);
     assert!(
@@ -263,7 +268,11 @@ fn snapshot_plus_delta_round_trip() {
     let mutated_bytes = export_workspace(&ws, &mutated_path);
     let mutated_records = read_records(&mutated_bytes);
     // 3 MEMORY.md sections + 2 from Jan 15 + 2 from Jan 16 = 7
-    assert_eq!(mutated_records.len(), 7, "mutated: 3 MEMORY.md + 2 daily-15 + 2 daily-16");
+    assert_eq!(
+        mutated_records.len(),
+        7,
+        "mutated: 3 MEMORY.md + 2 daily-15 + 2 daily-16"
+    );
 
     // ── Compute delta ─────────────────────────────────────────────
     let delta_entries = compute_delta(&base_records, &mutated_records);
@@ -276,8 +285,8 @@ fn snapshot_plus_delta_round_trip() {
     let delta_bytes = build_delta(agent_id, 0, &delta_entries);
 
     // ── Rebuild ───────────────────────────────────────────────────
-    let rebuilt_bytes = rebuild_snapshot(&base_bytes, &[delta_bytes.as_slice()])
-        .expect("rebuild failed");
+    let rebuilt_bytes =
+        rebuild_snapshot(&base_bytes, &[delta_bytes.as_slice()]).expect("rebuild failed");
 
     let rebuilt_records = read_records(&rebuilt_bytes);
 
@@ -373,7 +382,9 @@ fn multi_delta_chain() {
     // Also verify the deleted record is actually gone
     let rebuilt_contents: Vec<&str> = rebuilt_records.iter().map(|r| r.content.as_str()).collect();
     assert!(
-        !rebuilt_contents.iter().any(|c| c.contains("SSE notifications")),
+        !rebuilt_contents
+            .iter()
+            .any(|c| c.contains("SSE notifications")),
         "Session 2 (SSE notifications) should have been deleted by delta 2"
     );
 }
@@ -383,13 +394,7 @@ fn multi_delta_chain() {
 fn rebuild_preserves_identity_through_memory_delta() {
     let tmp = TempDir::new().unwrap();
 
-    let ws = create_workspace(
-        &tmp,
-        "workspace",
-        "Atlas",
-        "## Fact\n\nOriginal fact.",
-        &[],
-    );
+    let ws = create_workspace(&tmp, "workspace", "Atlas", "## Fact\n\nOriginal fact.", &[]);
 
     let base_path = tmp.path().join("base.alf");
     let base_bytes = export_workspace(&ws, &base_path);
@@ -429,7 +434,11 @@ fn rebuild_preserves_identity_through_memory_delta() {
 
     // Memory should be updated
     let rebuilt_records = read_records(&rebuilt_bytes);
-    assert_eq!(rebuilt_records.len(), 2, "rebuilt should have 2 MEMORY.md sections");
+    assert_eq!(
+        rebuilt_records.len(),
+        2,
+        "rebuilt should have 2 MEMORY.md sections"
+    );
 }
 
 /// Full pipeline: export → rebuild with no deltas → import → re-export → compare.
@@ -443,9 +452,10 @@ fn rebuild_then_import_produces_matching_workspace() {
         "workspace",
         "Atlas",
         "## Architecture\n\nEvent sourced.\n\n## Team\n\nThree engineers.",
-        &[
-            ("2026-01-15.md", "## Morning\n\nStandup notes.\n\n## EOD\n\nShipped v2."),
-        ],
+        &[(
+            "2026-01-15.md",
+            "## Morning\n\nStandup notes.\n\n## EOD\n\nShipped v2.",
+        )],
     );
 
     let base_path = tmp.path().join("base.alf");

@@ -199,11 +199,7 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
     let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for record in &all_records {
-        let origin_file = record
-            .source
-            .origin_file
-            .as_deref()
-            .unwrap_or("");
+        let origin_file = record.source.origin_file.as_deref().unwrap_or("");
 
         match record.namespace.as_str() {
             "curated" => {
@@ -216,7 +212,10 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
                 } else if let Some(observed) = record.temporal.observed_at {
                     format!("memory/{}.md", observed.format("%Y-%m-%d"))
                 } else {
-                    format!("memory/{}.md", record.temporal.created_at.format("%Y-%m-%d"))
+                    format!(
+                        "memory/{}.md",
+                        record.temporal.created_at.format("%Y-%m-%d")
+                    )
                 };
                 daily_groups
                     .entry(key)
@@ -302,12 +301,10 @@ mod tests {
         // Create a workspace, export, then import into a fresh directory
         let ws = create_workspace(&[
             ("SOUL.md", "# Clawd\n\nA helpful lobster."),
+            ("IDENTITY.md", "# Identity\n\nName: Clawd"),
             ("USER.md", "# Alice\n\n## Timezone\n\nAmerica/New_York\n"),
             ("MEMORY.md", "## Preferences\n\nLikes Rust."),
-            (
-                "memory/2026-01-15.md",
-                "## Morning\n\nBuilt the adapter.",
-            ),
+            ("memory/2026-01-15.md", "## Morning\n\nBuilt the adapter."),
         ]);
         let alf_file = ws.path().join("export.alf");
 
@@ -344,7 +341,10 @@ mod tests {
 
     #[test]
     fn import_creates_workspace_dirs() {
-        let ws = create_workspace(&[("SOUL.md", "# Bot\n\nTest.")]);
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nTest."),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
         let alf_file = ws.path().join("export.alf");
         export::export(ws.path(), &alf_file).unwrap();
 

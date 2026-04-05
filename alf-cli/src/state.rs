@@ -4,8 +4,8 @@
 //! This allows the CLI to track what has been synced and compute deltas
 //! from the correct base.
 
-use anyhow::{Context, Result};
 use anyhow::bail;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -90,7 +90,6 @@ impl AgentState {
     }
 
     /// Delete this agent's state file.
-    #[allow(dead_code)]
     pub fn delete(agent_id: Uuid) -> Result<()> {
         let path = Self::path_for(agent_id)?;
         if path.exists() {

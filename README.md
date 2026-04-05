@@ -274,8 +274,8 @@ Translates between OpenClaw's native file-based workspace and the ALF format.
 
 | OpenClaw File     | ALF Layer                            | Mapping                                                                  |
 | ----------------- | ------------------------------------ | ------------------------------------------------------------------------ |
-| `SOUL.md`         | Identity (§3.2)                      | Parsed into structured fields (name, role, personality) + prose blocks   |
-| `IDENTITY.md`     | Identity (§3.2)                      | Merged with SOUL.md; capabilities extracted with portability annotations |
+| `SOUL.md`         | Identity (§3.2)                      | Preserved as persona prose; not the canonical display name source        |
+| `IDENTITY.md`     | Identity (§3.2)                      | `Name` / `**Name:**` sets the canonical display name; rest merged as prose |
 | `AGENTS.md`       | Identity — sub-agent roster (§3.2.4) | Each agent entry → sub-agent with name, role, delegation scope           |
 | `USER.md`         | Principals (§3.3)                    | Parsed into primary principal with profile, preferences, work context    |
 | `MEMORY.md`       | Memory records (§3.1)                | Each entry → `MemoryRecord` with type classification, entity extraction  |

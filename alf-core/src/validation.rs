@@ -325,10 +325,7 @@ pub fn validate_identity(identity: &Identity) -> ValidationReport {
     }
 
     for key in identity.extra.keys() {
-        report.warning(
-            format!("identity.{key}"),
-            format!("Unknown field '{key}'"),
-        );
+        report.warning(format!("identity.{key}"), format!("Unknown field '{key}'"));
     }
 
     report
@@ -438,16 +435,17 @@ pub fn validate_credentials(doc: &CredentialsDocument) -> ValidationReport {
 /// Check if a string is a valid semver (MAJOR.MINOR.PATCH, all numeric).
 fn is_semver(s: &str) -> bool {
     let parts: Vec<&str> = s.split('.').collect();
-    parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Check if a checksum string matches `algorithm:hex` format.
 fn is_valid_checksum_format(s: &str) -> bool {
     match s.split_once(':') {
         Some((algo, hex)) => {
-            !algo.is_empty()
-                && !hex.is_empty()
-                && hex.chars().all(|c| c.is_ascii_hexdigit())
+            !algo.is_empty() && !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit())
         }
         None => false,
     }
@@ -645,7 +643,8 @@ mod tests {
     #[test]
     fn unknown_manifest_fields_produce_warnings() {
         let mut m = valid_manifest();
-        m.extra.insert("future_field".into(), serde_json::json!(true));
+        m.extra
+            .insert("future_field".into(), serde_json::json!(true));
         let report = validate_manifest(&m);
         assert!(report.is_valid()); // warnings don't fail
         assert_eq!(report.warnings().len(), 1);

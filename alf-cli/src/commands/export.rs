@@ -35,10 +35,7 @@ pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result
         );
     }
     if !workspace.is_dir() {
-        bail!(
-            "Workspace path is not a directory: {}",
-            workspace.display()
-        );
+        bail!("Workspace path is not a directory: {}", workspace.display());
     }
 
     let default_output;

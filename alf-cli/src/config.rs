@@ -249,7 +249,11 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
-        fs::write(&path, "[service]\napi_url = \"https://api.agent-life.ai\"\n").unwrap();
+        fs::write(
+            &path,
+            "[service]\napi_url = \"https://api.agent-life.ai\"\n",
+        )
+        .unwrap();
 
         std::env::set_var("ALF_API_KEY", "alf_sk_from_env");
         let config = Config::load_from(&path).unwrap();

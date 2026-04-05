@@ -816,7 +816,12 @@ def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report
         2. Deletes them all (snapshots, deltas)
         3. Deletes the agent row from Neon (CASCADE deletes snapshots + deltas rows)
 
-        This is irreversible. Let's do it and verify the cleanup is complete.
+        From the `alf` CLI, the same operation is `alf purge -r <runtime> -w <workspace>`
+        (optional `-a <agent-id>` if you track multiple agents). Purge also removes
+        local ~/.alf/state/ cursor files for that agent so the next sync starts clean.
+
+        This walkthrough calls the HTTP API directly below. This is irreversible.
+        Let's do it and verify the cleanup is complete.
     """)
 
     # Count objects before
@@ -827,6 +832,9 @@ def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report
     s3_prefix = f"{tenant_id}/{AGENT_ID}/" if tenant_id else None
     objects_before = s3.list_objects(s3_prefix) if s3_prefix else []
     print(f"  S3 objects before delete: {len(objects_before)}")
+    print(
+        f"  CLI equivalent: alf purge -r openclaw -w <workspace> -a {AGENT_ID}"
+    )
 
     t0 = time.time()
     r = api.delete(f"/agents/{AGENT_ID}")

@@ -122,7 +122,10 @@ mod tests {
         assert_eq!(doc.credentials[0].service, "openrouter");
         assert_eq!(doc.credentials[0].encrypted_payload, "<not-exported>");
         assert_eq!(doc.credentials[0].credential_type, CredentialType::ApiKey);
-        assert_eq!(doc.credentials[1].credential_type, CredentialType::OauthToken);
+        assert_eq!(
+            doc.credentials[1].credential_type,
+            CredentialType::OauthToken
+        );
         assert_eq!(doc.credentials[1].encryption.algorithm, "chacha20-poly1305");
     }
 

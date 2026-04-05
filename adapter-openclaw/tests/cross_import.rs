@@ -1,20 +1,28 @@
-use std::fs;
-use std::path::Path;
-use std::io::{Read, Write};
-use tempfile::TempDir;
 use adapter_openclaw::OpenClawAdapter;
 use alf_core::Adapter;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::Path;
+use tempfile::TempDir;
 
 fn build_cross_runtime_archive(out_path: &Path) {
     let tmp = TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
     fs::create_dir(&workspace).unwrap();
 
-    fs::write(workspace.join("SOUL.md"), "# Identity\nI am a cross-runtime agent.").unwrap();
+    fs::write(
+        workspace.join("SOUL.md"),
+        "# Identity\nI am a cross-runtime agent.",
+    )
+    .unwrap();
     fs::write(workspace.join("IDENTITY.md"), "This is my profile.").unwrap();
     fs::write(workspace.join("USER.md"), "This is the cross user.").unwrap();
     fs::create_dir(workspace.join("memory")).unwrap();
-    fs::write(workspace.join("memory").join("2026-01-01.md"), "A daily log entry.").unwrap();
+    fs::write(
+        workspace.join("memory").join("2026-01-01.md"),
+        "A daily log entry.",
+    )
+    .unwrap();
 
     let temp_alf = tmp.path().join("temp.alf");
     let adapter = OpenClawAdapter;
@@ -49,10 +57,15 @@ fn cross_import_reconstructs_files() {
 
     let workspace = tmp.path().join("workspace");
     let adapter = OpenClawAdapter;
-    let report = adapter.import(&alf_path, &workspace).expect("import failed");
+    let report = adapter
+        .import(&alf_path, &workspace)
+        .expect("import failed");
 
     // Expect warnings about reconstruction
-    assert!(report.warnings.iter().any(|w| w.contains("reconstructing")), "Expected a reconstruction warning");
+    assert!(
+        report.warnings.iter().any(|w| w.contains("reconstructing")),
+        "Expected a reconstruction warning"
+    );
 
     // Verify SOUL.md
     assert!(workspace.join("SOUL.md").exists());
@@ -75,6 +88,9 @@ fn cross_import_reconstructs_files() {
         .map(|r| r.unwrap().path())
         .filter(|p| p.extension().map_or(false, |ext| ext == "md"))
         .collect();
-    
-    assert!(!memory_files.is_empty(), "Expected a daily memory markdown file to be created");
+
+    assert!(
+        !memory_files.is_empty(),
+        "Expected a daily memory markdown file to be created"
+    );
 }

@@ -12,8 +12,7 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{
-    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, StructuredProfile,
-    ProseProfile,
+    Principal, PrincipalProfile, PrincipalType, PrincipalsDocument, ProseProfile, StructuredProfile,
 };
 
 // ---------------------------------------------------------------------------
@@ -97,8 +96,8 @@ fn extract_timezone(content: &str) -> Option<String> {
     for line in content.lines() {
         let t = line.trim();
         if t.starts_with("## ") {
-            in_tz_section = t.to_lowercase().contains("timezone")
-                || t.to_lowercase().contains("time zone");
+            in_tz_section =
+                t.to_lowercase().contains("timezone") || t.to_lowercase().contains("time zone");
             continue;
         }
         if in_tz_section && !t.is_empty() {
@@ -130,7 +129,8 @@ mod tests {
         fs::write(
             ws.join("USER.md"),
             "# Alice\n\nSoftware engineer.\n\n## Timezone\n\nAmerica/New_York\n",
-        ).unwrap();
+        )
+        .unwrap();
 
         let doc = parse_principals(ws, Uuid::new_v4()).unwrap().unwrap();
         assert_eq!(doc.principals.len(), 1);

@@ -827,10 +827,7 @@ mod tests {
         assert!(sealed.sealed);
 
         let current = &memory.partitions[1];
-        assert_eq!(
-            current.from,
-            NaiveDate::from_ymd_opt(2026, 1, 1).unwrap()
-        );
+        assert_eq!(current.from, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
         assert_eq!(current.to, None);
         assert!(!current.sealed);
     }
@@ -998,7 +995,10 @@ mod tests {
             serialized["future_attachment_field"],
             serde_json::json!("preserved")
         );
-        assert_eq!(serialized["hash"]["future_hash_field"], serde_json::json!(true));
+        assert_eq!(
+            serialized["hash"]["future_hash_field"],
+            serde_json::json!(true)
+        );
     }
 
     #[test]

@@ -1,11 +1,11 @@
+use adapter_openclaw::OpenClawAdapter;
+use alf_core::delta::compute_delta;
+use alf_core::manifest::DeltaOperation;
+use alf_core::Adapter;
+use alf_core::AlfReader;
 use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
-use adapter_openclaw::OpenClawAdapter;
-use alf_core::Adapter;
-use alf_core::AlfReader;
-use alf_core::delta::compute_delta;
-use alf_core::manifest::DeltaOperation;
 
 fn get_records(workspace: &Path) -> Vec<alf_core::memory::MemoryRecord> {
     let tmp = TempDir::new().unwrap();
@@ -25,7 +25,10 @@ fn no_changes_empty_delta() {
     let new = get_records(fixture);
 
     let delta = compute_delta(&old, &new);
-    assert!(delta.is_empty(), "Delta should be empty for identical workspaces");
+    assert!(
+        delta.is_empty(),
+        "Delta should be empty for identical workspaces"
+    );
 }
 
 #[test]
@@ -34,18 +37,25 @@ fn new_section_detected() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(workspace.join("memory")).unwrap();
     fs::write(workspace.join("SOUL.md"), "# Identity").unwrap();
-    
+
     let mem_file = workspace.join("memory/2026-01-01.md");
     fs::write(&mem_file, "## Section 1\nContent 1\n").unwrap();
-    
+
     let old = get_records(&workspace);
 
     // Add new section
-    fs::write(&mem_file, "## Section 1\nContent 1\n\n## Section 2\nContent 2\n").unwrap();
+    fs::write(
+        &mem_file,
+        "## Section 1\nContent 1\n\n## Section 2\nContent 2\n",
+    )
+    .unwrap();
     let new = get_records(&workspace);
 
     let delta = compute_delta(&old, &new);
-    let creates: Vec<_> = delta.iter().filter(|d| d.operation == DeltaOperation::Create).collect();
+    let creates: Vec<_> = delta
+        .iter()
+        .filter(|d| d.operation == DeltaOperation::Create)
+        .collect();
     assert_eq!(creates.len(), 1);
     assert!(creates[0].record.content.contains("Content 2"));
 }
@@ -56,10 +66,10 @@ fn modified_section_detected() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(workspace.join("memory")).unwrap();
     fs::write(workspace.join("SOUL.md"), "# Identity").unwrap();
-    
+
     let mem_file = workspace.join("memory/2026-01-01.md");
     fs::write(&mem_file, "## Section 1\nContent 1\n").unwrap();
-    
+
     let old = get_records(&workspace);
 
     // Modify section
@@ -78,10 +88,14 @@ fn deleted_section_detected() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(workspace.join("memory")).unwrap();
     fs::write(workspace.join("SOUL.md"), "# Identity").unwrap();
-    
+
     let mem_file = workspace.join("memory/2026-01-01.md");
-    fs::write(&mem_file, "## Section 1\nContent 1\n\n## Section 2\nContent 2\n").unwrap();
-    
+    fs::write(
+        &mem_file,
+        "## Section 1\nContent 1\n\n## Section 2\nContent 2\n",
+    )
+    .unwrap();
+
     let old = get_records(&workspace);
 
     // Delete section
@@ -89,7 +103,10 @@ fn deleted_section_detected() {
     let new = get_records(&workspace);
 
     let delta = compute_delta(&old, &new);
-    let deletes: Vec<_> = delta.iter().filter(|d| d.operation == DeltaOperation::Delete).collect();
+    let deletes: Vec<_> = delta
+        .iter()
+        .filter(|d| d.operation == DeltaOperation::Delete)
+        .collect();
     assert_eq!(deletes.len(), 1);
 }
 
@@ -99,10 +116,10 @@ fn renamed_file_produces_new_ids() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(workspace.join("memory")).unwrap();
     fs::write(workspace.join("SOUL.md"), "# Identity").unwrap();
-    
+
     let mem_file = workspace.join("memory/2026-01-01.md");
     fs::write(&mem_file, "## Section 1\nContent 1\n").unwrap();
-    
+
     let old = get_records(&workspace);
 
     // Rename file
@@ -113,8 +130,14 @@ fn renamed_file_produces_new_ids() {
     let delta = compute_delta(&old, &new);
     // Renaming a file changes its deterministic ID base, so it should delete the old and create the new.
     assert_eq!(delta.len(), 2);
-    let creates = delta.iter().filter(|d| d.operation == DeltaOperation::Create).count();
-    let deletes = delta.iter().filter(|d| d.operation == DeltaOperation::Delete).count();
+    let creates = delta
+        .iter()
+        .filter(|d| d.operation == DeltaOperation::Create)
+        .count();
+    let deletes = delta
+        .iter()
+        .filter(|d| d.operation == DeltaOperation::Delete)
+        .count();
     assert_eq!(creates, 1);
     assert_eq!(deletes, 1);
 }

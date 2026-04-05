@@ -75,16 +75,15 @@ pub fn gather_status() -> Result<StatusSummary> {
                     Err(_) => continue,
                 };
 
-                let state = AgentState::load(agent_id).unwrap_or_else(|_| AgentState::new(agent_id));
+                let state =
+                    AgentState::load(agent_id).unwrap_or_else(|_| AgentState::new(agent_id));
                 let snapshot_path = state_dir.join(format!("{agent_id}-snapshot.alf"));
                 let snapshot_exists = snapshot_path.is_file();
 
                 agents.push(AgentSummary {
                     agent_id,
                     last_synced_sequence: state.last_synced_sequence,
-                    last_synced_at: state
-                        .last_synced_at
-                        .map(|dt| dt.to_rfc3339()),
+                    last_synced_at: state.last_synced_at.map(|dt| dt.to_rfc3339()),
                     snapshot_exists,
                 });
             }
@@ -158,8 +157,14 @@ pub mod tests {
         assert!(!status.config_exists);
         assert!(!status.api_key_set);
         assert_eq!(status.agents.len(), 0);
-        assert!(status.config_path.ends_with(".alf/config.toml") || status.config_path.to_string_lossy().contains(".alf"));
-        assert!(status.state_dir.ends_with(".alf/state") || status.state_dir.to_string_lossy().contains(".alf"));
+        assert!(
+            status.config_path.ends_with(".alf/config.toml")
+                || status.config_path.to_string_lossy().contains(".alf")
+        );
+        assert!(
+            status.state_dir.ends_with(".alf/state")
+                || status.state_dir.to_string_lossy().contains(".alf")
+        );
     }
 
     #[test]
@@ -173,7 +178,11 @@ pub mod tests {
         let alf = tmp.path().join(".alf");
         let state_dir = alf.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
-        std::fs::write(alf.join("config.toml"), "[service]\napi_key = \"test-key\"\n").unwrap();
+        std::fs::write(
+            alf.join("config.toml"),
+            "[service]\napi_key = \"test-key\"\n",
+        )
+        .unwrap();
 
         // Use a distinct test UUID to avoid colliding with real ~/.alf/state when tests run in parallel.
         let agent_id = Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap();

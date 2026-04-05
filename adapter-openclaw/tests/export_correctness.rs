@@ -105,6 +105,10 @@ fn identity_and_principals_populated() {
         .expect("read principals failed")
         .expect("missing principals");
     let profile = &principals.principals[0].profile;
+    assert_eq!(
+        profile.structured.as_ref().unwrap().name.as_deref(),
+        Some("Human User")
+    );
     assert!(profile.prose.is_some());
     let p_prose = profile.prose.as_ref().unwrap();
     assert!(

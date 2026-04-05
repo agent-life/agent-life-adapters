@@ -90,7 +90,6 @@ impl AgentState {
     }
 
     /// Delete this agent's state file.
-    #[allow(dead_code)]
     pub fn delete(agent_id: Uuid) -> Result<()> {
         let path = Self::path_for(agent_id)?;
         if path.exists() {

@@ -115,6 +115,13 @@ pub struct SnapshotDownloadResponse {
     pub sequence: u64,
 }
 
+/// Returned by DELETE /v1/agents/:id.
+#[derive(Debug, Deserialize)]
+pub struct DeleteAgentResponse {
+    pub deleted: bool,
+    pub objects_removed: u32,
+}
+
 /// Structured error from the service (e.g. 409 conflict body).
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -210,6 +217,34 @@ impl ApiClient {
         check_status(&resp, StatusCode::OK, "get agent")?;
         resp.json::<AgentInfo>()
             .context("failed to parse agent response")
+    }
+
+    /// Delete an agent and all cloud sync blobs for it (`DELETE /v1/agents/:id`).
+    pub fn delete_agent(&self, agent_id: Uuid) -> Result<DeleteAgentResponse> {
+        let resp = self
+            .http
+            .delete(format!("{}/agents/{}", self.api_url, agent_id))
+            .header(AUTHORIZATION, format!("Bearer {}", self.api_key))
+            .send()
+            .context("failed to delete agent")?;
+
+        match resp.status() {
+            StatusCode::OK => resp
+                .json::<DeleteAgentResponse>()
+                .context("failed to parse delete agent response"),
+            StatusCode::NOT_FOUND => {
+                bail!("delete agent: not found (HTTP 404)");
+            }
+            StatusCode::UNAUTHORIZED => {
+                bail!(
+                    "delete agent: authentication failed (HTTP 401). Check your API key in ~/.alf/config.toml"
+                );
+            }
+            status => {
+                let body = resp.text().unwrap_or_default();
+                bail!("delete agent failed (HTTP {}): {}", status, body);
+            }
+        }
     }
 
     // ── Snapshot upload ───────────────────────────────────────────
@@ -588,5 +623,13 @@ mod tests {
         config.service.api_url = "https://api.example.com/v1/".into();
         let client = ApiClient::from_config(&config).unwrap();
         assert_eq!(client.api_url, "https://api.example.com/v1");
+    }
+
+    #[test]
+    fn delete_agent_response_deserializes() {
+        let j = r#"{"deleted":true,"objects_removed":42}"#;
+        let r: DeleteAgentResponse = serde_json::from_str(j).unwrap();
+        assert!(r.deleted);
+        assert_eq!(r.objects_removed, 42);
     }
 }

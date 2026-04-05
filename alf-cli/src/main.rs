@@ -122,6 +122,28 @@ enum Command {
         agent: Option<String>,
     },
 
+    /// Remove cloud sync data and agent registration (does not delete local workspace files)
+    #[command(
+        long_about = "Purge calls DELETE /v1/agents/:id on the agent-life service: it removes all \
+        snapshot and delta blobs in storage for this agent and deletes the agent row. It does not \
+        delete files under the workspace. It resets ~/.alf/state/ for this agent so the next \
+        `alf sync` uploads a full snapshot again.\n\n\
+        Example: alf purge -r openclaw -w ./my-agent"
+    )]
+    Purge {
+        /// Agent framework runtime (openclaw, zeroclaw)
+        #[arg(short, long)]
+        runtime: String,
+
+        /// Path to the agent workspace directory (used for CLI consistency; not modified)
+        #[arg(short, long)]
+        workspace: PathBuf,
+
+        /// Agent ID to purge (if omitted, uses the single tracked agent from ~/.alf/state/)
+        #[arg(short, long)]
+        agent: Option<String>,
+    },
+
     /// Authenticate with the agent-life service
     #[command(
         long_about = "Login stores your API key in ~/.alf/config.toml (service.api_key). \
@@ -155,7 +177,7 @@ enum Command {
     /// Show help (overview, status, files, troubleshoot, or per-command)
     #[command(
         long_about = "Topics: overview (default), status, files, troubleshoot, or a command name \
-        (export, import, sync, restore, validate, login, check). \
+        (export, import, sync, restore, purge, validate, login, check). \
         Status output is JSON by default; use --human for text."
     )]
     Help {
@@ -197,6 +219,12 @@ fn main() {
             workspace,
             agent,
         } => commands::restore::run(&runtime, &workspace, agent.as_deref()),
+
+        Command::Purge {
+            runtime,
+            workspace,
+            agent,
+        } => commands::purge::run(&runtime, &workspace, agent.as_deref()),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
 

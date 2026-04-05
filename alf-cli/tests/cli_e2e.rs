@@ -203,6 +203,7 @@ fn help_overview() {
         .stdout(predicate::str::contains("alf — Agent Life Format"))
         .stdout(predicate::str::contains("Commands:"))
         .stdout(predicate::str::contains("export"))
+        .stdout(predicate::str::contains("purge"))
         .stdout(predicate::str::contains("Current status:"));
 }
 
@@ -286,4 +287,15 @@ fn help_export_delegates() {
         .success()
         .stdout(predicate::str::contains("Export reads"))
         .stdout(predicate::str::contains("Usage: alf export"));
+}
+
+#[test]
+fn help_purge_delegates() {
+    alf_cmd()
+        .arg("help")
+        .arg("purge")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DELETE /v1/agents"))
+        .stdout(predicate::str::contains("Usage: alf purge"));
 }

@@ -54,12 +54,12 @@ pub fn run(topic: Option<&str>, _json: bool) -> Result<()> {
         "status" => print_status(),
         "files" => print_files(),
         "troubleshoot" => print_troubleshoot(),
-        "export" | "import" | "validate" | "sync" | "restore" | "login" | "check" => {
+        "export" | "import" | "validate" | "sync" | "restore" | "purge" | "login" | "check" => {
             delegate_command_help(topic)
         }
         _ => {
             eprintln!("Unknown topic: {}", topic);
-            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, sync, restore, login, check");
+            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, sync, restore, purge, login, check");
             std::process::exit(1);
         }
     }
@@ -113,6 +113,7 @@ fn print_overview() -> Result<()> {
     println!("  validate   Validate an .alf archive against the ALF specification");
     println!("  sync       Incremental sync to the cloud");
     println!("  restore    Download and restore from the cloud");
+    println!("  purge      Remove cloud sync data and agent registration");
     println!("  login      Authenticate with the agent-life service");
     println!("  help       Show this help (alf help [topic])");
     println!();

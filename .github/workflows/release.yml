@@ -162,8 +162,21 @@ jobs:
 
       - name: Validate and set S3 bucket name
         run: |
-          # Use bucket name only (not ARN). Strip whitespace/newlines that can break validation.
-          BUCKET=$(echo "$AWS_S3_BUCKET" | tr -d '\n\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          # Use bucket name only (not ARN). Normalize common paste issues (BOM, NBSP, s3:// URL).
+          BUCKET="${AWS_S3_BUCKET}"
+          # Strip UTF-8 BOM if the secret was re-saved from an editor that adds it
+          BUCKET="${BUCKET#$'\xef\xbb\xbf'}"
+          BUCKET=$(printf '%s' "$BUCKET" | tr -d '\n\r')
+          # NBSP (U+00A0) and other odd spaces → regular space, then trim
+          BUCKET="${BUCKET//$'\xc2\xa0'/ }"
+          BUCKET=$(printf '%s' "$BUCKET" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+          # Accept s3://bucket or s3://bucket/prefix — AWS CLI needs the label only
+          case "$BUCKET" in
+            [sS]3://*)
+              BUCKET="${BUCKET#[sS]3://}"
+              BUCKET="${BUCKET%%/*}"
+              ;;
+          esac
           if [ -z "$BUCKET" ]; then
             echo "::error::AWS_S3_BUCKET secret is empty. Set it to the bucket name only (e.g. agent-life-ai), not an ARN."
             exit 1
@@ -172,9 +185,9 @@ jobs:
             echo "::error::AWS_S3_BUCKET must be the bucket name only (e.g. agent-life-ai), not an ARN. Got value starting with 'arn:'"
             exit 1
           fi
-          # Bucket name must match [a-zA-Z0-9.\-_]{1,255}
-          if ! echo "$BUCKET" | grep -qE '^[a-zA-Z0-9.\-_]{1,255}$'; then
-            echo "::error::AWS_S3_BUCKET contains invalid characters. Use only letters, digits, period, hyphen, underscore (e.g. agent-life-ai)."
+          # Bucket name must match AWS DNS-style labels; put '-' last in [] so it is literal (not a range)
+          if ! printf '%s' "$BUCKET" | grep -qE '^[a-zA-Z0-9._-]{1,255}$'; then
+            echo "::error::AWS_S3_BUCKET contains invalid characters after normalization. Use the bucket DNS name only (letters, digits, . - _). Re-save the secret without URLs, paths, or hidden Unicode. Length was ${#BUCKET}."
             exit 1
           fi
           echo "BUCKET=$BUCKET" >> "$GITHUB_ENV"

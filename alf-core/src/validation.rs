@@ -190,6 +190,21 @@ fn validate_memory_inventory(memory: &MemoryInventory) -> ValidationReport {
         }
     }
 
+    // When `to` is set, it must not precede `from`
+    for (i, partition) in memory.partitions.iter().enumerate() {
+        if let Some(to) = partition.to {
+            if to < partition.from {
+                report.error(
+                    format!("manifest.layers.memory.partitions[{i}]"),
+                    format!(
+                        "Partition '{}' has 'to' ({to}) before 'from' ({})",
+                        partition.file, partition.from
+                    ),
+                );
+            }
+        }
+    }
+
     report
 }
 
@@ -638,6 +653,17 @@ mod tests {
         let report = validate_manifest(&m);
         assert!(!report.is_valid());
         assert!(report.errors()[0].message.contains("sealed"));
+    }
+
+    #[test]
+    fn partition_to_before_from() {
+        let mut m = valid_manifest();
+        let mem = m.layers.memory.as_mut().unwrap();
+        let from = mem.partitions[0].from;
+        mem.partitions[0].to = Some(from.pred_opt().unwrap());
+        let report = validate_manifest(&m);
+        assert!(!report.is_valid());
+        assert!(report.errors().iter().any(|e| e.message.contains("before 'from'")));
     }
 
     #[test]

@@ -138,6 +138,8 @@ pub fn apply_deltas(
 ///
 /// Uses JSON serialization for comparison so that floating-point and
 /// extra-field differences are handled consistently.
+// TODO(perf): avoid repeated serde_json::to_value per record pair in large
+// sets — e.g. float epsilon for confidence, or hash canonical JSON once.
 fn records_equal(a: &MemoryRecord, b: &MemoryRecord) -> bool {
     // Fast path: direct PartialEq
     if a == b {

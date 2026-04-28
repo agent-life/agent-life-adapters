@@ -78,13 +78,14 @@ impl PartitionAssigner {
         if !(1..=4).contains(&quarter) {
             return None;
         }
-        let (start_month, end_month, end_day) = match quarter {
-            1 => (1, 3, 31),
-            2 => (4, 6, 30),
-            3 => (7, 9, 30),
-            4 => (10, 12, 31),
-            _ => unreachable!(),
-        };
+        // Indexed by quarter-1; avoids a fallback arm after the bounds check above.
+        const RANGES: [(u32, u32, u32); 4] = [
+            (1, 3, 31),
+            (4, 6, 30),
+            (7, 9, 30),
+            (10, 12, 31),
+        ];
+        let (start_month, end_month, end_day) = RANGES[(quarter as usize) - 1];
         Some((
             NaiveDate::from_ymd_opt(year, start_month, 1)?,
             NaiveDate::from_ymd_opt(year, end_month, end_day)?,

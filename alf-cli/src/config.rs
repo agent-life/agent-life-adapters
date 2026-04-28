@@ -1,5 +1,7 @@
 //! Configuration management for `~/.alf/config.toml`.
 
+use crate::fs_private::write_private;
+
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -104,6 +106,9 @@ impl Config {
         };
 
         if config.service.api_key.is_empty() {
+            // Unsynchronized env read: fine for a single-process CLI. Tests that
+            // flip HOME / ALF_API_KEY use HOME_LOCK; do not use shared mutable env
+            // from multiple threads in production.
             if let Ok(key) = std::env::var("ALF_API_KEY") {
                 if !key.is_empty() {
                     config.service.api_key = key;
@@ -130,7 +135,7 @@ impl Config {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        fs::write(path, content)
+        write_private(path, &content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
         Ok(())
     }
@@ -276,5 +281,17 @@ mod tests {
         std::env::remove_var("ALF_API_KEY");
 
         assert_eq!(config.service.api_key, "from_file");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_to_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

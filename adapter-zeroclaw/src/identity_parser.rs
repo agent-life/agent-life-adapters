@@ -284,7 +284,7 @@ fn parse_aieos_identity(
         }),
         prose,
         source_format: Some("aieos".to_string()),
-        raw_source: Some(serde_json::from_str(&raw_json).unwrap_or(serde_json::Value::Null)),
+        raw_source: Some(val.clone()),
         extra: HashMap::new(),
     }))
 }

@@ -4,6 +4,9 @@
 //! This allows the CLI to track what has been synced and compute deltas
 //! from the correct base.
 
+use crate::config::Config;
+use crate::fs_private::write_private;
+
 use anyhow::bail;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -11,8 +14,6 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
-use crate::config::Config;
 
 /// Sync state for a single agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -84,7 +85,7 @@ impl AgentState {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize state")?;
-        fs::write(path, content)
+        write_private(path, &content)
             .with_context(|| format!("Failed to write state to {}", path.display()))?;
         Ok(())
     }
@@ -229,5 +230,18 @@ mod tests {
         // Optional None fields should be absent
         assert!(!toml_str.contains("last_synced_at"));
         assert!(!toml_str.contains("snapshot_path"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn save_to_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("agent.toml");
+        let state = AgentState::new(Uuid::new_v4());
+        state.save_to(&path).unwrap();
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 }

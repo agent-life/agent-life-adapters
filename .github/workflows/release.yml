@@ -14,8 +14,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify-version:
+    name: Verify tag matches alf-cli/Cargo.toml
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check git tag matches package version
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME:?}"
+
+          if [[ "$TAG_NAME" != v* ]]; then
+            echo "::error::Release tags must start with 'v' (got: ${TAG_NAME})"
+            exit 1
+          fi
+
+          TAG_VERSION="${TAG_NAME#v}"
+          CARGO_VERSION=$(grep -E '^version[[:space:]]*=' alf-cli/Cargo.toml | head -1 | sed -E 's/^version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/')
+
+          if [[ -z "$CARGO_VERSION" ]]; then
+            echo "::error::Could not read version from alf-cli/Cargo.toml"
+            exit 1
+          fi
+
+          if [[ "$TAG_VERSION" != "$CARGO_VERSION" ]]; then
+            echo "::error::Version mismatch: tag is '${TAG_NAME}' (expected semver '${TAG_VERSION}') but alf-cli/Cargo.toml has version = \"${CARGO_VERSION}\"."
+            echo ""
+            echo "alf --version is compiled from CARGO_PKG_VERSION in alf-cli; it must match the release tag."
+            echo ""
+            echo "How to fix:"
+            echo "  A) Match the tag: set version = \"${TAG_VERSION}\" in alf-cli/Cargo.toml, commit, then point the tag at that commit and force-push the tag:"
+            echo "       # after committing the version bump:"
+            echo "       git tag -f ${TAG_NAME} && git push -f origin ${TAG_NAME}"
+            echo ""
+            echo "  B) Match Cargo.toml: delete the mismatched tag and push a new tag whose name is v${CARGO_VERSION}:"
+            echo "       git push origin :refs/tags/${TAG_NAME}"
+            echo "       git tag v${CARGO_VERSION} <commit-with-current-toml>"
+            echo "       git push origin v${CARGO_VERSION}"
+            exit 1
+          fi
+
+          echo "OK: tag ${TAG_NAME} matches alf-cli/Cargo.toml version ${CARGO_VERSION}"
+
   test:
     name: Test
+    needs: verify-version
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout

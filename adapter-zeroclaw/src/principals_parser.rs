@@ -1,7 +1,8 @@
 //! Parse `USER.md` into an ALF `PrincipalsDocument`.
 //!
 //! Same approach as the OpenClaw adapter: one `Human` principal with the
-//! full USER.md content as prose and optional timezone extraction.
+//! full USER.md content as prose, structured name (`Name:` / H1 / default), and
+//! optional timezone extraction.
 
 use std::collections::HashMap;
 use std::fs;
@@ -33,7 +34,9 @@ pub fn parse_principals(workspace: &Path, agent_id: Uuid) -> Result<Option<Princ
         return Ok(None);
     }
 
-    let name = extract_h1(&content).unwrap_or_else(|| "User".to_string());
+    let name = extract_name_field(&content)
+        .or_else(|| extract_h1(&content))
+        .unwrap_or_else(|| "User".to_string());
     let timezone = extract_timezone(&content);
 
     let principal_id = Uuid::new_v4();
@@ -81,6 +84,46 @@ pub fn parse_principals(workspace: &Path, agent_id: Uuid) -> Result<Option<Princ
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// Extract the user's name from a structured `Name` line in `USER.md`.
+fn extract_name_field(content: &str) -> Option<String> {
+    content.lines().find_map(extract_name_line)
+}
+
+fn extract_name_line(line: &str) -> Option<String> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let without_bullet = trimmed
+        .strip_prefix("- ")
+        .or_else(|| trimmed.strip_prefix("* "))
+        .unwrap_or(trimmed)
+        .trim();
+    let normalized = without_bullet.to_ascii_lowercase();
+
+    let name = if normalized.starts_with("**name:**") {
+        &without_bullet["**name:**".len()..]
+    } else if normalized.starts_with("**name**:") {
+        &without_bullet["**name**:".len()..]
+    } else if normalized.starts_with("name:") {
+        &without_bullet["name:".len()..]
+    } else {
+        return None;
+    };
+
+    normalize_name_value(name)
+}
+
+fn normalize_name_value(name: &str) -> Option<String> {
+    let trimmed = name.trim().trim_matches('*').trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 fn extract_h1(content: &str) -> Option<String> {
     for line in content.lines() {
         let t = line.trim();
@@ -121,6 +164,34 @@ fn extract_timezone(content: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn markdown_name_field_wins_over_heading() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ws = tmp.path();
+        fs::write(
+            ws.join("USER.md"),
+            "\
+# USER.md - About Johan
+
+- **Name:** Johan
+- **Timezone:** PST (US West Coast)
+",
+        )
+        .unwrap();
+
+        let doc = parse_principals(ws, Uuid::new_v4()).unwrap().unwrap();
+        assert_eq!(
+            doc.principals[0]
+                .profile
+                .structured
+                .as_ref()
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("Johan")
+        );
+    }
 
     #[test]
     fn full_user_md() {

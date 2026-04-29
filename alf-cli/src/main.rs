@@ -7,6 +7,7 @@ mod api_client;
 mod commands;
 mod config;
 mod context;
+mod fs_private;
 pub mod output;
 mod state;
 

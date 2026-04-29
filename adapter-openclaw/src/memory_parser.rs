@@ -292,7 +292,9 @@ pub(crate) fn parse_memory_file(
             // Determine created_at: for daily logs use midnight of filename date,
             // otherwise fall back to file mtime.
             let created_at = if let Some(date) = daily_date {
-                date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                date.and_time(
+                    NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"),
+                )
                     .and_utc()
             } else {
                 file_mtime
@@ -300,7 +302,9 @@ pub(crate) fn parse_memory_file(
 
             // observed_at: only for daily logs
             let observed_at = daily_date.map(|date| {
-                date.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap())
+                date.and_time(
+                    NaiveTime::from_hms_opt(0, 0, 0).expect("midnight is valid"),
+                )
                     .and_utc()
             });
 

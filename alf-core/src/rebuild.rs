@@ -152,10 +152,13 @@ pub fn rebuild_snapshot(
             let (from, to) = PartitionAssigner::date_range_for_partition(&file_path)
                 .unwrap_or_else(|| {
                     // Fallback: use the first record's timestamp for from, no to
-                    let ts = records[0]
+                    let first = records
+                        .first()
+                        .expect("partition group is non-empty");
+                    let ts = first
                         .temporal
                         .observed_at
-                        .unwrap_or(records[0].temporal.created_at);
+                        .unwrap_or(first.temporal.created_at);
                     (ts.date_naive(), today)
                 });
 

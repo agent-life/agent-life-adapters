@@ -14,8 +14,25 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
   build:
     name: ${{ matrix.bin_name }}
+    needs: test
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

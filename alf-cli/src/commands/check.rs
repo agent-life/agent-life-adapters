@@ -419,10 +419,10 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let ws_path = &resolved.path;
     let ws_exists = ws_path.is_dir();
     let ws_writable = if ws_exists {
-        // Test writability by checking if we can access metadata
-        fs::metadata(ws_path)
-            .map(|m| !m.permissions().readonly())
-            .unwrap_or(false)
+        tempfile::Builder::new()
+            .prefix(".alf_check_write_")
+            .tempfile_in(ws_path)
+            .is_ok()
     } else {
         false
     };

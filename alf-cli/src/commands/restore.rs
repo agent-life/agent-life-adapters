@@ -6,7 +6,8 @@
 //! 3. Call restore endpoint (gets snapshot URL + delta URLs in one call)
 //! 4. Download snapshot, download deltas, merge into one `.alf` via [`merge_snapshot_with_deltas`]
 //! 5. Resolve adapter, import into workspace
-//! 6. Save state with latest sequence (only after a successful import)
+//! 6. Persist merged snapshot under ~/.alf/state/{id}-snapshot.alf (delta base for sync)
+//!    and save state with latest sequence (only after a successful import)
 
 use crate::adapter;
 use crate::api_client::ApiClient;
@@ -153,12 +154,28 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
     output::progress("  Importing into workspace...");
     let import_report = adapt.import(&temp_alf, workspace)?;
 
-    // 7. Save state only after a successful import
+    // 7. Persist merged snapshot as local delta base (matches sync first-sync behaviour).
+    // Without this file, the next `alf sync` sees has_synced() true but no snapshot and fails.
+    let state_dir = AgentState::state_dir().context("Failed to resolve ~/.alf/state")?;
+    fs::create_dir_all(&state_dir).with_context(|| {
+        format!(
+            "Failed to create state directory {}",
+            state_dir.display()
+        )
+    })?;
+    let snapshot_file = state_dir.join(format!("{agent_id}-snapshot.alf"));
+    fs::write(&snapshot_file, &final_bytes).with_context(|| {
+        format!(
+            "Failed to write restored snapshot base at {}",
+            snapshot_file.display()
+        )
+    })?;
+
     let state = AgentState {
         agent_id,
         last_synced_sequence: latest_sequence,
         last_synced_at: Some(Utc::now()),
-        snapshot_path: None,
+        snapshot_path: Some(snapshot_file.to_string_lossy().into()),
     };
     state.save()?;
 

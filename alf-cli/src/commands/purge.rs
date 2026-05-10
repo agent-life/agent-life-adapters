@@ -4,7 +4,7 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{resolve_agent_id, AgentState};
+use crate::state::{local_base_path, resolve_agent_id, AgentState};
 
 use anyhow::Result;
 use colored::Colorize;
@@ -63,7 +63,7 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
     let del = client.delete_agent(agent_id)?;
 
     AgentState::delete(agent_id)?;
-    let snapshot_path = AgentState::state_dir()?.join(format!("{agent_id}-snapshot.alf"));
+    let snapshot_path = local_base_path(agent_id)?;
     if snapshot_path.exists() {
         fs::remove_file(&snapshot_path).map_err(|e| {
             anyhow::anyhow!(

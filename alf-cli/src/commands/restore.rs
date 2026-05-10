@@ -3,17 +3,17 @@
 //! Flow:
 //! 1. Load config (check API key)
 //! 2. Parse agent ID
-//! 3. Call restore endpoint (gets snapshot URL + delta URLs in one call)
-//! 4. Download snapshot, download deltas, merge into one `.alf` via [`merge_snapshot_with_deltas`]
-//! 5. Resolve adapter, import into workspace
-//! 6. Persist merged snapshot under ~/.alf/state/{id}-snapshot.alf (delta base for sync)
-//!    and save state with latest sequence (only after a successful import)
+//! 3. [`pull_cloud_base`] — fetch snapshot + deltas, merge, persist `~/.alf/state/{id}-snapshot.alf`,
+//!    write state.toml. Atomic-write order: base.alf BEFORE state.toml.
+//! 4. Resolve adapter, import the merged archive into the workspace
+//!
+//! `pull_cloud_base` is also reused by `alf sync --recover` (commands/sync.rs).
 
 use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{resolve_agent_id, AgentState};
+use crate::state::{local_base_path, resolve_agent_id, AgentState};
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
@@ -25,7 +25,7 @@ use colored::Colorize;
 use serde::Serialize;
 use std::fs;
 use std::io::Cursor;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 #[derive(Serialize)]
@@ -39,6 +39,16 @@ struct RestoreResult {
     workspace: String,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+}
+
+/// Result of a successful [`pull_cloud_base`] call.
+pub(crate) struct CloudBase {
+    /// The merged archive bytes (snapshot + applied deltas).
+    pub final_bytes: Vec<u8>,
+    /// The cloud sequence after applying any deltas.
+    pub latest_sequence: u64,
+    /// Path the merged archive was written to (`~/.alf/state/{id}-snapshot.alf`).
+    pub local_base: PathBuf,
 }
 
 /// Merge a base snapshot with zero or more delta archives (same semantics as cloud restore).
@@ -61,17 +71,104 @@ fn merged_last_sequence(merged_bytes: &[u8], snapshot_sequence: u64) -> Result<u
         .unwrap_or(snapshot_sequence))
 }
 
+/// Download the cloud snapshot + deltas for `agent_id`, merge them, and write
+/// the result to `~/.alf/state/{agent_id}-snapshot.alf`. Then update the state
+/// file with `Some(latest_sequence)` and a fresh `last_synced_at`.
+///
+/// **Does not touch the workspace.** Use [`run`] when the workspace itself
+/// needs to be rebuilt; reuse this helper from `alf sync --recover` to repair
+/// a missing local base without disturbing live workspace state.
+///
+/// # Atomic-write invariant
+///
+/// `base.alf` is written **before** `state.toml`. This guarantees that
+/// state.toml-present ⇒ base.alf-present at the moment of the last successful
+/// write. See [`docs/how_alf_syncs.md`].
+pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<CloudBase> {
+    output::progress("  Fetching restore manifest...");
+    let restore = client.restore(agent_id)?;
+
+    let snapshot_bytes = match &restore.snapshot {
+        Some(snap) => {
+            output::progress(&format!(
+                "  Downloading snapshot (sequence {})...",
+                snap.sequence
+            ));
+            client.download_presigned(&snap.url)?
+        }
+        None => {
+            anyhow::bail!(
+                "No snapshot available for agent {}. \
+                 The agent must be synced at least once before restoring.",
+                agent_id
+            );
+        }
+    };
+
+    let snapshot_sequence = restore.snapshot.as_ref().map(|s| s.sequence).unwrap_or(0);
+
+    let delta_byte_vecs: Vec<Vec<u8>> = if restore.deltas.is_empty() {
+        output::progress("  No additional deltas to apply.");
+        Vec::new()
+    } else {
+        output::progress(&format!("  Downloading {} delta(s)...", restore.deltas.len()));
+        let mut out = Vec::with_capacity(restore.deltas.len());
+        for (i, delta_info) in restore.deltas.iter().enumerate() {
+            output::progress(&format!(
+                "  Downloading delta {} of {} (sequence {})...",
+                i + 1,
+                restore.deltas.len(),
+                delta_info.sequence
+            ));
+            out.push(client.download_presigned(&delta_info.url)?);
+        }
+        output::progress(&format!(
+            "  Merging {} delta(s) into snapshot...",
+            restore.deltas.len()
+        ));
+        out
+    };
+
+    let final_bytes = merge_snapshot_with_deltas(&snapshot_bytes, &delta_byte_vecs)
+        .context("Failed to merge snapshot and deltas for restore")?;
+
+    let latest_sequence = merged_last_sequence(&final_bytes, snapshot_sequence)?;
+
+    // Write base.alf BEFORE state.toml to preserve the atomic-write invariant.
+    let local_base = local_base_path(agent_id)?;
+    if let Some(parent) = local_base.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
+    }
+    fs::write(&local_base, &final_bytes).with_context(|| {
+        format!(
+            "Failed to write restored snapshot base at {}",
+            local_base.display()
+        )
+    })?;
+
+    let state = AgentState {
+        agent_id,
+        last_synced_sequence: Some(latest_sequence),
+        last_synced_at: Some(Utc::now()),
+    };
+    state.save()?;
+
+    Ok(CloudBase {
+        final_bytes,
+        latest_sequence,
+        local_base,
+    })
+}
+
 pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<()> {
     let human = output::human_mode();
 
-    // 1. Load config and create API client
     let config = Config::load()?;
     let client = ApiClient::from_config(&config)?;
 
-    // 2. Resolve agent ID (CLI arg or ~/.alf/state/*.toml)
     let agent_id: Uuid = resolve_agent_id(agent_arg)?;
 
-    // 3. Resolve adapter
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown runtime '{}'. Supported: {}",
@@ -98,90 +195,21 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
         ));
     }
 
-    // 4. Call restore endpoint — gets snapshot + delta URLs in one call
-    output::progress("  Fetching restore manifest...");
-    let restore = client.restore(agent_id)?;
+    // Pull cloud base (writes base.alf and state.toml under ~/.alf/state/).
+    let base = pull_cloud_base(&client, agent_id)?;
 
-    let snapshot_bytes = match &restore.snapshot {
-        Some(snap) => {
-            output::progress(&format!(
-                "  Downloading snapshot (sequence {})...",
-                snap.sequence
-            ));
-            client.download_presigned(&snap.url)?
-        }
-        None => {
-            anyhow::bail!(
-                "No snapshot available for agent {}. \
-                 The agent must be synced at least once before restoring.",
-                agent_id
-            );
-        }
-    };
-
-    let snapshot_sequence = restore.snapshot.as_ref().map(|s| s.sequence).unwrap_or(0);
-
-    // 5. Download deltas and merge into one snapshot archive
-    let delta_byte_vecs: Vec<Vec<u8>> = if restore.deltas.is_empty() {
-        output::progress("  No additional deltas to apply.");
-        Vec::new()
-    } else {
-        output::progress(&format!("  Downloading {} delta(s)...", restore.deltas.len()));
-        let mut out = Vec::with_capacity(restore.deltas.len());
-        for (i, delta_info) in restore.deltas.iter().enumerate() {
-            output::progress(&format!(
-                "  Downloading delta {} of {} (sequence {})...",
-                i + 1,
-                restore.deltas.len(),
-                delta_info.sequence
-            ));
-            out.push(client.download_presigned(&delta_info.url)?);
-        }
-        output::progress(&format!("  Merging {} delta(s) into snapshot...", restore.deltas.len()));
-        out
-    };
-
-    let final_bytes = merge_snapshot_with_deltas(&snapshot_bytes, &delta_byte_vecs)
-        .context("Failed to merge snapshot and deltas for restore")?;
-
-    let latest_sequence = merged_last_sequence(&final_bytes, snapshot_sequence)?;
-
-    // 6. Write snapshot to temp file and import
+    // Import the merged archive into the workspace.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &final_bytes)?;
+    fs::write(&temp_alf, &base.final_bytes)?;
 
     output::progress("  Importing into workspace...");
     let import_report = adapt.import(&temp_alf, workspace)?;
 
-    // 7. Persist merged snapshot as local delta base (matches sync first-sync behaviour).
-    // Without this file, the next `alf sync` sees has_synced() true but no snapshot and fails.
-    let state_dir = AgentState::state_dir().context("Failed to resolve ~/.alf/state")?;
-    fs::create_dir_all(&state_dir).with_context(|| {
-        format!(
-            "Failed to create state directory {}",
-            state_dir.display()
-        )
-    })?;
-    let snapshot_file = state_dir.join(format!("{agent_id}-snapshot.alf"));
-    fs::write(&snapshot_file, &final_bytes).with_context(|| {
-        format!(
-            "Failed to write restored snapshot base at {}",
-            snapshot_file.display()
-        )
-    })?;
+    let latest_sequence = base.latest_sequence;
 
-    let state = AgentState {
-        agent_id,
-        last_synced_sequence: latest_sequence,
-        last_synced_at: Some(Utc::now()),
-        snapshot_path: Some(snapshot_file.to_string_lossy().into()),
-    };
-    state.save()?;
-
-    // 8. Output result
     if human {
-        let state_path = AgentState::path_for(agent_id)?;
+        let state_path = crate::state::state_file_path(agent_id)?;
         println!();
         println!("  State file:   {}", state_path.display());
         println!("{} Restore complete", "✓".green().bold());

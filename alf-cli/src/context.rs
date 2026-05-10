@@ -80,9 +80,13 @@ pub fn gather_status() -> Result<StatusSummary> {
                 let snapshot_path = state_dir.join(format!("{agent_id}-snapshot.alf"));
                 let snapshot_exists = snapshot_path.is_file();
 
+                // last_synced_sequence is Option<u64> in AgentState (the sole
+                // sync-control variable; None ⇒ never synced). For display
+                // purposes the only way to get None here is a hand-edited state
+                // file: a successful sync always writes Some(N).
                 agents.push(AgentSummary {
                     agent_id,
-                    last_synced_sequence: state.last_synced_sequence,
+                    last_synced_sequence: state.last_synced_sequence.unwrap_or(0),
                     last_synced_at: state.last_synced_at.map(|dt| dt.to_rfc3339()),
                     snapshot_exists,
                 });

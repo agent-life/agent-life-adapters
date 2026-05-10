@@ -91,7 +91,15 @@ enum Command {
         long_about = "Sync exports the workspace to a temporary .alf, uploads it to the \
         agent-life service, and updates ~/.alf/state/{agent_id}.toml and the snapshot file \
         (~/.alf/state/{agent_id}-snapshot.alf). Use 'alf restore' to download later.\n\n\
-        Example: alf sync -r openclaw -w ./my-agent"
+        --recover: when the state file says we have synced before but the local base snapshot \
+        is missing (e.g. an old CLI populated state without writing the base), pull the cloud \
+        snapshot+deltas to repair the base, then take the normal delta path. Does not touch \
+        the workspace.\n\n\
+        --force-first-sync: required when the cloud already has an agent with this ID but no \
+        local state exists; uploads the current workspace as a fresh snapshot, overwriting \
+        cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
+        Example: alf sync -r openclaw -w ./my-agent\n\
+        Example: alf sync --recover -r openclaw -w ./my-agent"
     )]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
@@ -101,6 +109,14 @@ enum Command {
         /// Path to the agent workspace directory
         #[arg(short, long)]
         workspace: PathBuf,
+
+        /// Pull cloud snapshot + deltas to repair a missing local base snapshot
+        #[arg(long)]
+        recover: bool,
+
+        /// Allow first sync to overwrite an already-registered cloud agent
+        #[arg(long)]
+        force_first_sync: bool,
     },
 
     /// Download and restore from the cloud
@@ -213,7 +229,12 @@ fn main() {
 
         Command::Validate { alf_file } => commands::validate::run(&alf_file),
 
-        Command::Sync { runtime, workspace } => commands::sync::run(&runtime, &workspace),
+        Command::Sync {
+            runtime,
+            workspace,
+            recover,
+            force_first_sync,
+        } => commands::sync::run(&runtime, &workspace, recover, force_first_sync),
 
         Command::Restore {
             runtime,
@@ -265,6 +286,12 @@ fn error_hint(err: &anyhow::Error) -> String {
     }
     if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
         return "Run 'alf help troubleshoot' for workspace and path guidance.".into();
+    }
+    if msg.contains("Local delta base missing") {
+        return "See docs/how_alf_syncs.md (case E4) for the recovery procedure.".into();
+    }
+    if msg.contains("already exists in the cloud") {
+        return "See docs/how_alf_syncs.md (case E3) before using --force-first-sync.".into();
     }
     String::new()
 }

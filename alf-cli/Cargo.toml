@@ -1,6 +1,6 @@
 [package]
 name = "alf-cli"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "CLI for the Agent Life Format — export, import, validate, and sync agent data"
 license = "MIT"

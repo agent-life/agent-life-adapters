@@ -121,9 +121,15 @@ enum Command {
 
     /// Download and restore from the cloud
     #[command(
-        long_about = "Restore downloads the latest snapshot from the agent-life service \
-        and imports it into the workspace. Reads state from ~/.alf/state/; writes to the workspace.\n\n\
-        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>"
+        long_about = "Restore downloads a snapshot from the agent-life service and imports it \
+        into the workspace.\n\n\
+        Default: restores the head of history. Updates ~/.alf/state/ so the next `alf sync` \
+        runs against the restored base.\n\n\
+        --at-sequence N: point-in-time preview. Rebuilds the workspace as it looked after \
+        sequence N was applied, WITHOUT touching ~/.alf/state/. Use this to inspect history; \
+        run plain `alf restore` again to return to head. See docs/how_alf_syncs.md.\n\n\
+        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>\n\
+        Example: alf restore --at-sequence 3 -r openclaw -w ./preview -a <agent-id>"
     )]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw)
@@ -137,6 +143,11 @@ enum Command {
         /// Agent ID to restore (if omitted, uses the single tracked agent from ~/.alf/state/)
         #[arg(short, long)]
         agent: Option<String>,
+
+        /// Restore the workspace as it was after sequence N. Read-only preview;
+        /// ~/.alf/state/ is not modified.
+        #[arg(long, value_name = "N")]
+        at_sequence: Option<u64>,
     },
 
     /// Remove cloud sync data and agent registration (does not delete local workspace files)
@@ -240,7 +251,8 @@ fn main() {
             runtime,
             workspace,
             agent,
-        } => commands::restore::run(&runtime, &workspace, agent.as_deref()),
+            at_sequence,
+        } => commands::restore::run(&runtime, &workspace, agent.as_deref(), at_sequence),
 
         Command::Purge {
             runtime,

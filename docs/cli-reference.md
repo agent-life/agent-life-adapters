@@ -291,11 +291,17 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
 ## alf restore
 
-Download the latest snapshot (plus uncompacted deltas) from the service and import into a workspace.
+Download a snapshot (plus uncompacted deltas) from the service and import into a workspace.
 
 ### Usage
 
-    alf restore -r <runtime> -w <workspace> [-a <agent-id>]
+    alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>]
+
+### Modes
+
+- **Head restore (default)**: pulls the latest snapshot and all subsequent deltas, merges them, writes the merged base to `~/.alf/state/{agent-id}-snapshot.alf`, updates `~/.alf/state/{agent-id}.toml`, and imports into the workspace. After this, `alf sync` resumes against the freshly restored base.
+
+- **Point-in-time preview** (`--at-sequence N`): rebuilds the workspace as it looked after sequence `N` was applied. **Does not touch `~/.alf/state/`** — the local sync cursor remains pointed at head. This is a read-only inspection mode; running `alf sync` afterwards still works against head as if the preview never happened. To return the workspace to head, run plain `alf restore` again. See [`docs/how_alf_syncs.md`](how_alf_syncs.md) for the rationale.
 
 ### Flags
 
@@ -304,8 +310,9 @@ Download the latest snapshot (plus uncompacted deltas) from the service and impo
 | `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | Yes | Path to the target workspace directory |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
+| `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 
-### JSON Output (success)
+### JSON Output (success, head restore)
 
     {
       "ok": true,
@@ -315,7 +322,30 @@ Download the latest snapshot (plus uncompacted deltas) from the service and impo
       "runtime": "openclaw",
       "memory_records": 47,
       "workspace": "/home/user/.openclaw/workspace",
+      "preview": false,
       "warnings": []
+    }
+
+### JSON Output (success, point-in-time preview)
+
+    {
+      "ok": true,
+      "agent_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "agent_name": "Atlas",
+      "sequence": 3,
+      "runtime": "openclaw",
+      "memory_records": 42,
+      "workspace": "/home/user/preview-workspace",
+      "preview": true,
+      "at_sequence": 3,
+      "warnings": []
+    }
+
+### JSON Output (error, --at-sequence exceeds latest)
+
+    {
+      "ok": false,
+      "error": "restore failed with status 400 Bad Request: {\"error\":\"up_to_sequence 99 exceeds agent's latest sequence 5\"}"
     }
 
 ---

@@ -872,8 +872,84 @@ def step_restore(cfg: Config, api: ApiClient, report: Report) -> dict:
     return body
 
 
+def step_point_in_time_restore(cfg: Config, api: ApiClient, report: Report):
+    section(8, "Point-in-time Restore (Preview Mode)")
+    explain("""
+        GET /agents/:id/restore?up_to_sequence=N returns a bounded view of
+        the agent's history: the largest snapshot with sequence <= N, plus
+        every uncompacted delta with sequence in (snapshot.sequence, N].
+
+        The CLI surfaces this as `alf restore --at-sequence N`. It is a
+        read-only preview: the merged archive is imported into the target
+        workspace, but ~/.alf/state/ is NOT modified. The sync cursor stays
+        pinned at head, so a subsequent `alf sync` runs as if the preview
+        never happened.
+
+        Why preview-only? `alf sync`'s contract is "the workspace is the
+        truth". If a PIT restore stamped last_synced_sequence = Some(N) for
+        N < head, the next sync would compute a "rewind history" delta and
+        propagate it. Preview mode side-steps that entirely.
+
+        We'll demonstrate three things:
+        1. up_to_sequence=0    → snapshot only (no deltas).
+        2. up_to_sequence=1    → snapshot + first delta.
+        3. up_to_sequence=999  → 400 Bad Request (exceeds latest_sequence).
+    """)
+
+    t0 = time.time()
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=0")
+    duration = (time.time() - t0) * 1000
+    if r.status_code != 200:
+        fail(f"PIT restore at sequence 0 failed (HTTP {r.status_code})")
+        report.add(StepResult("PIT restore", False, duration, error=r.text[:200]))
+        return
+    body0 = r.json()
+    deltas0 = body0.get("deltas", [])
+    if body0.get("snapshot") and len(deltas0) == 0:
+        ok("up_to_sequence=0 → snapshot only, 0 deltas (as expected)")
+    else:
+        fail(f"up_to_sequence=0 returned unexpected payload: snapshot={bool(body0.get('snapshot'))}, deltas={len(deltas0)}")
+
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=1")
+    if r.status_code != 200:
+        fail(f"PIT restore at sequence 1 failed (HTTP {r.status_code})")
+    else:
+        body1 = r.json()
+        deltas1 = body1.get("deltas", [])
+        if body1.get("snapshot") and len(deltas1) == 1 and deltas1[0]["sequence"] == 1:
+            ok("up_to_sequence=1 → snapshot + delta@1 (as expected)")
+        else:
+            fail(f"up_to_sequence=1 returned unexpected payload: deltas={[d.get('sequence') for d in deltas1]}")
+
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=999")
+    if r.status_code == 400:
+        try:
+            err = r.json().get("error", "")
+        except Exception:
+            err = r.text
+        ok(f"up_to_sequence=999 → 400 Bad Request: \"{err[:80]}\"")
+    else:
+        fail(f"up_to_sequence=999 returned HTTP {r.status_code}, expected 400")
+
+    explain("""
+        Use-case: if `alf sync` is ever pointed at the wrong workspace and
+        propagates unintended deletes, every prior delta is still in S3 and
+        Neon indexed by sequence. Recovery is `alf restore --at-sequence
+        <last-good-N>` to inspect, then plain `alf restore` (head) to
+        materialise and resume normal sync.
+    """)
+
+    report.add(StepResult(
+        "Point-in-time restore",
+        True,
+        duration,
+        "up_to_sequence=0/1 succeed, =999 returns 400",
+    ))
+    pause(cfg)
+
+
 def step_simulate_data_loss(cfg: Config, report: Report):
-    section(8, "Simulate Local Data Loss")
+    section(9, "Simulate Local Data Loss")
     explain("""
         Imagine the user's machine crashes or the agent workspace is deleted.
         All local state — the exported .alf files, the ~/.alf/state/ directory,
@@ -908,7 +984,7 @@ def step_simulate_data_loss(cfg: Config, report: Report):
 
 
 def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
-    section(9, "Restore After Data Loss")
+    section(10, "Restore After Data Loss")
     explain("""
         We call the restore endpoint again — exactly what `alf restore` does.
         The response should be identical to step 6: the snapshot plus all deltas.
@@ -939,7 +1015,7 @@ def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
 
 
 def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report: Report):
-    section(10, "Cleanup — Delete Agent")
+    section(11, "Cleanup — Delete Agent")
     explain("""
         DELETE /agents/:id performs a full agent deletion:
         1. The Lambda lists all S3 objects under {tenant_id}/{agent_id}/
@@ -1100,13 +1176,16 @@ def main():
         # Step 7: Full restore
         step_restore(cfg, api, report)
 
-        # Step 8: Simulate data loss
+        # Step 8: Point-in-time restore (preview)
+        step_point_in_time_restore(cfg, api, report)
+
+        # Step 9: Simulate data loss
         step_simulate_data_loss(cfg, report)
 
-        # Step 9: Restore after loss
+        # Step 10: Restore after loss
         step_verify_restore_after_loss(cfg, api, report)
 
-        # Step 10: Cleanup
+        # Step 11: Cleanup
         step_cleanup(cfg, api, db, s3, report)
 
     except KeyboardInterrupt:

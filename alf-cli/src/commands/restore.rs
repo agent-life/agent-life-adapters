@@ -1,11 +1,17 @@
 //! `alf restore` — download and restore from the cloud.
 //!
-//! Flow:
+//! Flow (head restore, default):
 //! 1. Load config (check API key)
 //! 2. Parse agent ID
 //! 3. [`pull_cloud_base`] — fetch snapshot + deltas, merge, persist `~/.alf/state/{id}-snapshot.alf`,
 //!    write state.toml. Atomic-write order: base.alf BEFORE state.toml.
 //! 4. Resolve adapter, import the merged archive into the workspace
+//!
+//! Flow (point-in-time restore, `--at-sequence N`):
+//! 1-2. As above.
+//! 3. [`fetch_point_in_time`] — fetch snapshot + deltas bounded by `N`, merge in memory.
+//!    **Does not touch `~/.alf/state/`** — PIT restores are a read-only preview.
+//! 4. Import into the workspace as usual.
 //!
 //! `pull_cloud_base` is also reused by `alf sync --recover` (commands/sync.rs).
 
@@ -37,6 +43,12 @@ struct RestoreResult {
     runtime: String,
     memory_records: u64,
     workspace: String,
+    /// `true` when invoked with `--at-sequence N`. Indicates the local sync
+    /// state (`~/.alf/state/`) was deliberately not touched.
+    preview: bool,
+    /// Echoes the `--at-sequence N` flag; `None` for a head restore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_sequence: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -71,22 +83,22 @@ fn merged_last_sequence(merged_bytes: &[u8], snapshot_sequence: u64) -> Result<u
         .unwrap_or(snapshot_sequence))
 }
 
-/// Download the cloud snapshot + deltas for `agent_id`, merge them, and write
-/// the result to `~/.alf/state/{agent_id}-snapshot.alf`. Then update the state
-/// file with `Some(latest_sequence)` and a fresh `last_synced_at`.
+/// Fetch the restore manifest, download snapshot + deltas, and merge them.
 ///
-/// **Does not touch the workspace.** Use [`run`] when the workspace itself
-/// needs to be rebuilt; reuse this helper from `alf sync --recover` to repair
-/// a missing local base without disturbing live workspace state.
+/// `up_to_sequence = None` returns the head of history. `Some(N)` returns a
+/// point-in-time view bounded by sequence `N` (see the service-side
+/// `up_to_sequence` query parameter).
 ///
-/// # Atomic-write invariant
-///
-/// `base.alf` is written **before** `state.toml`. This guarantees that
-/// state.toml-present ⇒ base.alf-present at the moment of the last successful
-/// write. See [`docs/how_alf_syncs.md`].
-pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<CloudBase> {
+/// This helper performs no disk I/O beyond reading the merged archive into
+/// memory — it does **not** write `~/.alf/state/`. Use [`pull_cloud_base`]
+/// when the local sync state should be updated.
+fn fetch_restore_payload(
+    client: &ApiClient,
+    agent_id: Uuid,
+    up_to_sequence: Option<u64>,
+) -> Result<(Vec<u8>, u64)> {
     output::progress("  Fetching restore manifest...");
-    let restore = client.restore(agent_id)?;
+    let restore = client.restore(agent_id, up_to_sequence)?;
 
     let snapshot_bytes = match &restore.snapshot {
         Some(snap) => {
@@ -133,8 +145,25 @@ pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<Clou
         .context("Failed to merge snapshot and deltas for restore")?;
 
     let latest_sequence = merged_last_sequence(&final_bytes, snapshot_sequence)?;
+    Ok((final_bytes, latest_sequence))
+}
 
-    // Write base.alf BEFORE state.toml to preserve the atomic-write invariant.
+/// Download the cloud snapshot + deltas (head) for `agent_id`, merge them, and
+/// write the result to `~/.alf/state/{agent_id}-snapshot.alf`. Then update the
+/// state file with `Some(latest_sequence)` and a fresh `last_synced_at`.
+///
+/// **Does not touch the workspace.** Use [`run`] when the workspace itself
+/// needs to be rebuilt; reuse this helper from `alf sync --recover` to repair
+/// a missing local base without disturbing live workspace state.
+///
+/// # Atomic-write invariant
+///
+/// `base.alf` is written **before** `state.toml`. This guarantees that
+/// state.toml-present ⇒ base.alf-present at the moment of the last successful
+/// write. See [`docs/how_alf_syncs.md`].
+pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<CloudBase> {
+    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, None)?;
+
     let local_base = local_base_path(agent_id)?;
     if let Some(parent) = local_base.parent() {
         fs::create_dir_all(parent)
@@ -161,8 +190,29 @@ pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<Clou
     })
 }
 
-pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<()> {
+/// Fetch a point-in-time snapshot at `up_to_sequence` and return the merged
+/// archive bytes plus the resulting sequence number.
+///
+/// **Read-only preview**: this helper deliberately does **not** write to
+/// `~/.alf/state/`. The local sync cursor remains pointed at head so a
+/// subsequent `alf sync` is unaffected. See `docs/how_alf_syncs.md` for the
+/// rationale.
+fn fetch_point_in_time(
+    client: &ApiClient,
+    agent_id: Uuid,
+    up_to_sequence: u64,
+) -> Result<(Vec<u8>, u64)> {
+    fetch_restore_payload(client, agent_id, Some(up_to_sequence))
+}
+
+pub fn run(
+    runtime: &str,
+    workspace: &Path,
+    agent_arg: Option<&str>,
+    at_sequence: Option<u64>,
+) -> Result<()> {
     let human = output::human_mode();
+    let preview = at_sequence.is_some();
 
     let config = Config::load()?;
     let client = ApiClient::from_config(&config)?;
@@ -178,12 +228,26 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
     })?;
 
     if human {
-        println!(
-            "{} Restoring agent {} into {} workspace...",
-            "▸".blue().bold(),
-            &agent_id.to_string()[..8],
-            adapt.name()
-        );
+        if let Some(n) = at_sequence {
+            println!(
+                "{} Preview: restoring agent {} at sequence {} into {} workspace...",
+                "▸".blue().bold(),
+                &agent_id.to_string()[..8],
+                n,
+                adapt.name()
+            );
+            println!(
+                "  {}",
+                "Read-only preview — ~/.alf/state will not be touched.".yellow()
+            );
+        } else {
+            println!(
+                "{} Restoring agent {} into {} workspace...",
+                "▸".blue().bold(),
+                &agent_id.to_string()[..8],
+                adapt.name()
+            );
+        }
         println!("  Agent:     {agent_id}");
         println!("  Runtime:   {}", adapt.name());
         println!("  Workspace: {}", workspace.display());
@@ -195,24 +259,37 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
         ));
     }
 
-    // Pull cloud base (writes base.alf and state.toml under ~/.alf/state/).
-    let base = pull_cloud_base(&client, agent_id)?;
+    // Branch on at_sequence:
+    //   None    → head restore: pull_cloud_base writes base.alf + state.toml.
+    //   Some(n) → PIT preview: fetch only, leave ~/.alf/state untouched.
+    let (final_bytes, latest_sequence) = match at_sequence {
+        None => {
+            let base = pull_cloud_base(&client, agent_id)?;
+            (base.final_bytes, base.latest_sequence)
+        }
+        Some(n) => fetch_point_in_time(&client, agent_id, n)?,
+    };
 
     // Import the merged archive into the workspace.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &base.final_bytes)?;
+    fs::write(&temp_alf, &final_bytes)?;
 
     output::progress("  Importing into workspace...");
     let import_report = adapt.import(&temp_alf, workspace)?;
 
-    let latest_sequence = base.latest_sequence;
-
     if human {
-        let state_path = crate::state::state_file_path(agent_id)?;
         println!();
-        println!("  State file:   {}", state_path.display());
-        println!("{} Restore complete", "✓".green().bold());
+        if preview {
+            println!(
+                "{} Preview restore complete (state untouched)",
+                "✓".green().bold()
+            );
+        } else {
+            let state_path = crate::state::state_file_path(agent_id)?;
+            println!("  State file:   {}", state_path.display());
+            println!("{} Restore complete", "✓".green().bold());
+        }
         println!();
         println!("  Agent:      {}", import_report.agent_name);
         println!("  Memories:   {}", import_report.memory_records);
@@ -245,6 +322,8 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
             runtime: runtime.to_string(),
             memory_records: import_report.memory_records,
             workspace: workspace.to_string_lossy().into(),
+            preview,
+            at_sequence,
             warnings: import_report.warnings.clone(),
         });
     }
@@ -451,5 +530,50 @@ mod tests {
         let snap = build_minimal_snapshot(&[a]);
         let bad = vec![1u8, 2, 3];
         assert!(merge_snapshot_with_deltas(&snap, &[bad]).is_err());
+    }
+
+    #[test]
+    fn merge_with_subset_of_deltas_yields_point_in_time() {
+        // Simulate a point-in-time restore: the service returns a snapshot at
+        // sequence 0 plus only the first M deltas (those with sequence <= N).
+        // The merged result should reflect the cloud state at sequence M, not
+        // include any later changes.
+        let a = make_record(1, "A");
+        let snap = build_minimal_snapshot(&[a]);
+
+        let b = make_record(2, "B");
+        let d1 = build_delta(
+            0,
+            &[DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: b,
+            }],
+        );
+        let c = make_record(3, "C");
+        let d2 = build_delta(
+            1,
+            &[DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: c,
+            }],
+        );
+
+        // Head (snapshot + d1 + d2) has A, B, C.
+        let head = merge_snapshot_with_deltas(&snap, &[d1.clone(), d2.clone()]).unwrap();
+        let head_contents = read_record_contents(&head);
+        assert_eq!(head_contents.len(), 3);
+
+        // PIT at sequence 1 (snapshot + d1 only) has A, B — no C.
+        let pit = merge_snapshot_with_deltas(&snap, &[d1]).unwrap();
+        let pit_contents = read_record_contents(&pit);
+        assert_eq!(pit_contents.len(), 2);
+        assert!(pit_contents.contains(&"A".into()));
+        assert!(pit_contents.contains(&"B".into()));
+        assert!(!pit_contents.contains(&"C".into()));
+
+        // PIT at sequence 0 (snapshot only) has just A.
+        let pit0 = merge_snapshot_with_deltas(&snap, &[]).unwrap();
+        let pit0_contents = read_record_contents(&pit0);
+        assert_eq!(pit0_contents, vec!["A".to_string()]);
     }
 }

@@ -213,7 +213,36 @@ If `--recover` is passed but the local base is already healthy, the flag is a no
 
 The recovery emits a distinct human-readable progress line and includes `"recovered": true` in the JSON output, so suspend logs can distinguish a recovered sync from a regular delta sync.
 
-## 10. Operator runbook
+## 10. Point-in-time restore (preview mode)
+
+`alf restore --at-sequence N` reconstructs the workspace as it looked after sequence `N` was applied, without touching `~/.alf/state/`. The cloud invariants that make this safe:
+
+- **Append-only history**: every delta is written to S3 once with sequence `K` and never rewritten. `deltas.compacted_into` exists in the schema for future compaction, but is not exercised today.
+- **Snapshot rows are preserved**: the `snapshots` table retains every row ever inserted. The service picks the largest snapshot with `sequence <= N` and applies non-compacted deltas in `(snap.sequence, N]`.
+
+### Preview contract
+
+PIT is a deliberate read-only branch:
+
+- `~/.alf/state/{id}.toml` and `~/.alf/state/{id}-snapshot.alf` are **not modified**.
+- `last_synced_sequence` continues to point at head, so a subsequent `alf sync` is unaffected and will run against the head base — exactly as if the preview never happened.
+- The workspace, however, is overwritten with the merged archive at sequence `N`. If you want a non-destructive preview, point `--workspace` at an empty directory.
+
+### Why preview-only
+
+`alf sync`'s contract is "the workspace is the truth". If a PIT restore stamped `last_synced_sequence = Some(N)` for `N < head`, the next sync would compute a "rewind history to N" delta against an empty or partial workspace, which is exactly the silent-data-loss class we hardened against in §8. Preview mode side-steps that by never advancing the sync cursor backwards.
+
+### Recovering from an accidental destructive sync
+
+PIT also serves as the audit trail for sync mishaps: if `alf sync` is ever pointed at the wrong workspace and propagates unintended deletes, every prior delta still exists in S3 and Neon indexed by sequence. Recovery is `alf restore --at-sequence <last-good-N>` to inspect, then plain `alf restore` (head) to materialise the merged state and resume normal sync.
+
+### Failure modes
+
+- `--at-sequence N` where `N > agents.latest_sequence` → service returns 400 (`up_to_sequence N exceeds agent's latest sequence M`).
+- Agent has never been synced → service returns 404 (same as a head restore).
+- Negative `N` → CLI parse error (clap rejects).
+
+## 11. Operator runbook
 
 ### Symptom: suspend fails with `alf_sync_failed: ... Failed to read previous snapshot ...`
 

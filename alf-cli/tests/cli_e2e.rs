@@ -299,3 +299,91 @@ fn help_purge_delegates() {
         .stdout(predicate::str::contains("DELETE /v1/agents"))
         .stdout(predicate::str::contains("Usage: alf purge"));
 }
+
+// ---------------------------------------------------------------------------
+// sync — branch C from docs/how_alf_syncs.md: last_synced_sequence is Some(N)
+// but the local base snapshot is missing. `alf sync` must bail BEFORE making
+// any network call, with an error pointing the operator at `alf sync --recover`.
+//
+// This is the failure mode that motivated the formalize-alf-sync work. It is
+// what an operator sees in Fly suspend logs when a runtime carries orphan
+// state from the pre-0.1.4 CLI. The test locks in the exact error wording so
+// suspend log parsers don't break silently.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sync_bails_when_local_base_missing_and_no_recover() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+
+    // Known agent_id so we can pre-seed the matching state.toml below.
+    let agent_id = "ee8c59c6-0424-4cd2-b89c-19d4609bbcdf";
+    fs::write(workspace.join(".alf-agent-id"), agent_id).unwrap();
+    fs::write(workspace.join("SOUL.md"), "Test Agent").unwrap();
+
+    // Pre-seed ~/.alf with a config (so ApiClient::from_config doesn't bail on
+    // a missing API key) and a state.toml at sequence 5. Deliberately do NOT
+    // create the matching {agent_id}-snapshot.alf, simulating the E4 / failing
+    // log scenario.
+    let alf_dir = home.join(".alf");
+    let state_dir = alf_dir.join("state");
+    fs::create_dir_all(&state_dir).unwrap();
+    fs::write(
+        alf_dir.join("config.toml"),
+        // api_url is intentionally unreachable; we expect the bail to happen
+        // before any HTTP call.
+        "[service]\n\
+         api_url = \"https://api.example.invalid\"\n\
+         api_key = \"alf_test_fake_key\"\n",
+    )
+    .unwrap();
+    fs::write(
+        state_dir.join(format!("{agent_id}.toml")),
+        format!(
+            "agent_id = \"{agent_id}\"\n\
+             last_synced_sequence = 5\n\
+             last_synced_at = \"2026-05-09T18:42:11Z\"\n"
+        ),
+    )
+    .unwrap();
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("sync")
+        .arg("--runtime")
+        .arg("openclaw")
+        .arg("--workspace")
+        .arg(&workspace)
+        .assert()
+        .failure();
+
+    let stdout = assert.get_output().stdout.clone();
+    let text = std::str::from_utf8(&stdout).unwrap();
+    let v: serde_json::Value =
+        serde_json::from_str(text.trim()).expect("error stdout must be valid JSON");
+
+    assert_eq!(v["ok"], false);
+    let err_msg = v["error"].as_str().expect("error field must be a string");
+    assert!(
+        err_msg.contains("Local delta base missing"),
+        "expected bail message to mention the missing base; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("alf sync --recover"),
+        "expected bail message to point at the recovery command; got: {err_msg}"
+    );
+    assert!(
+        err_msg.contains("sequence 5"),
+        "expected bail message to surface the last-synced sequence; got: {err_msg}"
+    );
+
+    // The local base must remain absent — the bail must not have created it.
+    let base_path = state_dir.join(format!("{agent_id}-snapshot.alf"));
+    assert!(
+        !base_path.exists(),
+        "bail path must not create base.alf at {}",
+        base_path.display()
+    );
+}

@@ -263,7 +263,7 @@ runtime = "openclaw"
 workspace = "/home/user/.openclaw/workspace"  # optional, auto-discovered by alf check
 ```
 
-Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout.
+Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout, and [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) for the canonical reference on the sync data model, branch logic, ephemeral-runtime corner cases (E1–E8), and the operator runbook for recovery (`alf sync --recover`).
 
 ### `adapter-openclaw` — OpenClaw Framework Adapter
 

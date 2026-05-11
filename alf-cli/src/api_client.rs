@@ -33,6 +33,18 @@ pub struct AgentInfo {
     pub latest_sequence: u64,
 }
 
+/// Outcome of [`ApiClient::register_agent`].
+///
+/// `already_existed` is true when the server returned 409 (the agent was
+/// already registered). The E3 guard in `alf sync` uses this to refuse to
+/// upload an empty workspace as a fresh snapshot over an existing cloud
+/// agent unless `--force-first-sync` is passed.
+#[derive(Debug)]
+pub struct RegisterAgentOutcome {
+    pub info: AgentInfo,
+    pub already_existed: bool,
+}
+
 /// Returned by PUT /v1/agents/:id/snapshot (direct upload).
 #[allow(dead_code)]
 #[derive(Debug, Deserialize)]
@@ -173,14 +185,20 @@ impl ApiClient {
 
     /// Register a new agent with the service.
     ///
-    /// Returns the created agent. If the agent already exists (409), returns
-    /// the existing agent via GET instead — this is normal during sync.
+    /// Returns the agent info plus a flag indicating whether the agent already
+    /// existed in the cloud (the server returned 409 instead of 201). Callers
+    /// like `alf sync` use the flag to implement the E3 guard
+    /// (refuse to upload an empty workspace as a "first sync" over an existing
+    /// cloud agent unless `--force-first-sync` is passed).
+    ///
+    /// If the agent already exists (409), the existing record is fetched via
+    /// GET so the caller still gets a populated `AgentInfo`.
     pub fn register_agent(
         &self,
         agent_id: Uuid,
         name: &str,
         source_runtime: &str,
-    ) -> Result<AgentInfo> {
+    ) -> Result<RegisterAgentOutcome> {
         let body = serde_json::json!({
             "id": agent_id,
             "name": name,
@@ -197,12 +215,21 @@ impl ApiClient {
             .context("failed to contact sync service")?;
 
         match resp.status() {
-            StatusCode::CREATED => resp
-                .json::<AgentInfo>()
-                .context("failed to parse agent response"),
+            StatusCode::CREATED => {
+                let info = resp
+                    .json::<AgentInfo>()
+                    .context("failed to parse agent response")?;
+                Ok(RegisterAgentOutcome {
+                    info,
+                    already_existed: false,
+                })
+            }
             StatusCode::CONFLICT => {
-                // Agent already exists — fetch it instead
-                self.get_agent(agent_id)
+                let info = self.get_agent(agent_id)?;
+                Ok(RegisterAgentOutcome {
+                    info,
+                    already_existed: true,
+                })
             }
             status => {
                 let body = resp.text().unwrap_or_default();
@@ -360,9 +387,21 @@ impl ApiClient {
 
     // ── Restore ───────────────────────────────────────────────────
 
-    /// Get the full restore payload: snapshot URL + delta URLs.
-    pub fn restore(&self, agent_id: Uuid) -> Result<RestoreResponse> {
-        let resp = self.authed_get(&format!("/agents/{}/restore", agent_id))?;
+    /// Get the restore payload: snapshot URL + delta URLs.
+    ///
+    /// When `up_to_sequence` is `Some(N)`, the service returns a point-in-time
+    /// view: the largest snapshot with sequence ≤ N, plus all deltas with
+    /// sequence in `(snapshot.sequence, N]`. When `None`, returns head.
+    pub fn restore(
+        &self,
+        agent_id: Uuid,
+        up_to_sequence: Option<u64>,
+    ) -> Result<RestoreResponse> {
+        let path = match up_to_sequence {
+            Some(n) => format!("/agents/{}/restore?up_to_sequence={}", agent_id, n),
+            None => format!("/agents/{}/restore", agent_id),
+        };
+        let resp = self.authed_get(&path)?;
         check_status(&resp, StatusCode::OK, "restore")?;
         resp.json::<RestoreResponse>()
             .context("failed to parse restore response")

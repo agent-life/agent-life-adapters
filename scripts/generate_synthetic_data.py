@@ -104,7 +104,12 @@ def main():
         for sa in identity_data["structured"]["sub_agents"]:
             if "name" in sa and not sa["name"]:
                 sa["name"] = "Sub-agent Name"
-                
+
+    if "structured" in identity_data and "capabilities" in identity_data["structured"]:
+        for i, cap in enumerate(identity_data["structured"]["capabilities"]):
+            if "name" in cap and not cap["name"]:
+                cap["name"] = f"capability-{i}"
+
     for p in principals_data.get("principals", []):
         if "profile" in p:
             p["profile"]["principal_id"] = p.get("id")

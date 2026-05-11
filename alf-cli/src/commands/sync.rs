@@ -1,19 +1,27 @@
 //! `alf sync` — incremental sync to the cloud.
 //!
+//! The sole sync-control variable is `state.last_synced_sequence: Option<u64>`.
+//! Together with whether `~/.alf/state/{id}-snapshot.alf` exists on disk, it
+//! decides which path the sync takes. See [`docs/how_alf_syncs.md`] for the
+//! full model and `decide_sync_mode` for the pure decision function.
+//!
 //! Flow:
-//! 1. Load config (check API key present)
+//! 1. Load config, check API key
 //! 2. Resolve adapter, export workspace to a temp .alf
 //! 3. Read the manifest to get the agent ID
-//! 4. Load agent state from ~/.alf/state/
-//! 5. If first sync → upload full snapshot
-//! 6. If subsequent → load previous snapshot, compute delta, upload delta
-//! 7. Update state with new sequence number
+//! 4. Load `~/.alf/state/{id}.toml` and check for `{id}-snapshot.alf`
+//! 5. [`decide_sync_mode`] picks one of: FirstSync / Delta / BailMissingBase / Recover
+//! 6. Execute the chosen mode, persisting (in this order) base.alf, then state.toml.
+//!
+//! Atomic-write invariant: base.alf is always written **before** state.toml,
+//! both in the first-sync and delta paths.
 
 use crate::adapter;
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, RegisterAgentOutcome};
+use crate::commands::restore::pull_cloud_base;
 use crate::config::Config;
 use crate::output;
-use crate::state::AgentState;
+use crate::state::{local_base_exists, local_base_path, state_file_path, AgentState};
 
 use alf_core::archive::{AlfReader, DeltaWriter};
 use alf_core::delta::compute_delta;
@@ -26,7 +34,7 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(Serialize)]
 struct SyncResult {
@@ -37,6 +45,9 @@ struct SyncResult {
     changes: Option<SyncChanges>,
     snapshot_path: String,
     no_changes: bool,
+    /// True iff this sync invocation pulled the cloud base because the local
+    /// base was missing (i.e. went through the `--recover` path).
+    recovered: bool,
 }
 
 #[derive(Serialize)]
@@ -46,14 +57,114 @@ struct SyncChanges {
     deletes: usize,
 }
 
-pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
+/// Pure decision function for `alf sync` branching.
+///
+/// Inputs are the only two pieces of state that gate behaviour:
+/// - `state.last_synced_sequence` — `None` ⇒ never synced; `Some(N)` ⇒ synced at sequence N.
+/// - `base_present` — whether `~/.alf/state/{id}-snapshot.alf` exists on disk.
+/// - `recover` — whether `--recover` was passed on the CLI.
+///
+/// `last_synced_at` is **deliberately not** an input. It is informational
+/// metadata; branching on it has historically caused ambiguity (see commit
+/// log around the E4 failure) and is forbidden by the sync-control invariant.
+pub(crate) fn decide_sync_mode(
+    state: &AgentState,
+    base_present: bool,
+    recover: bool,
+) -> SyncMode {
+    match (state.last_synced_sequence, base_present, recover) {
+        (None, _, _) => SyncMode::FirstSync,
+        (Some(n), true, _) => SyncMode::Delta { base_sequence: n },
+        (Some(n), false, true) => SyncMode::Recover { base_sequence: n },
+        (Some(n), false, false) => SyncMode::BailMissingBase {
+            last_synced_sequence: n,
+        },
+    }
+}
+
+/// E3 guard: refuse to upload an empty/local-only workspace as a "first sync"
+/// when an agent with this ID already exists in the cloud, unless the operator
+/// explicitly opts in via `--force-first-sync`. See `docs/how_alf_syncs.md`.
+pub(crate) fn check_first_sync_safety(
+    agent_id: uuid::Uuid,
+    runtime: &str,
+    outcome: &RegisterAgentOutcome,
+    force_first_sync: bool,
+) -> Result<()> {
+    if outcome.already_existed && !force_first_sync {
+        bail!(
+            "Agent {} already exists in the cloud (latest_sequence = {}), \
+             but no local sync state was found at ~/.alf/state/. \
+             Refusing to upload as first sync to avoid overwriting cloud history. \
+             Either run `alf restore -r {} -w <workspace> -a {}` first to hydrate state, \
+             or pass --force-first-sync to overwrite the cloud agent with the current workspace. \
+             See docs/how_alf_syncs.md (case E3).",
+            agent_id,
+            outcome.info.latest_sequence,
+            runtime,
+            agent_id
+        );
+    }
+    Ok(())
+}
+
+/// Persist a successful sync to disk: copy the freshly-exported archive over
+/// the local base, then save the state file.
+///
+/// **Atomic-write invariant.** `base.alf` is written **before** `state.toml`.
+/// This guarantees that, at the moment of the last successful write,
+/// `state.toml` exists ⇒ `base.alf` exists. A future `alf sync` invocation
+/// reading these two files will therefore never see the orphan-state-file
+/// state described as case E4 in `docs/how_alf_syncs.md`.
+fn persist_local(
+    agent_id: uuid::Uuid,
+    sequence: u64,
+    temp_alf: &Path,
+    snapshot_path: &Path,
+) -> Result<()> {
+    fs::copy(temp_alf, snapshot_path).with_context(|| {
+        format!("Failed to persist snapshot at {}", snapshot_path.display())
+    })?;
+
+    let new_state = AgentState {
+        agent_id,
+        last_synced_sequence: Some(sequence),
+        last_synced_at: Some(Utc::now()),
+    };
+    new_state.save()?;
+    Ok(())
+}
+
+/// Outcome of [`decide_sync_mode`]. Each variant maps to a row of the branch
+/// table in [`docs/how_alf_syncs.md`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SyncMode {
+    /// First sync ever for this agent (`last_synced_sequence: None`).
+    /// Register the agent and upload a full snapshot at sequence 0.
+    FirstSync,
+    /// Subsequent sync. Compute a delta against `base_sequence` and push.
+    Delta { base_sequence: u64 },
+    /// State says we have synced before but the local base is missing and
+    /// `--recover` was not passed. Bail with an actionable error pointing to
+    /// `alf sync --recover`.
+    BailMissingBase { last_synced_sequence: u64 },
+    /// State says we have synced before, the local base is missing, and
+    /// `--recover` was passed. Pull the cloud base, then take the delta
+    /// path at `base_sequence`.
+    Recover { base_sequence: u64 },
+}
+
+pub fn run(
+    runtime: &str,
+    workspace: &Path,
+    recover: bool,
+    force_first_sync: bool,
+) -> Result<()> {
     let human = output::human_mode();
 
-    // 1. Load config and create API client
     let config = Config::load()?;
     let client = ApiClient::from_config(&config)?;
 
-    // 2. Resolve adapter
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown runtime '{}'. Supported: {}",
@@ -82,7 +193,7 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         output::progress(&format!("  Workspace: {}", workspace.display()));
     }
 
-    // 3. Export workspace to a temp file
+    // Export workspace to a temp file to discover the agent ID.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("snapshot.alf");
 
@@ -93,201 +204,448 @@ pub fn run(runtime: &str, workspace: &Path) -> Result<()> {
         report.memory_records
     ));
 
-    // 4. Read the exported archive to get agent ID
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
     let reader = AlfReader::new(Cursor::new(&alf_bytes))?;
     let agent_id = reader.manifest().agent.id;
 
-    // Stable snapshot path under ~/.alf/state for future delta computation
-    let mut snapshot_path: PathBuf = AgentState::state_dir()?;
-    if !snapshot_path.exists() {
-        fs::create_dir_all(&snapshot_path).with_context(|| {
-            format!(
-                "Failed to create state directory {}",
-                snapshot_path.display()
-            )
+    // Decide the sync mode strictly from (sequence, base_present, recover).
+    let state = AgentState::load(agent_id)?;
+    let base_present = local_base_exists(agent_id)?;
+    let mode = decide_sync_mode(&state, base_present, recover);
+
+    let snapshot_path = local_base_path(agent_id)?;
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent).with_context(|| {
+            format!("Failed to create state directory {}", parent.display())
         })?;
     }
-    snapshot_path.push(format!("{agent_id}-snapshot.alf"));
 
-    // 5. Load agent state
-    let state = AgentState::load(agent_id)?;
-
-    if !state.has_synced() {
-        // First sync: upload full snapshot
-        output::progress("  First sync — registering agent and uploading snapshot...");
-
-        let _agent_info = client.register_agent(agent_id, &report.agent_name, runtime)?;
-
-        let upload = client.upload_snapshot(agent_id, &alf_bytes)?;
-
-        fs::copy(&temp_alf, &snapshot_path).with_context(|| {
-            format!("Failed to persist snapshot at {}", snapshot_path.display())
-        })?;
-
-        let new_state = AgentState {
+    match mode {
+        SyncMode::FirstSync => execute_first_sync(
+            &client,
             agent_id,
-            last_synced_sequence: upload.sequence,
-            last_synced_at: Some(Utc::now()),
-            snapshot_path: Some(snapshot_path.to_string_lossy().into()),
-        };
-        new_state.save()?;
-
-        if human {
-            let state_path = AgentState::path_for(agent_id)?;
-            println!(
-                "{} Snapshot uploaded (sequence: {})",
-                "✓".green().bold(),
-                upload.sequence
-            );
-            println!("  Snapshot base: {}", snapshot_path.display());
-            println!("  State file:    {}", state_path.display());
-        } else {
-            output::json(&SyncResult {
-                ok: true,
-                sequence: upload.sequence,
-                delta: false,
-                changes: None,
-                snapshot_path: snapshot_path.to_string_lossy().into(),
-                no_changes: false,
-            });
-        }
-    } else {
-        // Subsequent sync: compute and upload delta
-        output::progress(&format!(
-            "  Computing delta since sequence {}...",
-            state.last_synced_sequence
-        ));
-
-        let prev_path: PathBuf = if let Some(p) = &state.snapshot_path {
-            p.into()
-        } else {
-            snapshot_path.clone()
-        };
-
-        let prev_bytes = fs::read(&prev_path).with_context(|| {
-            format!(
-                "Failed to read previous snapshot at {}",
-                prev_path.display()
+            runtime,
+            &report.agent_name,
+            &alf_bytes,
+            &temp_alf,
+            &snapshot_path,
+            force_first_sync,
+            human,
+        ),
+        SyncMode::Delta { base_sequence } => execute_delta(
+            &client,
+            agent_id,
+            runtime,
+            base_sequence,
+            state.last_synced_at,
+            &alf_bytes,
+            &temp_alf,
+            &snapshot_path,
+            /* recovered: */ false,
+            human,
+        ),
+        SyncMode::Recover { base_sequence } => {
+            output::progress(&format!(
+                "  Local base missing — recovering from cloud (base sequence {base_sequence})..."
+            ));
+            // pull_cloud_base writes base.alf and state.toml under ~/.alf/state/.
+            let cloud = pull_cloud_base(&client, agent_id)?;
+            output::progress(&format!(
+                "  Recovered local base at sequence {} ({})",
+                cloud.latest_sequence,
+                cloud.local_base.display()
+            ));
+            execute_delta(
+                &client,
+                agent_id,
+                runtime,
+                cloud.latest_sequence,
+                Some(Utc::now()),
+                &alf_bytes,
+                &temp_alf,
+                &snapshot_path,
+                /* recovered: */ true,
+                human,
             )
-        })?;
-        let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
-        let prev_records = prev_reader.read_all_memory()?;
-
-        let mut curr_reader = AlfReader::new(Cursor::new(&alf_bytes))?;
-        let curr_records = curr_reader.read_all_memory()?;
-
-        let delta_entries = compute_delta(&prev_records, &curr_records);
-
-        if delta_entries.is_empty() {
-            if human {
-                println!(
-                    "{} No changes detected — already up to date",
-                    "✓".green().bold()
-                );
-            } else {
-                output::json(&SyncResult {
-                    ok: true,
-                    sequence: state.last_synced_sequence,
-                    delta: false,
-                    changes: None,
-                    snapshot_path: snapshot_path.to_string_lossy().into(),
-                    no_changes: true,
-                });
-            }
-            return Ok(());
         }
+        SyncMode::BailMissingBase {
+            last_synced_sequence,
+        } => bail!(
+            "Local delta base missing at {} (state says last synced at sequence {}). \
+             Run `alf sync --recover -r {} -w {}` to pull the cloud snapshot and rebuild the base. \
+             See docs/how_alf_syncs.md (case E4) for details.",
+            snapshot_path.display(),
+            last_synced_sequence,
+            runtime,
+            workspace.display()
+        ),
+    }
+}
 
-        let creates = delta_entries
-            .iter()
-            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Create)
-            .count();
-        let updates = delta_entries
-            .iter()
-            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Update)
-            .count();
-        let deletes = delta_entries
-            .iter()
-            .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Delete)
-            .count();
+#[allow(clippy::too_many_arguments)]
+fn execute_first_sync(
+    client: &ApiClient,
+    agent_id: uuid::Uuid,
+    runtime: &str,
+    agent_name: &str,
+    alf_bytes: &[u8],
+    temp_alf: &Path,
+    snapshot_path: &Path,
+    force_first_sync: bool,
+    human: bool,
+) -> Result<()> {
+    output::progress("  First sync — registering agent and uploading snapshot...");
 
-        output::progress(&format!(
-            "  Delta: {creates} creates, {updates} updates, {deletes} deletes"
-        ));
+    let outcome = client.register_agent(agent_id, agent_name, runtime)?;
 
-        let delta_manifest = DeltaManifest {
-            alf_version: "1.0.0".into(),
-            created_at: Utc::now(),
-            agent: DeltaAgentRef {
-                id: agent_id,
-                source_runtime: Some(runtime.into()),
-                extra: HashMap::new(),
-            },
-            sync: DeltaSyncCursor {
-                base_sequence: state.last_synced_sequence,
-                new_sequence: 0,
-                base_timestamp: state.last_synced_at,
-                new_timestamp: None,
-                extra: HashMap::new(),
-            },
-            changes: ChangeInventory {
-                identity: None,
-                principals: None,
-                credentials: None,
-                memory: None,
-                extra: HashMap::new(),
-            },
-            extra: HashMap::new(),
-        };
+    check_first_sync_safety(agent_id, runtime, &outcome, force_first_sync)?;
 
-        let delta_buf = Cursor::new(Vec::new());
-        let mut delta_writer = DeltaWriter::new(delta_buf, delta_manifest)?;
-        delta_writer.add_memory_deltas(&delta_entries)?;
-        let delta_buf = delta_writer.finish()?;
-        let delta_bytes = delta_buf.into_inner();
+    let upload = client.upload_snapshot(agent_id, alf_bytes)?;
 
-        output::progress(&format!(
-            "  Uploading delta ({} bytes)...",
-            delta_bytes.len()
-        ));
-        let upload = client.push_delta(agent_id, state.last_synced_sequence, &delta_bytes)?;
+    persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
 
-        fs::copy(&temp_alf, &snapshot_path).with_context(|| {
-            format!("Failed to persist snapshot at {}", snapshot_path.display())
-        })?;
-
-        let new_state = AgentState {
-            agent_id,
-            last_synced_sequence: upload.sequence,
-            last_synced_at: Some(Utc::now()),
-            snapshot_path: Some(snapshot_path.to_string_lossy().into()),
-        };
-        new_state.save()?;
-
-        if human {
-            let state_path = AgentState::path_for(agent_id)?;
-            println!(
-                "{} Delta uploaded (sequence: {})",
-                "✓".green().bold(),
-                upload.sequence
-            );
-            println!("  Snapshot base: {}", snapshot_path.display());
-            println!("  State file:    {}", state_path.display());
-        } else {
-            output::json(&SyncResult {
-                ok: true,
-                sequence: upload.sequence,
-                delta: true,
-                changes: Some(SyncChanges {
-                    creates,
-                    updates,
-                    deletes,
-                }),
-                snapshot_path: snapshot_path.to_string_lossy().into(),
-                no_changes: false,
-            });
-        }
+    if human {
+        let state_path = state_file_path(agent_id)?;
+        println!(
+            "{} Snapshot uploaded (sequence: {})",
+            "✓".green().bold(),
+            upload.sequence
+        );
+        println!("  Snapshot base: {}", snapshot_path.display());
+        println!("  State file:    {}", state_path.display());
+    } else {
+        output::json(&SyncResult {
+            ok: true,
+            sequence: upload.sequence,
+            delta: false,
+            changes: None,
+            snapshot_path: snapshot_path.to_string_lossy().into(),
+            no_changes: false,
+            recovered: false,
+        });
     }
 
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_delta(
+    client: &ApiClient,
+    agent_id: uuid::Uuid,
+    runtime: &str,
+    base_sequence: u64,
+    base_timestamp: Option<chrono::DateTime<Utc>>,
+    alf_bytes: &[u8],
+    temp_alf: &Path,
+    snapshot_path: &Path,
+    recovered: bool,
+    human: bool,
+) -> Result<()> {
+    output::progress(&format!(
+        "  Computing delta since sequence {base_sequence}..."
+    ));
+
+    let prev_bytes = fs::read(snapshot_path).with_context(|| {
+        format!(
+            "Failed to read previous snapshot at {}",
+            snapshot_path.display()
+        )
+    })?;
+    let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
+    let prev_records = prev_reader.read_all_memory()?;
+
+    let mut curr_reader = AlfReader::new(Cursor::new(alf_bytes))?;
+    let curr_records = curr_reader.read_all_memory()?;
+
+    let delta_entries = compute_delta(&prev_records, &curr_records);
+
+    if delta_entries.is_empty() {
+        if human {
+            println!(
+                "{} No changes detected — already up to date",
+                "✓".green().bold()
+            );
+        } else {
+            output::json(&SyncResult {
+                ok: true,
+                sequence: base_sequence,
+                delta: false,
+                changes: None,
+                snapshot_path: snapshot_path.to_string_lossy().into(),
+                no_changes: true,
+                recovered,
+            });
+        }
+        return Ok(());
+    }
+
+    let creates = delta_entries
+        .iter()
+        .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Create)
+        .count();
+    let updates = delta_entries
+        .iter()
+        .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Update)
+        .count();
+    let deletes = delta_entries
+        .iter()
+        .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Delete)
+        .count();
+
+    output::progress(&format!(
+        "  Delta: {creates} creates, {updates} updates, {deletes} deletes"
+    ));
+
+    let delta_manifest = DeltaManifest {
+        alf_version: "1.0.0".into(),
+        created_at: Utc::now(),
+        agent: DeltaAgentRef {
+            id: agent_id,
+            source_runtime: Some(runtime.into()),
+            extra: HashMap::new(),
+        },
+        sync: DeltaSyncCursor {
+            base_sequence,
+            new_sequence: 0,
+            // base_timestamp is informational metadata propagated from the
+            // previous successful sync. Never read by control flow.
+            base_timestamp,
+            new_timestamp: None,
+            extra: HashMap::new(),
+        },
+        changes: ChangeInventory {
+            identity: None,
+            principals: None,
+            credentials: None,
+            memory: None,
+            extra: HashMap::new(),
+        },
+        extra: HashMap::new(),
+    };
+
+    let delta_buf = Cursor::new(Vec::new());
+    let mut delta_writer = DeltaWriter::new(delta_buf, delta_manifest)?;
+    delta_writer.add_memory_deltas(&delta_entries)?;
+    let delta_buf = delta_writer.finish()?;
+    let delta_bytes = delta_buf.into_inner();
+
+    output::progress(&format!(
+        "  Uploading delta ({} bytes)...",
+        delta_bytes.len()
+    ));
+    let upload = client.push_delta(agent_id, base_sequence, &delta_bytes)?;
+
+    persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
+
+    if human {
+        let state_path = state_file_path(agent_id)?;
+        let label = if recovered {
+            "Delta uploaded (recovered)"
+        } else {
+            "Delta uploaded"
+        };
+        println!(
+            "{} {} (sequence: {})",
+            "✓".green().bold(),
+            label,
+            upload.sequence
+        );
+        println!("  Snapshot base: {}", snapshot_path.display());
+        println!("  State file:    {}", state_path.display());
+    } else {
+        output::json(&SyncResult {
+            ok: true,
+            sequence: upload.sequence,
+            delta: true,
+            changes: Some(SyncChanges {
+                creates,
+                updates,
+                deletes,
+            }),
+            snapshot_path: snapshot_path.to_string_lossy().into(),
+            no_changes: false,
+            recovered,
+        });
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    fn state_with(seq: Option<u64>) -> AgentState {
+        AgentState {
+            agent_id: Uuid::new_v4(),
+            last_synced_sequence: seq,
+            last_synced_at: None,
+        }
+    }
+
+    /// Branch A — never synced: first sync regardless of base presence or --recover.
+    #[test]
+    fn decide_first_sync_when_sequence_is_none() {
+        let s = state_with(None);
+        assert_eq!(decide_sync_mode(&s, false, false), SyncMode::FirstSync);
+        assert_eq!(decide_sync_mode(&s, true, false), SyncMode::FirstSync);
+        assert_eq!(decide_sync_mode(&s, false, true), SyncMode::FirstSync);
+        assert_eq!(decide_sync_mode(&s, true, true), SyncMode::FirstSync);
+    }
+
+    /// Branch B — synced + base present: delta path. --recover is a no-op.
+    #[test]
+    fn decide_delta_when_base_present() {
+        let s = state_with(Some(7));
+        assert_eq!(
+            decide_sync_mode(&s, true, false),
+            SyncMode::Delta { base_sequence: 7 }
+        );
+        assert_eq!(
+            decide_sync_mode(&s, true, true),
+            SyncMode::Delta { base_sequence: 7 },
+            "--recover should be a no-op when the local base is healthy"
+        );
+    }
+
+    /// Branch C — synced but base missing, no --recover: bail.
+    #[test]
+    fn decide_bail_when_base_missing_and_no_recover() {
+        let s = state_with(Some(3));
+        assert_eq!(
+            decide_sync_mode(&s, false, false),
+            SyncMode::BailMissingBase {
+                last_synced_sequence: 3,
+            }
+        );
+    }
+
+    /// Branch D — synced but base missing, --recover passed: recover.
+    #[test]
+    fn decide_recover_when_base_missing_and_recover() {
+        let s = state_with(Some(5));
+        assert_eq!(
+            decide_sync_mode(&s, false, true),
+            SyncMode::Recover { base_sequence: 5 }
+        );
+    }
+
+    /// Some(0) is the post-first-sync state, NOT a fresh state. The
+    /// `Option<u64>` typing keeps the two distinct.
+    #[test]
+    fn decide_some_zero_with_base_is_delta_not_first_sync() {
+        let s = state_with(Some(0));
+        assert_eq!(
+            decide_sync_mode(&s, true, false),
+            SyncMode::Delta { base_sequence: 0 }
+        );
+    }
+
+    /// last_synced_at is informational metadata only — flipping it does not
+    /// change the chosen sync mode.
+    #[test]
+    fn decide_ignores_last_synced_at() {
+        let mut s = state_with(Some(2));
+        let m1 = decide_sync_mode(&s, true, false);
+        s.last_synced_at = Some(Utc::now());
+        let m2 = decide_sync_mode(&s, true, false);
+        assert_eq!(m1, m2);
+    }
+
+    fn make_outcome(already_existed: bool, latest_sequence: u64) -> RegisterAgentOutcome {
+        RegisterAgentOutcome {
+            info: crate::api_client::AgentInfo {
+                id: Uuid::new_v4(),
+                name: "Test".into(),
+                source_runtime: Some("openclaw".into()),
+                created_at: "2026-05-09T00:00:00Z".into(),
+                latest_sequence,
+            },
+            already_existed,
+        }
+    }
+
+    /// Branch E — first sync but the cloud already has this agent: bail unless
+    /// --force-first-sync is set. (E3 guard.)
+    #[test]
+    fn first_sync_safety_bails_on_409_without_force_flag() {
+        let outcome = make_outcome(true, 7);
+        let result = check_first_sync_safety(Uuid::new_v4(), "openclaw", &outcome, false);
+        let err = result.expect_err("E3 guard must reject already-registered agent");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("already exists in the cloud"),
+            "error must explain why: {msg}"
+        );
+        assert!(
+            msg.contains("--force-first-sync"),
+            "error must mention the override flag: {msg}"
+        );
+        assert!(
+            msg.contains("alf restore"),
+            "error must offer the safe alternative: {msg}"
+        );
+    }
+
+    #[test]
+    fn first_sync_safety_allows_409_with_force_flag() {
+        let outcome = make_outcome(true, 7);
+        check_first_sync_safety(Uuid::new_v4(), "openclaw", &outcome, true)
+            .expect("--force-first-sync must override the guard");
+    }
+
+    #[test]
+    fn first_sync_safety_passes_for_freshly_created_agent() {
+        let outcome = make_outcome(false, 0);
+        check_first_sync_safety(Uuid::new_v4(), "openclaw", &outcome, false)
+            .expect("freshly created agent must not trip the guard");
+    }
+
+    /// Atomic-write invariant: persist_local writes base.alf BEFORE state.toml.
+    /// We assert this via mtime ordering on a HOME-redirected temp dir.
+    #[test]
+    fn persist_local_writes_base_before_state() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let agent_id = Uuid::new_v4();
+        let snapshot_path = crate::state::local_base_path(agent_id).unwrap();
+        fs::create_dir_all(snapshot_path.parent().unwrap()).unwrap();
+
+        let temp_alf = tmp.path().join("export.alf");
+        fs::write(&temp_alf, b"fake-alf-bytes").unwrap();
+
+        persist_local(agent_id, 42, &temp_alf, &snapshot_path).unwrap();
+
+        let state_path = crate::state::state_file_path(agent_id).unwrap();
+        let base_mtime = fs::metadata(&snapshot_path).unwrap().modified().unwrap();
+        let state_mtime = fs::metadata(&state_path).unwrap().modified().unwrap();
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert!(snapshot_path.is_file());
+        assert!(state_path.is_file());
+        assert!(
+            base_mtime <= state_mtime,
+            "atomic-write invariant: base.alf must be written before state.toml \
+             (base_mtime={:?}, state_mtime={:?})",
+            base_mtime,
+            state_mtime
+        );
+
+        // And, rounding out the invariant: the saved sequence must be Some(42).
+        let saved = AgentState::load_from(&state_path, agent_id).unwrap();
+        assert_eq!(saved.last_synced_sequence, Some(42));
+        assert!(saved.last_synced_at.is_some());
+    }
 }

@@ -196,9 +196,11 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 Incremental sync to the cloud. First sync uploads a full snapshot; subsequent syncs upload deltas.
 
+The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.alf/state/{agent_id}.toml` (`None` ⇒ never synced; `Some(N)` ⇒ synced at sequence N), and whether `~/.alf/state/{agent_id}-snapshot.alf` exists on disk. See [how_alf_syncs.md](how_alf_syncs.md) for the full data model, branch table, and ephemeral-runtime corner cases.
+
 ### Usage
 
-    alf sync -r <runtime> -w <workspace>
+    alf sync -r <runtime> -w <workspace> [--recover] [--force-first-sync]
 
 ### Flags
 
@@ -206,6 +208,8 @@ Incremental sync to the cloud. First sync uploads a full snapshot; subsequent sy
 |---|---|---|---|
 | `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | Yes | Path to the agent workspace directory |
+| `--recover` | | No | When the state file says we have synced before but the local base snapshot is missing, pull the cloud snapshot+deltas to repair the base, then take the normal delta path. Does not touch the workspace. No-op when the local base is already present. |
+| `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
 
 ### JSON Output (success — delta)
 
@@ -215,7 +219,8 @@ Incremental sync to the cloud. First sync uploads a full snapshot; subsequent sy
       "delta": true,
       "changes": { "creates": 2, "updates": 1, "deletes": 0 },
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
-      "no_changes": false
+      "no_changes": false,
+      "recovered": false
     }
 
 ### JSON Output (success — no changes)
@@ -226,10 +231,25 @@ Incremental sync to the cloud. First sync uploads a full snapshot; subsequent sy
       "delta": false,
       "changes": null,
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
-      "no_changes": true
+      "no_changes": true,
+      "recovered": false
     }
 
-### JSON Output (error)
+### JSON Output (success — recovered)
+
+When `--recover` was passed and the local base was actually missing, the response carries `"recovered": true` so suspend logs and other automated callers can distinguish a recovered sync from a regular delta.
+
+    {
+      "ok": true,
+      "sequence": 6,
+      "delta": true,
+      "changes": { "creates": 0, "updates": 0, "deletes": 0 },
+      "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
+      "no_changes": false,
+      "recovered": true
+    }
+
+### JSON Output (error — sequence conflict)
 
     {
       "ok": false,
@@ -237,11 +257,33 @@ Incremental sync to the cloud. First sync uploads a full snapshot; subsequent sy
       "hint": "Run 'alf restore' to pull latest, then sync again"
     }
 
+### JSON Output (error — local base missing)
+
+When `last_synced_sequence` is set but `{agent_id}-snapshot.alf` is absent, the sync bails by default rather than silently re-uploading the workspace as a fresh snapshot.
+
+    {
+      "ok": false,
+      "error": "Local delta base missing at /home/user/.alf/state/a1b2c3d4-snapshot.alf (state says last synced at sequence 5). Run `alf sync --recover -r openclaw -w /home/user/.openclaw/workspace` to pull the cloud snapshot and rebuild the base. See docs/how_alf_syncs.md (case E4) for details.",
+      "hint": "See docs/how_alf_syncs.md (case E4) for the recovery procedure."
+    }
+
+### JSON Output (error — agent already registered, first sync)
+
+When a first sync (no local state) is attempted but `register_agent` returns 409 (the cloud already has an agent with this ID), the sync bails by default to avoid overwriting cloud history.
+
+    {
+      "ok": false,
+      "error": "Agent a1b2c3d4-... already exists in the cloud (latest_sequence = 7), but no local sync state was found at ~/.alf/state/. Refusing to upload as first sync to avoid overwriting cloud history. Either run `alf restore -r openclaw -w <workspace> -a a1b2c3d4-...` first to hydrate state, or pass --force-first-sync to overwrite the cloud agent with the current workspace. See docs/how_alf_syncs.md (case E3).",
+      "hint": "See docs/how_alf_syncs.md (case E3) before using --force-first-sync."
+    }
+
 ### Error Codes
 
 | Code | HTTP | Meaning | Fix |
 |---|---|---|---|
 | `conflict` | 409 | Base sequence mismatch | `alf restore` first, then sync again |
+| `missing_local_base` | — | State file present but `{agent_id}-snapshot.alf` is absent | `alf sync --recover` to repair the base from the cloud |
+| `agent_already_exists` | — | First sync attempted but the cloud already has this agent | `alf restore` first, or `alf sync --force-first-sync` to overwrite cloud |
 | `unauthorized` | 401 | Bad or revoked API key | `alf login --key <new-key>` |
 | `agent_limit` | 402 | Subscription agent limit reached | Upgrade at agent-life.ai |
 
@@ -249,11 +291,17 @@ Incremental sync to the cloud. First sync uploads a full snapshot; subsequent sy
 
 ## alf restore
 
-Download the latest snapshot (plus uncompacted deltas) from the service and import into a workspace.
+Download a snapshot (plus uncompacted deltas) from the service and import into a workspace.
 
 ### Usage
 
-    alf restore -r <runtime> -w <workspace> [-a <agent-id>]
+    alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>]
+
+### Modes
+
+- **Head restore (default)**: pulls the latest snapshot and all subsequent deltas, merges them, writes the merged base to `~/.alf/state/{agent-id}-snapshot.alf`, updates `~/.alf/state/{agent-id}.toml`, and imports into the workspace. After this, `alf sync` resumes against the freshly restored base.
+
+- **Point-in-time preview** (`--at-sequence N`): rebuilds the workspace as it looked after sequence `N` was applied. **Does not touch `~/.alf/state/`** — the local sync cursor remains pointed at head. This is a read-only inspection mode; running `alf sync` afterwards still works against head as if the preview never happened. To return the workspace to head, run plain `alf restore` again. See [`docs/how_alf_syncs.md`](how_alf_syncs.md) for the rationale.
 
 ### Flags
 
@@ -262,8 +310,9 @@ Download the latest snapshot (plus uncompacted deltas) from the service and impo
 | `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | Yes | Path to the target workspace directory |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
+| `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 
-### JSON Output (success)
+### JSON Output (success, head restore)
 
     {
       "ok": true,
@@ -273,7 +322,30 @@ Download the latest snapshot (plus uncompacted deltas) from the service and impo
       "runtime": "openclaw",
       "memory_records": 47,
       "workspace": "/home/user/.openclaw/workspace",
+      "preview": false,
       "warnings": []
+    }
+
+### JSON Output (success, point-in-time preview)
+
+    {
+      "ok": true,
+      "agent_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+      "agent_name": "Atlas",
+      "sequence": 3,
+      "runtime": "openclaw",
+      "memory_records": 42,
+      "workspace": "/home/user/preview-workspace",
+      "preview": true,
+      "at_sequence": 3,
+      "warnings": []
+    }
+
+### JSON Output (error, --at-sequence exceeds latest)
+
+    {
+      "ok": false,
+      "error": "restore failed with status 400 Bad Request: {\"error\":\"up_to_sequence 99 exceeds agent's latest sequence 5\"}"
     }
 
 ---

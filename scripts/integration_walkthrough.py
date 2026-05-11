@@ -458,8 +458,124 @@ def step_connectivity(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, r
     pause(cfg)
 
 
+def step_cli_sync_model(cfg: Config, report: Report):
+    section(1, "CLI Sync Branch Decisions (Client-Side State Model)")
+    explain("""
+        Before we touch the API, let's understand what `alf sync` does locally
+        and how it decides whether to upload a full snapshot or push a delta.
+
+        Per agent, the CLI keeps exactly two files under ~/.alf/state/:
+
+          {agent_id}.toml             ← sync cursor (a few hundred bytes)
+          {agent_id}-snapshot.alf     ← frozen copy of the last successful
+                                        sync; used purely as the delta base
+                                        for the NEXT sync
+
+        These two files are independent on-disk artifacts. The cursor lives
+        forever; the workspace itself can change freely between syncs.
+    """)
+
+    explain("""
+        The cursor is one variable, with type Option<u64>:
+
+            last_synced_sequence
+
+          • None      ⇒ the agent has never completed a sync.
+          • Some(0)   ⇒ the first snapshot has been uploaded.
+          • Some(N>0) ⇒ N deltas have been pushed on top of the snapshot.
+
+        This is the SOLE sync-control variable. `last_synced_at` is also
+        persisted but it's informational metadata only — never read by
+        control flow, only displayed by `alf help status` and propagated
+        into delta manifests as `base_timestamp` for audit trails.
+
+        Why Option<u64>? Because the cloud assigns the first snapshot
+        sequence 0, so a bare `u64` couldn't distinguish "never synced"
+        from "first snapshot just uploaded". The Option carries that
+        distinction at the type level.
+    """)
+
+    explain("""
+        On every run, `alf sync` reads the cursor and checks whether the
+        local base snapshot exists on disk. Those two inputs decide the
+        branch — that's the entire sync control flow:
+
+          (last_synced_sequence,     base.alf present) → action
+          ──────────────────────────────────────────────────────────────────
+          (None,                     *               ) → First sync.
+                                                         Register agent +
+                                                         upload full snapshot.
+
+          (Some(N),                  present         ) → Delta path.
+                                                         Compute change set
+                                                         against base.alf at
+                                                         sequence N, push,
+                                                         advance to Some(N+1).
+
+          (Some(N),                  absent          ) → Bail loudly with:
+                                                         "Run alf sync --recover"
+                                                         (or run with --recover
+                                                         to pull cloud base
+                                                         and proceed as Delta).
+    """)
+
+    explain("""
+        Two corner cases the current CLI handles explicitly rather than
+        silently swallowing:
+
+          E3 — First sync, but the cloud already has this agent ID.
+               POST /agents returns 409. By default `alf sync` bails,
+               because uploading a fresh snapshot would overwrite cloud
+               history with whatever happens to be in the local workspace.
+               Pass --force-first-sync only if you really do mean "the
+               local workspace is the truth".
+
+          E4 — state.toml present, base.alf absent (orphan state from a
+               pre-0.1.4 CLI that did not write the base during restore).
+               Default behaviour: bail with an actionable error pointing
+               at `alf sync --recover`, which pulls the cloud snapshot+deltas,
+               materialises the local base, and proceeds as a normal delta.
+               Boot-time runtimes auto-recover via the runtime self-heal
+               step in 50-configure-runtime.
+
+        Atomic-write invariant: base.alf is always written BEFORE state.toml.
+        Consequence: state.toml-present ⇒ base.alf-present at the moment of
+        the last successful write. The bail above can only fire if something
+        deleted base.alf out from under us, or an old CLI wrote state.toml
+        without writing base.alf.
+
+        Full reference: agent-life-adapters/docs/how_alf_syncs.md
+    """)
+
+    example_state = textwrap.dedent("""
+        # ~/.alf/state/e2e10000-feed-4000-b000-000000000001.toml
+        agent_id = "e2e10000-feed-4000-b000-000000000001"
+        last_synced_sequence = 2
+        last_synced_at = "2026-05-09T18:42:11Z"
+    """).strip()
+    print(f"  {c('yellow', 'Example state.toml after two deltas')}:")
+    for line in example_state.splitlines():
+        print(f"    {c('dim', line)}")
+    print()
+
+    explain("""
+        Right now our walkthrough agent has no local state yet:
+        last_synced_sequence is None and base.alf does not exist. So the
+        very next step — register the agent and upload an initial snapshot —
+        corresponds to the first-sync branch of `alf sync`.
+    """)
+
+    report.add(StepResult(
+        "CLI sync branch model",
+        True,
+        0,
+        "Conceptual step — explains client-side state and branch table",
+    ))
+    pause(cfg)
+
+
 def step_create_agent(cfg: Config, api: ApiClient, db: DbClient, report: Report) -> dict:
-    section(1, "Create Agent")
+    section(2, "Create Agent")
     explain(f"""
         We'll register a new agent with the service. This is what happens when
         you run `alf sync` for the first time.
@@ -515,7 +631,7 @@ def step_create_agent(cfg: Config, api: ApiClient, db: DbClient, report: Report)
 
 def step_upload_snapshot(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client,
                          report: Report) -> dict:
-    section(2, "Upload Initial Snapshot")
+    section(3, "Upload Initial Snapshot")
     explain("""
         Now we'll upload the first full snapshot. This is an .alf archive — a
         ZIP file containing manifest.json and JSONL memory partitions.
@@ -604,7 +720,7 @@ def step_upload_snapshot(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client
 def step_push_delta(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client,
                     report: Report, delta_num: int, base_seq: int,
                     memories: list[dict], description: str) -> dict:
-    section(2 + delta_num, f"Push Delta {delta_num}")
+    section(3 + delta_num, f"Push Delta {delta_num}")
     explain(f"""
         {description}
 
@@ -661,7 +777,7 @@ def step_push_delta(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client,
 
 
 def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
-    section(5, "Pull Deltas (since sequence 0)")
+    section(6, "Pull Deltas (since sequence 0)")
     explain("""
         GET /agents/:id/deltas?since=0 returns all uncompacted deltas with
         presigned S3 download URLs. This is what a client uses to check for
@@ -691,7 +807,7 @@ def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
 
 
 def step_restore(cfg: Config, api: ApiClient, report: Report) -> dict:
-    section(6, "Restore (Snapshot + Deltas)")
+    section(7, "Restore (Snapshot + Deltas)")
     explain("""
         GET /agents/:id/restore returns everything needed to reconstruct the
         agent's current state: a presigned URL for the latest snapshot plus
@@ -756,8 +872,84 @@ def step_restore(cfg: Config, api: ApiClient, report: Report) -> dict:
     return body
 
 
+def step_point_in_time_restore(cfg: Config, api: ApiClient, report: Report):
+    section(8, "Point-in-time Restore (Preview Mode)")
+    explain("""
+        GET /agents/:id/restore?up_to_sequence=N returns a bounded view of
+        the agent's history: the largest snapshot with sequence <= N, plus
+        every uncompacted delta with sequence in (snapshot.sequence, N].
+
+        The CLI surfaces this as `alf restore --at-sequence N`. It is a
+        read-only preview: the merged archive is imported into the target
+        workspace, but ~/.alf/state/ is NOT modified. The sync cursor stays
+        pinned at head, so a subsequent `alf sync` runs as if the preview
+        never happened.
+
+        Why preview-only? `alf sync`'s contract is "the workspace is the
+        truth". If a PIT restore stamped last_synced_sequence = Some(N) for
+        N < head, the next sync would compute a "rewind history" delta and
+        propagate it. Preview mode side-steps that entirely.
+
+        We'll demonstrate three things:
+        1. up_to_sequence=0    → snapshot only (no deltas).
+        2. up_to_sequence=1    → snapshot + first delta.
+        3. up_to_sequence=999  → 400 Bad Request (exceeds latest_sequence).
+    """)
+
+    t0 = time.time()
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=0")
+    duration = (time.time() - t0) * 1000
+    if r.status_code != 200:
+        fail(f"PIT restore at sequence 0 failed (HTTP {r.status_code})")
+        report.add(StepResult("PIT restore", False, duration, error=r.text[:200]))
+        return
+    body0 = r.json()
+    deltas0 = body0.get("deltas", [])
+    if body0.get("snapshot") and len(deltas0) == 0:
+        ok("up_to_sequence=0 → snapshot only, 0 deltas (as expected)")
+    else:
+        fail(f"up_to_sequence=0 returned unexpected payload: snapshot={bool(body0.get('snapshot'))}, deltas={len(deltas0)}")
+
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=1")
+    if r.status_code != 200:
+        fail(f"PIT restore at sequence 1 failed (HTTP {r.status_code})")
+    else:
+        body1 = r.json()
+        deltas1 = body1.get("deltas", [])
+        if body1.get("snapshot") and len(deltas1) == 1 and deltas1[0]["sequence"] == 1:
+            ok("up_to_sequence=1 → snapshot + delta@1 (as expected)")
+        else:
+            fail(f"up_to_sequence=1 returned unexpected payload: deltas={[d.get('sequence') for d in deltas1]}")
+
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=999")
+    if r.status_code == 400:
+        try:
+            err = r.json().get("error", "")
+        except Exception:
+            err = r.text
+        ok(f"up_to_sequence=999 → 400 Bad Request: \"{err[:80]}\"")
+    else:
+        fail(f"up_to_sequence=999 returned HTTP {r.status_code}, expected 400")
+
+    explain("""
+        Use-case: if `alf sync` is ever pointed at the wrong workspace and
+        propagates unintended deletes, every prior delta is still in S3 and
+        Neon indexed by sequence. Recovery is `alf restore --at-sequence
+        <last-good-N>` to inspect, then plain `alf restore` (head) to
+        materialise and resume normal sync.
+    """)
+
+    report.add(StepResult(
+        "Point-in-time restore",
+        True,
+        duration,
+        "up_to_sequence=0/1 succeed, =999 returns 400",
+    ))
+    pause(cfg)
+
+
 def step_simulate_data_loss(cfg: Config, report: Report):
-    section(7, "Simulate Local Data Loss")
+    section(9, "Simulate Local Data Loss")
     explain("""
         Imagine the user's machine crashes or the agent workspace is deleted.
         All local state — the exported .alf files, the ~/.alf/state/ directory,
@@ -773,12 +965,26 @@ def step_simulate_data_loss(cfg: Config, report: Report):
 
         (There's nothing to do programmatically here — this step is conceptual.)
     """)
+
+    explain("""
+        Aside: don't reach for `alf sync` here. Sync's contract is "the
+        workspace is the truth" — pointed at an empty workspace it would
+        compute a deletion-delta and push it. The CLI catches the obvious
+        case (total loss ⇒ first-sync branch ⇒ E3 guard bails because the
+        cloud already has this agent), but if `state.toml` + `base.alf`
+        happen to have survived the loss while the workspace did not,
+        `alf sync` would silently propagate the wipe. The asymmetry is
+        deliberate: `alf restore` is the cloud → workspace direction;
+        `alf sync` is the workspace → cloud direction. For recovery you
+        always want restore.
+    """)
+
     report.add(StepResult("Simulate data loss", True, 0, "Conceptual step"))
     pause(cfg, "Press Enter to restore from the cloud...")
 
 
 def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
-    section(8, "Restore After Data Loss")
+    section(10, "Restore After Data Loss")
     explain("""
         We call the restore endpoint again — exactly what `alf restore` does.
         The response should be identical to step 6: the snapshot plus all deltas.
@@ -809,7 +1015,7 @@ def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
 
 
 def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report: Report):
-    section(9, "Cleanup — Delete Agent")
+    section(11, "Cleanup — Delete Agent")
     explain("""
         DELETE /agents/:id performs a full agent deletion:
         1. The Lambda lists all S3 objects under {tenant_id}/{agent_id}/
@@ -929,13 +1135,16 @@ def main():
         # Step 0: Connectivity
         step_connectivity(cfg, api, db, s3, report)
 
-        # Step 1: Create agent
+        # Step 1: CLI sync branch decisions (conceptual)
+        step_cli_sync_model(cfg, report)
+
+        # Step 2: Create agent
         step_create_agent(cfg, api, db, report)
 
-        # Step 2: Upload initial snapshot (3 memories)
+        # Step 3: Upload initial snapshot (3 memories)
         step_upload_snapshot(cfg, api, db, s3, report)
 
-        # Step 3: Push delta 1 (2 new memories)
+        # Step 4: Push delta 1 (2 new memories)
         delta1_memories = [
             make_memory("00000000-0000-0000-0000-000000000004",
                          "Redis migration runbook complete — 25 min window.",
@@ -948,7 +1157,7 @@ def main():
             "The user worked on the Redis migration and wants to sync new memories.\n"
             "        We push a delta with 2 new episodic memory records.")
 
-        # Step 4: Push delta 2 (2 more memories)
+        # Step 5: Push delta 2 (2 more memories)
         delta2_memories = [
             make_memory("00000000-0000-0000-0000-000000000006",
                          "Redis migration executed — zero downtime, 22 min for 1.2M keys.",
@@ -961,19 +1170,22 @@ def main():
             "The migration is complete. More memories to sync.\n"
             "        We push delta 2 building on sequence 1.")
 
-        # Step 5: Pull deltas
+        # Step 6: Pull deltas
         step_pull_deltas(cfg, api, report)
 
-        # Step 6: Full restore
+        # Step 7: Full restore
         step_restore(cfg, api, report)
 
-        # Step 7: Simulate data loss
+        # Step 8: Point-in-time restore (preview)
+        step_point_in_time_restore(cfg, api, report)
+
+        # Step 9: Simulate data loss
         step_simulate_data_loss(cfg, report)
 
-        # Step 8: Restore after loss
+        # Step 10: Restore after loss
         step_verify_restore_after_loss(cfg, api, report)
 
-        # Step 9: Cleanup
+        # Step 11: Cleanup
         step_cleanup(cfg, api, db, s3, report)
 
     except KeyboardInterrupt:

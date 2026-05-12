@@ -621,9 +621,7 @@ ZeroClaw supports two identity formats, both mapped to ALF:
 
 ### Credentials
 
-ZeroClaw encrypts secrets with ChaCha20-Poly1305. The adapter exports
-**metadata only** — service name (provider name), credential type, and
-label. The `encrypted_payload` field contains `"<not-exported>"`.
+ZeroClaw encrypts local secrets with ChaCha20-Poly1305 using `~/.zeroclaw/.secret_key` — that is **separate** from the ALF vault key ([vault-key-management.md](../../docs/vault-key-management.md)). Without a vault key, the adapter exports **metadata only** and `encrypted_payload` is `"<not-exported>"`. With a vault key passed to `alf export` / `alf sync`, the adapter reads secrets from `config.toml` and `auth_profiles.json`, encrypts them for Layer 4, and writes real ciphertext.
 
 Source: `config.toml` sections `[secrets]`, provider API keys, and
 channel tokens. The adapter parses `config.toml` to enumerate configured

@@ -20,9 +20,11 @@ use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
 use crate::state::{local_base_path, resolve_agent_id, AgentState};
+use crate::vault_key::{self, VaultKeyArgs};
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
+use alf_core::ImportOptions;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -210,6 +212,7 @@ pub fn run(
     workspace: &Path,
     agent_arg: Option<&str>,
     at_sequence: Option<u64>,
+    key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
     let preview = at_sequence.is_some();
@@ -276,7 +279,17 @@ pub fn run(
     fs::write(&temp_alf, &final_bytes)?;
 
     output::progress("  Importing into workspace...");
-    let import_report = adapt.import(&temp_alf, workspace)?;
+    let resolved_key = vault_key::resolve(key_args, runtime)?;
+    if let Some((_, src)) = &resolved_key {
+        output::progress(&format!(
+            "Using vault key from {} — credentials will be decrypted and restored",
+            src.label()
+        ));
+    }
+    let import_options = ImportOptions {
+        vault_key: resolved_key.as_ref().map(|(k, _)| k),
+    };
+    let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
 
     if human {
         println!();

@@ -15,7 +15,7 @@ use walkdir::WalkDir;
 
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, IdentityLayerInfo, LayerInventory, Manifest,
-    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo, VaultKey,
 };
 
 use crate::config_parser::{self, MemoryBackend, ZeroClawConfig};
@@ -192,7 +192,11 @@ fn quarter_end(year: i32, quarter: u32) -> NaiveDate {
 // ---------------------------------------------------------------------------
 
 /// Export a ZeroClaw workspace to an `.alf` archive.
-pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
+///
+/// `vault_key`, when supplied, causes credential records to carry real
+/// AEAD ciphertext (read from `config.toml [secrets]`) instead of the
+/// legacy `<not-exported>` placeholder.
+pub fn export(workspace: &Path, output: &Path, vault_key: Option<&VaultKey>) -> Result<ExportReport> {
     if !workspace.is_dir() {
         bail!(
             "Workspace directory does not exist: {}",
@@ -297,7 +301,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     // 5. Build other layers
     let identity = identity_parser::parse_identity(workspace, &config, agent_id)?;
     let principals = principals_parser::parse_principals(workspace, agent_id)?;
-    let credentials = credential_map::build_credentials(&config, agent_id)?;
+    let credentials = credential_map::build_credentials(&config, agent_id, vault_key)?;
 
     let has_identity = identity.is_some();
     let identity_version = identity.as_ref().map(|i| i.version);
@@ -505,7 +509,7 @@ format = "openclaw"
         create_test_db(dir.path());
 
         let output = dir.path().join("test.alf");
-        let report = export(&ws, &output).unwrap();
+        let report = export(&ws, &output, None).unwrap();
 
         assert_eq!(report.agent_name, "ZCAgent");
         assert_eq!(report.memory_records, 2);
@@ -533,7 +537,7 @@ backend = "markdown"
         );
 
         let output = dir.path().join("test.alf");
-        let report = export(&ws, &output).unwrap();
+        let report = export(&ws, &output, None).unwrap();
 
         assert_eq!(report.agent_name, "MdAgent");
         assert_eq!(report.memory_records, 2);
@@ -547,15 +551,15 @@ backend = "markdown"
 
         let out1 = dir.path().join("out1.alf");
         let out2 = dir.path().join("out2.alf");
-        export(&ws, &out1).unwrap();
-        export(&ws, &out2).unwrap();
+        export(&ws, &out1, None).unwrap();
+        export(&ws, &out2, None).unwrap();
 
         assert!(ws.join(".alf-agent-id").is_file());
     }
 
     #[test]
     fn export_nonexistent_workspace() {
-        let result = export(Path::new("/nonexistent"), Path::new("/tmp/out.alf"));
+        let result = export(Path::new("/nonexistent"), Path::new("/tmp/out.alf"), None);
         assert!(result.is_err());
     }
 }

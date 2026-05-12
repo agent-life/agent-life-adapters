@@ -27,6 +27,7 @@ forward_compatible_enum! {
         SessionToken  => "session_token",
         SshKey        => "ssh_key",
         Certificate   => "certificate",
+        Account       => "account",
         Custom        => "custom",
     }
 }
@@ -94,6 +95,13 @@ pub struct CredentialRecord {
     /// Human-readable label.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+
+    /// Free-form plaintext description of what this credential is for
+    /// (e.g., `"agent-life.run"`, `"primary email for kleo agent"`).
+    /// Plaintext — visible to the sync service. See §3.4.6 for opaque-mode
+    /// guidance when this leak is unacceptable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 
     /// Capability names that this credential enables.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -205,6 +213,7 @@ mod tests {
                     },
                     created_at: now,
                     label: Some("OpenAI Production Key".into()),
+                    description: Some("Primary LLM provider key for the kleo agent".into()),
                     capabilities_granted: vec!["web_search".into(), "embeddings".into()],
                     updated_at: Some(now),
                     last_rotated_at: None,
@@ -227,6 +236,7 @@ mod tests {
                     },
                     created_at: now,
                     label: None,
+                    description: None,
                     capabilities_granted: vec![],
                     updated_at: None,
                     last_rotated_at: None,
@@ -303,6 +313,7 @@ mod tests {
             },
             created_at: now,
             label: None,
+            description: None,
             capabilities_granted: vec![],
             updated_at: None,
             last_rotated_at: None,
@@ -324,6 +335,7 @@ mod tests {
 
         // Optional fields absent
         assert!(!obj.contains_key("label"));
+        assert!(!obj.contains_key("description"));
         assert!(!obj.contains_key("capabilities_granted"));
         assert!(!obj.contains_key("updated_at"));
         assert!(!obj.contains_key("last_rotated_at"));
@@ -420,6 +432,7 @@ mod tests {
             ("session_token", CredentialType::SessionToken),
             ("ssh_key", CredentialType::SshKey),
             ("certificate", CredentialType::Certificate),
+            ("account", CredentialType::Account),
             ("custom", CredentialType::Custom),
         ];
 
@@ -429,5 +442,41 @@ mod tests {
             assert_eq!(parsed, expected, "parsing {s}");
             assert_eq!(serde_json::to_string(&parsed).unwrap(), json_str);
         }
+    }
+
+    #[test]
+    fn account_credential_with_description() {
+        let now = Utc::now();
+        let cred = CredentialRecord {
+            id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            service: "email".into(),
+            credential_type: CredentialType::Account,
+            encrypted_payload: "ciphertext==".into(),
+            encryption: EncryptionMetadata {
+                algorithm: "xchacha20-poly1305".into(),
+                nonce: "nonce==".into(),
+                kdf: None,
+                kdf_params: None,
+                extra: HashMap::new(),
+            },
+            created_at: now,
+            label: Some("kleo@agent-life.run".into()),
+            description: Some("agent-life.run".into()),
+            capabilities_granted: vec![],
+            updated_at: None,
+            last_rotated_at: None,
+            expires_at: None,
+            tags: vec!["agent-provisioned".into()],
+            extra: HashMap::new(),
+        };
+
+        let value = serde_json::to_value(&cred).unwrap();
+        assert_eq!(value["credential_type"], "account");
+        assert_eq!(value["description"], "agent-life.run");
+        assert_eq!(value["label"], "kleo@agent-life.run");
+
+        let deserialized: CredentialRecord = serde_json::from_value(value).unwrap();
+        assert_eq!(deserialized, cred);
     }
 }

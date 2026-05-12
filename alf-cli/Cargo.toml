@@ -1,6 +1,6 @@
 [package]
 name = "alf-cli"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 description = "CLI for the Agent Life Format — export, import, validate, and sync agent data"
 license = "MIT"
@@ -15,6 +15,7 @@ alf-core = { path = "../alf-core" }
 adapter-openclaw = { path = "../adapter-openclaw" }
 adapter-zeroclaw = { path = "../adapter-zeroclaw" }
 anyhow = "1"
+base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 colored = "2"

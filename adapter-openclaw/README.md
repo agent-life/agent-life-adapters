@@ -301,7 +301,9 @@ All three files are also preserved verbatim in `raw/openclaw/` for lossless roun
 
 OpenClaw stores credentials in `~/.openclaw/credentials/` and in auth profiles at `~/.openclaw/agents/<agentId>/agent/auth-profiles.json`. These contain OAuth tokens, API keys, and provider credentials.
 
-The adapter does NOT export raw credential secrets. It exports credential metadata (service name, credential type, capability grants) with the `encrypted_payload` field containing a placeholder. Actual credential migration requires the user to re-authenticate in the target runtime. This is a deliberate security decision.
+The adapter exports credential **metadata only** when no ALF vault key is supplied (`encrypted_payload` is the placeholder `<not-exported>`). When you pass a vault key to `alf export` or `alf sync` (`--vault-key-file`, `ALF_VAULT_KEY`, etc.), it encrypts secret material from `auth-profiles.json` into Layer 4 per the ALF spec. See [vault-key-management.md](../../docs/vault-key-management.md).
+
+Actual credential migration without encryption still requires the user to re-authenticate in the target runtime if they never configured a vault key.
 
 ### Raw Source Preservation
 

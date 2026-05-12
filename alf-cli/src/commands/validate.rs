@@ -25,7 +25,7 @@ struct FindingJson {
     message: String,
 }
 
-pub fn run(alf_file: &Path) -> Result<()> {
+pub fn run(alf_file: &Path, strict_crypto: bool) -> Result<()> {
     let human = output::human_mode();
 
     if !alf_file.exists() {
@@ -75,7 +75,12 @@ pub fn run(alf_file: &Path) -> Result<()> {
     }
 
     if let Some(credentials) = archive.read_credentials()? {
-        report.merge(validation::validate_credentials(&credentials));
+        let cred_report = if strict_crypto {
+            validation::validate_credentials_strict(&credentials)
+        } else {
+            validation::validate_credentials(&credentials)
+        };
+        report.merge(cred_report);
     }
 
     let all_memory = archive.read_all_memory()?;

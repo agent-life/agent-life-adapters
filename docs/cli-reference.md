@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.2.1 | Updated: 2026-04-05
+> Version: 0.2.2 | Updated: 2026-05-10
 > HTML: https://agent-life.ai/docs/cli
 > Markdown: https://agent-life.ai/docs/cli.md
 
@@ -29,14 +29,32 @@ Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable col
 | `alf purge` | Delete cloud sync data and agent registration | Yes |
 | `alf import` | .alf archive → workspace | No |
 | `alf validate` | Validate .alf archive | No |
+| `alf vault` | Layer 4: keygen, encrypt/decrypt/list/delete credentials | No (decrypt/encrypt need a key) |
 | `alf help` | Help topics and status | No |
+
+### Vault key flags (export, sync, import, restore, `alf vault encrypt|decrypt`)
+
+Optional. Behavior depends on the command:
+
+- **`alf export` / `alf sync`:** When no key resolves, adapters still run but emit the **legacy metadata-only** credential path (`encrypted_payload: "<not-exported>"`, `algorithm: "none"`). When a key resolves, Layer 4 holds **real AEAD ciphertext**.
+- **`alf import` / `alf restore`:** When a key resolves, encrypted credentials are **decrypted and written** into the runtime. When no key resolves, other layers import normally but **secrets are not restored**; if the archive declares credentials, expect a **warning** in JSON (`warnings`) or stderr (human mode). Legacy `<not-exported>` rows are skipped with warnings.
+
+| Flag | Description |
+|---|---|
+| `--vault-key-file PATH` | File with base64-encoded 32-byte key |
+| `--vault-key-env VAR` | Env var name holding base64 key (default var: `ALF_VAULT_KEY` when reading) |
+| `--vault-passphrase-file PATH` | Argon2id passphrase from file |
+| `--vault-passphrase-env VAR` | Argon2id passphrase from env (e.g. `ALF_VAULT_PASSPHRASE`) |
+| `--vault-salt BASE64` | Salt for passphrase mode (optional; documented in [vault-key-management.md](vault-key-management.md)) |
+
+Default key file if none of the above apply: `~/.openclaw/state/.alf-vault-key` or `~/.zeroclaw/state/.alf-vault-key` depending on `-r` / `--runtime`.
 
 ---
 
 ## alf check
 
 Pre-flight diagnostic. Discovers the workspace, verifies resources, reports readiness.
-Run this first before any other command — it tells you whether sync will work and what to fix if not.
+Run this first before any other command — it tells you whether sync will work and surfaces guidance when not.
 
 ### Usage
 
@@ -108,15 +126,15 @@ The `workspace.source` field in the output reports which method was used: `"flag
       "resources": { ... },
       "alf": { "config_exists": false, "api_key_set": false, "agent_tracked": false, "last_synced_sequence": null, "service_reachable": false },
       "issues": [
-        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found", "fix": "Pass correct path: alf check -r openclaw -w /path/to/workspace" },
-        { "severity": "error", "code": "no_api_key", "message": "No API key configured", "fix": "Run: alf login --key <your-api-key>" }
+        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found", "suggestion": "Pass correct path: alf check -r openclaw -w /path/to/workspace" },
+        { "severity": "error", "code": "no_api_key", "message": "No API key configured", "suggestion": "Run: alf login --key <your-api-key>" }
       ],
       "suggestions": ["Get an API key at https://agent-life.ai/settings/api-keys"]
     }
 
 ### Issue Codes
 
-| Code | Severity | Meaning | Fix |
+| Code | Severity | Meaning | Typical suggestion |
 |---|---|---|---|
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
@@ -167,9 +185,11 @@ Store an API key for the agent-life sync service.
 
 Export an agent's complete state from a framework workspace to an `.alf` archive.
 
+**Credentials (Layer 4):** If a vault key resolves (see [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt)), secrets from the runtime are encrypted into the archive. If none resolves, the archive still lists credential **metadata**, but payloads are the placeholder `"<not-exported>"` with `algorithm: "none"` — re-authenticate after import unless you export again with a key.
+
 ### Usage
 
-    alf export -r <runtime> -w <workspace> [-o <output>]
+    alf export -r <runtime> -w <workspace> [-o <output>] [--vault-key-file …]
 
 ### Flags
 
@@ -178,6 +198,11 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 | `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | Yes | Path to the agent workspace directory |
 | `--output` | `-o` | No | Output file path (default: auto-generated in current directory) |
+| `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt) |
+| `--vault-key-env` | | No | |
+| `--vault-passphrase-file` | | No | |
+| `--vault-passphrase-env` | | No | |
+| `--vault-salt` | | No | |
 
 ### JSON Output (success)
 
@@ -185,7 +210,7 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
       "ok": true,
       "output": "/home/user/agent-export-2026-03-14.alf",
       "agent_name": "Atlas",
-      "alf_version": "1.0.0-rc.1",
+      "alf_version": "1.0.0-rc.2",
       "memory_records": 47,
       "file_size": 102400
     }
@@ -200,7 +225,7 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 
 ### Usage
 
-    alf sync -r <runtime> -w <workspace> [--recover] [--force-first-sync]
+    alf sync -r <runtime> -w <workspace> [--recover] [--force-first-sync] [--vault-key-file …]
 
 ### Flags
 
@@ -210,6 +235,7 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 | `--workspace` | `-w` | Yes | Path to the agent workspace directory |
 | `--recover` | | No | When the state file says we have synced before but the local base snapshot is missing, pull the cloud snapshot+deltas to repair the base, then take the normal delta path. Does not touch the workspace. No-op when the local base is already present. |
 | `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
+| **Vault key** | | No | Optional: `--vault-key-file`, `--vault-key-env`, `--vault-passphrase-file`, `--vault-passphrase-env`, `--vault-salt` — see [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt). When set, the snapshot includes real Layer 4 ciphertext. |
 
 ### JSON Output (success — delta)
 
@@ -293,9 +319,11 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
 Download a snapshot (plus uncompacted deltas) from the service and import into a workspace.
 
+**Credentials:** Same rules as [`alf import`](#alf-import) — pass vault key flags (or rely on the default key file) to decrypt Layer 4 into the runtime; otherwise the restore succeeds for non-credential data and **warnings** tell you secrets were not restored.
+
 ### Usage
 
-    alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>]
+    alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>] [--vault-key-file …]
 
 ### Modes
 
@@ -311,6 +339,11 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 | `--workspace` | `-w` | Yes | Path to the target workspace directory |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
+| `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt); when set, encrypted credentials are decrypted and written into the runtime |
+| `--vault-key-env` | | No | |
+| `--vault-passphrase-file` | | No | |
+| `--vault-passphrase-env` | | No | |
+| `--vault-salt` | | No | |
 
 ### JSON Output (success, head restore)
 
@@ -381,9 +414,11 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 
 Import an `.alf` archive into a framework workspace.
 
+**Credentials:** With a resolved vault key, the adapter decrypts ciphertext and restores runtime auth storage. **Without** a key, import still applies memory / identity / principals / raw source, but **does not** write decrypted secrets; check `warnings` in JSON output (e.g. “pass … `ALF_VAULT_KEY` … or re-authenticate”). Rows that were exported as metadata-only (`<not-exported>`) are skipped with per-record warnings.
+
 ### Usage
 
-    alf import -r <runtime> -w <workspace> <alf-file>
+    alf import -r <runtime> -w <workspace> <alf-file> [--vault-key-file …]
 
 ### Flags
 
@@ -391,6 +426,11 @@ Import an `.alf` archive into a framework workspace.
 |---|---|---|---|
 | `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | Yes | Path to the target workspace directory |
+| `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt) |
+| `--vault-key-env` | | No | |
+| `--vault-passphrase-file` | | No | |
+| `--vault-passphrase-env` | | No | |
+| `--vault-salt` | | No | |
 
 ### Positional Arguments
 
@@ -419,13 +459,19 @@ Validate an `.alf` or `.alf-delta` file against the ALF JSON schemas.
 
 ### Usage
 
-    alf validate <alf-file>
+    alf validate <alf-file> [--strict-crypto]
 
 ### Positional Arguments
 
 | Argument | Description |
 |---|---|
 | `<alf-file>` | Path to the `.alf` or `.alf-delta` archive to validate |
+
+### Flags
+
+| Flag | Required | Description |
+|---|---|---|
+| `--strict-crypto` | No | Credential records with `algorithm: "none"` (legacy metadata-only) or unknown algorithms become **errors** instead of warnings |
 
 ### JSON Output (success — valid)
 
@@ -448,6 +494,38 @@ Validate an `.alf` or `.alf-delta` file against the ALF JSON schemas.
         { "path": "memory/2026-Q1.jsonl[3].memory_type", "message": "Unknown enum value: 'custom_type'" }
       ]
     }
+
+---
+
+## alf vault
+
+Zero-knowledge tooling for **Layer 4** (`credentials.json` inside an `.alf` archive). Each record is encrypted separately. **`alf vault list`** and **`alf vault delete`** do **not** need the vault key (they operate on plaintext descriptor fields only).
+
+### Subcommands
+
+| Subcommand | Purpose |
+|---|---|
+| `alf vault keygen` | Generate a random 32-byte key (`--out FILE` or `--stdout`; `--force` to overwrite) |
+| `alf vault encrypt` | Read a `VaultPayload` JSON from `--in` / stdin (or a raw secret string); emit one `CredentialRecord` JSON on stdout |
+| `alf vault decrypt` | Decrypt one selected record from `credentials.json` or an `.alf` (`--in`); requires vault key; refuses non-TTY stdout without `--yes-insecure` |
+| `alf vault list` | Print plaintext descriptors for all records (no key) |
+| `alf vault delete` | Remove one record by `--id` / `--label` / `--service` from `credentials.json` (no key); `--out` to write elsewhere |
+
+### `alf vault encrypt`
+
+    alf vault encrypt -r openclaw -s <service> [-t <credential_type>] [--description …] [--label …] [--tag …] [--capability …] [--in FILE]
+
+Requires a resolved vault key. `--type` / `-t` defaults to `custom`. `--agent-id` overrides the UUID embedded in the record (default: nil UUID for ad-hoc use).
+
+### `alf vault decrypt`
+
+Exactly one of `--id`, `--label`, or `--service` must match a single record.
+
+### `alf vault delete`
+
+Exactly one selector; mutates the credentials document on disk (or `--out`).
+
+See [vault-key-management.md](vault-key-management.md) for key storage conventions (OpenClaw, ZeroClaw, `ALF_VAULT_KEY`, fly.io).
 
 ---
 

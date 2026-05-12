@@ -2,6 +2,8 @@
 
 use crate::adapter;
 use crate::output;
+use crate::vault_key::{self, VaultKeyArgs};
+use alf_core::ImportOptions;
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -20,7 +22,12 @@ struct ImportResult {
     warnings: Vec<String>,
 }
 
-pub fn run(runtime: &str, alf_file: &Path, workspace: &Path) -> Result<()> {
+pub fn run(
+    runtime: &str,
+    alf_file: &Path,
+    workspace: &Path,
+    key_args: &VaultKeyArgs,
+) -> Result<()> {
     let human = output::human_mode();
 
     let adapter = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -51,7 +58,17 @@ pub fn run(runtime: &str, alf_file: &Path, workspace: &Path) -> Result<()> {
         output::progress(&format!("Importing into {} workspace...", adapter.name()));
     }
 
-    let report = adapter.import(alf_file, workspace)?;
+    let resolved_key = vault_key::resolve(key_args, runtime)?;
+    if let Some((_, src)) = &resolved_key {
+        output::progress(&format!(
+            "Using vault key from {} — credentials will be decrypted and restored",
+            src.label()
+        ));
+    }
+    let options = ImportOptions {
+        vault_key: resolved_key.as_ref().map(|(k, _)| k),
+    };
+    let report = adapter.import_with_options(alf_file, workspace, options)?;
 
     if human {
         println!("{} Import complete", "✓".green().bold());

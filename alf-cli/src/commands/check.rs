@@ -91,7 +91,7 @@ struct Issue {
     severity: String, // "error", "warning", "info"
     code: String,
     message: String,
-    fix: String,
+    suggestion: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -261,7 +261,7 @@ fn collect_issues(
             severity: "error".into(),
             code: "workspace_not_found".into(),
             message: format!("Workspace directory not found at {}", ws.path),
-            fix: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
+            suggestion: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
                 .into(),
         });
         return issues; // no point checking resources if workspace doesn't exist
@@ -272,7 +272,7 @@ fn collect_issues(
             severity: "warning".into(),
             code: "workspace_not_writable".into(),
             message: format!("Workspace exists but is not writable: {}", ws.path),
-            fix: "Check file permissions on the workspace directory".into(),
+            suggestion: "Check file permissions on the workspace directory".into(),
         });
     }
 
@@ -287,7 +287,7 @@ fn collect_issues(
             severity: "warning".into(),
             code: "workspace_empty".into(),
             message: "No markdown files found in workspace root".into(),
-            fix: "Workspace may not be initialized — check the path".into(),
+            suggestion: "Workspace may not be initialized — check the path".into(),
         });
     }
 
@@ -296,7 +296,7 @@ fn collect_issues(
             severity: "warning".into(),
             code: "no_soul_md".into(),
             message: "SOUL.md not found in workspace".into(),
-            fix: "Agent has no persona file; export will use a fallback name".into(),
+            suggestion: "Agent has no persona file; export will use a fallback name".into(),
         });
     }
 
@@ -307,7 +307,7 @@ fn collect_issues(
             severity: "warning".into(),
             code: "no_memory_content".into(),
             message: "No MEMORY.md and no daily logs in memory/ directory".into(),
-            fix: "Nothing to sync — agent has no memories yet".into(),
+            suggestion: "Nothing to sync — agent has no memories yet".into(),
         });
     }
 
@@ -318,7 +318,7 @@ fn collect_issues(
                     severity: "warning".into(),
                     code: "memory_dir_empty".into(),
                     message: "memory/ directory exists but has no daily log files".into(),
-                    fix: "No daily logs yet — memories will accumulate over time".into(),
+                    suggestion: "No daily logs yet — memories will accumulate over time".into(),
                 });
             }
         }
@@ -329,7 +329,7 @@ fn collect_issues(
             severity: "error".into(),
             code: "no_api_key".into(),
             message: "No API key configured".into(),
-            fix: "Run: alf login --key <your-api-key>".into(),
+            suggestion: "Run: alf login --key <your-api-key>".into(),
         });
     }
 
@@ -338,7 +338,7 @@ fn collect_issues(
             severity: "error".into(),
             code: "service_unreachable".into(),
             message: "API endpoint not responding".into(),
-            fix: "Check network connectivity and API URL in ~/.alf/config.toml".into(),
+            suggestion: "Check network connectivity and API URL in ~/.alf/config.toml".into(),
         });
     }
 
@@ -350,7 +350,7 @@ fn collect_issues(
                 severity: "info".into(),
                 code: "openclaw_config_not_found".into(),
                 message: "~/.openclaw/openclaw.json not found".into(),
-                fix: "OpenClaw may not be installed, or uses a non-standard location".into(),
+                suggestion: "OpenClaw may not be installed, or uses a non-standard location".into(),
             });
         }
     }
@@ -368,7 +368,7 @@ fn collect_issues(
                         "-w path ({}) differs from openclaw.json configured path ({})",
                         ws.path, oc_ws
                     ),
-                    fix: "May be intentional; noting for awareness".into(),
+                    suggestion: "May be intentional; noting for awareness".into(),
                 });
             }
         }
@@ -588,7 +588,7 @@ fn print_human(result: &CheckResult) {
                 "    [{}] {} ({})",
                 severity_label, issue.message, issue.code
             );
-            println!("      Fix: {}", issue.fix);
+            println!("      Suggestion: {}", issue.suggestion);
         }
         println!();
     }

@@ -20,6 +20,7 @@ pub mod memory;
 pub mod adapter;
 pub mod archive;
 pub mod credentials;
+pub mod crypto;
 pub mod delta;
 pub mod identity;
 pub mod manifest;
@@ -28,9 +29,13 @@ pub mod principals;
 pub mod rebuild;
 pub mod validation;
 
-pub use adapter::{Adapter, ExportReport, ImportReport};
+pub use adapter::{Adapter, ExportOptions, ExportReport, ImportOptions, ImportReport};
 pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
 pub use credentials::*;
+pub use crypto::{
+    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob,
+    VaultKey, VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
+};
 pub use delta::{apply_delta, apply_deltas, compute_delta};
 pub use identity::*;
 pub use manifest::*;

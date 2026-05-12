@@ -520,8 +520,8 @@ if [ "$ready" = "true" ]; then
         echo "Sync failed: $error" >&2
     fi
 else
-    # Report issues — agent can fix some automatically
-    echo "$check" | jq -r '.issues[] | "[\(.severity)] \(.message)\n  Fix: \(.fix)"' >&2
+    # Report issues — agent can act on suggestions where appropriate
+    echo "$check" | jq -r '.issues[] | "[\(.severity)] \(.message)\n  Suggestion: \(.suggestion)"' >&2
 fi
 ```
 
@@ -533,7 +533,7 @@ This is dramatically better than parsing human-readable text with regex, which i
 
 ### 5.1 Purpose
 
-A pre-flight diagnostic that discovers the OpenClaw environment, verifies all resources ALF needs, and reports issues with machine-readable fix instructions. This is the first command an agent should run — it answers "can I sync, and if not, what do I need to fix?"
+A pre-flight diagnostic that discovers the OpenClaw environment, verifies all resources ALF needs, and reports issues with machine-readable suggestions. This is the first command an agent should run — it answers "can I sync, and if not, what should I look at?"
 
 Unlike `alf help status` (which reports ALF's own state), `alf check` inspects the **target runtime environment**: workspace location, file presence, memory content, OpenClaw configuration, and readiness to sync.
 
@@ -643,13 +643,13 @@ The check command verifies every resource the adapter reads during export:
       "severity": "error",
       "code": "workspace_not_found",
       "message": "Workspace directory not found at /home/user/.openclaw/workspace",
-      "fix": "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
+      "suggestion": "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
     },
     {
       "severity": "error",
       "code": "no_api_key",
       "message": "No API key configured",
-      "fix": "Run: alf login --key <your-api-key>"
+      "suggestion": "Run: alf login --key <your-api-key>"
     }
   ],
   "suggestions": [
@@ -772,7 +772,7 @@ if [ "$ready" = "true" ]; then
     alf sync -r openclaw -w "$ws"
 else
     # Report issues to user
-    echo "$check" | jq -r '.issues[] | "[\(.severity)] \(.message)\n  Fix: \(.fix)"'
+    echo "$check" | jq -r '.issues[] | "[\(.severity)] \(.message)\n  Suggestion: \(.suggestion)"'
 fi
 ```
 
@@ -1233,7 +1233,7 @@ This mirrors the existing `tests/installer-openclaw/` flow but with JSON-first o
 | CLI output philosophy | JSON-first (stdout=JSON, stderr=progress) | Agents are the primary CLI consumer. JSON on stdout is parseable; human progress on stderr is still visible in terminals. `--human` / `ALF_HUMAN=1` opts back into text output. |
 | Install script output | JSON on stdout by default | Same philosophy as CLI. Agents piping `curl ... \| sh` get structured results. Humans see progress on stderr. |
 | Scope of CLI JSON changes | All commands in 3.5a | The cost of converting each command is low (~15 lines per command). Doing it incrementally would mean the SKILL.md instructions differ per command, which is confusing. Better to do it all at once. |
-| `alf check` command | New command for environment diagnostics | Agents need a pre-flight check that discovers the workspace, verifies resources, and reports issues with fix instructions. This is the entry point the SKILL.md teaches agents to use. |
+| `alf check` command | New command for environment diagnostics | Agents need a pre-flight check that discovers the workspace, verifies resources, and reports issues with suggestions. This is the entry point the SKILL.md teaches agents to use. |
 | Workspace auto-discovery | Read `openclaw.json` → `agents.defaults.workspace` | Agents shouldn't have to guess workspace paths. The check command discovers it and reports it in JSON. |
 | `defaults.workspace` config field | Added to `~/.alf/config.toml` | Allows saving a discovered workspace path for reuse across commands. `-w` flag always takes precedence. |
 | Auto-save workspace to config | Deferred | `alf check` reports the discovered path but doesn't write config. Requires a `config set` subcommand or explicit save flag. Keep scope tight for 3.5a. |

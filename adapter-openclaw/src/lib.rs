@@ -24,7 +24,7 @@ use anyhow::Result;
 
 // Re-export the shared types so `crate::ExportReport` / `crate::ImportReport`
 // continue to resolve in export.rs and import.rs without changes.
-pub use alf_core::adapter::{ExportReport, ImportReport};
+pub use alf_core::adapter::{ExportOptions, ExportReport, ImportOptions, ImportReport};
 pub use alf_core::Adapter;
 
 pub mod credential_map;
@@ -53,11 +53,21 @@ impl Adapter for OpenClawAdapter {
         "OpenClaw framework — file-based Markdown agent workspace"
     }
 
-    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
-        export::export(workspace, output)
+    fn export_with_options(
+        &self,
+        workspace: &Path,
+        output: &Path,
+        options: ExportOptions<'_>,
+    ) -> Result<ExportReport> {
+        export::export(workspace, output, options.vault_key)
     }
 
-    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
-        import::import(alf_file, workspace)
+    fn import_with_options(
+        &self,
+        alf_file: &Path,
+        workspace: &Path,
+        options: ImportOptions<'_>,
+    ) -> Result<ImportReport> {
+        import::import(alf_file, workspace, options.vault_key)
     }
 }

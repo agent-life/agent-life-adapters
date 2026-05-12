@@ -23,7 +23,7 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub use alf_core::adapter::{ExportReport, ImportReport};
+pub use alf_core::adapter::{ExportOptions, ExportReport, ImportOptions, ImportReport};
 pub use alf_core::Adapter;
 
 pub mod config_parser;
@@ -55,11 +55,21 @@ impl Adapter for ZeroClawAdapter {
         "ZeroClaw framework — configurable backend agent workspace"
     }
 
-    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
-        export::export(workspace, output)
+    fn export_with_options(
+        &self,
+        workspace: &Path,
+        output: &Path,
+        options: ExportOptions<'_>,
+    ) -> Result<ExportReport> {
+        export::export(workspace, output, options.vault_key)
     }
 
-    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
-        import::import(alf_file, workspace)
+    fn import_with_options(
+        &self,
+        alf_file: &Path,
+        workspace: &Path,
+        options: ImportOptions<'_>,
+    ) -> Result<ImportReport> {
+        import::import(alf_file, workspace, options.vault_key)
     }
 }

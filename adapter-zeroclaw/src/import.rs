@@ -15,7 +15,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use alf_core::AlfReader;
+use alf_core::{AlfReader, VaultKey};
 
 use crate::ImportReport;
 
@@ -27,7 +27,10 @@ use crate::ImportReport;
 ///
 /// Creates workspace directories if they don't exist. Prefers raw source files
 /// when available. Falls back to reconstructing workspace from ALF data.
-pub fn import(alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
+///
+/// `vault_key`, when supplied, decrypts credential records and writes a
+/// fresh `auth_profiles.json` to the workspace.
+pub fn import(alf_file: &Path, workspace: &Path, vault_key: Option<&VaultKey>) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
     let reader = std::io::BufReader::new(file);
@@ -68,6 +71,28 @@ pub fn import(alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
     let credentials = alf.read_credentials()?;
     let all_memory = alf.read_all_memory()?;
 
+    // Restore credentials when a vault key is supplied.
+    if let (Some(key), Some(doc)) = (vault_key, credentials.as_ref()) {
+        match restore_credentials(doc, key, workspace) {
+            Ok(n) => {
+                if n > 0 {
+                    warnings.push(format!(
+                        "Restored {n} credential(s) into auth_profiles.json. Verify with ZeroClaw."
+                    ));
+                }
+            }
+            Err(e) => warnings.push(format!("Credential restore failed: {e}")),
+        }
+    } else if let Some(doc) = credentials.as_ref() {
+        if !doc.credentials.is_empty() {
+            warnings.push(format!(
+                "{} credential(s) found in archive (metadata only). \
+                 Pass --vault-key-file or set ALF_VAULT_KEY to restore secret material.",
+                doc.credentials.len()
+            ));
+        }
+    }
+
     Ok(ImportReport {
         agent_name,
         memory_records: all_memory.len() as u64,
@@ -82,6 +107,62 @@ pub fn import(alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
             .unwrap_or(0),
         warnings,
     })
+}
+
+fn restore_credentials(
+    doc: &alf_core::CredentialsDocument,
+    key: &VaultKey,
+    workspace: &Path,
+) -> Result<usize> {
+    use serde_json::{Map, Value};
+
+    let mut profiles = Map::new();
+    let mut restored = 0;
+
+    for cred in &doc.credentials {
+        if cred.encryption.algorithm == "none" || cred.encrypted_payload == "<not-exported>" {
+            continue;
+        }
+        let plaintext = match alf_core::decrypt_record(cred, key) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        let payload = match alf_core::VaultPayload::from_json_bytes(&plaintext) {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        let key_name = cred
+            .label
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", cred.service, cred.id));
+        let mut entry = Map::new();
+        entry.insert("service".into(), Value::String(cred.service.clone()));
+        entry.insert("kind".into(), Value::String(payload.kind.clone()));
+        entry.insert("secret".into(), Value::String(payload.secret.clone()));
+        if let Some(u) = payload.username.clone() {
+            entry.insert("username".into(), Value::String(u));
+        }
+        if let Some(section) = payload.extra.get("zeroclaw_section").cloned() {
+            entry.insert("section".into(), section);
+        }
+        if let Some(field) = payload.extra.get("zeroclaw_field").cloned() {
+            entry.insert("field".into(), field);
+        }
+        profiles.insert(key_name, Value::Object(entry));
+        restored += 1;
+    }
+
+    if restored == 0 {
+        return Ok(0);
+    }
+
+    let target = workspace.join("auth_profiles.json");
+    let serialized = serde_json::to_string_pretty(&Value::Object(profiles))?;
+    fs::write(&target, serialized)
+        .with_context(|| format!("Failed to write {}", target.display()))?;
+
+    Ok(restored)
 }
 
 // ---------------------------------------------------------------------------
@@ -369,7 +450,7 @@ mod tests {
 
         // Export
         let alf_file = dir.path().join("export.alf");
-        let export_report = export::export(&ws, &alf_file).unwrap();
+        let export_report = export::export(&ws, &alf_file, None).unwrap();
         assert!(export_report.memory_records > 0);
 
         // Import into fresh workspace
@@ -377,7 +458,7 @@ mod tests {
         let target_ws = target_dir.path().join("workspace");
         fs::create_dir_all(&target_ws).unwrap();
 
-        let import_report = import(&alf_file, &target_ws).unwrap();
+        let import_report = import(&alf_file, &target_ws, None).unwrap();
         assert_eq!(import_report.agent_name, "ZCBot");
         assert!(import_report.identity_imported);
         assert_eq!(import_report.principals_count, 1);
@@ -405,11 +486,11 @@ mod tests {
         );
 
         let alf_file = dir.path().join("export.alf");
-        export::export(&ws, &alf_file).unwrap();
+        export::export(&ws, &alf_file, None).unwrap();
 
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep).unwrap();
+        let report = import(&alf_file, &deep, None).unwrap();
         assert_eq!(report.agent_name, "DirTest");
         assert!(deep.is_dir());
     }

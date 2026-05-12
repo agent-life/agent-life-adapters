@@ -816,6 +816,7 @@ mod tests {
                 },
                 created_at: now,
                 label: Some("Test Key".into()),
+                description: None,
                 capabilities_granted: vec![],
                 updated_at: None,
                 last_rotated_at: None,

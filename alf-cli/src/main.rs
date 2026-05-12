@@ -10,11 +10,14 @@ mod context;
 mod fs_private;
 pub mod output;
 mod state;
+mod vault_key;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;
 use std::process;
+
+use crate::vault_key::VaultKeyArgs;
 
 #[derive(Parser)]
 #[command(
@@ -54,6 +57,9 @@ enum Command {
         /// Output .alf file path [default: ./<agent-name>.alf]
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
     },
 
     /// Import an .alf archive into an agent workspace
@@ -73,17 +79,26 @@ enum Command {
 
         /// Path to the .alf file to import
         alf_file: PathBuf,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
     },
 
     /// Validate an .alf archive against the ALF specification
     #[command(
         long_about = "Validate checks the .alf file structure and contents against the \
         ALF spec. Does not modify any files.\n\n\
-        Example: alf validate backup.alf"
+        --strict-crypto: credential records with algorithm \"none\" or unknown algorithms become errors.\n\n\
+        Example: alf validate backup.alf\n\
+        Example: alf validate --strict-crypto backup.alf"
     )]
     Validate {
         /// Path to the .alf file to validate
         alf_file: PathBuf,
+
+        /// Treat weak/unknown credential crypto as errors (default: legacy metadata-only and unknown algorithms are warnings)
+        #[arg(long)]
+        strict_crypto: bool,
     },
 
     /// Incremental sync to the cloud
@@ -99,7 +114,8 @@ enum Command {
         local state exists; uploads the current workspace as a fresh snapshot, overwriting \
         cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
         Example: alf sync -r openclaw -w ./my-agent\n\
-        Example: alf sync --recover -r openclaw -w ./my-agent"
+        Example: alf sync --recover -r openclaw -w ./my-agent\n\n\
+        When a vault key is resolved (same flags as export/import), the snapshot includes encrypted Layer 4 credentials."
     )]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
@@ -117,6 +133,9 @@ enum Command {
         /// Allow first sync to overwrite an already-registered cloud agent
         #[arg(long)]
         force_first_sync: bool,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
     },
 
     /// Download and restore from the cloud
@@ -148,6 +167,9 @@ enum Command {
         /// ~/.alf/state/ is not modified.
         #[arg(long, value_name = "N")]
         at_sequence: Option<u64>,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
     },
 
     /// Remove cloud sync data and agent registration (does not delete local workspace files)
@@ -216,6 +238,208 @@ enum Command {
         #[arg(long, hide = true)]
         json: bool,
     },
+
+    /// Manage the zero-knowledge credentials vault
+    #[command(
+        long_about = "Vault tooling for ALF Layer 4 (credentials). Each credential is\n\
+        independently encrypted; plaintext descriptors (service, label, description,\n\
+        tags) stay visible so an agent can find and delete records without ever\n\
+        holding the vault key. See https://agent-life.ai/docs/cli for details."
+    )]
+    Vault {
+        #[command(subcommand)]
+        command: VaultCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum VaultCommand {
+    /// Generate a fresh 32-byte vault key
+    #[command(
+        long_about = "Generates a cryptographically-random 32-byte vault key and writes\n\
+        it as base64 to the given file with mode 0600. Pass --stdout to print the\n\
+        key on stdout instead (use for piping into env vars on ephemeral hosts).\n\n\
+        Example: alf vault keygen --out ~/.openclaw/state/.alf-vault-key"
+    )]
+    Keygen {
+        /// File to write the base64-encoded key to (mode 0600)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+
+        /// Print the base64 key on stdout (for env-var pipelines)
+        #[arg(long)]
+        stdout: bool,
+
+        /// Overwrite an existing key file
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Encrypt a plaintext credential into a CredentialRecord
+    #[command(
+        long_about = "Reads plaintext JSON (a VaultPayload envelope) from --in or stdin,\n\
+        encrypts it under the resolved vault key, and emits one CredentialRecord JSON\n\
+        on stdout. If the input is not JSON, it is treated as a raw API key string.\n\n\
+        Example: echo '{\"vault_payload_version\":1,\"kind\":\"login\",\"username\":\"kleo@agent-life.run\",\"secret\":\"...\"}' \\\n\
+        | alf vault encrypt -r openclaw --service email --type account \\\n\
+        --description agent-life.run --label kleo@agent-life.run"
+    )]
+    Encrypt {
+        /// Plaintext input file. Stdin if omitted.
+        #[arg(short = 'i', long = "in")]
+        input: Option<PathBuf>,
+
+        /// Service identifier (e.g., "openai", "email").
+        #[arg(short, long)]
+        service: String,
+
+        /// Credential type: api_key, oauth_token, account, custom, ...
+        #[arg(short = 't', long = "type", default_value = "custom")]
+        credential_type: String,
+
+        /// Optional plaintext description (visible to the sync service).
+        #[arg(short, long)]
+        description: Option<String>,
+
+        /// Optional plaintext label.
+        #[arg(short, long)]
+        label: Option<String>,
+
+        /// Plaintext tags (repeatable: --tag a --tag b).
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+
+        /// Capability names this credential enables.
+        #[arg(long = "capability")]
+        capabilities: Vec<String>,
+
+        /// Agent UUID (defaults to the nil UUID for ad-hoc records).
+        #[arg(short = 'a', long = "agent-id")]
+        agent_id: Option<String>,
+
+        /// Runtime for default key path resolution (openclaw, zeroclaw).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
+    },
+
+    /// Decrypt one record and print its payload
+    #[command(
+        long_about = "Reads credentials.json (or the entry inside a .alf archive),\n\
+        decrypts a single selected record under the resolved key, and prints the\n\
+        plaintext envelope. Refuses to print to non-TTY stdout without --yes-insecure.\n\n\
+        Select with one of: --id <UUID>, --label <STR>, --service <STR>.\n\n\
+        Example: alf vault decrypt --in credentials.json --label kleo@agent-life.run"
+    )]
+    Decrypt {
+        /// Path to credentials.json or .alf archive.
+        #[arg(short = 'i', long = "in")]
+        input: PathBuf,
+
+        /// Record selector: UUID.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Record selector: plaintext label.
+        #[arg(short, long)]
+        label: Option<String>,
+
+        /// Record selector: service name.
+        #[arg(short, long)]
+        service: Option<String>,
+
+        /// Runtime for default key path resolution.
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        /// Allow printing plaintext to a non-TTY stdout.
+        #[arg(long)]
+        yes_insecure: bool,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
+    },
+
+    /// List plaintext descriptors (no key required)
+    #[command(
+        long_about = "Lists the plaintext descriptor fields of every credential in\n\
+        the given file or archive. Never touches ciphertext or keys — useful for\n\
+        triage and for picking a record to surgically delete.\n\n\
+        Example: alf vault list --in credentials.json"
+    )]
+    List {
+        /// Path to credentials.json or .alf archive.
+        #[arg(short = 'i', long = "in")]
+        input: PathBuf,
+    },
+
+    /// Remove a single credential record (NO key required)
+    #[command(
+        long_about = "Drops one record from credentials.json. Selecting works on\n\
+        plaintext descriptors so the agent never needs to decrypt anything — the\n\
+        surgical-delete path for ephemeral hosts that provisioned an account on\n\
+        the user's behalf and now needs to remove it.\n\n\
+        Example: alf vault delete --in credentials.json --label kleo@agent-life.run"
+    )]
+    Delete {
+        /// Path to credentials.json to mutate.
+        #[arg(short = 'i', long = "in")]
+        input: PathBuf,
+
+        /// Record selector: UUID.
+        #[arg(long)]
+        id: Option<String>,
+
+        /// Record selector: plaintext label.
+        #[arg(short, long)]
+        label: Option<String>,
+
+        /// Record selector: service name.
+        #[arg(short, long)]
+        service: Option<String>,
+
+        /// Write to a different file (default: overwrite --in).
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+}
+
+/// Vault-key flags shared by `alf export`, `alf sync`, `alf import`, `alf restore`, and most `alf vault *`.
+#[derive(clap::Args, Debug, Clone, Default)]
+pub struct VaultKeyCli {
+    /// Explicit path to a base64-encoded 32-byte vault key file.
+    #[arg(long, value_name = "PATH")]
+    pub vault_key_file: Option<PathBuf>,
+
+    /// Name of an env var holding a base64 vault key (default: ALF_VAULT_KEY).
+    #[arg(long, value_name = "VAR")]
+    pub vault_key_env: Option<String>,
+
+    /// Path to a file containing a passphrase (Argon2id mode).
+    #[arg(long, value_name = "PATH")]
+    pub vault_passphrase_file: Option<PathBuf>,
+
+    /// Name of an env var holding a passphrase (Argon2id mode).
+    #[arg(long, value_name = "VAR")]
+    pub vault_passphrase_env: Option<String>,
+
+    /// Base64-encoded salt for passphrase mode (default: per-runtime constant).
+    #[arg(long, value_name = "BASE64")]
+    pub vault_salt: Option<String>,
+}
+
+impl VaultKeyCli {
+    pub fn to_args(&self) -> VaultKeyArgs {
+        VaultKeyArgs {
+            key_file: self.vault_key_file.clone(),
+            key_env: self.vault_key_env.clone(),
+            passphrase_file: self.vault_passphrase_file.clone(),
+            passphrase_env: self.vault_passphrase_env.clone(),
+            salt_b64: self.vault_salt.clone(),
+        }
+    }
 }
 
 fn main() {
@@ -230,29 +454,48 @@ fn main() {
             runtime,
             workspace,
             output,
-        } => commands::export::run(&runtime, &workspace, output.as_deref()),
+            key,
+        } => commands::export::run(&runtime, &workspace, output.as_deref(), &key.to_args()),
 
         Command::Import {
             runtime,
             workspace,
             alf_file,
-        } => commands::import::run(&runtime, &alf_file, &workspace),
+            key,
+        } => commands::import::run(&runtime, &alf_file, &workspace, &key.to_args()),
 
-        Command::Validate { alf_file } => commands::validate::run(&alf_file),
+        Command::Validate {
+            alf_file,
+            strict_crypto,
+        } => commands::validate::run(&alf_file, strict_crypto),
 
         Command::Sync {
             runtime,
             workspace,
             recover,
             force_first_sync,
-        } => commands::sync::run(&runtime, &workspace, recover, force_first_sync),
+            key,
+        } => commands::sync::run(
+            &runtime,
+            &workspace,
+            recover,
+            force_first_sync,
+            &key.to_args(),
+        ),
 
         Command::Restore {
             runtime,
             workspace,
             agent,
             at_sequence,
-        } => commands::restore::run(&runtime, &workspace, agent.as_deref(), at_sequence),
+            key,
+        } => commands::restore::run(
+            &runtime,
+            &workspace,
+            agent.as_deref(),
+            at_sequence,
+            &key.to_args(),
+        ),
 
         Command::Purge {
             runtime,
@@ -267,6 +510,8 @@ fn main() {
         }
 
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
+
+        Command::Vault { command } => dispatch_vault(command),
     };
 
     if let Err(err) = result {
@@ -280,6 +525,72 @@ fn main() {
             output::json_error(&format!("{err:#}"), &hint);
         }
         process::exit(1);
+    }
+}
+
+fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
+    match cmd {
+        VaultCommand::Keygen { out, stdout, force } => {
+            commands::vault::keygen(out.as_deref(), force, stdout)
+        }
+        VaultCommand::Encrypt {
+            input,
+            service,
+            credential_type,
+            description,
+            label,
+            tags,
+            capabilities,
+            agent_id,
+            runtime,
+            key,
+        } => commands::vault::encrypt(
+            input.as_deref(),
+            &service,
+            &credential_type,
+            description.as_deref(),
+            label.as_deref(),
+            &tags,
+            &capabilities,
+            agent_id.as_deref(),
+            &key.to_args(),
+            &runtime,
+        ),
+        VaultCommand::Decrypt {
+            input,
+            id,
+            label,
+            service,
+            runtime,
+            yes_insecure,
+            key,
+        } => commands::vault::decrypt(
+            &input,
+            &commands::vault::Selector {
+                id,
+                label,
+                service,
+            },
+            &key.to_args(),
+            &runtime,
+            yes_insecure,
+        ),
+        VaultCommand::List { input } => commands::vault::list(&input),
+        VaultCommand::Delete {
+            input,
+            id,
+            label,
+            service,
+            out,
+        } => commands::vault::delete(
+            &input,
+            &commands::vault::Selector {
+                id,
+                label,
+                service,
+            },
+            out.as_deref(),
+        ),
     }
 }
 

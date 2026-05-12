@@ -16,7 +16,7 @@ use walkdir::WalkDir;
 
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, IdentityLayerInfo, LayerInventory, Manifest,
-    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo, VaultKey,
 };
 
 use crate::credential_map;
@@ -168,7 +168,10 @@ fn quarter_end(year: i32, quarter: u32) -> NaiveDate {
 // ---------------------------------------------------------------------------
 
 /// Export an OpenClaw workspace to an `.alf` archive.
-pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
+///
+/// `vault_key`, when supplied, causes credential records to carry real
+/// AEAD ciphertext instead of the legacy `<not-exported>` placeholder.
+pub fn export(workspace: &Path, output: &Path, vault_key: Option<&VaultKey>) -> Result<ExportReport> {
     if !workspace.is_dir() {
         bail!(
             "Workspace directory does not exist: {}",
@@ -233,6 +236,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         state_dir.as_deref(),
         "main", // default agent ID string
         agent_id,
+        vault_key,
     )?;
 
     // 6. Build manifest
@@ -399,7 +403,7 @@ mod tests {
         );
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output).unwrap();
+        let report = export(&workspace, &output, None).unwrap();
         assert_eq!(report.agent_name, "test-agent");
         assert_eq!(report.memory_records, 1);
         assert!(report.identity_version.is_some());
@@ -419,7 +423,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output).unwrap();
+        let report = export(&workspace, &output, None).unwrap();
         assert_eq!(report.agent_name, "Kleo");
     }
 
@@ -435,7 +439,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output).unwrap();
+        let report = export(&workspace, &output, None).unwrap();
         // 2 sections from Jan 15 + 1 from Jan 16
         assert_eq!(report.memory_records, 3);
     }
@@ -449,7 +453,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output).unwrap();
+        let report = export(&workspace, &output, None).unwrap();
         assert!(report.raw_sources.contains(&"SOUL.md".to_string()));
         assert!(report.raw_sources.contains(&"USER.md".to_string()));
         assert!(report.raw_sources.contains(&"TOOLS.md".to_string()));
@@ -461,8 +465,8 @@ mod tests {
         let output1 = workspace.join("test1.alf");
         let output2 = workspace.join("test2.alf");
 
-        export(&workspace, &output1).unwrap();
-        export(&workspace, &output2).unwrap();
+        export(&workspace, &output1, None).unwrap();
+        export(&workspace, &output2, None).unwrap();
 
         // .alf-agent-id should have been written
         let id_file = workspace.join(".alf-agent-id");
@@ -471,7 +475,7 @@ mod tests {
 
     #[test]
     fn export_nonexistent_workspace() {
-        let result = export(Path::new("/nonexistent/path"), Path::new("/tmp/out.alf"));
+        let result = export(Path::new("/nonexistent/path"), Path::new("/tmp/out.alf"), None);
         assert!(result.is_err());
     }
 }

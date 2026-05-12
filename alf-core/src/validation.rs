@@ -6,11 +6,36 @@
 //!
 //! See §8.2 of the ALF specification for forward compatibility rules.
 
-use crate::credentials::{CredentialType, CredentialsDocument};
+use base64::{engine::general_purpose::STANDARD as B64, Engine};
+
+use crate::credentials::{CredentialType, CredentialsDocument, EncryptionMetadata};
 use crate::identity::Identity;
 use crate::manifest::{Manifest, MemoryInventory};
 use crate::memory::{MemoryRecord, MemoryStatus, MemoryType};
 use crate::principals::PrincipalsDocument;
+
+/// Validation strictness for credential records.
+///
+/// `Lenient` (default): legacy metadata-only records (`algorithm: "none"`)
+/// are warnings, unknown algorithms are warnings. `Strict`: legacy and
+/// unknown algorithms become errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CryptoStrictness {
+    #[default]
+    Lenient,
+    Strict,
+}
+
+/// Known AEAD algorithms and their required nonce lengths (bytes).
+const KNOWN_ALGORITHMS: &[(&str, usize)] = &[
+    ("xchacha20-poly1305", 24),
+    ("aes-256-gcm", 12),
+];
+
+/// OWASP-minimum Argon2id parameters (m = 19 MiB, t = 2, p = 1).
+const ARGON2_MIN_MEMORY_COST: u64 = 19_456;
+const ARGON2_MIN_TIME_COST: u32 = 2;
+const ARGON2_MIN_PARALLELISM: u32 = 1;
 
 /// Severity level for a validation finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -395,8 +420,29 @@ pub fn validate_principals(doc: &PrincipalsDocument) -> ValidationReport {
 // Credentials validation
 // ===========================================================================
 
-/// Validate a credentials document.
+/// Validate a credentials document in lenient mode.
+///
+/// Legacy metadata-only records (`algorithm: "none"`) and unknown
+/// algorithms produce warnings, not errors. See
+/// [`validate_credentials_strict`] for the strict variant.
 pub fn validate_credentials(doc: &CredentialsDocument) -> ValidationReport {
+    validate_credentials_with(doc, CryptoStrictness::Lenient)
+}
+
+/// Validate a credentials document in strict-crypto mode.
+///
+/// `algorithm: "none"` (legacy metadata-only) and unknown algorithm
+/// identifiers are errors. Use this when the caller requires that every
+/// record carry real ciphertext.
+pub fn validate_credentials_strict(doc: &CredentialsDocument) -> ValidationReport {
+    validate_credentials_with(doc, CryptoStrictness::Strict)
+}
+
+/// Validate a credentials document with caller-chosen strictness.
+pub fn validate_credentials_with(
+    doc: &CredentialsDocument,
+    strictness: CryptoStrictness,
+) -> ValidationReport {
     let mut report = ValidationReport::new();
 
     for (i, cred) in doc.credentials.iter().enumerate() {
@@ -415,21 +461,7 @@ pub fn validate_credentials(doc: &CredentialsDocument) -> ValidationReport {
             );
         }
 
-        // encryption.algorithm: non-empty
-        if cred.encryption.algorithm.is_empty() {
-            report.error(
-                format!("{p}.encryption.algorithm"),
-                "Encryption algorithm must not be empty",
-            );
-        }
-
-        // encryption.nonce: non-empty
-        if cred.encryption.nonce.is_empty() {
-            report.error(
-                format!("{p}.encryption.nonce"),
-                "Encryption nonce must not be empty",
-            );
-        }
+        validate_encryption_metadata(&cred.encryption, &cred.encrypted_payload, &p, strictness, &mut report);
 
         // Unknown credential_type warning
         if let CredentialType::Unknown(val) = &cred.credential_type {
@@ -441,6 +473,159 @@ pub fn validate_credentials(doc: &CredentialsDocument) -> ValidationReport {
     }
 
     report
+}
+
+fn validate_encryption_metadata(
+    enc: &EncryptionMetadata,
+    encrypted_payload: &str,
+    record_path: &str,
+    strictness: CryptoStrictness,
+    report: &mut ValidationReport,
+) {
+    // algorithm: non-empty
+    if enc.algorithm.is_empty() {
+        report.error(
+            format!("{record_path}.encryption.algorithm"),
+            "Encryption algorithm must not be empty",
+        );
+        return;
+    }
+
+    // Legacy metadata-only records use algorithm = "none". These come
+    // from older adapter exports that wrote `<not-exported>` as the
+    // placeholder payload. Lenient mode warns; strict mode rejects.
+    if enc.algorithm == "none" {
+        let msg = "Legacy metadata-only credential record (algorithm='none'); no ciphertext to verify";
+        match strictness {
+            CryptoStrictness::Lenient => report.warning(format!("{record_path}.encryption.algorithm"), msg),
+            CryptoStrictness::Strict => report.error(format!("{record_path}.encryption.algorithm"), msg),
+        }
+        return;
+    }
+
+    // nonce: non-empty
+    if enc.nonce.is_empty() {
+        report.error(
+            format!("{record_path}.encryption.nonce"),
+            "Encryption nonce must not be empty",
+        );
+        return;
+    }
+
+    // Known algorithm: enforce nonce length + base64 decodability of
+    // both nonce and ciphertext.
+    let known = KNOWN_ALGORITHMS
+        .iter()
+        .find(|(name, _)| *name == enc.algorithm.as_str());
+    match known {
+        Some((_, nonce_len)) => {
+            match B64.decode(enc.nonce.as_bytes()) {
+                Ok(decoded) => {
+                    if decoded.len() != *nonce_len {
+                        report.error(
+                            format!("{record_path}.encryption.nonce"),
+                            format!(
+                                "Nonce length for {} must be {} bytes, got {}",
+                                enc.algorithm,
+                                nonce_len,
+                                decoded.len()
+                            ),
+                        );
+                    }
+                }
+                Err(_) => report.error(
+                    format!("{record_path}.encryption.nonce"),
+                    "Nonce is not valid base64",
+                ),
+            }
+
+            if B64.decode(encrypted_payload.as_bytes()).is_err() {
+                report.error(
+                    format!("{record_path}.encrypted_payload"),
+                    "Encrypted payload is not valid base64",
+                );
+            }
+        }
+        None => {
+            let msg = format!(
+                "Unknown encryption algorithm '{}' — supported: xchacha20-poly1305, aes-256-gcm",
+                enc.algorithm
+            );
+            match strictness {
+                CryptoStrictness::Lenient => report.warning(format!("{record_path}.encryption.algorithm"), msg),
+                CryptoStrictness::Strict => report.error(format!("{record_path}.encryption.algorithm"), msg),
+            }
+        }
+    }
+
+    // KDF: when present, validate.
+    if let Some(kdf) = &enc.kdf {
+        if kdf == "argon2id" {
+            match &enc.kdf_params {
+                None => report.error(
+                    format!("{record_path}.encryption.kdf_params"),
+                    "Argon2id KDF requires kdf_params",
+                ),
+                Some(params) => {
+                    if let Some(mem) = params.memory_cost {
+                        if mem < ARGON2_MIN_MEMORY_COST {
+                            report.error(
+                                format!("{record_path}.encryption.kdf_params.memory_cost"),
+                                format!(
+                                    "Argon2id memory_cost ({}) below OWASP minimum ({} KiB)",
+                                    mem, ARGON2_MIN_MEMORY_COST
+                                ),
+                            );
+                        }
+                    } else {
+                        report.error(
+                            format!("{record_path}.encryption.kdf_params.memory_cost"),
+                            "Argon2id KDF requires memory_cost",
+                        );
+                    }
+
+                    if let Some(t) = params.time_cost {
+                        if t < ARGON2_MIN_TIME_COST {
+                            report.error(
+                                format!("{record_path}.encryption.kdf_params.time_cost"),
+                                format!(
+                                    "Argon2id time_cost ({}) below OWASP minimum ({})",
+                                    t, ARGON2_MIN_TIME_COST
+                                ),
+                            );
+                        }
+                    } else {
+                        report.error(
+                            format!("{record_path}.encryption.kdf_params.time_cost"),
+                            "Argon2id KDF requires time_cost",
+                        );
+                    }
+
+                    if let Some(p) = params.parallelism {
+                        if p < ARGON2_MIN_PARALLELISM {
+                            report.error(
+                                format!("{record_path}.encryption.kdf_params.parallelism"),
+                                format!(
+                                    "Argon2id parallelism ({}) below minimum ({})",
+                                    p, ARGON2_MIN_PARALLELISM
+                                ),
+                            );
+                        }
+                    } else {
+                        report.error(
+                            format!("{record_path}.encryption.kdf_params.parallelism"),
+                            "Argon2id KDF requires parallelism",
+                        );
+                    }
+                }
+            }
+        } else {
+            report.warning(
+                format!("{record_path}.encryption.kdf"),
+                format!("Unknown KDF '{kdf}' — only argon2id is currently recognized"),
+            );
+        }
+    }
 }
 
 // ===========================================================================
@@ -931,168 +1116,238 @@ mod tests {
 
     // -- Credentials --------------------------------------------------------
 
+    /// Build a minimum-valid credential record for tests. Uses xchacha20-poly1305
+    /// with a properly-sized base64-encoded nonce and ciphertext.
+    fn valid_credential_record() -> crate::credentials::CredentialRecord {
+        crate::credentials::CredentialRecord {
+            id: Uuid::new_v4(),
+            agent_id: Uuid::new_v4(),
+            service: "github".into(),
+            credential_type: CredentialType::ApiKey,
+            // 12-byte payload "ciphertext\0\0" b64-encoded.
+            encrypted_payload: "Y2lwaGVydGV4dAAA".into(),
+            encryption: EncryptionMetadata {
+                algorithm: "xchacha20-poly1305".into(),
+                // 24 zero bytes base64-encoded.
+                nonce: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+                kdf: None,
+                kdf_params: None,
+                extra: HashMap::new(),
+            },
+            created_at: Utc::now(),
+            label: None,
+            description: None,
+            capabilities_granted: vec![],
+            updated_at: None,
+            last_rotated_at: None,
+            expires_at: None,
+            tags: vec![],
+            extra: HashMap::new(),
+        }
+    }
+
     #[test]
     fn valid_credentials_passes() {
-        let now = Utc::now();
         let doc = CredentialsDocument {
-            credentials: vec![crate::credentials::CredentialRecord {
-                id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                service: "github".into(),
-                credential_type: CredentialType::ApiKey,
-                encrypted_payload: "ciphertext==".into(),
-                encryption: EncryptionMetadata {
-                    algorithm: "xchacha20-poly1305".into(),
-                    nonce: "nonce==".into(),
-                    kdf: None,
-                    kdf_params: None,
-                    extra: HashMap::new(),
-                },
-                created_at: now,
-                label: None,
-                capabilities_granted: vec![],
-                updated_at: None,
-                last_rotated_at: None,
-                expires_at: None,
-                tags: vec![],
-                extra: HashMap::new(),
-            }],
+            credentials: vec![valid_credential_record()],
             extra: HashMap::new(),
         };
         let report = validate_credentials(&doc);
-        assert!(report.is_valid());
+        assert!(report.is_valid(), "findings: {:?}", report.findings);
+        assert!(report.warnings().is_empty());
     }
 
     #[test]
     fn empty_service() {
-        let now = Utc::now();
+        let mut rec = valid_credential_record();
+        rec.service = "".into();
         let doc = CredentialsDocument {
-            credentials: vec![crate::credentials::CredentialRecord {
-                id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                service: "".into(),
-                credential_type: CredentialType::Custom,
-                encrypted_payload: "data".into(),
-                encryption: EncryptionMetadata {
-                    algorithm: "aes".into(),
-                    nonce: "n".into(),
-                    kdf: None,
-                    kdf_params: None,
-                    extra: HashMap::new(),
-                },
-                created_at: now,
-                label: None,
-                capabilities_granted: vec![],
-                updated_at: None,
-                last_rotated_at: None,
-                expires_at: None,
-                tags: vec![],
-                extra: HashMap::new(),
-            }],
+            credentials: vec![rec],
             extra: HashMap::new(),
         };
         let report = validate_credentials(&doc);
         assert!(!report.is_valid());
+        assert!(report.errors().iter().any(|e| e.path.contains("service")));
     }
 
     #[test]
     fn empty_encrypted_payload() {
-        let now = Utc::now();
+        let mut rec = valid_credential_record();
+        rec.encrypted_payload = "".into();
         let doc = CredentialsDocument {
-            credentials: vec![crate::credentials::CredentialRecord {
-                id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                service: "svc".into(),
-                credential_type: CredentialType::ApiKey,
-                encrypted_payload: "".into(),
-                encryption: EncryptionMetadata {
-                    algorithm: "aes".into(),
-                    nonce: "n".into(),
-                    kdf: None,
-                    kdf_params: None,
-                    extra: HashMap::new(),
-                },
-                created_at: now,
-                label: None,
-                capabilities_granted: vec![],
-                updated_at: None,
-                last_rotated_at: None,
-                expires_at: None,
-                tags: vec![],
-                extra: HashMap::new(),
-            }],
+            credentials: vec![rec],
             extra: HashMap::new(),
         };
         let report = validate_credentials(&doc);
         assert!(!report.is_valid());
-        assert!(report.errors()[0].message.contains("payload"));
+        assert!(report
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("payload")));
     }
 
     #[test]
     fn empty_encryption_nonce() {
-        let now = Utc::now();
+        let mut rec = valid_credential_record();
+        rec.encryption.nonce = "".into();
         let doc = CredentialsDocument {
-            credentials: vec![crate::credentials::CredentialRecord {
-                id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                service: "svc".into(),
-                credential_type: CredentialType::ApiKey,
-                encrypted_payload: "data".into(),
-                encryption: EncryptionMetadata {
-                    algorithm: "aes".into(),
-                    nonce: "".into(),
-                    kdf: None,
-                    kdf_params: None,
-                    extra: HashMap::new(),
-                },
-                created_at: now,
-                label: None,
-                capabilities_granted: vec![],
-                updated_at: None,
-                last_rotated_at: None,
-                expires_at: None,
-                tags: vec![],
-                extra: HashMap::new(),
-            }],
+            credentials: vec![rec],
             extra: HashMap::new(),
         };
         let report = validate_credentials(&doc);
         assert!(!report.is_valid());
-        assert!(report.errors()[0].message.contains("nonce"));
+        assert!(report.errors().iter().any(|e| e.message.contains("nonce")));
     }
 
     #[test]
     fn unknown_credential_type_warns() {
-        let now = Utc::now();
+        let mut rec = valid_credential_record();
+        rec.credential_type = CredentialType::Unknown("biometric".into());
         let doc = CredentialsDocument {
-            credentials: vec![crate::credentials::CredentialRecord {
-                id: Uuid::new_v4(),
-                agent_id: Uuid::new_v4(),
-                service: "svc".into(),
-                credential_type: CredentialType::Unknown("biometric".into()),
-                encrypted_payload: "data".into(),
-                encryption: EncryptionMetadata {
-                    algorithm: "aes".into(),
-                    nonce: "n".into(),
-                    kdf: None,
-                    kdf_params: None,
-                    extra: HashMap::new(),
-                },
-                created_at: now,
-                label: None,
-                capabilities_granted: vec![],
-                updated_at: None,
-                last_rotated_at: None,
-                expires_at: None,
-                tags: vec![],
-                extra: HashMap::new(),
-            }],
+            credentials: vec![rec],
             extra: HashMap::new(),
         };
         let report = validate_credentials(&doc);
         assert!(report.is_valid());
-        assert_eq!(report.warnings().len(), 1);
-        assert!(report.warnings()[0].message.contains("biometric"));
+        assert!(report
+            .warnings()
+            .iter()
+            .any(|w| w.message.contains("biometric")));
+    }
+
+    #[test]
+    fn legacy_algorithm_none_warns_lenient_errors_strict() {
+        let mut rec = valid_credential_record();
+        rec.encryption.algorithm = "none".into();
+        rec.encryption.nonce = "".into();
+        rec.encrypted_payload = "<not-exported>".into();
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+
+        let lenient = validate_credentials(&doc);
+        assert!(lenient.is_valid(), "legacy records should warn in lenient mode");
+        assert!(lenient
+            .warnings()
+            .iter()
+            .any(|w| w.message.contains("Legacy metadata-only")));
+
+        let strict = validate_credentials_strict(&doc);
+        assert!(!strict.is_valid(), "legacy records should error in strict mode");
+    }
+
+    #[test]
+    fn unknown_algorithm_warns_lenient_errors_strict() {
+        let mut rec = valid_credential_record();
+        rec.encryption.algorithm = "future-cipher".into();
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+
+        assert!(validate_credentials(&doc).is_valid());
+        assert!(!validate_credentials_strict(&doc).is_valid());
+    }
+
+    #[test]
+    fn wrong_nonce_length_errors() {
+        let mut rec = valid_credential_record();
+        // 12-byte nonce: valid for AES-GCM but not for XChaCha20.
+        rec.encryption.nonce = B64.encode([0u8; 12]);
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(!report.is_valid());
+        assert!(report
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("Nonce length")));
+    }
+
+    #[test]
+    fn aes_256_gcm_valid() {
+        let mut rec = valid_credential_record();
+        rec.encryption.algorithm = "aes-256-gcm".into();
+        rec.encryption.nonce = B64.encode([0u8; 12]);
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(report.is_valid(), "findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn invalid_base64_nonce_errors() {
+        let mut rec = valid_credential_record();
+        rec.encryption.nonce = "not!base64".into();
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(!report.is_valid());
+        assert!(report
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("not valid base64")));
+    }
+
+    #[test]
+    fn argon2id_requires_kdf_params() {
+        let mut rec = valid_credential_record();
+        rec.encryption.kdf = Some("argon2id".into());
+        rec.encryption.kdf_params = None;
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(!report.is_valid());
+        assert!(report
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("kdf_params")));
+    }
+
+    #[test]
+    fn argon2id_weak_params_error() {
+        let mut rec = valid_credential_record();
+        rec.encryption.kdf = Some("argon2id".into());
+        rec.encryption.kdf_params = Some(crate::credentials::KdfParams {
+            memory_cost: Some(1024),
+            time_cost: Some(1),
+            parallelism: Some(1),
+            extra: HashMap::new(),
+        });
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(!report.is_valid());
+        assert!(report.errors().iter().any(|e| e.message.contains("OWASP")));
+    }
+
+    #[test]
+    fn argon2id_owasp_minimum_passes() {
+        let mut rec = valid_credential_record();
+        rec.encryption.kdf = Some("argon2id".into());
+        rec.encryption.kdf_params = Some(crate::credentials::KdfParams {
+            memory_cost: Some(19_456),
+            time_cost: Some(2),
+            parallelism: Some(1),
+            extra: HashMap::new(),
+        });
+        let doc = CredentialsDocument {
+            credentials: vec![rec],
+            extra: HashMap::new(),
+        };
+        let report = validate_credentials(&doc);
+        assert!(report.is_valid(), "findings: {:?}", report.findings);
     }
 
     // -- Helpers -----------------------------------------------------------

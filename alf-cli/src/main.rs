@@ -43,6 +43,10 @@ enum Command {
         long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
         and writes a single .alf archive. Reads from the workspace path; writes to the given \
         output file or ./<agent-name>.alf by default.\n\n\
+        Vault key (same flags as import/sync/restore): when a key resolves, Layer 4 credentials \
+        are AEAD-encrypted from the runtime into the archive. When no key resolves, export still \
+        succeeds but adapters write metadata-only placeholders (encrypted_payload \"<not-exported>\", \
+        algorithm \"none\") — you must re-authenticate after import unless you re-export with a key.\n\n\
         Example: alf export -r openclaw -w ./my-agent -o backup.alf"
     )]
     Export {
@@ -66,6 +70,10 @@ enum Command {
     #[command(
         long_about = "Import unpacks an .alf file into the given workspace directory. \
         Reads the .alf file; writes SOUL.md, config, principals, and other files into the workspace.\n\n\
+        Vault key: when a key resolves, Layer 4 ciphertext is decrypted and secrets are restored \
+        into the runtime (e.g. auth profiles). When no key resolves, non-credential layers still \
+        import; encrypted credentials are not written back — check warnings for \"pass … ALF_VAULT_KEY\" \
+        or re-authenticate. Legacy metadata-only rows (<not-exported>) are skipped with warnings.\n\n\
         Example: alf import -r openclaw -w ./restored-agent archive.alf"
     )]
     Import {
@@ -115,7 +123,8 @@ enum Command {
         cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
         Example: alf sync -r openclaw -w ./my-agent\n\
         Example: alf sync --recover -r openclaw -w ./my-agent\n\n\
-        When a vault key is resolved (same flags as export/import), the snapshot includes encrypted Layer 4 credentials."
+        When a vault key is resolved (same flags as export/import), the snapshot includes encrypted Layer 4 credentials. \
+        Without a resolved key, Layer 4 uses the metadata-only placeholder (same as export)."
     )]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
@@ -147,6 +156,9 @@ enum Command {
         --at-sequence N: point-in-time preview. Rebuilds the workspace as it looked after \
         sequence N was applied, WITHOUT touching ~/.alf/state/. Use this to inspect history; \
         run plain `alf restore` again to return to head. See docs/how_alf_syncs.md.\n\n\
+        Vault key: same behavior as `alf import` — with a resolved key, Layer 4 is decrypted into \
+        the runtime; without a key, restore still applies other layers and warnings explain that \
+        secrets were not restored.\n\n\
         Example: alf restore -r openclaw -w ./my-agent -a <agent-id>\n\
         Example: alf restore --at-sequence 3 -r openclaw -w ./preview -a <agent-id>"
     )]

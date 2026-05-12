@@ -37,6 +37,15 @@ The CLI resolves the key from the **first** source that succeeds (see `alf-cli/s
 
 If no key is resolved, **`alf export`** and **`alf sync`** still work but adapters emit the legacy **metadata-only** credential path (`encrypted_payload: "<not-exported>"`, `algorithm: "none"`).
 
+## Import and restore (Layer 4)
+
+**`alf import`** and **`alf restore`** use the same vault key resolution as export/sync.
+
+- **With a resolved vault key:** the adapter decrypts each real ciphertext record and writes secret material back into the runtime (e.g. OpenClaw `auth-profiles.json`). Legacy rows (`algorithm: "none"` or `encrypted_payload: "<not-exported>"`) are **skipped** with a per-record warning — there is nothing to decrypt.
+- **Without a vault key:** memory, identity, principals, and other layers still import, but **encrypted credentials are not restored** into the runtime. If the manifest reports a non-zero credentials count, you get a **warning** telling you to pass vault flags / set `ALF_VAULT_KEY` or re-authenticate in the framework.
+
+Use the same key (or Argon2 passphrase + salt) that was used when the archive was produced.
+
 ## Recommended patterns
 
 | Environment | Pattern |

@@ -34,7 +34,10 @@ Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable col
 
 ### Vault key flags (export, sync, import, restore, `alf vault encrypt|decrypt`)
 
-Optional; when omitted, **export** and **sync** use the legacy metadata-only credential placeholder.
+Optional. Behavior depends on the command:
+
+- **`alf export` / `alf sync`:** When no key resolves, adapters still run but emit the **legacy metadata-only** credential path (`encrypted_payload: "<not-exported>"`, `algorithm: "none"`). When a key resolves, Layer 4 holds **real AEAD ciphertext**.
+- **`alf import` / `alf restore`:** When a key resolves, encrypted credentials are **decrypted and written** into the runtime. When no key resolves, other layers import normally but **secrets are not restored**; if the archive declares credentials, expect a **warning** in JSON (`warnings`) or stderr (human mode). Legacy `<not-exported>` rows are skipped with warnings.
 
 | Flag | Description |
 |---|---|
@@ -51,7 +54,7 @@ Default key file if none of the above apply: `~/.openclaw/state/.alf-vault-key` 
 ## alf check
 
 Pre-flight diagnostic. Discovers the workspace, verifies resources, reports readiness.
-Run this first before any other command — it tells you whether sync will work and what to fix if not.
+Run this first before any other command — it tells you whether sync will work and surfaces guidance when not.
 
 ### Usage
 
@@ -123,15 +126,15 @@ The `workspace.source` field in the output reports which method was used: `"flag
       "resources": { ... },
       "alf": { "config_exists": false, "api_key_set": false, "agent_tracked": false, "last_synced_sequence": null, "service_reachable": false },
       "issues": [
-        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found", "fix": "Pass correct path: alf check -r openclaw -w /path/to/workspace" },
-        { "severity": "error", "code": "no_api_key", "message": "No API key configured", "fix": "Run: alf login --key <your-api-key>" }
+        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found", "suggestion": "Pass correct path: alf check -r openclaw -w /path/to/workspace" },
+        { "severity": "error", "code": "no_api_key", "message": "No API key configured", "suggestion": "Run: alf login --key <your-api-key>" }
       ],
       "suggestions": ["Get an API key at https://agent-life.ai/settings/api-keys"]
     }
 
 ### Issue Codes
 
-| Code | Severity | Meaning | Fix |
+| Code | Severity | Meaning | Typical suggestion |
 |---|---|---|---|
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
@@ -182,6 +185,8 @@ Store an API key for the agent-life sync service.
 
 Export an agent's complete state from a framework workspace to an `.alf` archive.
 
+**Credentials (Layer 4):** If a vault key resolves (see [Vault key flags](#vault-key-flags-export-import-restore-alf-vault-encryptdecrypt)), secrets from the runtime are encrypted into the archive. If none resolves, the archive still lists credential **metadata**, but payloads are the placeholder `"<not-exported>"` with `algorithm: "none"` — re-authenticate after import unless you export again with a key.
+
 ### Usage
 
     alf export -r <runtime> -w <workspace> [-o <output>] [--vault-key-file …]
@@ -205,7 +210,7 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
       "ok": true,
       "output": "/home/user/agent-export-2026-03-14.alf",
       "agent_name": "Atlas",
-      "alf_version": "1.0.0-rc.1",
+      "alf_version": "1.0.0-rc.2",
       "memory_records": 47,
       "file_size": 102400
     }
@@ -314,6 +319,8 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
 Download a snapshot (plus uncompacted deltas) from the service and import into a workspace.
 
+**Credentials:** Same rules as [`alf import`](#alf-import) — pass vault key flags (or rely on the default key file) to decrypt Layer 4 into the runtime; otherwise the restore succeeds for non-credential data and **warnings** tell you secrets were not restored.
+
 ### Usage
 
     alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>] [--vault-key-file …]
@@ -406,6 +413,8 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 ## alf import
 
 Import an `.alf` archive into a framework workspace.
+
+**Credentials:** With a resolved vault key, the adapter decrypts ciphertext and restores runtime auth storage. **Without** a key, import still applies memory / identity / principals / raw source, but **does not** write decrypted secrets; check `warnings` in JSON output (e.g. “pass … `ALF_VAULT_KEY` … or re-authenticate”). Rows that were exported as metadata-only (`<not-exported>`) are skipped with per-record warnings.
 
 ### Usage
 

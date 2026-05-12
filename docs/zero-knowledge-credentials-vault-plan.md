@@ -23,8 +23,8 @@ End-to-end **client-side encryption** for ALF Layer 4 so agents can sync **ciphe
 
 ## User documentation
 
-- **[vault-key-management.md](vault-key-management.md)** — OpenClaw vs ZeroClaw native secret storage, ALF vault key paths, `ALF_VAULT_KEY`, fly.io, surgical delete.
-- **[cli-reference.md](cli-reference.md)** — full `alf` command reference including vault subcommands.
+- **[vault-key-management.md](vault-key-management.md)** — OpenClaw vs ZeroClaw native secret storage, ALF vault key paths, `ALF_VAULT_KEY`, fly.io, surgical delete, and **import/restore without a key** (warnings, no secret restore).
+- **[cli-reference.md](cli-reference.md)** — full `alf` command reference including vault subcommands and per-command Layer 4 behavior for `export`, `import`, `sync`, and `restore`.
 
 ## Design pillars
 

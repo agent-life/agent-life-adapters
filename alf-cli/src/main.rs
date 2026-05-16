@@ -43,10 +43,8 @@ enum Command {
         long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
         and writes a single .alf archive. Reads from the workspace path; writes to the given \
         output file or ./<agent-name>.alf by default.\n\n\
-        Vault key (same flags as import/sync/restore): when a key resolves, Layer 4 credentials \
-        are AEAD-encrypted from the runtime into the archive. When no key resolves, export still \
-        succeeds but adapters write metadata-only placeholders (encrypted_payload \"<not-exported>\", \
-        algorithm \"none\") — you must re-authenticate after import unless you re-export with a key.\n\n\
+        Layer 4 (credentials) is the agent's explicit ALF vault (~/.alf/vault/credentials.json), \
+        already AEAD-encrypted by `alf vault add` — export never reads a vault key.\n\n\
         Example: alf export -r openclaw -w ./my-agent -o backup.alf"
     )]
     Export {
@@ -61,9 +59,6 @@ enum Command {
         /// Output .alf file path [default: ./<agent-name>.alf]
         #[arg(short, long)]
         output: Option<PathBuf>,
-
-        #[command(flatten)]
-        key: VaultKeyCli,
     },
 
     /// Import an .alf archive into an agent workspace
@@ -123,8 +118,8 @@ enum Command {
         cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
         Example: alf sync -r openclaw -w ./my-agent\n\
         Example: alf sync --recover -r openclaw -w ./my-agent\n\n\
-        When a vault key is resolved (same flags as export/import), the snapshot includes encrypted Layer 4 credentials. \
-        Without a resolved key, Layer 4 uses the metadata-only placeholder (same as export)."
+        Layer 4 (credentials) is the agent's explicit ALF vault, already AEAD-encrypted \
+        by `alf vault add`; sync carries it as-is and never reads a vault key."
     )]
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
@@ -142,9 +137,6 @@ enum Command {
         /// Allow first sync to overwrite an already-registered cloud agent
         #[arg(long)]
         force_first_sync: bool,
-
-        #[command(flatten)]
-        key: VaultKeyCli,
     },
 
     /// Download and restore from the cloud
@@ -337,6 +329,81 @@ enum VaultCommand {
         key: VaultKeyCli,
     },
 
+    /// Add an account credential to the agent's vault
+    #[command(
+        long_about = "Encrypts a credential under the resolved vault key and appends it\n\
+        to the ALF vault. The default target is ~/.alf/vault/credentials.json, which\n\
+        `alf sync` merges into the archive's encrypted Layer 4 and `alf restore` brings\n\
+        back on another host. The vault is ALF's own store — separate from any runtime\n\
+        keystore — and the agent chooses exactly what goes in it.\n\n\
+        The secret may come from --secret, --secret-file, stdin, or --secret-json (a\n\
+        JSON object whose user/password/token fields are mapped automatically). Every\n\
+        record is tagged `alf-vault`.\n\n\
+        Example: alf vault add -r openclaw --service email --type account \\\n\
+        --secret-json /config/agent/.runtime-config/email.json \\\n\
+        --label me@agent-life.run --tag agent-provisioned --update"
+    )]
+    Add {
+        /// Vault file to append to [default: ~/.alf/vault/credentials.json]
+        #[arg(short = 'i', long = "in")]
+        input: Option<PathBuf>,
+
+        /// Service identifier (e.g., "email", "telegram").
+        #[arg(short, long)]
+        service: String,
+
+        /// Credential type: account, api_key, oauth_token, custom, ...
+        #[arg(short = 't', long = "type", default_value = "account")]
+        credential_type: String,
+
+        /// Account username / address (plaintext descriptor).
+        #[arg(short, long)]
+        username: Option<String>,
+
+        /// Secret value. Overrides --secret-file, --secret-json, and stdin.
+        #[arg(long)]
+        secret: Option<String>,
+
+        /// File whose trimmed contents are the secret.
+        #[arg(long)]
+        secret_file: Option<PathBuf>,
+
+        /// JSON object file; user/password/token fields are mapped automatically.
+        #[arg(long)]
+        secret_json: Option<PathBuf>,
+
+        /// Plaintext label, the selector for list/decrypt/delete [default: username].
+        #[arg(short, long)]
+        label: Option<String>,
+
+        /// Optional plaintext description (visible to the sync service).
+        #[arg(short, long)]
+        description: Option<String>,
+
+        /// Plaintext tags (repeatable). An `alf-vault` tag is always added.
+        #[arg(long = "tag")]
+        tags: Vec<String>,
+
+        /// Extra key=value pairs folded into the encrypted payload (repeatable).
+        #[arg(long = "field")]
+        fields: Vec<String>,
+
+        /// Agent UUID (defaults to the nil UUID).
+        #[arg(short = 'a', long = "agent-id")]
+        agent_id: Option<String>,
+
+        /// Replace an existing record with the same label instead of duplicating it.
+        #[arg(long)]
+        update: bool,
+
+        /// Runtime for default key + vault path resolution (openclaw, zeroclaw).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
+    },
+
     /// Decrypt one record and print its payload
     #[command(
         long_about = "Reads credentials.json (or the entry inside a .alf archive),\n\
@@ -466,8 +533,7 @@ fn main() {
             runtime,
             workspace,
             output,
-            key,
-        } => commands::export::run(&runtime, &workspace, output.as_deref(), &key.to_args()),
+        } => commands::export::run(&runtime, &workspace, output.as_deref()),
 
         Command::Import {
             runtime,
@@ -486,14 +552,7 @@ fn main() {
             workspace,
             recover,
             force_first_sync,
-            key,
-        } => commands::sync::run(
-            &runtime,
-            &workspace,
-            recover,
-            force_first_sync,
-            &key.to_args(),
-        ),
+        } => commands::sync::run(&runtime, &workspace, recover, force_first_sync),
 
         Command::Restore {
             runtime,
@@ -565,6 +624,39 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             &tags,
             &capabilities,
             agent_id.as_deref(),
+            &key.to_args(),
+            &runtime,
+        ),
+        VaultCommand::Add {
+            input,
+            service,
+            credential_type,
+            username,
+            secret,
+            secret_file,
+            secret_json,
+            label,
+            description,
+            tags,
+            fields,
+            agent_id,
+            update,
+            runtime,
+            key,
+        } => commands::vault::add(
+            input.as_deref(),
+            &service,
+            &credential_type,
+            username.as_deref(),
+            secret.as_deref(),
+            secret_file.as_deref(),
+            secret_json.as_deref(),
+            label.as_deref(),
+            description.as_deref(),
+            &tags,
+            &fields,
+            agent_id.as_deref(),
+            update,
             &key.to_args(),
             &runtime,
         ),

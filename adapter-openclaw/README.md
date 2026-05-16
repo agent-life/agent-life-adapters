@@ -299,11 +299,13 @@ All three files are also preserved verbatim in `raw/openclaw/` for lossless roun
 
 ### Credentials (ALF §3.4)
 
-OpenClaw stores credentials in `~/.openclaw/credentials/` and in auth profiles at `~/.openclaw/agents/<agentId>/agent/auth-profiles.json`. These contain OAuth tokens, API keys, and provider credentials.
+ALF's Layer 4 is the agent's **explicit vault** — a runtime-neutral `credentials.json` at `~/.alf/vault/credentials.json`. The agent populates it with `alf vault add`, which AEAD-encrypts each credential under a vault key the sync service never sees.
 
-The adapter exports credential **metadata only** when no ALF vault key is supplied (`encrypted_payload` is the placeholder `<not-exported>`). When you pass a vault key to `alf export` or `alf sync` (`--vault-key-file`, `ALF_VAULT_KEY`, etc.), it encrypts secret material from `auth-profiles.json` into Layer 4 per the ALF spec. See [vault-key-management.md](../../docs/vault-key-management.md).
+The adapter does **not** read OpenClaw's own keystores (`~/.openclaw/credentials/`, `~/.openclaw/agents/<agentId>/agent/auth-profiles.json`) — the agent decides what to vault, explicitly. On `alf export` / `alf sync` the adapter copies the vault file verbatim into Layer 4 (already ciphertext, no key needed). On `alf restore` / `alf import` it writes the vault records back to `~/.alf/vault/credentials.json` — still encrypted; the agent decrypts on demand with `alf vault decrypt`.
 
-Actual credential migration without encryption still requires the user to re-authenticate in the target runtime if they never configured a vault key.
+For backward compatibility, importing a **legacy** archive whose Layer 4 was produced by an older adapter (records derived from `auth-profiles.json`, not tagged `alf-vault`) still decrypts those into the runtime keystore when a vault key is supplied. New exports never produce such records.
+
+See [vault-key-management.md](../../docs/vault-key-management.md) for the vault file layout, key resolution, and the add / sync / restore / decrypt workflow sequences.
 
 ### Raw Source Preservation
 

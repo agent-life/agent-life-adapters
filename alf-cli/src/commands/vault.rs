@@ -4,6 +4,7 @@
 //!
 //! - `keygen`  — generate a fresh 32-byte vault key.
 //! - `encrypt` — wrap a plaintext credential into a `CredentialRecord`.
+//! - `add`     — encrypt a credential and append it to the agent's vault.
 //! - `decrypt` — read one record out of a vault and print its plaintext.
 //! - `list`    — print plaintext descriptors only (no key required).
 //! - `delete`  — surgically remove a record by id/label/service (no key required).
@@ -14,7 +15,7 @@
 use std::fs;
 use std::fs::File;
 use std::io::{BufReader, IsTerminal, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
@@ -193,6 +194,255 @@ pub fn encrypt(
         output::json(&EncryptResult {
             ok: true,
             record: &record,
+        });
+    }
+
+    Ok(())
+}
+
+// ===========================================================================
+// add — encrypt a credential and append it to the agent's vault
+// ===========================================================================
+
+#[derive(Serialize)]
+struct AddResult {
+    ok: bool,
+    id: Uuid,
+    service: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    updated: bool,
+    written_to: String,
+    total: usize,
+}
+
+/// Keys in a `--secret-json` object treated as the account username.
+const SECRET_JSON_USERNAME_KEYS: &[&str] = &["username", "user", "email", "bot_username"];
+/// Keys in a `--secret-json` object treated as the account secret.
+const SECRET_JSON_SECRET_KEYS: &[&str] = &["secret", "password", "token", "bot_token", "api_key"];
+
+/// Add an account credential to the agent's vault.
+///
+/// Encrypts the secret under the resolved vault key and appends a
+/// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
+/// `CredentialsDocument`. The default target is the agent vault at
+/// `~/.<runtime>/agents/main/agent/credentials.json`, which the OpenClaw
+/// adapter merges into the archive's Layer 4 on the next `alf sync`.
+#[allow(clippy::too_many_arguments)]
+pub fn add(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    username: Option<&str>,
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    secret_json: Option<&Path>,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    fields: &[String],
+    agent_id: Option<&str>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    // 1. Resolve the target vault file (~/.alf/vault/credentials.json default).
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path()?,
+    };
+    if target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("alf"))
+        .unwrap_or(false)
+    {
+        bail!(
+            "Cannot add a credential into a .alf archive in place. \
+             Pass --in PATH to a credentials.json file."
+        );
+    }
+
+    // 2. Assemble the plaintext payload.
+    let mut payload_username = username.map(str::to_string);
+    let mut secret_value: Option<String> = None;
+    let mut extra: std::collections::HashMap<String, serde_json::Value> =
+        std::collections::HashMap::new();
+
+    if let Some(json_path) = secret_json {
+        let raw = fs::read_to_string(json_path)
+            .with_context(|| format!("Failed to read {}", json_path.display()))?;
+        let obj: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)
+            .with_context(|| format!("{} is not a JSON object", json_path.display()))?;
+        for k in SECRET_JSON_USERNAME_KEYS {
+            if payload_username.is_none() {
+                if let Some(v) = obj.get(*k).and_then(|v| v.as_str()) {
+                    payload_username = Some(v.to_string());
+                }
+            }
+        }
+        for k in SECRET_JSON_SECRET_KEYS {
+            if secret_value.is_none() {
+                if let Some(v) = obj.get(*k).and_then(|v| v.as_str()) {
+                    secret_value = Some(v.to_string());
+                }
+            }
+        }
+        for (k, v) in &obj {
+            if !SECRET_JSON_USERNAME_KEYS.contains(&k.as_str())
+                && !SECRET_JSON_SECRET_KEYS.contains(&k.as_str())
+            {
+                extra.insert(k.clone(), v.clone());
+            }
+        }
+    }
+
+    // Explicit --secret / --secret-file override the JSON-derived secret.
+    if let Some(s) = secret {
+        secret_value = Some(s.to_string());
+    } else if let Some(sf) = secret_file {
+        let raw = fs::read_to_string(sf)
+            .with_context(|| format!("Failed to read {}", sf.display()))?;
+        secret_value = Some(raw.trim().to_string());
+    } else if secret_value.is_none() {
+        // Last resort: read the secret from stdin.
+        let buf = read_input(None)?;
+        let s = String::from_utf8(buf)
+            .map_err(|_| anyhow!("Secret read from stdin is not UTF-8 text"))?;
+        secret_value = Some(s.trim().to_string());
+    }
+
+    // --field key=value pairs fold into the encrypted payload's extra map.
+    for f in fields {
+        let (k, v) = f
+            .split_once('=')
+            .ok_or_else(|| anyhow!("--field must be key=value, got {f:?}"))?;
+        extra.insert(k.to_string(), serde_json::Value::String(v.to_string()));
+    }
+
+    let secret_value = secret_value.filter(|s| !s.is_empty()).ok_or_else(|| {
+        anyhow!(
+            "No secret to store. Pass --secret, --secret-file, or a --secret-json \
+             file with a password/token field."
+        )
+    })?;
+
+    let kind = if payload_username.is_some() {
+        "login"
+    } else {
+        "api_key"
+    };
+    let payload = VaultPayload {
+        vault_payload_version: alf_core::VAULT_PAYLOAD_VERSION,
+        kind: kind.to_string(),
+        username: payload_username.clone(),
+        secret: secret_value,
+        extra,
+    };
+
+    // 3. Encrypt under the resolved key.
+    let (key, source) = vault_key::resolve_required(key_args, runtime)?;
+    output::progress(&format!(
+        "Encrypting with key from {} (fingerprint {})",
+        source.label(),
+        key.fingerprint()
+    ));
+    let blob = encrypt_payload(&payload.to_json_bytes(), &key, Algorithm::XChaCha20Poly1305)
+        .map_err(|e| anyhow!("Encryption failed: {e}"))?;
+
+    let agent_uuid = match agent_id {
+        Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
+        None => Uuid::nil(),
+    };
+    let record_label = label.map(str::to_string).or_else(|| payload_username.clone());
+
+    // Every agent-added record carries `alf-vault` — the discriminator the
+    // OpenClaw adapter uses to route records back to this file on import.
+    let mut record_tags = tags.to_vec();
+    if !record_tags.iter().any(|t| t == "alf-vault") {
+        record_tags.push("alf-vault".to_string());
+    }
+
+    let record = CredentialRecord {
+        id: Uuid::new_v4(),
+        agent_id: agent_uuid,
+        service: service.to_string(),
+        credential_type: parse_credential_type(credential_type),
+        encrypted_payload: blob.ciphertext_b64.clone(),
+        encryption: blob.to_encryption_metadata(),
+        created_at: Utc::now(),
+        label: record_label.clone(),
+        description: description.map(str::to_string),
+        capabilities_granted: Vec::new(),
+        updated_at: None,
+        last_rotated_at: None,
+        expires_at: None,
+        tags: record_tags,
+        extra: std::collections::HashMap::new(),
+    };
+
+    // 4. Load the existing document (empty when the file is absent) and upsert.
+    let mut doc = if target.is_file() {
+        load_credentials_document(&target)?
+    } else {
+        CredentialsDocument {
+            credentials: Vec::new(),
+            extra: std::collections::HashMap::new(),
+        }
+    };
+
+    let mut updated = false;
+    if update {
+        if let Some(new_label) = &record_label {
+            if let Some(pos) = doc
+                .credentials
+                .iter()
+                .position(|c| c.label.as_deref() == Some(new_label.as_str()))
+            {
+                doc.credentials[pos] = record.clone();
+                updated = true;
+            }
+        }
+    }
+    if !updated {
+        doc.credentials.push(record.clone());
+    }
+
+    // 5. Write back with owner-only permissions (the file holds ciphertext,
+    //    but tightening to 0600 matches the vault key file).
+    if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create {}", parent.display()))?;
+        }
+    }
+    let serialized =
+        serde_json::to_string_pretty(&doc).context("Failed to serialize credentials document")?;
+    write_private(&target, &serialized)
+        .with_context(|| format!("Failed to write {}", target.display()))?;
+
+    if output::human_mode() {
+        println!(
+            "{} {} credential in vault",
+            "✓".green().bold(),
+            if updated { "Updated" } else { "Added" }
+        );
+        println!("  Record ID:  {}", record.id);
+        println!("  Service:    {}", record.service);
+        if let Some(l) = &record.label {
+            println!("  Label:      {l}");
+        }
+        println!("  Written to: {}", target.display());
+        println!("  Total:      {} credential(s)", doc.credentials.len());
+    } else {
+        output::json(&AddResult {
+            ok: true,
+            id: record.id,
+            service: record.service.clone(),
+            label: record.label.clone(),
+            updated,
+            written_to: target.display().to_string(),
+            total: doc.credentials.len(),
         });
     }
 
@@ -718,5 +968,195 @@ mod tests {
         let after: CredentialsDocument =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert!(after.credentials.is_empty());
+    }
+
+    fn read_doc(path: &Path) -> CredentialsDocument {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn add_creates_file_and_tags_record() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let target = dir.path().join("sub").join("credentials.json");
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+
+        add(
+            Some(&target),
+            "email",
+            "account",
+            Some("me@example.com"),
+            Some("hunter2"),
+            None,
+            None,
+            Some("me@example.com"),
+            None,
+            &[],
+            &[],
+            None,
+            false,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let doc = read_doc(&target);
+        assert_eq!(doc.credentials.len(), 1);
+        assert_eq!(doc.credentials[0].service, "email");
+        assert_eq!(doc.credentials[0].credential_type, CredentialType::Account);
+        assert!(doc.credentials[0].tags.iter().any(|t| t == "alf-vault"));
+        assert_ne!(doc.credentials[0].encryption.algorithm, "none");
+    }
+
+    #[test]
+    fn add_record_round_trips_through_decrypt() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+        add(
+            Some(&target),
+            "telegram",
+            "account",
+            None,
+            Some("bot-token-xyz"),
+            None,
+            None,
+            Some("mybot"),
+            None,
+            &[],
+            &[],
+            None,
+            false,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let doc = read_doc(&target);
+        let plaintext = decrypt_record(&doc.credentials[0], &key).unwrap();
+        let payload = VaultPayload::from_json_bytes(&plaintext).unwrap();
+        assert_eq!(payload.secret, "bot-token-xyz");
+    }
+
+    #[test]
+    fn add_update_replaces_same_label() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+        let call = |secret: &str, update: bool| {
+            add(
+                Some(&target),
+                "email",
+                "account",
+                Some("a@b.com"),
+                Some(secret),
+                None,
+                None,
+                Some("a@b.com"),
+                None,
+                &[],
+                &[],
+                None,
+                update,
+                &args,
+                "openclaw",
+            )
+            .unwrap();
+        };
+        call("old", false);
+        call("new", true);
+
+        let doc = read_doc(&target);
+        assert_eq!(doc.credentials.len(), 1);
+        let plaintext = decrypt_record(&doc.credentials[0], &key).unwrap();
+        assert_eq!(
+            VaultPayload::from_json_bytes(&plaintext).unwrap().secret,
+            "new"
+        );
+    }
+
+    #[test]
+    fn add_secret_json_maps_known_fields() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        let sj = dir.path().join("email.json");
+        std::fs::write(
+            &sj,
+            r#"{"user":"me@x.com","password":"pw","smtp_host":"smtp.x.com"}"#,
+        )
+        .unwrap();
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+        add(
+            Some(&target),
+            "email",
+            "account",
+            None,
+            None,
+            None,
+            Some(&sj),
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            false,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let doc = read_doc(&target);
+        let plaintext = decrypt_record(&doc.credentials[0], &key).unwrap();
+        let payload = VaultPayload::from_json_bytes(&plaintext).unwrap();
+        assert_eq!(payload.username.as_deref(), Some("me@x.com"));
+        assert_eq!(payload.secret, "pw");
+        assert_eq!(
+            payload.extra.get("smtp_host").and_then(|v| v.as_str()),
+            Some("smtp.x.com")
+        );
+    }
+
+    #[test]
+    fn add_rejects_alf_archive() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let target = dir.path().join("x.alf");
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+        let result = add(
+            Some(&target),
+            "email",
+            "account",
+            None,
+            Some("s"),
+            None,
+            None,
+            None,
+            None,
+            &[],
+            &[],
+            None,
+            false,
+            &args,
+            "openclaw",
+        );
+        assert!(result.is_err());
     }
 }

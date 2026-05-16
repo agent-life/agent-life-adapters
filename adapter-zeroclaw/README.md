@@ -461,8 +461,9 @@ encrypt = true                  # ChaCha20-Poly1305 AEAD encryption
 
 ZeroClaw encrypts all API keys at rest using ChaCha20-Poly1305 AEAD.
 The encryption key is stored at `~/.zeroclaw/.secret_key` with `0600`
-permissions. The adapter exports credential metadata only — actual
-secrets are never included in ALF archives.
+permissions. This keystore is ZeroClaw's own — the adapter never reads
+or exports it. ALF credentials live in the agent's explicit, separate
+vault; see [Credentials](#credentials) below.
 
 ---
 
@@ -621,12 +622,13 @@ ZeroClaw supports two identity formats, both mapped to ALF:
 
 ### Credentials
 
-ZeroClaw encrypts local secrets with ChaCha20-Poly1305 using `~/.zeroclaw/.secret_key` — that is **separate** from the ALF vault key ([vault-key-management.md](../../docs/vault-key-management.md)). Without a vault key, the adapter exports **metadata only** and `encrypted_payload` is `"<not-exported>"`. With a vault key passed to `alf export` / `alf sync`, the adapter reads secrets from `config.toml` and `auth_profiles.json`, encrypts them for Layer 4, and writes real ciphertext.
+ALF's Layer 4 is the agent's **explicit vault** — a runtime-neutral `credentials.json` at `~/.alf/vault/credentials.json`. The agent populates it with `alf vault add`, which AEAD-encrypts each credential under a vault key the sync service never sees.
 
-Source: `config.toml` sections `[secrets]`, provider API keys, and
-channel tokens. The adapter parses `config.toml` to enumerate configured
-providers and channels, creating one `CredentialRecord` per configured
-API key.
+The adapter does **not** read ZeroClaw's own secret store (`config.toml [secrets]`, `~/.zeroclaw/.secret_key`, `auth_profiles.json`) — the agent decides what to vault, explicitly. On `alf export` / `alf sync` the adapter copies the vault file verbatim into Layer 4 (already ciphertext, no key needed). On `alf restore` / `alf import` it writes the vault records back to `~/.alf/vault/credentials.json` — still encrypted; the agent decrypts on demand with `alf vault decrypt`.
+
+For backward compatibility, importing a **legacy** archive whose Layer 4 was produced by an older adapter (records not tagged `alf-vault`) still decrypts those into `auth_profiles.json` when a vault key is supplied. New exports never produce such records.
+
+See [vault-key-management.md](../../docs/vault-key-management.md) for the vault file layout, key resolution, and the add / sync / restore / decrypt workflow sequences.
 
 ### Raw Source Preservation
 
@@ -690,7 +692,7 @@ All ZeroClaw concepts map cleanly to existing alf-core types:
 | OpenClaw-format identity | `Identity` (prose) | ✅ Same as OpenClaw adapter |
 | AIEOS identity | `Identity` (structured + extra) | ✅ Core fields map; extensions go to `extra` |
 | `USER.md` | `PrincipalsDocument` | ✅ Same as OpenClaw adapter |
-| Encrypted secrets | `CredentialsDocument` | ✅ Metadata-only export |
+| ZeroClaw `[secrets]` keystore | — (not exported) | ✅ ALF vault is separate; agent fills it via `alf vault add` |
 | `config.toml` | Not memory — goes to `raw/` | ✅ Preserved for reference |
 
 **No changes needed to alf-core.** All ZeroClaw concepts fit within the

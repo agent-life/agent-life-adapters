@@ -71,25 +71,52 @@ pub fn import(alf_file: &Path, workspace: &Path, vault_key: Option<&VaultKey>) -
     let credentials = alf.read_credentials()?;
     let all_memory = alf.read_all_memory()?;
 
-    // Restore credentials when a vault key is supplied.
-    if let (Some(key), Some(doc)) = (vault_key, credentials.as_ref()) {
-        match restore_credentials(doc, key, workspace) {
-            Ok(n) => {
-                if n > 0 {
-                    warnings.push(format!(
-                        "Restored {n} credential(s) into auth_profiles.json. Verify with ZeroClaw."
-                    ));
-                }
-            }
-            Err(e) => warnings.push(format!("Credential restore failed: {e}")),
-        }
-    } else if let Some(doc) = credentials.as_ref() {
-        if !doc.credentials.is_empty() {
+    let credentials_count = credentials
+        .as_ref()
+        .map(|c| c.credentials.len() as u32)
+        .unwrap_or(0);
+
+    // Restore credentials. Records the agent added with `alf vault add` carry
+    // the `alf-vault` tag — they go back to the agent's ALF vault as-is (still
+    // encrypted, no key needed). Any other records came from a legacy archive's
+    // runtime keystore and need the vault key to decrypt.
+    if let Some(doc) = credentials {
+        let (vault_records, auth_records): (Vec<_>, Vec<_>) = doc
+            .credentials
+            .into_iter()
+            .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
+
+        let vaulted = restore_agent_vault(vault_records, workspace)?;
+        if vaulted > 0 {
             warnings.push(format!(
-                "{} credential(s) found in archive (metadata only). \
-                 Pass --vault-key-file or set ALF_VAULT_KEY to restore secret material.",
-                doc.credentials.len()
+                "Restored {vaulted} vaulted account(s) to the agent vault \
+                 (inspect with `alf vault list`, decrypt with `alf vault decrypt`)."
             ));
+        }
+
+        if !auth_records.is_empty() {
+            let auth_doc = alf_core::CredentialsDocument {
+                credentials: auth_records,
+                extra: std::collections::HashMap::new(),
+            };
+            match vault_key {
+                Some(key) => match restore_credentials(&auth_doc, key, workspace) {
+                    Ok(n) => {
+                        if n > 0 {
+                            warnings.push(format!(
+                                "Restored {n} credential(s) into auth_profiles.json. \
+                                 Verify with ZeroClaw."
+                            ));
+                        }
+                    }
+                    Err(e) => warnings.push(format!("Credential restore failed: {e}")),
+                },
+                None => warnings.push(format!(
+                    "{} credential(s) found in archive (metadata only). \
+                     Pass --vault-key-file or set ALF_VAULT_KEY to restore secret material.",
+                    auth_doc.credentials.len()
+                )),
+            }
         }
     }
 
@@ -101,10 +128,7 @@ pub fn import(alf_file: &Path, workspace: &Path, vault_key: Option<&VaultKey>) -
             .as_ref()
             .map(|p| p.principals.len() as u32)
             .unwrap_or(0),
-        credentials_count: credentials
-            .as_ref()
-            .map(|c| c.credentials.len() as u32)
-            .unwrap_or(0),
+        credentials_count,
         warnings,
     })
 }
@@ -163,6 +187,47 @@ fn restore_credentials(
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(restored)
+}
+
+/// Restore `alf-vault`-tagged records — accounts the agent added with
+/// `alf vault add` — into the agent's ALF vault (`~/.alf/vault/credentials.json`).
+///
+/// Records stay AEAD-encrypted exactly as the archive carried them: no vault
+/// key is required, and the agent decrypts on demand with `alf vault decrypt`.
+/// This is the write-twin of `export::load_agent_vault`.
+fn restore_agent_vault(
+    records: Vec<alf_core::CredentialRecord>,
+    workspace: &Path,
+) -> Result<usize> {
+    if records.is_empty() {
+        return Ok(0);
+    }
+    let count = records.len();
+    let doc = alf_core::CredentialsDocument {
+        credentials: records,
+        extra: std::collections::HashMap::new(),
+    };
+
+    // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
+    // neutral and deliberately separate from any runtime keystore. Falls back
+    // to a workspace-local copy the user can move when HOME is unset.
+    let target = std::env::var_os("HOME")
+        .map(|h| {
+            std::path::PathBuf::from(h)
+                .join(".alf")
+                .join("vault")
+                .join("credentials.json")
+        })
+        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let serialized = serde_json::to_string_pretty(&doc)?;
+    fs::write(&target, serialized)
+        .with_context(|| format!("Failed to write {}", target.display()))?;
+
+    Ok(count)
 }
 
 // ---------------------------------------------------------------------------
@@ -450,7 +515,7 @@ mod tests {
 
         // Export
         let alf_file = dir.path().join("export.alf");
-        let export_report = export::export(&ws, &alf_file, None).unwrap();
+        let export_report = export::export(&ws, &alf_file).unwrap();
         assert!(export_report.memory_records > 0);
 
         // Import into fresh workspace
@@ -486,7 +551,7 @@ mod tests {
         );
 
         let alf_file = dir.path().join("export.alf");
-        export::export(&ws, &alf_file, None).unwrap();
+        export::export(&ws, &alf_file).unwrap();
 
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/workspace");

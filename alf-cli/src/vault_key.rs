@@ -185,6 +185,17 @@ pub fn default_key_path(runtime: &str) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// Path of the agent-managed ALF vault: `~/.alf/vault/credentials.json`.
+///
+/// Runtime-neutral — the vault is ALF's own store, deliberately separate from
+/// any runtime keystore. `alf vault add` writes here, and the adapter merges
+/// this file into the archive's Layer 4 on `alf sync`. Unlike the vault key,
+/// this file holds only ciphertext, so it is safe to sync.
+pub fn default_vault_path() -> Result<PathBuf> {
+    let home = home_dir().context("Could not determine home directory")?;
+    Ok(home.join(".alf").join("vault").join("credentials.json"))
+}
+
 fn home_dir() -> Option<PathBuf> {
     #[cfg(unix)]
     {

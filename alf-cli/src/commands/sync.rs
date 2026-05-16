@@ -22,12 +22,10 @@ use crate::commands::restore::pull_cloud_base;
 use crate::config::Config;
 use crate::output;
 use crate::state::{local_base_exists, local_base_path, state_file_path, AgentState};
-use crate::vault_key::{self, VaultKeyArgs};
 
 use alf_core::archive::{AlfReader, DeltaWriter};
 use alf_core::delta::compute_delta;
 use alf_core::manifest::{ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaSyncCursor};
-use alf_core::ExportOptions;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -161,7 +159,6 @@ pub fn run(
     workspace: &Path,
     recover: bool,
     force_first_sync: bool,
-    key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
 
@@ -201,17 +198,7 @@ pub fn run(
     let temp_alf = temp_dir.path().join("snapshot.alf");
 
     output::progress("  Exporting workspace...");
-    let resolved_key = vault_key::resolve(key_args, runtime)?;
-    if let Some((_, src)) = &resolved_key {
-        output::progress(&format!(
-            "Using vault key from {} — credentials will be AEAD-encrypted in the snapshot",
-            src.label()
-        ));
-    }
-    let export_opts = ExportOptions {
-        vault_key: resolved_key.as_ref().map(|(k, _)| k),
-    };
-    let report = adapt.export_with_options(workspace, &temp_alf, export_opts)?;
+    let report = adapt.export(workspace, &temp_alf)?;
     output::progress(&format!(
         "  Exported {} memory records",
         report.memory_records

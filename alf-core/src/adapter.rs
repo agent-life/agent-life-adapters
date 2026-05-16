@@ -40,19 +40,8 @@ pub struct ImportReport {
 }
 
 // ---------------------------------------------------------------------------
-// Export / Import options
+// Import options
 // ---------------------------------------------------------------------------
-
-/// Optional inputs for an export run.
-///
-/// `vault_key`, when supplied, tells the adapter to read real credential
-/// material from the runtime and emit AEAD ciphertext in
-/// `CredentialRecord.encrypted_payload`. When absent, adapters fall back
-/// to the legacy metadata-only path (`<not-exported>` placeholder).
-#[derive(Default)]
-pub struct ExportOptions<'a> {
-    pub vault_key: Option<&'a VaultKey>,
-}
 
 /// Optional inputs for an import run.
 ///
@@ -81,25 +70,13 @@ pub trait Adapter {
     /// Human-readable description of the adapter.
     fn description(&self) -> &str;
 
-    /// Export a workspace to an .alf file with no options.
+    /// Export a workspace to an .alf file.
     ///
-    /// Default implementation delegates to
-    /// [`export_with_options`](Self::export_with_options) so existing
-    /// callers don't break, while new callers can pass a vault key.
-    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
-        self.export_with_options(workspace, output, ExportOptions::default())
-    }
-
-    /// Export a workspace to an .alf file with caller-supplied options.
-    ///
-    /// `workspace` is the path to the framework's workspace directory.
-    /// `output` is the path to write the .alf file.
-    fn export_with_options(
-        &self,
-        workspace: &Path,
-        output: &Path,
-        options: ExportOptions<'_>,
-    ) -> Result<ExportReport>;
+    /// `workspace` is the path to the framework's workspace directory;
+    /// `output` is the path to write the .alf file. Layer 4 (credentials)
+    /// comes from the agent's explicit ALF vault (`~/.alf/vault/`) — export
+    /// never reads a vault key.
+    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport>;
 
     /// Import an .alf file into a workspace with no options.
     fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {

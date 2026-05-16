@@ -29,7 +29,7 @@ pub mod principals;
 pub mod rebuild;
 pub mod validation;
 
-pub use adapter::{Adapter, ExportOptions, ExportReport, ImportOptions, ImportReport};
+pub use adapter::{Adapter, ExportReport, ImportOptions, ImportReport};
 pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
 pub use credentials::*;
 pub use crypto::{

@@ -16,10 +16,9 @@ use walkdir::WalkDir;
 
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, IdentityLayerInfo, LayerInventory, Manifest,
-    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo, VaultKey,
+    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
 };
 
-use crate::credential_map;
 use crate::identity_parser;
 use crate::memory_parser;
 use crate::principals_parser;
@@ -164,14 +163,44 @@ fn quarter_end(year: i32, quarter: u32) -> NaiveDate {
 }
 
 // ---------------------------------------------------------------------------
+// Agent vault (Layer 4)
+// ---------------------------------------------------------------------------
+
+/// Load the agent-managed ALF vault — the `CredentialsDocument` the agent
+/// builds explicitly with `alf vault add`.
+///
+/// This is the ONLY source of the archive's Layer 4. ALF deliberately does
+/// not capture a runtime's own keystore (e.g. OpenClaw `auth-profiles.json`):
+/// the agent chooses what to back up. Vault records are already AEAD-encrypted,
+/// so they enter the archive verbatim. Returns `None` when the vault file is
+/// missing, unreadable, or has no records — the graceful-degradation contract
+/// export relies on for every optional layer.
+fn load_agent_vault(vault_path: Option<&Path>) -> Result<Option<alf_core::CredentialsDocument>> {
+    let path = match vault_path {
+        Some(p) if p.is_file() => p,
+        _ => return Ok(None),
+    };
+    let content = match fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return Ok(None),
+    };
+    match serde_json::from_str::<alf_core::CredentialsDocument>(&content) {
+        Ok(doc) if doc.credentials.is_empty() => Ok(None),
+        Ok(doc) => Ok(Some(doc)),
+        Err(_) => Ok(None), // graceful degradation
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Export entry point
 // ---------------------------------------------------------------------------
 
 /// Export an OpenClaw workspace to an `.alf` archive.
 ///
-/// `vault_key`, when supplied, causes credential records to carry real
-/// AEAD ciphertext instead of the legacy `<not-exported>` placeholder.
-pub fn export(workspace: &Path, output: &Path, vault_key: Option<&VaultKey>) -> Result<ExportReport> {
+/// Layer 4 (credentials) is the agent's explicit ALF vault — see
+/// [`load_agent_vault`]. Its records are already AEAD-encrypted; export never
+/// touches a vault key.
+pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     if !workspace.is_dir() {
         bail!(
             "Workspace directory does not exist: {}",
@@ -230,14 +259,12 @@ pub fn export(workspace: &Path, output: &Path, vault_key: Option<&VaultKey>) -> 
     let identity = identity_parser::build_identity(workspace, agent_id)?;
     let principals = principals_parser::build_principals(workspace, agent_id)?;
 
-    // Try to find state dir for credentials
-    let state_dir = dirs_home().map(|h| h.join(".openclaw"));
-    let credentials = credential_map::build_credentials(
-        state_dir.as_deref(),
-        "main", // default agent ID string
-        agent_id,
-        vault_key,
-    )?;
+    // Layer 4 = the agent's explicit ALF vault ONLY. ALF never captures a
+    // runtime's own keystore (e.g. OpenClaw `auth-profiles.json`) — the agent
+    // chooses what to back up via `alf vault add`. Vault records are already
+    // AEAD-encrypted, so they enter the archive verbatim.
+    let vault_path = dirs_home().map(|h| h.join(".alf").join("vault").join("credentials.json"));
+    let credentials = load_agent_vault(vault_path.as_deref())?;
 
     // 6. Build manifest
     let has_identity = identity.is_some();
@@ -403,7 +430,7 @@ mod tests {
         );
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output, None).unwrap();
+        let report = export(&workspace, &output).unwrap();
         assert_eq!(report.agent_name, "test-agent");
         assert_eq!(report.memory_records, 1);
         assert!(report.identity_version.is_some());
@@ -423,7 +450,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output, None).unwrap();
+        let report = export(&workspace, &output).unwrap();
         assert_eq!(report.agent_name, "Kleo");
     }
 
@@ -439,7 +466,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output, None).unwrap();
+        let report = export(&workspace, &output).unwrap();
         // 2 sections from Jan 15 + 1 from Jan 16
         assert_eq!(report.memory_records, 3);
     }
@@ -453,7 +480,7 @@ mod tests {
         ]);
         let output = workspace.join("test.alf");
 
-        let report = export(&workspace, &output, None).unwrap();
+        let report = export(&workspace, &output).unwrap();
         assert!(report.raw_sources.contains(&"SOUL.md".to_string()));
         assert!(report.raw_sources.contains(&"USER.md".to_string()));
         assert!(report.raw_sources.contains(&"TOOLS.md".to_string()));
@@ -465,8 +492,8 @@ mod tests {
         let output1 = workspace.join("test1.alf");
         let output2 = workspace.join("test2.alf");
 
-        export(&workspace, &output1, None).unwrap();
-        export(&workspace, &output2, None).unwrap();
+        export(&workspace, &output1).unwrap();
+        export(&workspace, &output2).unwrap();
 
         // .alf-agent-id should have been written
         let id_file = workspace.join(".alf-agent-id");
@@ -475,7 +502,67 @@ mod tests {
 
     #[test]
     fn export_nonexistent_workspace() {
-        let result = export(Path::new("/nonexistent/path"), Path::new("/tmp/out.alf"), None);
+        let result = export(Path::new("/nonexistent/path"), Path::new("/tmp/out.alf"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_agent_vault_reads_credentials_json() {
+        use alf_core::{CredentialRecord, CredentialType, CredentialsDocument, EncryptionMetadata};
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+        let doc = CredentialsDocument {
+            credentials: vec![CredentialRecord {
+                id: Uuid::nil(),
+                agent_id: Uuid::nil(),
+                service: "email".into(),
+                credential_type: CredentialType::Account,
+                encrypted_payload: "ZmFrZQ==".into(),
+                encryption: EncryptionMetadata {
+                    algorithm: "xchacha20-poly1305".into(),
+                    nonce: "bm9uY2U=".into(),
+                    kdf: None,
+                    kdf_params: None,
+                    extra: HashMap::new(),
+                },
+                created_at: Utc::now(),
+                label: Some("me@example.com".into()),
+                description: None,
+                capabilities_granted: vec![],
+                updated_at: None,
+                last_rotated_at: None,
+                expires_at: None,
+                tags: vec!["alf-vault".into()],
+                extra: HashMap::new(),
+            }],
+            extra: HashMap::new(),
+        };
+        fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let loaded = load_agent_vault(Some(&path)).unwrap().unwrap();
+        assert_eq!(loaded.credentials.len(), 1);
+        assert_eq!(loaded.credentials[0].service, "email");
+    }
+
+    #[test]
+    fn load_agent_vault_missing_or_empty_returns_none() {
+        use alf_core::CredentialsDocument;
+        use std::collections::HashMap;
+
+        let dir = TempDir::new().unwrap();
+        assert!(load_agent_vault(None).unwrap().is_none());
+        assert!(load_agent_vault(Some(&dir.path().join("nope.json")))
+            .unwrap()
+            .is_none());
+
+        let empty = dir.path().join("empty.json");
+        let doc = CredentialsDocument {
+            credentials: vec![],
+            extra: HashMap::new(),
+        };
+        fs::write(&empty, serde_json::to_string(&doc).unwrap()).unwrap();
+        assert!(load_agent_vault(Some(&empty)).unwrap().is_none());
     }
 }

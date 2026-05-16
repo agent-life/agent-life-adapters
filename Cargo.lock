@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "adapter-openclaw"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alf-core",
  "anyhow",
@@ -21,7 +21,7 @@ dependencies = [
 
 [[package]]
 name = "adapter-zeroclaw"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "alf-core",
  "anyhow",
@@ -101,7 +101,7 @@ dependencies = [
 
 [[package]]
 name = "alf-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "adapter-openclaw",
  "adapter-zeroclaw",
@@ -124,7 +124,7 @@ dependencies = [
 
 [[package]]
 name = "alf-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

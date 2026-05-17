@@ -1,3 +1,25 @@
+## [0.1.6] — 2026-05-16
+
+### Added
+
+- **`alf vault add`** — encrypt a credential and append it to the agent's vault (`~/.alf/vault/credentials.json`). Secret input from `--secret`, `--secret-file`, stdin, or `--secret-json` (a JSON object whose `user`/`username`/`email` and `password`/`token`/`bot_token`/`secret` fields are mapped automatically); `--update` upserts by label; `--field k=v` and `--tag` add metadata. Every record is tagged `alf-vault`.
+
+### Changed
+
+- **Explicit, runtime-neutral vault.** The ALF vault is now a single file the agent fills deliberately with `alf vault add`: `~/.alf/vault/credentials.json` (the same path for every runtime). Adapters no longer scrape a runtime's own keystore (OpenClaw `auth-profiles.json`, ZeroClaw `config.toml [secrets]`) into Layer 4 — `credential_map::build_credentials` is removed from both adapters. The agent chooses exactly what is backed up.
+- **`alf export` / `alf sync` no longer take vault-key flags.** Layer 4 is already ciphertext, so export/sync copy the vault file verbatim into the archive. `--vault-key-file` / `--vault-key-env` / `--vault-passphrase-*` / `--vault-salt` were removed from `export` and `sync`; they remain on `import`, `restore`, and `alf vault add` / `encrypt` / `decrypt`.
+- **`alf restore` / `alf import`** write `alf-vault`-tagged records back to `~/.alf/vault/credentials.json` as-is — encrypted, no key needed. A vault key is used only to decrypt a **legacy** archive whose Layer 4 came from a runtime keystore.
+- **`alf-core`:** removed `ExportOptions` and `Adapter::export_with_options`; `Adapter::export(workspace, output)` is the single export method (export threads no vault key). `ImportOptions` / `import_with_options` are unchanged.
+
+### Documentation
+
+- **`docs/vault-key-management.md`** rewritten: exact on-disk locations of the vault file and key, a per-command read/write table, and the add / sync / restore / read / recover-key workflow sequences.
+- **`docs/cli-reference.md`**, **`adapter-openclaw/README.md`**, **`adapter-zeroclaw/README.md`**, the top-level **`README.md`**, and **`scripts/integration_walkthrough_for_vault.py`** updated to the explicit-vault model.
+
+### Security
+
+- ALF no longer copies a runtime's entire credential keystore into the synced archive. Only credentials the agent explicitly adds with `alf vault add` enter Layer 4 — the agent decides what leaves the machine. The zero-knowledge property is unchanged: the sync service only ever sees ciphertext.
+
 ## [0.1.5] — 2026-05-10
 
 ### Added

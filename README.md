@@ -101,7 +101,7 @@ agent-life-adapters/
 │           ├── restore.rs      # alf restore — download and import
 │           ├── sync.rs         # alf sync — push deltas/snapshots to sync service API
 │           ├── validate.rs     # alf validate — schema validation (--strict-crypto optional)
-│           └── vault.rs        # alf vault — keygen, encrypt, decrypt, list, delete
+│           └── vault.rs        # alf vault — keygen, add, encrypt, decrypt, list, delete
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -111,8 +111,7 @@ agent-life-adapters/
 │       ├── import.rs           # ALF archive → write OpenClaw workspace
 │       ├── memory_parser.rs    # Parse MEMORY.md and daily logs → MemoryRecords
 │       ├── identity_parser.rs  # Parse SOUL.md, IDENTITY.md → Identity
-│       ├── principals_parser.rs # Parse USER.md → Principals
-│       └── credential_map.rs   # Map OpenClaw credential config → Credentials
+│       └── principals_parser.rs # Parse USER.md → Principals
 │
 ├── adapter-zeroclaw/          # ZeroClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -124,8 +123,7 @@ agent-life-adapters/
 │       ├── identity_parser.rs  # Parse identity (AIEOS/OpenClaw formats) → ALF Identity
 │       ├── principals_parser.rs # Parse USER.md → Principals
 │       ├── markdown_parser.rs  # Parse memory markdown files → MemoryRecords
-│       ├── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
-│       └── credential_map.rs   # Map config credential hints → Credentials (metadata only)
+│       └── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
 │
 ├── scripts/
 │   ├── install.sh              # Quick-install script (curl | sh)
@@ -219,22 +217,22 @@ alf check --runtime <runtime> [--workspace <path>]
 Pre-flight environment diagnostic. Discovers the agent workspace (auto-detects from `~/.openclaw/openclaw.json` if `-w` is omitted), checks for expected resources (SOUL.md, memory files, etc.), verifies ALF config and API key, and reports readiness to sync. Outputs a structured `CheckResult` with issue codes and per-issue `suggestion` text (guidance, not a guaranteed shell command). This is the recommended first command for agents to run.
 
 ```
-alf export --runtime <runtime> --workspace <path> [--output <path>] [--vault-key-file …]
+alf export --runtime <runtime> --workspace <path> [--output <path>]
 ```
 
-Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Vault:** optional `--vault-key-file`, `--vault-key-env`, passphrase flags, or the default `~/.{runtime}/state/.alf-vault-key` — when a key resolves, Layer 4 secrets are AEAD-encrypted; otherwise adapters emit metadata-only placeholders (`<not-exported>`). See `docs/vault-key-management.md`.
+Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
 
 ```
 alf import --runtime <runtime> --workspace <path> <alf-file> [--vault-key-file …]
 ```
 
-Import an `.alf` file into a framework workspace. Creates or populates the workspace with memory, identity, principals, credentials metadata, and artifacts translated to the target runtime's native format. **Vault:** with a resolved key, ciphertext is decrypted into runtime auth storage; without a key, other layers import but secrets are not restored (see JSON `warnings`).
+Import an `.alf` file into a framework workspace. Creates or populates the workspace with memory, identity, principals, and artifacts translated to the target runtime's native format. **Layer 4** vault records are written back to `~/.alf/vault/credentials.json` (still encrypted); a vault key is needed only to decrypt a legacy archive's runtime-keystore credentials.
 
 ```
-alf sync --runtime <runtime> --workspace <path> [--recover] [--force-first-sync] [--vault-key-file …]
+alf sync --runtime <runtime> --workspace <path> [--recover] [--force-first-sync]
 ```
 
-Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Same vault flags as export.
+Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags.
 
 ```
 alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>] [--vault-key-file …]
@@ -246,7 +244,7 @@ Download the latest snapshot (plus any uncompacted deltas) from the service and 
 alf vault <subcommand> …
 ```
 
-Layer 4 tooling: `keygen`, `encrypt`, `decrypt`, `list`, `delete`. See `docs/cli-reference.md` and `alf vault --help`.
+Layer 4 vault tooling: `keygen`, `add`, `encrypt`, `decrypt`, `list`, `delete`. The vault is `~/.alf/vault/credentials.json`. See `docs/cli-reference.md` and `alf vault --help`.
 
 ```
 alf purge --runtime <runtime> --workspace <path> [-a|--agent <agent-id>]

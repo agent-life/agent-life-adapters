@@ -4,9 +4,11 @@ agent-life Vault Integration Walkthrough
 =======================================
 
 Teaches new engineers how the zero-knowledge credentials vault fits into the
-sync pipeline: what exists **on disk** (workspace + `~/.alf` + runtime vault
-key material), what lands **in the cloud** (opaque S3 blob + Postgres metadata
-only), and how `credentials.json` travels inside an `.alf` snapshot.
+sync pipeline: what the vault is and where it lives
+(`~/.alf/vault/credentials.json` — runtime-neutral, ciphertext only), what a
+vault record looks like field by field, what lands **in the cloud** (opaque S3
+blob + Postgres metadata only), and how the vault travels inside an `.alf`
+snapshot as the Layer 4 `credentials.json`.
 
 Follows the same UX as `integration_walkthrough.py` (banner, steps, pauses,
 markdown report).
@@ -81,43 +83,51 @@ def make_vault_memory(record_id: str, content: str, namespace: str = "default") 
 
 
 def build_vault_credentials_document(agent_id_str: str) -> dict:
-    """Synthetic credentials: one real-shaped ciphertext row + one legacy `none` row."""
-    nonce = base64.standard_b64encode(os.urandom(24)).decode("ascii")
-    ciphertext = base64.standard_b64encode(os.urandom(48)).decode("ascii")
+    """Two realistic `alf vault add` records — an email account and a Telegram account.
+
+    The shapes match exactly what `alf vault add` writes into
+    `~/.alf/vault/credentials.json`: real-looking AEAD ciphertext, plaintext
+    descriptors (service / label / description / tags), and the `alf-vault` tag
+    every agent-added record carries.
+    """
     now = datetime.now(timezone.utc).isoformat()
-    # Legacy row matches alf-core tests: algorithm "none" still includes encryption.nonce
-    # (serde requires the field); payload is the historical placeholder string, not b64.
-    legacy_payload = "<not-exported>"
+
+    def record(rec_id: str, service: str, label: str, description: str) -> dict:
+        return {
+            "id": rec_id,
+            "agent_id": agent_id_str,
+            "service": service,
+            "credential_type": "account",
+            # Random bytes stand in for a real AEAD blob — without the vault key
+            # this is indistinguishable from the secret it protects.
+            "encrypted_payload": base64.standard_b64encode(os.urandom(48)).decode("ascii"),
+            "encryption": {
+                "algorithm": "xchacha20-poly1305",
+                "nonce": base64.standard_b64encode(os.urandom(24)).decode("ascii"),
+            },
+            "created_at": now,
+            "label": label,
+            "description": description,
+            "capabilities_granted": [],
+            "tags": ["agent-provisioned", "alf-vault"],
+        }
+
     return {
         "credentials": [
-            {
-                "id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaa0001",
-                "agent_id": agent_id_str,
-                "service": "agent-life.run",
-                "credential_type": "account",
-                "encrypted_payload": ciphertext,
-                "encryption": {
-                    "algorithm": "xchacha20-poly1305",
-                    "nonce": nonce,
-                },
-                "created_at": now,
-                "label": "Walkthrough credential (pedagogical)",
-                "description": (
-                    "Plaintext description — operator-visible in DB listings and exports; "
-                    "not the secret itself."
-                ),
-            },
-            {
-                "id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbb0002",
-                "agent_id": agent_id_str,
-                "service": "legacy-adapter-example",
-                "credential_type": "custom",
-                "encrypted_payload": legacy_payload,
-                "encryption": {"algorithm": "none", "nonce": ""},
-                "created_at": now,
-                "description": "Legacy metadata-only row (algorithm 'none') for contrast",
-            },
-        ]
+            record(
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaa0001",
+                "email",
+                "kleo@agent-life.run",
+                "Agent email account — plaintext metadata, operator-visible.",
+            ),
+            record(
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbb0002",
+                "telegram",
+                "kleo_bot",
+                "Agent Telegram bot account.",
+            ),
+        ],
+        "extra": {},
     }
 
 
@@ -206,7 +216,10 @@ def step_vault_zero_knowledge(cfg: iw.Config, report: iw.Report):
     iw.section(1, "Zero-Knowledge Boundary (Concept)")
     iw.explain(
         """
-        Layer 4 credentials are **client-encrypted** before they ever reach the API.
+        The **vault** is a local file — `~/.alf/vault/credentials.json` — holding
+        Layer 4 credentials **client-encrypted** before they ever reach the API.
+        The agent fills it explicitly with `alf vault add`; ALF never scrapes a
+        runtime's own keystore.
 
         • **Vault key** — raw bytes (file or env) or a passphrase stretched with
           Argon2id. The sync service never receives it.
@@ -233,31 +246,69 @@ def step_vault_zero_knowledge(cfg: iw.Config, report: iw.Report):
 
 
 def step_on_disk_layout(cfg: iw.Config, report: iw.Report):
-    iw.section(2, "On-Disk Layout (Engineer Workstation)")
+    iw.section(2, "The Vault On Disk — Location, Neutrality, Anatomy")
     iw.explain(
         """
-        **`~/.alf/config.toml`** — service URL + **API key** (authenticates you to
-        agent-life; unrelated to the vault key).
+        The ALF vault is one file:
 
-        **`~/.alf/state/{agent_id}.toml`** + **`{agent_id}-snapshot.alf`** — sync
-        cursor and frozen base archive the CLI uses for deltas (may contain
-        `credentials.json` after a sync).
+            ~/.alf/vault/credentials.json
 
-        **Vault key material (per runtime)** — resolved in priority order by the CLI
-        (`alf export/sync/restore` vault flags, `ALF_VAULT_KEY`, passphrase env,
-        then e.g. `~/.openclaw/state/.alf-vault-key` or `~/.zeroclaw/state/.alf-vault-key`).
+        It is **runtime-neutral** — the same path whether the agent runs on
+        OpenClaw or ZeroClaw. It lives under ALF's own home (`~/.alf/`, beside
+        `config.toml` and `state/`), NOT inside a runtime directory, and is
+        deliberately separate from any runtime keystore (OpenClaw
+        `auth-profiles.json`, ZeroClaw `config.toml [secrets]`). ALF never reads
+        or syncs those keystores — the agent decides what to vault with
+        `alf vault add`.
 
-        **Workspace** — adapter-defined files; encrypted credential **records** in
-        exportable form live in `credentials.json` **inside** the `.alf` snapshot,
-        not as a separate server-side table row per secret.
+        It holds a `CredentialsDocument`: a list of independently AEAD-encrypted
+        `CredentialRecord`s. Ciphertext only, so syncing it is safe. `alf sync`
+        copies it verbatim into the `.alf` archive as the Layer 4
+        `credentials.json`; `alf restore` writes it back to the same path.
+
+        Other files on the host (none of which is the vault):
+          • `~/.alf/config.toml` — service URL + API key (authenticates you to
+            agent-life; unrelated to the vault key).
+          • `~/.alf/state/{agent_id}.toml` + `{agent_id}-snapshot.alf` — sync
+            cursor + frozen base archive used to compute deltas.
+          • **Vault key** — `~/.openclaw/state/.alf-vault-key` (or the zeroclaw
+            path), or `ALF_VAULT_KEY`, or a passphrase. Secret; never synced,
+            never inside the archive. Needed by `alf vault add` / `decrypt`,
+            not by `export` / `sync`.
+        """
+    )
+
+    # Show what a vault record actually looks like.
+    cred_doc = build_vault_credentials_document(str(VAULT_AGENT_ID))
+    print(f"  {iw.c('yellow', '~/.alf/vault/credentials.json (redacted)')}:")
+    print(json.dumps(redact_credentials_for_display(cred_doc), indent=4))
+    print()
+    iw.explain(
+        """
+        A `CredentialRecord`, field by field:
+          • `id`                — stable UUID; the selector for `vault delete`.
+          • `service` / `label` — plaintext descriptors; how an agent finds a
+                                   record without the key. Operator-visible.
+          • `credential_type`   — `account`, `api_key`, `oauth_token`, …
+          • `encrypted_payload` — base64 AEAD ciphertext. The actual secret
+                                   (username + password / token) lives ONLY here.
+          • `encryption`        — `algorithm` (xchacha20-poly1305) + `nonce`.
+          • `description`       — optional plaintext; treat as semi-public.
+          • `tags`              — plaintext; every `alf vault add` record carries
+                                   `alf-vault`, the tag that routes it back into
+                                   the vault file on `alf restore`.
+
+        Only `encrypted_payload` hides anything. Every other field is readable by
+        anyone with the file — by design, so `vault list` / `vault delete` need
+        no key.
         """
     )
     report.add(
         iw.StepResult(
-            "On-disk layout",
+            "Vault on disk",
             True,
             0,
-            "Config, state, vault key paths, workspace vs archive",
+            "Location (~/.alf/vault/credentials.json), runtime-neutrality, record anatomy",
         )
     )
     iw.pause(cfg)
@@ -483,16 +534,21 @@ def step_surgical_delete_concept(cfg: iw.Config, report: iw.Report):
     iw.section(6, "Surgical Delete (`alf vault delete`) — No Key")
     iw.explain(
         """
-        **`alf vault delete`** removes a credential **record** from `credentials.json`
-        using only structural metadata (id / service / description match). It does
-        **not** need the vault key, because it never decrypts — it edits JSON and
-        rewrites the file (or `--out` for a copy).
+        The `alf vault` command family: `keygen` mints a key; `add` encrypts a
+        credential into `~/.alf/vault/credentials.json`; `list` and `delete`
+        work on plaintext descriptors only; `decrypt` reads one secret back.
+        `add` and `decrypt` need the vault key — `list` and `delete` do not.
+
+        **`alf vault delete`** removes a credential **record** from the vault file
+        using only structural metadata (id / service / label / description match).
+        It does **not** need the vault key, because it never decrypts — it edits
+        JSON and rewrites the file (or `--out` for a copy).
 
         Contrast with **`alf vault decrypt`**, which requires the vault key and a TTY
         unless `--yes-insecure`.
 
-        After deletion, the next `alf sync` uploads a delta reflecting the smaller
-        credential set; the cloud still never sees plaintext.
+        After deletion, the next `alf sync` carries the smaller credential set;
+        the cloud still never sees plaintext.
         """
     )
     report.add(

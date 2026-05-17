@@ -2,8 +2,6 @@
 
 use crate::adapter;
 use crate::output;
-use crate::vault_key::{self, VaultKeyArgs};
-use alf_core::ExportOptions;
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -19,12 +17,7 @@ struct ExportResult {
     file_size: u64,
 }
 
-pub fn run(
-    runtime: &str,
-    workspace: &Path,
-    output_arg: Option<&Path>,
-    key_args: &VaultKeyArgs,
-) -> Result<()> {
+pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result<()> {
     let human = output::human_mode();
 
     let adapter = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -71,17 +64,7 @@ pub fn run(
         output::progress(&format!("Exporting {} workspace...", adapter.name()));
     }
 
-    let resolved_key = vault_key::resolve(key_args, runtime)?;
-    if let Some((_, src)) = &resolved_key {
-        output::progress(&format!(
-            "Using vault key from {} — credentials will be AEAD-encrypted",
-            src.label()
-        ));
-    }
-    let options = ExportOptions {
-        vault_key: resolved_key.as_ref().map(|(k, _)| k),
-    };
-    let report = adapter.export_with_options(workspace, output_path, options)?;
+    let report = adapter.export(workspace, output_path)?;
 
     if human {
         println!("{} Export complete", "✓".green().bold());

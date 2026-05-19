@@ -11,6 +11,9 @@
 #   ALF_VERSION      Pin a specific release (e.g. ALF_VERSION=v0.1.0). Default: latest.
 #   ALF_INSTALL_DIR  Override install directory. Default: /usr/local/bin or ~/.local/bin.
 #   ALF_QUIET        Set to 1 to suppress all progress output (stderr is still quiet).
+#   ALF_ALLOW_UNVERIFIED  Set to 1 to install even when the SHA256 checksum cannot
+#                         be verified (missing/empty .sha256, or no sha256sum/shasum
+#                         tool). Default: verification failure is fatal (exit 4).
 #   ALF_RELEASE_URL  Override GitHub release base URL (for testing). If set, also
 #                    overrides the GitHub API URL using the same base.
 #   ALF_BACKUP_URL   Override the backup (agent-life.ai) release base URL (for testing).
@@ -19,7 +22,7 @@
 #   0 — success
 #   2 — unsupported platform or architecture
 #   3 — download failed (all sources exhausted)
-#   4 — checksum mismatch
+#   4 — checksum verification failed (mismatch, or unavailable when ALF_ALLOW_UNVERIFIED is unset)
 #   5 — post-install verification failed (alf --version did not work)
 
 set -e
@@ -42,21 +45,22 @@ fi
 BACKUP_BASE="${ALF_BACKUP_URL:-https://agent-life.ai/releases}"
 
 CHECKSUM_VERIFIED="false"
+WARNINGS=""
 
 # log: write progress to stderr (suppressed when ALF_QUIET=1)
 log() { [ "${ALF_QUIET:-0}" = "1" ] || printf "%s\n" "$@" >&2; }
 
 on_success() {
     installed_version=$("$install_dir/$BINARY_NAME" --version 2>&1) || true
-    printf '{"ok":true,"version":"%s","installed_version":"%s","path":"%s/%s","checksum_verified":%s}\n' \
-        "$VERSION" "$installed_version" "$install_dir" "$BINARY_NAME" "$CHECKSUM_VERIFIED"
+    printf '{"ok":true,"version":"%s","installed_version":"%s","path":"%s/%s","checksum_verified":%s,"warnings":[%s]}\n' \
+        "$VERSION" "$installed_version" "$install_dir" "$BINARY_NAME" "$CHECKSUM_VERIFIED" "$WARNINGS"
 }
 
 on_failure() {
     code="$1"
     msg="$2"
-    printf '{"ok":false,"error":"%s","exit_code":%s}\n' "$msg" "$code" >&2
-    printf '{"ok":false,"error":"%s","exit_code":%s}\n' "$msg" "$code"
+    printf '{"ok":false,"error":"%s","exit_code":%s,"warnings":[%s]}\n' "$msg" "$code" "$WARNINGS" >&2
+    printf '{"ok":false,"error":"%s","exit_code":%s,"warnings":[%s]}\n' "$msg" "$code" "$WARNINGS"
     exit "$code"
 }
 
@@ -96,7 +100,7 @@ main() {
 
     chmod +x "$tmpdir/$BINARY_NAME"
 
-    # Checksum verification (gracefully skipped if unavailable)
+    # Checksum verification (fatal unless ALF_ALLOW_UNVERIFIED=1)
     verify_checksum "$tmpdir/$BINARY_NAME" "$checksum_url"
 
     install_dir=$(resolve_install_dir)
@@ -222,21 +226,33 @@ download() {
     fi
 }
 
+# verification_failed: handle a checksum-verification failure.
+# Exits 4 unless ALF_ALLOW_UNVERIFIED=1 is set, in which case it records the
+# reason as a warning and lets the install continue with checksum_verified=false.
+verification_failed() {
+    reason="$1"
+    if [ "${ALF_ALLOW_UNVERIFIED:-0}" = "1" ]; then
+        log "  ⚠ $reason — continuing because ALF_ALLOW_UNVERIFIED=1"
+        WARNINGS="${WARNINGS}${WARNINGS:+,}\"$reason\""
+        CHECKSUM_VERIFIED="false"
+        return 0
+    fi
+    on_failure 4 "$reason"
+}
+
 verify_checksum() {
     binary_path="$1"
     checksum_url="$2"
     checksum_file="$tmpdir/checksum.sha256"
 
     if ! download "$checksum_url" "$checksum_file" 2>/dev/null; then
-        log "  ⚠ Checksum file not available — skipping verification"
-        CHECKSUM_VERIFIED="false"
+        verification_failed "checksum file unavailable"
         return 0
     fi
 
     expected=$(awk '{print $1}' "$checksum_file")
     if [ -z "$expected" ]; then
-        log "  ⚠ Checksum file empty or malformed — skipping verification"
-        CHECKSUM_VERIFIED="false"
+        verification_failed "checksum file empty or malformed"
         return 0
     fi
 
@@ -245,15 +261,12 @@ verify_checksum() {
     elif command -v shasum >/dev/null 2>&1; then
         actual=$(shasum -a 256 "$binary_path" | awk '{print $1}')
     else
-        log "  ⚠ No sha256sum or shasum available — skipping verification"
-        CHECKSUM_VERIFIED="false"
+        verification_failed "no sha256sum or shasum tool available"
         return 0
     fi
 
     if [ "$expected" != "$actual" ]; then
-        printf '{"ok":false,"error":"checksum mismatch","exit_code":4}\n' >&2
-        printf '{"ok":false,"error":"checksum mismatch","exit_code":4}\n'
-        exit 4
+        on_failure 4 "checksum mismatch"
     fi
 
     log "  ✓ Checksum verified"

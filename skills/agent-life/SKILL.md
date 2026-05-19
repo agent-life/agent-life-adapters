@@ -55,7 +55,7 @@ The install script detects your platform, downloads the binary from GitHub Relea
 
     {"ok":true,"version":"v0.1.7","installed_version":"alf 0.1.7","path":"/usr/local/bin/alf","checksum_verified":true}
 
-**Checksum verification is mandatory by default.** The script exits non-zero if the `.sha256` file is missing, empty, or if no `sha256sum`/`shasum` tool is available. To install without verification (not recommended), set `ALF_ALLOW_UNVERIFIED=1`. In that case `checksum_verified` is `false` in the output JSON.
+**Checksum verification is mandatory by default.** A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed at all — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case only (not recommended), in which case `checksum_verified` is `false` and a `warnings` array in the output JSON records the reason.
 
 For production use, pin to a specific release:
 
@@ -234,7 +234,8 @@ Inspect the effect with `alf export --dry-run` — the `excluded_by_alfignore` c
 | HTTP 401 Unauthorized | Bad or revoked API key | `alf login --key <new-key>` |
 | HTTP 409 Conflict | Sequence mismatch during sync | `alf restore --dry-run` to inspect, then `alf restore` and sync again |
 | HTTP 402 agent_limit | Subscription agent limit reached | Upgrade at <https://agent-life.ai> |
-| `install.sh` exit 4 | Checksum verification failed or unavailable | Re-run with `ALF_ALLOW_UNVERIFIED=1` (not recommended) or check that the release publishes a `.sha256` file |
+| `install.sh` exit 4 — `checksum mismatch` | Downloaded binary's hash ≠ the published `.sha256` — corrupt download or tampering | Do **not** install. Retry the download; if it persists, treat it as a supply-chain issue and report it. `ALF_ALLOW_UNVERIFIED` does not override a mismatch |
+| `install.sh` exit 4 — verification unavailable | `.sha256` missing or empty, or no `sha256sum`/`shasum` tool on the host | Fix the host, or wait for the release to publish a `.sha256`. As a last resort, re-run with `ALF_ALLOW_UNVERIFIED=1` (not recommended) |
 
 
 ## Environment Status
@@ -292,7 +293,7 @@ Credential secrets are encrypted on your machine using XChaCha20-Poly1305 (defau
 
 ### Install integrity
 
-The `alf` binary is downloaded from GitHub Releases and SHA256-verified during install. The install script **exits non-zero** if verification cannot complete (missing `.sha256` file, empty checksum, or no `sha256sum`/`shasum` available). The user must explicitly opt out with `ALF_ALLOW_UNVERIFIED=1` to install without verification, in which case the JSON output reports `"checksum_verified":false`. Inspect the install script before running it (see *Install* above).
+The `alf` binary is downloaded from GitHub Releases and SHA256-verified during install. A hash mismatch always aborts the install (exit 4) and is never bypassable. If verification cannot complete — missing `.sha256` file, empty checksum, or no `sha256sum`/`shasum` available — the script also exits 4 by default; the user must explicitly opt out with `ALF_ALLOW_UNVERIFIED=1` to install without verification, in which case the JSON output reports `"checksum_verified":false` and a `warnings` array. Inspect the install script before running it (see *Install* above).
 
 ### Review before uploading
 

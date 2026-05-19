@@ -1,0 +1,28 @@
+FROM alpine:3.19
+
+# Deliberately omits coreutils so the image has no GNU sha256sum/shasum.
+RUN apk add --no-cache \
+        curl \
+        python3 \
+        ca-certificates \
+        bash
+
+# Remove busybox's own sha256sum applet so neither sha256sum nor shasum is on
+# PATH — this image exercises install.sh's "no checksum tool" failure branch.
+# The command -v assertions fail the build loudly if a hashing tool survives.
+RUN rm -f /usr/bin/sha256sum /bin/sha256sum /usr/local/bin/sha256sum \
+          /usr/bin/shasum /bin/shasum \
+    && ! command -v sha256sum >/dev/null 2>&1 \
+    && ! command -v shasum >/dev/null 2>&1
+
+RUN adduser -D testuser
+
+COPY scripts/install.sh /install.sh
+COPY scripts/test_install/ /test_install/
+
+RUN chmod +x /install.sh /test_install/run_tests.sh
+
+USER testuser
+WORKDIR /home/testuser
+
+ENTRYPOINT ["/bin/sh"]

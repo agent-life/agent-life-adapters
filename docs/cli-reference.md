@@ -4,9 +4,9 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.2.2 | Updated: 2026-05-16
-> HTML: https://agent-life.ai/docs/cli
-> Markdown: https://agent-life.ai/docs/cli.md
+> Version: 0.1.6 | Updated: 2026-05-16
+> HTML: <https://agent-life.ai/docs/cli>
+> Markdown: <https://agent-life.ai/docs/cli.md>
 
 ## Global Flags
 

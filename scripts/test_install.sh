@@ -157,8 +157,9 @@ OVERALL_EXIT=0
 
 start_mock_server
 
-# Determine which distros to test
-DISTROS="ubuntu debian alpine"
+# Determine which distros to test.
+# alpine-nochecksum has no sha256sum/shasum — exercises the no-tool failure path.
+DISTROS="ubuntu debian alpine alpine-nochecksum"
 if echo "$MODE" | grep -q "quick"; then
     DISTROS="ubuntu"
 fi

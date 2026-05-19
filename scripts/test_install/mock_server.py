@@ -12,6 +12,8 @@ URL patterns served:
   GET /releases/latest/<filename>
       → serve file from <fixtures_dir>/<filename>
       → if ?bad_checksum=1 on .sha256 requests, return a wrong hash
+      → if ?missing-checksum=1 on .sha256 requests, return 404
+      → if ?empty-checksum=1 on .sha256 requests, return an empty body
 
 Any other path or file not found → 404.
 
@@ -51,14 +53,32 @@ def main():
             self.end_headers()
             self.wfile.write(body)
 
-        def send_file(self, filepath, bad_checksum=False):
+        def send_file(self, filepath, bad_checksum=False,
+                      missing_checksum=False, empty_checksum=False):
+            is_checksum = filepath.endswith(".sha256")
+
+            # Simulate a missing .sha256: 404 even though the fixture exists.
+            if is_checksum and missing_checksum:
+                self.send_response(404)
+                self.end_headers()
+                self.wfile.write(b"Not found")
+                return
+
             if not os.path.isfile(filepath):
                 self.send_response(404)
                 self.end_headers()
                 self.wfile.write(b"Not found")
                 return
 
-            if bad_checksum and filepath.endswith(".sha256"):
+            # Simulate an empty .sha256.
+            if is_checksum and empty_checksum:
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+
+            if is_checksum and bad_checksum:
                 # Return a deliberately wrong hash
                 body = b"0000000000000000000000000000000000000000000000000000000000000000  fake\n"
                 self.send_response(200)
@@ -81,6 +101,8 @@ def main():
             path = parsed.path
             qs = parse_qs(parsed.query)
             bad_checksum = "bad_checksum" in qs and qs["bad_checksum"][0] == "1"
+            missing_checksum = "missing-checksum" in qs and qs["missing-checksum"][0] == "1"
+            empty_checksum = "empty-checksum" in qs and qs["empty-checksum"][0] == "1"
 
             # GitHub API: GET /repos/{owner}/{repo}/releases/latest
             if re.match(r"^/repos/[^/]+/[^/]+/releases/latest$", path):
@@ -97,14 +119,16 @@ def main():
                     self.end_headers()
                     self.wfile.write(f"No release found for tag {tag}".encode())
                     return
-                self.send_file(os.path.join(fixtures_dir, filename), bad_checksum)
+                self.send_file(os.path.join(fixtures_dir, filename), bad_checksum,
+                               missing_checksum, empty_checksum)
                 return
 
             # Alternative path: /releases/latest/<filename>  (used by some scripts)
             m = re.match(r"^/releases/latest/(.+)$", path)
             if m:
                 filename = m.group(1)
-                self.send_file(os.path.join(fixtures_dir, filename), bad_checksum)
+                self.send_file(os.path.join(fixtures_dir, filename), bad_checksum,
+                               missing_checksum, empty_checksum)
                 return
 
             self.send_response(404)

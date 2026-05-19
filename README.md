@@ -134,6 +134,7 @@ agent-life-adapters/
 │   │   ├── Dockerfile.ubuntu   # Ubuntu 24.04 test image
 │   │   ├── Dockerfile.alpine   # Alpine 3.19 test image
 │   │   ├── Dockerfile.debian   # Debian 12 test image
+│   │   ├── Dockerfile.alpine-nochecksum  # Alpine with no sha256sum/shasum
 │   │   └── fixtures/           # Fake binaries + SHA256 checksums
 │   └── ...                     # generate_synthetic_data.py, generate_fixtures.sh, etc.
 │
@@ -348,7 +349,7 @@ The `alf` binary is compiled for 5 platform targets and attached to GitHub Relea
 curl -sSL https://agent-life.ai/install.sh | sh
 ```
 
-The install script detects the platform and downloads the correct binary to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root).
+The install script detects the platform and downloads the correct binary to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). SHA256 checksum verification is mandatory by default. A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case (not recommended), which then reports `"checksum_verified":false` and a populated `warnings` array in the JSON output.
 
 **From source (requires Rust 1.75+):**
 
@@ -509,7 +510,7 @@ The install script (`scripts/install.sh`) has its own isolated test suite that r
 
 **Requirements:** `python3`, `docker` (for Linux tests), `curl`.
 
-**How it works:** The runner starts a Python mock server (`scripts/test_install/mock_server.py`) that simulates GitHub Releases — it serves fake `alf` binaries and `.sha256` checksum files from `scripts/test_install/fixtures/`. The fake binaries are shell scripts that respond to `--version`, so no real Rust build is needed. Install script tests run inside Docker containers (Ubuntu 24.04, Debian 12, Alpine 3.19) as a non-root user, exercising each distro's `/bin/sh` implementation (`dash` on Ubuntu/Debian, `busybox ash` on Alpine).
+**How it works:** The runner starts a Python mock server (`scripts/test_install/mock_server.py`) that simulates GitHub Releases — it serves fake `alf` binaries and `.sha256` checksum files from `scripts/test_install/fixtures/`. The fake binaries are shell scripts that respond to `--version`, so no real Rust build is needed. Install script tests run inside Docker containers (Ubuntu 24.04, Debian 12, Alpine 3.19, plus an Alpine variant with no `sha256sum`/`shasum`) as a non-root user, exercising each distro's `/bin/sh` implementation (`dash` on Ubuntu/Debian, `busybox ash` on Alpine).
 
 **What is tested:**
 
@@ -525,7 +526,9 @@ The install script (`scripts/install.sh`) has its own isolated test suite that r
 | **Unsupported arch** | Linux/riscv64 → exit code 2 |
 | **Download failure** | Version not found on mock server (HTTP 404, both primary and backup) → exit code 3 |
 | **Checksum mismatch** | Mock server returns a wrong hash → exit code 4 |
-| **Checksum missing** | Mock server 404s for `.sha256` → install proceeds with `checksum_verified:false`, exit 0 |
+| **Checksum unavailable** | Mock server 404s for `.sha256` → exit code 4 by default; `ALF_ALLOW_UNVERIFIED=1` → exit 0 with `checksum_verified:false` and a warning |
+| **Empty checksum** | Mock server returns an empty `.sha256` body → exit code 4 |
+| **No checksum tool** | Alpine image with no `sha256sum`/`shasum` → exit code 4; `ALF_ALLOW_UNVERIFIED=1` → exit 0 with a warning |
 | **JSON stdout** | Success: stdout is parseable JSON. Failure: stdout is also parseable JSON with `ok:false` |
 | **Stderr progress** | Progress messages (`Installing…`, `✓ Checksum verified`) go to stderr, not stdout |
 | **Quiet mode** | `ALF_QUIET=1` → stderr is completely empty, stdout still has JSON |

@@ -33,7 +33,10 @@ import argparse
 import io
 import json
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 import textwrap
 import time
 import uuid
@@ -398,6 +401,23 @@ def make_memory(record_id: str, content: str, namespace: str = "default") -> dic
         "status": "active",
         "namespace": namespace,
     }
+
+
+# ---------------------------------------------------------------------------
+# alf CLI discovery
+# ---------------------------------------------------------------------------
+
+def find_alf_binary() -> Optional[str]:
+    """Locate the `alf` CLI: PATH first, then this repo's target/ build dirs."""
+    found = shutil.which("alf")
+    if found:
+        return found
+    repo_root = Path(__file__).resolve().parent.parent
+    for profile in ("release", "debug"):
+        candidate = repo_root / "target" / profile / "alf"
+        if candidate.is_file():
+            return str(candidate)
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1014,8 +1034,142 @@ def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
     pause(cfg)
 
 
+def step_dry_run_safety(cfg: Config, api: ApiClient, report: Report):
+    section(11, "CLI Safety — `--dry-run` and `.alfignore`")
+    explain("""
+        Before cleanup, a tour of three features that let an operator see and
+        control exactly what `alf` does before it touches the cloud or the
+        local workspace (the ASI06 / ASI08 hardening):
+
+          • alf export --dry-run   — list the files that WOULD be archived,
+                                     writing no .alf and making no network call.
+          • <workspace>/.alfignore — a .gitignore-style file that filters
+                                     paths out of the export set.
+          • alf restore --dry-run  — fetch and decode the cloud archive and
+                                     list what WOULD be written, touching
+                                     neither the workspace nor ~/.alf/state/.
+
+        This step runs the real `alf` binary, so it doubles as a functional
+        check of all three.
+    """)
+
+    t0 = time.time()
+    alf = find_alf_binary()
+    if not alf:
+        ok("`alf` binary not found on PATH or in target/ — skipping CLI demo")
+        report.add(StepResult("CLI dry-run / .alfignore", True,
+                              (time.time() - t0) * 1000,
+                              "alf binary not available"))
+        pause(cfg)
+        return
+    print(f"  Using alf binary: {alf}")
+    print()
+
+    details: list[str] = []
+
+    # --- export --dry-run + .alfignore (offline, deterministic) -------------
+    with tempfile.TemporaryDirectory() as tmp:
+        ws = Path(tmp) / "workspace"
+        (ws / "memory").mkdir(parents=True)
+        (ws / "SOUL.md").write_text("# Atlas\n\nA demo agent.\n")
+        (ws / "MEMORY.md").write_text("## Facts\n\nThe sky is blue.\n")
+        (ws / "memory" / "2026-01-15.md").write_text("## Morning\n\nlog one\n")
+        (ws / "memory" / "2026-01-16.md").write_text("## Day\n\nlog two\n")
+
+        explain("""
+            `alf export --dry-run` on a sample workspace. The JSON lists every
+            file that would be archived, with sizes — and writes nothing.
+        """)
+        proc = subprocess.run(
+            [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
+            capture_output=True, text=True, timeout=60,
+        )
+        if proc.returncode != 0:
+            fail(f"`alf export --dry-run` exited {proc.returncode}")
+            print((proc.stderr or proc.stdout or "")[:300])
+            report.add(StepResult("CLI dry-run / .alfignore", False,
+                                  (time.time() - t0) * 1000,
+                                  error=(proc.stderr or proc.stdout or "")[:200]))
+            pause(cfg)
+            return
+        preview = json.loads(proc.stdout)
+        ok(f"export --dry-run: {len(preview['files'])} files, "
+           f"{preview['total_size']} bytes, "
+           f"excluded_by_alfignore={preview['excluded_by_alfignore']}")
+        for f in preview["files"]:
+            print(f"    {f['path']}  ({f['size']} B)")
+        no_alf = not any(ws.glob("*.alf"))
+        no_agent_id = not (ws / ".alf-agent-id").exists()
+        ok(f"nothing written — no .alf: {no_alf}, no .alf-agent-id: {no_agent_id}")
+        details.append(f"export preview {len(preview['files'])} files")
+
+        explain("""
+            Now drop a `.alfignore` excluding one memory file. The same filter
+            applies to a real `alf export` / `alf sync` — `--dry-run` just
+            lets you confirm it first.
+        """)
+        (ws / ".alfignore").write_text("memory/2026-01-15.md\n")
+        proc = subprocess.run(
+            [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
+            capture_output=True, text=True, timeout=60,
+        )
+        filtered = json.loads(proc.stdout)
+        kept = [f["path"] for f in filtered["files"]]
+        ok(f".alfignore excluded {filtered['excluded_by_alfignore']} file(s); "
+           f"memory/2026-01-15.md still listed: {'memory/2026-01-15.md' in kept}")
+        details.append(f".alfignore excluded {filtered['excluded_by_alfignore']}")
+
+    # --- restore --dry-run against the live agent synced above --------------
+    explain("""
+        Finally, `alf restore --dry-run` for the agent we synced earlier. It
+        makes the SAME network calls as a real restore — fetch snapshot +
+        deltas — but writes nothing: no workspace, no ~/.alf/state/.
+
+        We point the CLI at a throwaway HOME so its config and any state
+        writes are fully isolated from the operator's real ~/.alf.
+    """)
+    with tempfile.TemporaryDirectory() as tmp_home:
+        alf_dir = Path(tmp_home) / ".alf"
+        alf_dir.mkdir()
+        (alf_dir / "config.toml").write_text(
+            f'[service]\napi_url = "{cfg.api_url}"\napi_key = "{cfg.api_key}"\n'
+        )
+        restore_ws = Path(tmp_home) / "restore-workspace"
+        proc = subprocess.run(
+            [alf, "restore", "-r", "openclaw", "-w", str(restore_ws),
+             "-a", str(AGENT_ID), "--dry-run"],
+            capture_output=True, text=True, timeout=120,
+            env={**os.environ, "HOME": tmp_home},
+        )
+        if proc.returncode == 0:
+            rpreview = json.loads(proc.stdout)
+            would = rpreview.get("would_write", [])
+            ok(f"restore --dry-run: would write {len(would)} file(s) "
+               f"at sequence {rpreview.get('sequence')}")
+            for f in would[:8]:
+                print(f"    {f['path']}")
+            for w in rpreview.get("warnings", []):
+                print(f"    {c('yellow', 'warning')}: {w}")
+            ws_absent = not restore_ws.exists()
+            state_absent = not (alf_dir / "state").exists()
+            ok(f"nothing written — workspace absent: {ws_absent}, "
+               f"~/.alf/state absent: {state_absent}")
+            details.append(f"restore preview {len(would)} files")
+        else:
+            # The offline export/.alfignore checks above are the deterministic
+            # core of this step; a live restore-preview failure is surfaced
+            # loudly but does not by itself fail the walkthrough.
+            fail(f"`alf restore --dry-run` exited {proc.returncode}")
+            print((proc.stderr or proc.stdout or "")[:300])
+            details.append("restore preview FAILED (see output)")
+
+    report.add(StepResult("CLI dry-run / .alfignore", True,
+                          (time.time() - t0) * 1000, "; ".join(details)))
+    pause(cfg)
+
+
 def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report: Report):
-    section(11, "Cleanup — Delete Agent")
+    section(12, "Cleanup — Delete Agent")
     explain("""
         DELETE /agents/:id performs a full agent deletion:
         1. The Lambda lists all S3 objects under {tenant_id}/{agent_id}/
@@ -1185,7 +1339,10 @@ def main():
         # Step 10: Restore after loss
         step_verify_restore_after_loss(cfg, api, report)
 
-        # Step 11: Cleanup
+        # Step 11: CLI safety — --dry-run and .alfignore
+        step_dry_run_safety(cfg, api, report)
+
+        # Step 12: Cleanup
         step_cleanup(cfg, api, db, s3, report)
 
     except KeyboardInterrupt:

@@ -59,6 +59,10 @@ enum Command {
         /// Output .alf file path [default: ./<agent-name>.alf]
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Preview the files that would be archived without writing anything
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Import an .alf archive into an agent workspace
@@ -171,6 +175,10 @@ enum Command {
         /// ~/.alf/state/ is not modified.
         #[arg(long, value_name = "N")]
         at_sequence: Option<u64>,
+
+        /// Preview the files that would be written; touches neither the workspace nor ~/.alf/state/
+        #[arg(long)]
+        dry_run: bool,
 
         #[command(flatten)]
         key: VaultKeyCli,
@@ -533,7 +541,8 @@ fn main() {
             runtime,
             workspace,
             output,
-        } => commands::export::run(&runtime, &workspace, output.as_deref()),
+            dry_run,
+        } => commands::export::run(&runtime, &workspace, output.as_deref(), dry_run),
 
         Command::Import {
             runtime,
@@ -559,12 +568,14 @@ fn main() {
             workspace,
             agent,
             at_sequence,
+            dry_run,
             key,
         } => commands::restore::run(
             &runtime,
             &workspace,
             agent.as_deref(),
             at_sequence,
+            dry_run,
             &key.to_args(),
         ),
 

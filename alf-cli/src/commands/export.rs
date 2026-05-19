@@ -2,6 +2,7 @@
 
 use crate::adapter;
 use crate::output;
+use alf_core::FileEntry;
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -15,9 +16,28 @@ struct ExportResult {
     alf_version: String,
     memory_records: u64,
     file_size: u64,
+    excluded_by_alfignore: u32,
 }
 
-pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result<()> {
+#[derive(Serialize)]
+struct ExportDryRunResult {
+    ok: bool,
+    dry_run: bool,
+    agent_name: String,
+    memory_records: u64,
+    files: Vec<FileEntry>,
+    excluded_by_alfignore: u32,
+    total_size: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+pub fn run(
+    runtime: &str,
+    workspace: &Path,
+    output_arg: Option<&Path>,
+    dry_run: bool,
+) -> Result<()> {
     let human = output::human_mode();
 
     let adapter = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -36,6 +56,10 @@ pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result
     }
     if !workspace.is_dir() {
         bail!("Workspace path is not a directory: {}", workspace.display());
+    }
+
+    if dry_run {
+        return run_dry_run(adapter.as_ref(), workspace, human);
     }
 
     let default_output;
@@ -89,6 +113,13 @@ pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result
             println!("  Raw sources: {}", report.raw_sources.join(", "));
         }
 
+        if report.excluded_by_alfignore > 0 {
+            println!(
+                "  Excluded:    {} file(s) by .alfignore",
+                report.excluded_by_alfignore
+            );
+        }
+
         let size = format_size(report.output_size_bytes);
         println!("  File size:   {size}");
         println!();
@@ -101,6 +132,65 @@ pub fn run(runtime: &str, workspace: &Path, output_arg: Option<&Path>) -> Result
             alf_version: report.alf_version.clone(),
             memory_records: report.memory_records,
             file_size: report.output_size_bytes,
+            excluded_by_alfignore: report.excluded_by_alfignore,
+        });
+    }
+
+    Ok(())
+}
+
+/// `alf export --dry-run` — enumerate the upload set, write nothing.
+fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -> Result<()> {
+    if human {
+        println!(
+            "{} Previewing {} export (dry run — nothing will be written)...",
+            "▸".blue().bold(),
+            adapter.name()
+        );
+        println!("  Workspace: {}", workspace.display());
+        println!();
+    } else {
+        output::progress(&format!(
+            "Previewing {} export (dry run)...",
+            adapter.name()
+        ));
+    }
+
+    let preview = adapter.enumerate_workspace(workspace)?;
+
+    if human {
+        println!("{} Dry run complete — no archive written", "✓".green().bold());
+        println!();
+        println!("  Agent:     {}", preview.agent_name);
+        println!("  Memories:  {}", preview.memory_records);
+        println!("  Files:     {}", preview.files.len());
+        for f in &preview.files {
+            println!("    {} ({})", f.path, format_size(f.size));
+        }
+        if preview.excluded_by_alfignore > 0 {
+            println!(
+                "  Excluded:  {} file(s) by .alfignore",
+                preview.excluded_by_alfignore
+            );
+        }
+        println!("  Total:     {}", format_size(preview.total_size));
+        if !preview.warnings.is_empty() {
+            println!();
+            println!("  {} Warnings:", "⚠".yellow().bold());
+            for w in &preview.warnings {
+                println!("    • {w}");
+            }
+        }
+    } else {
+        output::json(&ExportDryRunResult {
+            ok: true,
+            dry_run: true,
+            agent_name: preview.agent_name,
+            memory_records: preview.memory_records,
+            files: preview.files,
+            excluded_by_alfignore: preview.excluded_by_alfignore,
+            total_size: preview.total_size,
+            warnings: preview.warnings,
         });
     }
 

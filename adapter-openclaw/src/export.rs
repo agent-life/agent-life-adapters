@@ -7,16 +7,18 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, Utc};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use alf_core::{
-    AgentMetadata, AlfWriter, CredentialsLayerInfo, IdentityLayerInfo, LayerInventory, Manifest,
-    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    AgentMetadata, AlfWriter, CredentialsLayerInfo, FileEntry, IdentityLayerInfo, LayerInventory,
+    Manifest, MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    WorkspaceEnumeration,
 };
 
 use crate::identity_parser;
@@ -34,27 +36,39 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
     0x74, 0x2d, 0x69, 0x64, 0x2d, 0x6e, 0x73, 0x31, // "t-id-ns1"
 ]);
 
-/// Read or generate the agent UUID.
+/// Resolve the agent UUID without writing anything.
 ///
-/// If `{workspace}/.alf-agent-id` exists, read it. Otherwise generate a
-/// deterministic UUID v5 from the canonical workspace path and persist it.
-fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
+/// If `{workspace}/.alf-agent-id` exists, read it. Otherwise derive a
+/// deterministic UUID v5 from the canonical workspace path. Unlike
+/// [`resolve_agent_id`], a freshly-derived id is **not** persisted — this is
+/// the read-only path used by `export --dry-run`.
+fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
         let id = Uuid::parse_str(raw.trim()).context("Invalid UUID in .alf-agent-id")?;
         return Ok(id);
     }
-
-    // Derive from canonical workspace path
     let canonical = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let id = Uuid::new_v5(&AGENT_ID_NS, canonical.to_string_lossy().as_bytes());
+    Ok(Uuid::new_v5(
+        &AGENT_ID_NS,
+        canonical.to_string_lossy().as_bytes(),
+    ))
+}
 
-    // Persist for stability across future exports
-    let _ = fs::write(&id_file, id.to_string());
-
+/// Read or generate the agent UUID.
+///
+/// If `{workspace}/.alf-agent-id` exists, read it. Otherwise generate a
+/// deterministic UUID v5 from the canonical workspace path and persist it.
+fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
+    let id = resolve_agent_id_readonly(workspace)?;
+    let id_file = workspace.join(".alf-agent-id");
+    if !id_file.is_file() {
+        // Persist for stability across future exports.
+        let _ = fs::write(&id_file, id.to_string());
+    }
     Ok(id)
 }
 
@@ -98,45 +112,153 @@ const ROOT_FILES: &[&str] = &[
     "MEMORY.md",
 ];
 
-/// Collect all raw source files to preserve in the archive.
-/// Returns `(workspace-relative path, file contents)` pairs.
-fn collect_raw_sources(workspace: &Path) -> Vec<(String, Vec<u8>)> {
-    let mut sources = Vec::new();
+/// The set of files an export would archive, before their contents are read.
+pub struct EnumerationResult {
+    pub files: Vec<FileEntry>,
+    pub excluded_by_alfignore: u32,
+    pub alfignore_warnings: Vec<String>,
+}
 
-    // Root-level files
-    for name in ROOT_FILES {
-        let path = workspace.join(name);
-        if path.is_file() {
-            if let Ok(data) = fs::read(&path) {
-                sources.push((name.to_string(), data));
-            }
+/// Load `<workspace>/.alfignore` into a gitignore matcher.
+///
+/// A missing file yields an empty matcher (nothing excluded) and no warning.
+/// A malformed file also yields an empty matcher plus a warning — filtering is
+/// skipped rather than failing the export, so a broken `.alfignore` can never
+/// silently drop files or block a backup.
+fn load_alfignore(workspace: &Path) -> (Gitignore, Vec<String>) {
+    let path = workspace.join(".alfignore");
+    if !path.is_file() {
+        return (Gitignore::empty(), Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let mut builder = GitignoreBuilder::new(workspace);
+    if let Some(err) = builder.add(&path) {
+        warnings.push(format!(
+            ".alfignore could not be read ({err}); continuing without filtering"
+        ));
+        return (Gitignore::empty(), warnings);
+    }
+    match builder.build() {
+        Ok(matcher) => (matcher, warnings),
+        Err(err) => {
+            warnings.push(format!(
+                ".alfignore is unparseable ({err}); continuing without filtering"
+            ));
+            (Gitignore::empty(), warnings)
         }
     }
+}
 
-    // memory/ directory
+/// Whether a workspace-relative path is excluded by the `.alfignore` matcher.
+///
+/// `matched_path_or_any_parents` is required so a directory pattern such as
+/// `memory/` excludes everything beneath it, and so negations re-include.
+fn is_alfignored(matcher: &Gitignore, rel: &str) -> bool {
+    matcher
+        .matched_path_or_any_parents(rel, /* is_dir = */ false)
+        .is_ignore()
+}
+
+/// Enumerate the workspace files an export would preserve as raw sources.
+///
+/// This is the single source of truth for the export file list — both the
+/// real `export` and `export --dry-run` go through it. The candidate set is
+/// the [`ROOT_FILES`] plus everything under `memory/`, filtered through
+/// `<workspace>/.alfignore` if that file exists. The memory walk is sorted so
+/// the file list is deterministic across platforms.
+///
+/// `.alfignore` itself is never a candidate (it is neither a root file nor
+/// under `memory/`), so it can never appear in the result.
+pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
+    let (matcher, mut warnings) = load_alfignore(workspace);
+    let mut files = Vec::new();
+    let mut excluded: u32 = 0;
+
+    // Root-level files.
+    for name in ROOT_FILES {
+        let path = workspace.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        if is_alfignored(&matcher, name) {
+            excluded += 1;
+            warnings.push(format!(".alfignore excludes the structural file {name}"));
+            continue;
+        }
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        files.push(FileEntry {
+            path: name.to_string(),
+            size,
+        });
+    }
+
+    // memory/ directory — collected and sorted for a deterministic file list.
     let memory_dir = workspace.join("memory");
     if memory_dir.is_dir() {
-        for entry in WalkDir::new(&memory_dir)
+        let mut walked: Vec<(String, PathBuf)> = WalkDir::new(&memory_dir)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            if !entry.path().is_file() {
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(workspace)
+                    .unwrap_or(e.path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, e.path().to_path_buf())
+            })
+            .collect();
+        walked.sort();
+        for (rel, abs) in &walked {
+            if is_alfignored(&matcher, rel) {
+                excluded += 1;
                 continue;
             }
-            let relative = entry
-                .path()
-                .strip_prefix(workspace)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Ok(data) = fs::read(entry.path()) {
-                sources.push((relative, data));
-            }
+            let size = fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+            files.push(FileEntry {
+                path: rel.clone(),
+                size,
+            });
         }
     }
 
-    sources
+    Ok(EnumerationResult {
+        files,
+        excluded_by_alfignore: excluded,
+        alfignore_warnings: warnings,
+    })
+}
+
+/// Build the `export --dry-run` preview: the enumerated file list plus the
+/// agent name and memory-record count.
+///
+/// Strictly read-only — writes no archive and, unlike a real export, never
+/// persists `.alf-agent-id`.
+pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
+    if !workspace.is_dir() {
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
+    }
+
+    let enumeration = enumerate(workspace)?;
+    let total_size = enumeration.files.iter().map(|f| f.size).sum();
+
+    let agent_name = identity_parser::resolve_agent_display_name(workspace);
+    let agent_id = resolve_agent_id_readonly(workspace)?;
+    let memory_records = memory_parser::collect_all_memory(workspace, agent_id)?.len() as u64;
+
+    Ok(WorkspaceEnumeration {
+        agent_name,
+        memory_records,
+        files: enumeration.files,
+        excluded_by_alfignore: enumeration.excluded_by_alfignore,
+        total_size,
+        warnings: enumeration.alfignore_warnings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -363,11 +485,15 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         alf_writer.add_memory_partition(info.clone(), group_records)?;
     }
 
-    // Raw sources
-    let raw_sources = collect_raw_sources(workspace);
-    let raw_source_names: Vec<String> = raw_sources.iter().map(|(n, _)| n.clone()).collect();
-    for (relative_path, data) in &raw_sources {
-        alf_writer.add_raw_source("openclaw", relative_path, data)?;
+    // Raw sources — `enumerate` is the single source of truth for the file set.
+    let enumeration = enumerate(workspace)?;
+    let excluded_by_alfignore = enumeration.excluded_by_alfignore;
+    let mut raw_source_names = Vec::with_capacity(enumeration.files.len());
+    for entry in &enumeration.files {
+        let data = fs::read(workspace.join(&entry.path))
+            .with_context(|| format!("Failed to read raw source {}", entry.path))?;
+        alf_writer.add_raw_source("openclaw", &entry.path, &data)?;
+        raw_source_names.push(entry.path.clone());
     }
 
     let inner = alf_writer.finish()?;
@@ -387,6 +513,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         raw_sources: raw_source_names,
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
+        excluded_by_alfignore,
     })
 }
 
@@ -564,5 +691,125 @@ mod tests {
         };
         fs::write(&empty, serde_json::to_string(&doc).unwrap()).unwrap();
         assert!(load_agent_vault(Some(&empty)).unwrap().is_none());
+    }
+
+    // --- .alfignore enumeration (EX-1..7) ------------------------------------
+
+    fn enumerated_paths(result: &EnumerationResult) -> Vec<String> {
+        result.files.iter().map(|f| f.path.clone()).collect()
+    }
+
+    /// EX-1: with no `.alfignore`, `enumerate` lists every candidate file.
+    #[test]
+    fn ex1_enumerate_without_alfignore_lists_all_candidates() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("MEMORY.md", "mem"),
+            ("memory/2026-01-15.md", "a"),
+            ("memory/2026-01-16.md", "b"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert_eq!(
+            enumerated_paths(&result),
+            vec![
+                "SOUL.md",
+                "MEMORY.md",
+                "memory/2026-01-15.md",
+                "memory/2026-01-16.md",
+            ]
+        );
+        assert_eq!(result.excluded_by_alfignore, 0);
+        assert!(result.alfignore_warnings.is_empty());
+    }
+
+    /// EX-2: a `.alfignore` naming one file excludes only that file.
+    #[test]
+    fn ex2_alfignore_excludes_a_single_file() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("memory/2026-01-15.md", "a"),
+            ("memory/2026-01-16.md", "b"),
+            (".alfignore", "memory/2026-01-15.md\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert_eq!(result.excluded_by_alfignore, 1);
+        assert_eq!(
+            enumerated_paths(&result),
+            vec!["SOUL.md", "memory/2026-01-16.md"]
+        );
+    }
+
+    /// EX-3: a `memory/` directory pattern excludes every memory file.
+    #[test]
+    fn ex3_alfignore_excludes_entire_memory_dir() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("memory/2026-01-15.md", "a"),
+            ("memory/2026-01-16.md", "b"),
+            (".alfignore", "memory/\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert_eq!(result.excluded_by_alfignore, 2);
+        assert_eq!(enumerated_paths(&result), vec!["SOUL.md"]);
+    }
+
+    /// EX-4: a negation re-includes one file from an excluded directory.
+    #[test]
+    fn ex4_alfignore_negation_reincludes_a_file() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("memory/2026-01-15.md", "a"),
+            ("memory/2026-01-16.md", "b"),
+            (".alfignore", "memory/\n!memory/2026-01-15.md\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert_eq!(result.excluded_by_alfignore, 1);
+        assert_eq!(
+            enumerated_paths(&result),
+            vec!["SOUL.md", "memory/2026-01-15.md"]
+        );
+    }
+
+    /// EX-5: `.alfignore` itself never appears in the file list.
+    #[test]
+    fn ex5_alfignore_file_is_never_listed() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            (".alfignore", "# excludes nothing\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert!(!enumerated_paths(&result).contains(&".alfignore".to_string()));
+    }
+
+    /// EX-6: excluding a structural root file emits a warning naming it.
+    #[test]
+    fn ex6_warns_when_root_file_excluded() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("MEMORY.md", "mem"),
+            (".alfignore", "SOUL.md\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert!(!enumerated_paths(&result).contains(&"SOUL.md".to_string()));
+        assert_eq!(result.excluded_by_alfignore, 1);
+        assert!(result
+            .alfignore_warnings
+            .iter()
+            .any(|w| w.contains("SOUL.md")));
+    }
+
+    /// EX-7: a malformed `.alfignore` never crashes enumeration or silently
+    /// over-excludes — filtering is skipped, the candidate set stays intact.
+    #[test]
+    fn ex7_malformed_alfignore_does_not_over_exclude() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("memory/2026-01-15.md", "a"),
+            (".alfignore", "[unterminated\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        assert!(enumerated_paths(&result).contains(&"SOUL.md".to_string()));
+        assert!(enumerated_paths(&result).contains(&"memory/2026-01-15.md".to_string()));
+        assert_eq!(result.excluded_by_alfignore, 0);
     }
 }

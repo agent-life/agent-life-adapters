@@ -387,3 +387,172 @@ fn sync_bails_when_local_base_missing_and_no_recover() {
         base_path.display()
     );
 }
+
+// ---------------------------------------------------------------------------
+// --dry-run + .alfignore
+// ---------------------------------------------------------------------------
+
+fn json_stdout(assert: &assert_cmd::assert::Assert) -> serde_json::Value {
+    let out = assert.get_output().stdout.clone();
+    let text = std::str::from_utf8(&out).unwrap();
+    serde_json::from_str(text).expect("stdout must be valid JSON")
+}
+
+/// CLI-1 / IN-2: `export --dry-run` emits a preview and writes nothing —
+/// no .alf archive, no .alf-agent-id.
+#[test]
+fn export_dry_run_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("SOUL.md"), "Atlas").unwrap();
+    fs::write(workspace.join("MEMORY.md"), "## Facts\n\nThe sky is blue.").unwrap();
+
+    let output_alf = tmp.path().join("out.alf");
+
+    let assert = alf_cmd()
+        .arg("export")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .arg("-o")
+        .arg(&output_alf)
+        .arg("--dry-run")
+        .assert()
+        .success();
+
+    let v = json_stdout(&assert);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["dry_run"], true);
+    assert!(v["excluded_by_alfignore"].is_number());
+    let paths: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"SOUL.md"));
+
+    // --dry-run must write neither the archive (even with -o) nor .alf-agent-id.
+    assert!(!output_alf.exists());
+    assert!(!workspace.join(".alf-agent-id").exists());
+}
+
+/// CLI-3: a `.alfignore` workflow end-to-end — dry-run shows the exclusion,
+/// the real export drops the file, and the archive still validates.
+#[test]
+fn alfignore_workflow_dry_run_export_validate() {
+    let tmp = TempDir::new().unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(workspace.join("memory")).unwrap();
+    fs::write(workspace.join("SOUL.md"), "Atlas").unwrap();
+    fs::write(workspace.join("memory/2026-01-15.md"), "## A\n\nlog one").unwrap();
+    fs::write(workspace.join("memory/2026-01-16.md"), "## B\n\nlog two").unwrap();
+    fs::write(workspace.join(".alfignore"), "memory/2026-01-15.md\n").unwrap();
+
+    // 1. dry-run shows the file excluded.
+    let assert = alf_cmd()
+        .arg("export")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .arg("--dry-run")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["excluded_by_alfignore"], 1);
+    let paths: Vec<&str> = v["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["path"].as_str().unwrap())
+        .collect();
+    assert!(!paths.contains(&"memory/2026-01-15.md"));
+    assert!(paths.contains(&"memory/2026-01-16.md"));
+
+    // 2. real export omits the file and reports the same exclusion count.
+    let output_alf = tmp.path().join("out.alf");
+    let assert = alf_cmd()
+        .arg("export")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .arg("-o")
+        .arg(&output_alf)
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["excluded_by_alfignore"], 1);
+    assert!(output_alf.exists());
+
+    // 3. the archive validates.
+    let assert = alf_cmd().arg("validate").arg(&output_alf).assert().success();
+    assert_eq!(json_stdout(&assert)["valid"], true);
+}
+
+/// IN-6: `alf check` reports `alfignore.present` in both states.
+#[test]
+fn check_reports_alfignore_present() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let workspace = tmp.path().join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::write(workspace.join("SOUL.md"), "Atlas").unwrap();
+
+    // Absent → present:false.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("check")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["alfignore"]["present"], false);
+
+    // Present → present:true.
+    fs::write(workspace.join(".alfignore"), "memory/\n").unwrap();
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("check")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["alfignore"]["present"], true);
+}
+
+/// IN-4 (local half): `restore --dry-run` bails cleanly when no API key is
+/// configured and never creates the target workspace.
+#[test]
+fn restore_dry_run_without_api_key_writes_nothing() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let workspace = tmp.path().join("workspace"); // deliberately absent
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("restore")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&workspace)
+        .arg("-a")
+        .arg("ee8c59c6-0424-4cd2-b89c-19d4609bbcdf")
+        .arg("--dry-run")
+        .assert()
+        .failure();
+
+    // clap accepted --dry-run; the failure is the runtime missing-key error.
+    assert_eq!(json_stdout(&assert)["ok"], false);
+
+    // The preview must not have created the workspace.
+    assert!(!workspace.exists());
+}

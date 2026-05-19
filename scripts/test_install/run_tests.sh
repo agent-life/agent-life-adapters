@@ -114,6 +114,23 @@ SHIM
     chmod +x "$_mshim_dir/uname"
 }
 
+# patch_checksum_url: write a copy of install.sh to <dst> with <query> appended
+# to the .sha256 download URL, so the mock server's checksum flags can be driven
+# (bad_checksum / missing-checksum / empty-checksum). Python handles the
+# substitution reliably — no shell quoting issues with the $ in the pattern.
+patch_checksum_url() {
+    _pcu_dst="$1"; _pcu_query="$2"
+    python3 - "$INSTALL_SH" "$_pcu_dst" "$_pcu_query" <<'PYEOF'
+import sys
+src, dst, query = sys.argv[1], sys.argv[2], sys.argv[3]
+old = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"'
+new = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256?%s"' % query
+code = open(src).read().replace(old, new)
+open(dst, 'w').write(code)
+PYEOF
+    chmod +x "$_pcu_dst"
+}
+
 # --------------------------------------------------------------------------
 # Test groups
 # --------------------------------------------------------------------------
@@ -137,6 +154,8 @@ test_happy_path() {
         sh -c "ALF_RELEASE_URL='$MOCK_BASE' ALF_VERSION='v0.0.0-test' ALF_INSTALL_DIR='$tmpdir/bin4' sh "$INSTALL_SH""
     check_stdout "stdout has checksum_verified" '"checksum_verified"' \
         sh -c "ALF_RELEASE_URL='$MOCK_BASE' ALF_VERSION='v0.0.0-test' ALF_INSTALL_DIR='$tmpdir/bin5' sh "$INSTALL_SH""
+    check_stdout "stdout has empty warnings array" '"warnings":\[\]' \
+        sh -c "ALF_RELEASE_URL='$MOCK_BASE' ALF_VERSION='v0.0.0-test' ALF_INSTALL_DIR='$tmpdir/bin6' sh "$INSTALL_SH""
 
     check "version flag works" sh -c "$tmpdir/bin/alf --version | grep -q 'alf'"
 
@@ -232,16 +251,7 @@ test_checksum_mismatch() {
     check "bad_checksum param returns wrong hash" sh -c "[ '$bad_hash' = '0000000000000000000000000000000000000000000000000000000000000000' ]"
 
     # Create a patched install.sh where the checksum URL gets ?bad_checksum=1 appended.
-    # Python handles the substitution reliably (no shell quoting issues with $ in the pattern).
-    python3 - "$INSTALL_SH" "$tmpdir/patched.sh" <<'PYEOF'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-old = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"'
-new = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256?bad_checksum=1"'
-code = open(src).read().replace(old, new)
-open(dst, 'w').write(code)
-PYEOF
-    chmod +x "$tmpdir/patched.sh"
+    patch_checksum_url "$tmpdir/patched.sh" "bad_checksum=1"
 
     check_exit "checksum mismatch exits with 4" 4 \
         env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin" sh "$tmpdir/patched.sh"
@@ -249,33 +259,70 @@ PYEOF
     rm -rf "$tmpdir"
 }
 
-test_checksum_missing() {
+test_checksum_unavailable() {
     echo ""
-    echo "=== Checksum file missing (graceful skip) ==="
+    echo "=== Checksum file unavailable (fail closed / opt-out) ==="
     tmpdir=$(mktemp -d)
 
-    # Use a version tag where no .sha256 file exists on the mock server
-    # The mock server returns 404 for unknown filenames → checksum skipped
-    # alf-linux-amd64 exists but alf-linux-amd64-nochecksum doesn't
-    # Simplest: point checksum URL at a 404 path by using a platform that has
-    # no checksum file. We'll use our own patched install that downloads
-    # a non-existent checksum.
+    # Mock server 404s the .sha256 → "checksum file unavailable" verification failure
+    patch_checksum_url "$tmpdir/install.sh" "missing-checksum=1"
 
-    # Create a patched install that uses a checksum URL that 404s
-    python3 - "$INSTALL_SH" "$tmpdir/nochecksum_install.sh" <<'PYEOF'
-import sys
-src, dst = sys.argv[1], sys.argv[2]
-old = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"'
-new = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256.nonexistent"'
-code = open(src).read().replace(old, new)
-open(dst, 'w').write(code)
-PYEOF
-    chmod +x "$tmpdir/nochecksum_install.sh"
+    # Default: fail closed, exit 4, nothing installed
+    check_exit "missing checksum fails closed (exit 4)" 4 \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin4" sh "$tmpdir/install.sh"
+    check "binary NOT installed when fail-closed" sh -c "! test -e '$tmpdir/bin4/alf'"
+    check_stdout "stdout reports 'checksum file unavailable'" "checksum file unavailable" \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin4b" sh "$tmpdir/install.sh"
 
-    out=$(ALF_RELEASE_URL="$MOCK_BASE" ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin" sh "$tmpdir/nochecksum_install.sh" 2>/dev/null) || true
-    check "binary still installed when checksum missing" test -x "$tmpdir/bin/alf"
-    check "stdout ok=true when checksum skipped" sh -c "printf '%s' '$out' | grep -q '\"ok\":true'"
-    check "checksum_verified=false when skipped" sh -c "printf '%s' '$out' | grep -q '\"checksum_verified\":false'"
+    # ALF_ALLOW_UNVERIFIED=1: install succeeds with a warning
+    out=$(ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin5" ALF_ALLOW_UNVERIFIED=1 \
+          sh "$tmpdir/install.sh" 2>/dev/null) || true
+    check "opt-out installs the binary" test -x "$tmpdir/bin5/alf"
+    check "opt-out: ok=true" sh -c "printf '%s' '$out' | grep -q '\"ok\":true'"
+    check "opt-out: checksum_verified=false" sh -c "printf '%s' '$out' | grep -q '\"checksum_verified\":false'"
+    check "opt-out: warnings array carries the reason" \
+        sh -c "printf '%s' '$out' | grep -q 'checksum file unavailable'"
+
+    rm -rf "$tmpdir"
+}
+
+test_checksum_empty() {
+    echo ""
+    echo "=== Empty checksum file (fail closed) ==="
+    tmpdir=$(mktemp -d)
+
+    # Mock server returns a 200 with an empty body for the .sha256
+    patch_checksum_url "$tmpdir/install.sh" "empty-checksum=1"
+
+    check_exit "empty checksum fails closed (exit 4)" 4 \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin" sh "$tmpdir/install.sh"
+    check_stdout "stdout reports 'checksum file empty or malformed'" \
+        "checksum file empty or malformed" \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin2" sh "$tmpdir/install.sh"
+
+    rm -rf "$tmpdir"
+}
+
+test_no_checksum_tool() {
+    echo ""
+    echo "=== No sha256sum/shasum tool (fail closed / opt-out) ==="
+    tmpdir=$(mktemp -d)
+
+    # Runs only where neither tool is on PATH (Dockerfile.alpine-nochecksum).
+    # The .sha256 downloads fine; verification fails for lack of a hashing tool.
+    check_exit "no checksum tool fails closed (exit 4)" 4 \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin" sh "$INSTALL_SH"
+    check "binary NOT installed when fail-closed" sh -c "! test -e '$tmpdir/bin/alf'"
+    check_stdout "stdout reports 'no sha256sum or shasum tool available'" \
+        "no sha256sum or shasum tool available" \
+        env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin2" sh "$INSTALL_SH"
+
+    out=$(ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin3" ALF_ALLOW_UNVERIFIED=1 \
+          sh "$INSTALL_SH" 2>/dev/null) || true
+    check "opt-out installs the binary" test -x "$tmpdir/bin3/alf"
+    check "opt-out: checksum_verified=false" sh -c "printf '%s' '$out' | grep -q '\"checksum_verified\":false'"
+    check "opt-out: warnings array carries the reason" \
+        sh -c "printf '%s' '$out' | grep -q 'no sha256sum or shasum tool available'"
 
     rm -rf "$tmpdir"
 }
@@ -423,19 +470,29 @@ if ! curl -sf "$MOCK_BASE/repos/agent-life/agent-life-adapters/releases/latest" 
 fi
 echo "Mock server OK"
 
-test_happy_path
-test_version_resolution
-test_custom_install_dir
-test_version_pin
-test_unsupported_platform
-test_download_failure
-test_checksum_mismatch
-test_checksum_missing
-test_json_stdout
-test_stderr_progress
-test_quiet_mode
-test_post_install_verification
-test_linux_platform_detection
+# The runnable test set depends on whether a checksum tool is present. A no-tool
+# environment (Dockerfile.alpine-nochecksum) can only exercise the tool-absent
+# path — every "install succeeds" test would otherwise fail closed (exit 4).
+if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; then
+    test_happy_path
+    test_version_resolution
+    test_custom_install_dir
+    test_version_pin
+    test_unsupported_platform
+    test_download_failure
+    test_checksum_mismatch
+    test_checksum_unavailable
+    test_checksum_empty
+    test_json_stdout
+    test_stderr_progress
+    test_quiet_mode
+    test_post_install_verification
+    test_linux_platform_detection
+else
+    echo ""
+    echo "No sha256sum/shasum on PATH — running checksum-tool-absent tests only"
+    test_no_checksum_tool
+fi
 
 echo ""
 echo "======================================"

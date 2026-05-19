@@ -13,7 +13,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use alf_core::{AlfReader, VaultKey};
+use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, VaultKey};
 
 use crate::ImportReport;
 
@@ -143,6 +143,81 @@ pub fn import(alf_file: &Path, workspace: &Path, vault_key: Option<&VaultKey>) -
         credentials_count,
         warnings,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Dry-run archive enumeration
+// ---------------------------------------------------------------------------
+
+/// Enumerate the workspace files an [`import`] would write, without touching
+/// the filesystem. Backs `alf restore --dry-run`.
+///
+/// Mirrors the path decision in [`import`]: when the archive carries
+/// `raw/openclaw/` entries the list is exact (paths and sizes from the
+/// archive); otherwise restore reconstructs files from structured layers, and
+/// the preview is a coarse, `size: 0` approximation with a warning.
+pub fn enumerate_archive(alf_file: &Path) -> Result<ArchiveEnumeration> {
+    let file = std::fs::File::open(alf_file)
+        .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
+    let reader = std::io::BufReader::new(file);
+    let mut alf = AlfReader::new(reader)?;
+
+    let file_names = alf.file_names();
+    let raw_prefix = "raw/openclaw/";
+    let mut files = Vec::new();
+    let mut warnings = Vec::new();
+
+    let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
+    if has_raw {
+        let mut raw: Vec<String> = file_names
+            .iter()
+            .filter(|f| f.starts_with(raw_prefix) && f.len() > raw_prefix.len())
+            .cloned()
+            .collect();
+        raw.sort();
+        for name in &raw {
+            let size = alf.entry_size(name)?;
+            files.push(FileEntry {
+                path: name[raw_prefix.len()..].to_string(),
+                size,
+            });
+        }
+    } else {
+        warnings.push(
+            "Archive has no raw/openclaw/ sources — restore would reconstruct files \
+             from structured data; the list below is approximate and sizes are unknown."
+                .to_string(),
+        );
+        let manifest = alf.manifest();
+        if manifest.layers.identity.is_some() {
+            for name in ["SOUL.md", "IDENTITY.md", "AGENTS.md"] {
+                files.push(FileEntry {
+                    path: name.to_string(),
+                    size: 0,
+                });
+            }
+        }
+        if manifest.layers.principals.is_some() {
+            files.push(FileEntry {
+                path: "USER.md".to_string(),
+                size: 0,
+            });
+        }
+        let memory_records = manifest
+            .layers
+            .memory
+            .as_ref()
+            .map(|m| m.record_count)
+            .unwrap_or(0);
+        if memory_records > 0 {
+            files.push(FileEntry {
+                path: "MEMORY.md".to_string(),
+                size: 0,
+            });
+        }
+    }
+
+    Ok(ArchiveEnumeration { files, warnings })
 }
 
 // ---------------------------------------------------------------------------

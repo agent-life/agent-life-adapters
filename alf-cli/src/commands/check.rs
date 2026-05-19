@@ -25,11 +25,18 @@ struct CheckResult {
     ready_to_sync: bool,
     workspace: WorkspaceInfo,
     resources: ResourceInfo,
+    alfignore: AlfignoreInfo,
     #[serde(skip_serializing_if = "Option::is_none")]
     openclaw: Option<OpenClawInfo>,
     alf: AlfInfo,
     issues: Vec<Issue>,
     suggestions: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct AlfignoreInfo {
+    /// Whether a `.alfignore` file exists at the workspace root.
+    present: bool,
 }
 
 #[derive(Serialize)]
@@ -503,12 +510,17 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let has_errors = issues.iter().any(|i| i.severity == "error");
     let ready_to_sync = !has_errors && ws_exists;
 
+    let alfignore = AlfignoreInfo {
+        present: ws_exists && ws_path.join(".alfignore").is_file(),
+    };
+
     let mut result = CheckResult {
         ok: !has_errors,
         runtime: runtime.into(),
         ready_to_sync,
         workspace: workspace_info,
         resources,
+        alfignore,
         openclaw,
         alf: alf_info,
         issues,
@@ -560,6 +572,7 @@ fn print_human(result: &CheckResult) {
     println!("    USER.md:     {}", yn(result.resources.user_md));
     println!("    MEMORY.md:   {}", yn(result.resources.memory_md));
     println!("    memory/:     {}", yn(result.resources.memory_dir));
+    println!("    .alfignore:  {}", yn(result.alfignore.present));
     if let Some(ref dl) = result.resources.daily_logs {
         println!(
             "    Daily logs:  {} (latest: {})",

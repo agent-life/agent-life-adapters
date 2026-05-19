@@ -24,7 +24,7 @@ use crate::vault_key::{self, VaultKeyArgs};
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
-use alf_core::ImportOptions;
+use alf_core::{FileEntry, ImportOptions};
 
 use anyhow::Context;
 use anyhow::Result;
@@ -49,6 +49,20 @@ struct RestoreResult {
     /// state (`~/.alf/state/`) was deliberately not touched.
     preview: bool,
     /// Echoes the `--at-sequence N` flag; `None` for a head restore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct RestoreDryRunResult {
+    ok: bool,
+    dry_run: bool,
+    agent_id: String,
+    sequence: u64,
+    would_write: Vec<FileEntry>,
+    /// Echoes the `--at-sequence N` flag; `None` for a head preview.
     #[serde(skip_serializing_if = "Option::is_none")]
     at_sequence: Option<u64>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -212,6 +226,7 @@ pub fn run(
     workspace: &Path,
     agent_arg: Option<&str>,
     at_sequence: Option<u64>,
+    dry_run: bool,
     key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
@@ -229,6 +244,10 @@ pub fn run(
             adapter::supported_runtimes()
         )
     })?;
+
+    if dry_run {
+        return run_dry_run(&client, agent_id, adapt.as_ref(), at_sequence, human);
+    }
 
     if human {
         if let Some(n) = at_sequence {
@@ -338,6 +357,76 @@ pub fn run(
             preview,
             at_sequence,
             warnings: import_report.warnings.clone(),
+        });
+    }
+
+    Ok(())
+}
+
+/// `alf restore --dry-run` — fetch and decode the archive, list what *would*
+/// be written, and touch nothing.
+///
+/// Makes the same network calls as a real restore, but fetches via
+/// [`fetch_restore_payload`] directly (never [`pull_cloud_base`]) so
+/// `~/.alf/state/` is untouched. The workspace is never created or written.
+/// `at_sequence` composes for free — `--at-sequence N --dry-run` previews the
+/// point-in-time view.
+fn run_dry_run(
+    client: &ApiClient,
+    agent_id: Uuid,
+    adapt: &dyn alf_core::Adapter,
+    at_sequence: Option<u64>,
+    human: bool,
+) -> Result<()> {
+    if human {
+        println!(
+            "{} Preview: restoring agent {} ({} dry run — workspace and ~/.alf/state untouched)...",
+            "▸".blue().bold(),
+            &agent_id.to_string()[..8],
+            adapt.name()
+        );
+    } else {
+        output::progress(&format!(
+            "Previewing restore of agent {} (dry run)...",
+            &agent_id.to_string()[..8]
+        ));
+    }
+
+    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, at_sequence)?;
+
+    // Decode in a tempdir that is removed on exit — no workspace, no state.
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_alf = temp_dir.path().join("restored.alf");
+    fs::write(&temp_alf, &final_bytes)?;
+
+    let enumeration = adapt.enumerate_archive(&temp_alf)?;
+
+    if human {
+        println!();
+        println!("{} Dry run complete — nothing written", "✓".green().bold());
+        println!();
+        println!("  Agent:     {agent_id}");
+        println!("  Sequence:  {latest_sequence}");
+        println!("  Would write {} file(s):", enumeration.files.len());
+        for f in &enumeration.files {
+            println!("    {}", f.path);
+        }
+        if !enumeration.warnings.is_empty() {
+            println!();
+            println!("  {} Warnings:", "⚠".yellow().bold());
+            for w in &enumeration.warnings {
+                println!("    • {w}");
+            }
+        }
+    } else {
+        output::json(&RestoreDryRunResult {
+            ok: true,
+            dry_run: true,
+            agent_id: agent_id.to_string(),
+            sequence: latest_sequence,
+            would_write: enumeration.files,
+            at_sequence,
+            warnings: enumeration.warnings,
         });
     }
 

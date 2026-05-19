@@ -4,7 +4,8 @@
 //! trait. The CLI dispatches to the correct adapter based on the `--runtime`
 //! flag.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
+use serde::Serialize;
 use std::path::Path;
 
 use crate::crypto::VaultKey;
@@ -26,6 +27,9 @@ pub struct ExportReport {
     pub raw_sources: Vec<String>,
     pub output_path: String,
     pub output_size_bytes: u64,
+    /// Number of workspace files dropped by a `.alfignore` filter (0 when no
+    /// `.alfignore` is present).
+    pub excluded_by_alfignore: u32,
 }
 
 /// Summary of an import operation.
@@ -53,6 +57,39 @@ pub struct ImportReport {
 #[derive(Default)]
 pub struct ImportOptions<'a> {
     pub vault_key: Option<&'a VaultKey>,
+}
+
+// ---------------------------------------------------------------------------
+// Dry-run enumeration
+// ---------------------------------------------------------------------------
+
+/// A single file in an export or restore preview.
+///
+/// `path` is the path as it appears in the archive's `raw/{runtime}/` tree —
+/// workspace-relative for files that live under the workspace, or a synthesized
+/// name (e.g. ZeroClaw's redacted `config.toml`) for entries that do not.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FileEntry {
+    pub path: String,
+    pub size: u64,
+}
+
+/// Result of enumerating a workspace for an `export --dry-run` preview.
+#[derive(Debug)]
+pub struct WorkspaceEnumeration {
+    pub agent_name: String,
+    pub memory_records: u64,
+    pub files: Vec<FileEntry>,
+    pub excluded_by_alfignore: u32,
+    pub total_size: u64,
+    pub warnings: Vec<String>,
+}
+
+/// Result of enumerating an archive for a `restore --dry-run` preview.
+#[derive(Debug)]
+pub struct ArchiveEnumeration {
+    pub files: Vec<FileEntry>,
+    pub warnings: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -90,4 +127,21 @@ pub trait Adapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport>;
+
+    /// Enumerate the files an `export` would archive, without writing anything.
+    ///
+    /// Backs `alf export --dry-run`. Adapters that support dry-run override
+    /// this; the default rejects the call so the CLI surfaces a clear error.
+    fn enumerate_workspace(&self, _workspace: &Path) -> Result<WorkspaceEnumeration> {
+        bail!("dry-run not supported for this runtime")
+    }
+
+    /// Enumerate the files an `import` would write from an archive, without
+    /// touching the filesystem.
+    ///
+    /// Backs `alf restore --dry-run`. Adapters that support dry-run override
+    /// this; the default rejects the call so the CLI surfaces a clear error.
+    fn enumerate_archive(&self, _alf_file: &Path) -> Result<ArchiveEnumeration> {
+        bail!("dry-run not supported for this runtime")
+    }
 }

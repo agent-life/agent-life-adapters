@@ -641,6 +641,120 @@ def step_optional_alf_vault_list(cfg: iw.Config, report: iw.Report):
     iw.pause(cfg)
 
 
+def step_dry_run_upload_preview(cfg: iw.Config, report: iw.Report):
+    iw.section(8, "Optional — Preview the Upload Set (`--dry-run` + `.alfignore`)")
+    iw.explain(
+        """
+        The vault travels inside the snapshot as Layer 4 — but the snapshot
+        also carries the workspace files (SOUL.md, memory/, ...). `alf export
+        --dry-run` lists exactly which WORKSPACE files would be archived,
+        writing no .alf and making no network call, and a `.alfignore` at the
+        workspace root filters that set, .gitignore-style.
+
+        Note the boundary this draws with the vault:
+
+          • `.alfignore` scopes WORKSPACE files only.
+          • The vault file `~/.alf/vault/credentials.json` lives OUTSIDE the
+            workspace and is never affected by `.alfignore` — use `alf vault`
+            to control its contents.
+
+        Skip silently if `alf` is not installed.
+        """
+    )
+
+    t0 = time.time()
+    alf = iw.find_alf_binary()
+    if not alf:
+        iw.ok("`alf` not found on PATH or in target/ — skipping CLI demo")
+        report.add(
+            iw.StepResult(
+                "export --dry-run / .alfignore (optional)",
+                True,
+                (time.time() - t0) * 1000,
+                "alf not available",
+            )
+        )
+        iw.pause(cfg)
+        return
+    print(f"  Using alf binary: {alf}")
+    print()
+
+    def run_dry_run(ws: Path) -> dict:
+        proc = subprocess.run(
+            [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"alf export --dry-run exited {proc.returncode}: "
+                f"{(proc.stderr or proc.stdout or '')[:200]}"
+            )
+        return json.loads(proc.stdout)
+
+    excluded = 0
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            ws = Path(tmp) / "workspace"
+            (ws / "memory").mkdir(parents=True)
+            (ws / "SOUL.md").write_text("# Vault Demo\n\nAn agent with a vault.\n")
+            (ws / "MEMORY.md").write_text("## Facts\n\nUses a zero-knowledge vault.\n")
+            (ws / "memory" / "2026-02-01.md").write_text(
+                "## Log\n\nProvisioned an account.\n"
+            )
+            (ws / "memory" / "secrets-scratch.md").write_text(
+                "## Scratch\n\ndo-not-upload\n"
+            )
+
+            preview = run_dry_run(ws)
+            iw.ok(
+                f"export --dry-run: {len(preview['files'])} workspace files "
+                f"would be archived ({preview['total_size']} bytes)"
+            )
+            for f in preview["files"]:
+                print(f"    {f['path']}  ({f['size']} B)")
+            iw.ok(f"no .alf written: {not any(ws.glob('*.alf'))}")
+
+            iw.explain(
+                """
+                Drop a `.alfignore` excluding the scratch file, then preview
+                again — the same filter applies to a real `alf export` / sync.
+                """
+            )
+            (ws / ".alfignore").write_text("memory/secrets-scratch.md\n")
+            filtered = run_dry_run(ws)
+            excluded = filtered["excluded_by_alfignore"]
+            kept = [f["path"] for f in filtered["files"]]
+            iw.ok(
+                f".alfignore excluded {excluded} file(s); "
+                f"memory/secrets-scratch.md still listed: "
+                f"{'memory/secrets-scratch.md' in kept}"
+            )
+    except (RuntimeError, json.JSONDecodeError) as e:
+        iw.fail(str(e))
+        report.add(
+            iw.StepResult(
+                "export --dry-run / .alfignore (optional)",
+                False,
+                (time.time() - t0) * 1000,
+                error=str(e)[:200],
+            )
+        )
+        iw.pause(cfg)
+        return
+
+    report.add(
+        iw.StepResult(
+            "export --dry-run / .alfignore (optional)",
+            True,
+            (time.time() - t0) * 1000,
+            f"previewed upload set; .alfignore excluded {excluded}",
+        )
+    )
+    iw.pause(cfg)
+
+
 def step_cleanup_vault_agent(
     cfg: iw.Config,
     api: iw.ApiClient,
@@ -648,7 +762,7 @@ def step_cleanup_vault_agent(
     s3: iw.S3Client,
     report: iw.Report,
 ):
-    iw.section(8, "Cleanup — Delete Vault Walkthrough Agent")
+    iw.section(9, "Cleanup — Delete Vault Walkthrough Agent")
     iw.explain(
         """
         `DELETE /agents/:id` removes the agent, cascades snapshot/delta rows, and
@@ -781,6 +895,7 @@ def main():
             step_inspect_s3_archive(cfg, s3, report, upload_body)
         step_surgical_delete_concept(cfg, report)
         step_optional_alf_vault_list(cfg, report)
+        step_dry_run_upload_preview(cfg, report)
         step_cleanup_vault_agent(cfg, api, db, s3, report)
 
     except KeyboardInterrupt:

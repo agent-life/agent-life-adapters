@@ -6,16 +6,18 @@
 use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::BufWriter;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{NaiveDate, Utc};
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use alf_core::{
-    AgentMetadata, AlfWriter, CredentialsLayerInfo, IdentityLayerInfo, LayerInventory, Manifest,
-    MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    AgentMetadata, AlfWriter, CredentialsLayerInfo, FileEntry, IdentityLayerInfo, LayerInventory,
+    Manifest, MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
+    WorkspaceEnumeration,
 };
 
 use crate::config_parser::{self, MemoryBackend, ZeroClawConfig};
@@ -35,20 +37,34 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
     0x2d, 0x61, 0x67, 0x65, 0x6e, 0x74, 0x2d, 0x31, // "-agent-1"
 ]);
 
-/// Read or generate the agent UUID.
-fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
+/// Resolve the agent UUID without writing anything.
+///
+/// Reads `{workspace}/.alf-agent-id` if present, otherwise derives a
+/// deterministic UUID v5 from the canonical workspace path. A freshly-derived
+/// id is **not** persisted — the read-only path used by `export --dry-run`.
+fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
         let id = Uuid::parse_str(raw.trim()).context("Invalid UUID in .alf-agent-id")?;
         return Ok(id);
     }
-
     let canonical = workspace
         .canonicalize()
         .unwrap_or_else(|_| workspace.to_path_buf());
-    let id = Uuid::new_v5(&AGENT_ID_NS, canonical.to_string_lossy().as_bytes());
-    let _ = fs::write(&id_file, id.to_string());
+    Ok(Uuid::new_v5(
+        &AGENT_ID_NS,
+        canonical.to_string_lossy().as_bytes(),
+    ))
+}
+
+/// Read or generate the agent UUID, persisting a freshly-derived id.
+fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
+    let id = resolve_agent_id_readonly(workspace)?;
+    let id_file = workspace.join(".alf-agent-id");
+    if !id_file.is_file() {
+        let _ = fs::write(&id_file, id.to_string());
+    }
     Ok(id)
 }
 
@@ -102,30 +118,107 @@ const ROOT_FILES: &[&str] = &[
     "HEARTBEAT.md",
 ];
 
-/// Collect all raw source files from a ZeroClaw workspace.
-/// Returns `(relative_path, data)` pairs.
-fn collect_raw_sources(
-    workspace: &Path,
-    _zc_home: &Path,
-    config: &ZeroClawConfig,
-) -> Vec<(String, Vec<u8>)> {
-    let mut sources = Vec::new();
+/// The set of files an export would archive, before their contents are read.
+pub struct EnumerationResult {
+    pub files: Vec<FileEntry>,
+    pub excluded_by_alfignore: u32,
+    pub alfignore_warnings: Vec<String>,
+}
 
-    // config.toml (redacted)
-    let redacted = config_parser::redact_secrets(&config.raw_toml);
-    sources.push(("config.toml".to_string(), redacted.into_bytes()));
+/// Where a raw-source entry's bytes come from.
+enum RawContent {
+    /// Read verbatim from this absolute path.
+    Disk(PathBuf),
+    /// Synthesized bytes — ZeroClaw's redacted `config.toml`.
+    Inline(Vec<u8>),
+}
 
-    // Root-level workspace files
-    for name in ROOT_FILES {
-        let path = workspace.join(name);
-        if path.is_file() {
-            if let Ok(data) = fs::read(&path) {
-                sources.push((name.to_string(), data));
-            }
+/// Load `<workspace>/.alfignore` into a gitignore matcher.
+///
+/// A missing file yields an empty matcher (nothing excluded) and no warning.
+/// A malformed file also yields an empty matcher plus a warning — filtering is
+/// skipped rather than failing the export.
+fn load_alfignore(workspace: &Path) -> (Gitignore, Vec<String>) {
+    let path = workspace.join(".alfignore");
+    if !path.is_file() {
+        return (Gitignore::empty(), Vec::new());
+    }
+    let mut warnings = Vec::new();
+    let mut builder = GitignoreBuilder::new(workspace);
+    if let Some(err) = builder.add(&path) {
+        warnings.push(format!(
+            ".alfignore could not be read ({err}); continuing without filtering"
+        ));
+        return (Gitignore::empty(), warnings);
+    }
+    match builder.build() {
+        Ok(matcher) => (matcher, warnings),
+        Err(err) => {
+            warnings.push(format!(
+                ".alfignore is unparseable ({err}); continuing without filtering"
+            ));
+            (Gitignore::empty(), warnings)
         }
     }
+}
 
-    // identity.json (AIEOS)
+/// Whether a workspace-relative path is excluded by the `.alfignore` matcher.
+fn is_alfignored(matcher: &Gitignore, rel: &str) -> bool {
+    matcher
+        .matched_path_or_any_parents(rel, /* is_dir = */ false)
+        .is_ignore()
+}
+
+/// Enumerate every raw-source entry alongside the location of its bytes.
+///
+/// Two buckets, deliberately treated differently by `.alfignore`:
+/// - **Filterable** — the workspace-relative [`ROOT_FILES`] and `memory/**`.
+///   `.alfignore` patterns (which are workspace-relative) apply to these.
+/// - **Unfilterable** — the synthesized, redacted `config.toml` and the AIEOS
+///   `identity.json` (which may live outside the workspace entirely). A
+///   workspace-relative `.alfignore` pattern cannot meaningfully address these,
+///   so they are always included, never matched, and never counted.
+fn enumerate_raw(
+    workspace: &Path,
+    config: &ZeroClawConfig,
+) -> (Vec<(FileEntry, RawContent)>, u32, Vec<String>) {
+    let (matcher, mut warnings) = load_alfignore(workspace);
+    let mut entries: Vec<(FileEntry, RawContent)> = Vec::new();
+    let mut excluded: u32 = 0;
+
+    // config.toml — synthesized & redacted; unfilterable.
+    let redacted = config_parser::redact_secrets(&config.raw_toml).into_bytes();
+    entries.push((
+        FileEntry {
+            path: "config.toml".to_string(),
+            size: redacted.len() as u64,
+        },
+        RawContent::Inline(redacted),
+    ));
+
+    // Root-level workspace files — `.alfignore` applies.
+    for name in ROOT_FILES {
+        let path = workspace.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        if is_alfignored(&matcher, name) {
+            excluded += 1;
+            warnings.push(format!(".alfignore excludes the structural file {name}"));
+            continue;
+        }
+        let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        entries.push((
+            FileEntry {
+                path: name.to_string(),
+                size,
+            },
+            RawContent::Disk(path),
+        ));
+    }
+
+    // identity.json (AIEOS) — may be absolute / outside the workspace;
+    // unfilterable.
     if let Some(ref aieos_path) = config.aieos_path {
         let path = if Path::new(aieos_path).is_absolute() {
             Path::new(aieos_path).to_path_buf()
@@ -133,36 +226,102 @@ fn collect_raw_sources(
             workspace.join(aieos_path)
         };
         if path.is_file() {
-            if let Ok(data) = fs::read(&path) {
-                sources.push(("identity.json".to_string(), data));
-            }
+            let size = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            entries.push((
+                FileEntry {
+                    path: "identity.json".to_string(),
+                    size,
+                },
+                RawContent::Disk(path),
+            ));
         }
     }
 
-    // memory/ directory (Markdown backend files)
+    // memory/ directory — collected sorted; `.alfignore` applies.
     let memory_dir = workspace.join("memory");
     if memory_dir.is_dir() {
-        for entry in WalkDir::new(&memory_dir)
+        let mut walked: Vec<(String, PathBuf)> = WalkDir::new(&memory_dir)
             .follow_links(false)
             .into_iter()
             .filter_map(|e| e.ok())
-        {
-            if !entry.path().is_file() {
+            .filter(|e| e.path().is_file())
+            .map(|e| {
+                let rel = e
+                    .path()
+                    .strip_prefix(workspace)
+                    .unwrap_or(e.path())
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                (rel, e.path().to_path_buf())
+            })
+            .collect();
+        walked.sort();
+        for (rel, abs) in walked {
+            if is_alfignored(&matcher, &rel) {
+                excluded += 1;
                 continue;
             }
-            let relative = entry
-                .path()
-                .strip_prefix(workspace)
-                .unwrap_or(entry.path())
-                .to_string_lossy()
-                .replace('\\', "/");
-            if let Ok(data) = fs::read(entry.path()) {
-                sources.push((relative, data));
-            }
+            let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            entries.push((FileEntry { path: rel, size }, RawContent::Disk(abs)));
         }
     }
 
-    sources
+    (entries, excluded, warnings)
+}
+
+/// Enumerate the workspace files an export would preserve as raw sources.
+///
+/// The single source of truth for the export file list — both the real
+/// `export` and `export --dry-run` go through it.
+pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
+    let zc_home = zeroclaw_home(workspace);
+    let config = load_config(&zc_home)?;
+    let (entries, excluded, warnings) = enumerate_raw(workspace, &config);
+    Ok(EnumerationResult {
+        files: entries.into_iter().map(|(fe, _)| fe).collect(),
+        excluded_by_alfignore: excluded,
+        alfignore_warnings: warnings,
+    })
+}
+
+/// Build the `export --dry-run` preview: the enumerated file list plus the
+/// agent name and memory-record count.
+///
+/// Strictly read-only — writes no archive and, unlike a real export, never
+/// persists `.alf-agent-id`.
+pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
+    if !workspace.is_dir() {
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
+    }
+
+    let zc_home = zeroclaw_home(workspace);
+    let config = load_config(&zc_home)?;
+    let (entries, excluded, warnings) = enumerate_raw(workspace, &config);
+    let files: Vec<FileEntry> = entries.into_iter().map(|(fe, _)| fe).collect();
+    let total_size = files.iter().map(|f| f.size).sum();
+
+    let agent_id = resolve_agent_id_readonly(workspace)?;
+    let agent_name = identity_parser::detect_agent_name(workspace, &config);
+    let runtime_version = detect_zeroclaw_version(&zc_home);
+    let records = extract_memory_records(
+        workspace,
+        &zc_home,
+        &config,
+        agent_id,
+        runtime_version.as_deref(),
+    )?;
+
+    Ok(WorkspaceEnumeration {
+        agent_name,
+        memory_records: records.len() as u64,
+        files,
+        excluded_by_alfignore: excluded,
+        total_size,
+        warnings,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +381,58 @@ fn load_agent_vault(vault_path: Option<&Path>) -> Result<Option<alf_core::Creden
 }
 
 // ---------------------------------------------------------------------------
+// Config + memory helpers (shared by export and dry-run enumeration)
+// ---------------------------------------------------------------------------
+
+/// Parse `config.toml` from the ZeroClaw home, falling back to defaults with
+/// heuristic backend detection when no config file exists.
+fn load_config(zc_home: &Path) -> Result<ZeroClawConfig> {
+    let config_path = zc_home.join("config.toml");
+    Ok(config_parser::parse_config(&config_path)?.unwrap_or_else(|| {
+        let backend = config_parser::detect_backend_heuristic(zc_home);
+        ZeroClawConfig {
+            memory_backend: backend,
+            auto_save: true,
+            embedding_provider: "none".into(),
+            vector_weight: 0.7,
+            keyword_weight: 0.3,
+            identity_format: config_parser::IdentityFormat::OpenClaw,
+            aieos_path: None,
+            aieos_inline: None,
+            secrets_encrypt: true,
+            credential_hints: Vec::new(),
+            raw_toml: String::new(),
+        }
+    }))
+}
+
+/// Extract memory records for the configured backend (SQLite or Markdown).
+fn extract_memory_records(
+    workspace: &Path,
+    zc_home: &Path,
+    config: &ZeroClawConfig,
+    agent_id: Uuid,
+    runtime_version: Option<&str>,
+) -> Result<Vec<alf_core::MemoryRecord>> {
+    let records = match config.memory_backend {
+        MemoryBackend::Sqlite => {
+            let db_path = zc_home.join("memory.db");
+            if db_path.is_file() {
+                sqlite_extractor::extract_from_sqlite(&db_path, config, agent_id, runtime_version)?
+            } else {
+                // SQLite configured but file missing — try markdown fallback.
+                markdown_parser::collect_markdown_memory(workspace, agent_id, runtime_version)?
+            }
+        }
+        MemoryBackend::Markdown => {
+            markdown_parser::collect_markdown_memory(workspace, agent_id, runtime_version)?
+        }
+        MemoryBackend::None | MemoryBackend::Unsupported => Vec::new(),
+    };
+    Ok(records)
+}
+
+// ---------------------------------------------------------------------------
 // Export entry point
 // ---------------------------------------------------------------------------
 
@@ -241,24 +452,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     let zc_home = zeroclaw_home(workspace);
 
     // 1. Parse config
-    let config_path = zc_home.join("config.toml");
-    let config = config_parser::parse_config(&config_path)?.unwrap_or_else(|| {
-        // No config.toml — use defaults with heuristic backend detection
-        let backend = config_parser::detect_backend_heuristic(&zc_home);
-        ZeroClawConfig {
-            memory_backend: backend,
-            auto_save: true,
-            embedding_provider: "none".into(),
-            vector_weight: 0.7,
-            keyword_weight: 0.3,
-            identity_format: config_parser::IdentityFormat::OpenClaw,
-            aieos_path: None,
-            aieos_inline: None,
-            secrets_encrypt: true,
-            credential_hints: Vec::new(),
-            raw_toml: String::new(),
-        }
-    });
+    let config = load_config(&zc_home)?;
 
     // 2. Agent ID + name
     let agent_id = resolve_agent_id(workspace)?;
@@ -266,32 +460,13 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     let runtime_version = detect_zeroclaw_version(&zc_home);
 
     // 3. Extract memory records (based on backend)
-    let records = match config.memory_backend {
-        MemoryBackend::Sqlite => {
-            let db_path = zc_home.join("memory.db");
-            if db_path.is_file() {
-                sqlite_extractor::extract_from_sqlite(
-                    &db_path,
-                    &config,
-                    agent_id,
-                    runtime_version.as_deref(),
-                )?
-            } else {
-                // SQLite configured but file missing — try markdown fallback
-                markdown_parser::collect_markdown_memory(
-                    workspace,
-                    agent_id,
-                    runtime_version.as_deref(),
-                )?
-            }
-        }
-        MemoryBackend::Markdown => markdown_parser::collect_markdown_memory(
-            workspace,
-            agent_id,
-            runtime_version.as_deref(),
-        )?,
-        MemoryBackend::None | MemoryBackend::Unsupported => Vec::new(),
-    };
+    let records = extract_memory_records(
+        workspace,
+        &zc_home,
+        &config,
+        agent_id,
+        runtime_version.as_deref(),
+    )?;
     let total_records = records.len() as u64;
 
     // Check for embeddings in the record set
@@ -434,11 +609,17 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         alf_writer.add_memory_partition(info.clone(), group_records)?;
     }
 
-    // Raw sources
-    let raw_sources = collect_raw_sources(workspace, &zc_home, &config);
-    let raw_source_names: Vec<String> = raw_sources.iter().map(|(n, _)| n.clone()).collect();
-    for (relative_path, data) in &raw_sources {
-        alf_writer.add_raw_source("zeroclaw", relative_path, data)?;
+    // Raw sources — `enumerate_raw` is the single source of truth for the set.
+    let (raw_entries, excluded_by_alfignore, _warnings) = enumerate_raw(workspace, &config);
+    let mut raw_source_names = Vec::with_capacity(raw_entries.len());
+    for (entry, content) in raw_entries {
+        let data = match content {
+            RawContent::Inline(bytes) => bytes,
+            RawContent::Disk(path) => fs::read(&path)
+                .with_context(|| format!("Failed to read raw source {}", path.display()))?,
+        };
+        alf_writer.add_raw_source("zeroclaw", &entry.path, &data)?;
+        raw_source_names.push(entry.path);
     }
 
     let inner = alf_writer.finish()?;
@@ -457,6 +638,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         raw_sources: raw_source_names,
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
+        excluded_by_alfignore,
     })
 }
 
@@ -645,5 +827,58 @@ backend = "markdown"
         let loaded = load_agent_vault(Some(&path)).unwrap().unwrap();
         assert_eq!(loaded.credentials.len(), 1);
         assert_eq!(loaded.credentials[0].service, "telegram");
+    }
+
+    // --- .alfignore enumeration (ZeroClaw parity) ----------------------------
+
+    /// `.alfignore` filters workspace files but never the synthesized
+    /// `config.toml`, which is not a workspace path.
+    #[test]
+    fn enumerate_alfignore_filters_workspace_not_config() {
+        let config = "[memory]\nbackend = \"markdown\"\n";
+        let (_dir, ws) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# Agent\n\nHello.\n"),
+                ("memory/2026-02-15.md", "## A\n\nlog\n"),
+                ("memory/2026-02-16.md", "## B\n\nlog\n"),
+                (".alfignore", "memory/2026-02-15.md\n"),
+            ],
+        );
+
+        let result = enumerate(&ws).unwrap();
+        let paths: Vec<String> = result.files.iter().map(|f| f.path.clone()).collect();
+
+        // config.toml is synthesized and unfilterable — always present.
+        assert!(paths.contains(&"config.toml".to_string()));
+        assert!(paths.contains(&"SOUL.md".to_string()));
+        // The .alfignore'd memory file is gone; the other remains.
+        assert!(!paths.contains(&"memory/2026-02-15.md".to_string()));
+        assert!(paths.contains(&"memory/2026-02-16.md".to_string()));
+        assert_eq!(result.excluded_by_alfignore, 1);
+    }
+
+    /// `enumerate` is the single source of truth: its file list equals the
+    /// real export's `raw/zeroclaw/` entries.
+    #[test]
+    fn enumerate_matches_export_raw_sources() {
+        let config = "[memory]\nbackend = \"markdown\"\n";
+        let (dir, ws) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# Agent\n\nHello.\n"),
+                ("memory/2026-02-15.md", "## A\n\nlog\n"),
+            ],
+        );
+
+        let enumerated: std::collections::BTreeSet<String> =
+            enumerate(&ws).unwrap().files.into_iter().map(|f| f.path).collect();
+
+        let output = dir.path().join("out.alf");
+        let report = export(&ws, &output).unwrap();
+        let exported: std::collections::BTreeSet<String> =
+            report.raw_sources.into_iter().collect();
+
+        assert_eq!(enumerated, exported);
     }
 }

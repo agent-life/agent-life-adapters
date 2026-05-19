@@ -23,7 +23,9 @@ use std::path::Path;
 
 use anyhow::Result;
 
-pub use alf_core::adapter::{ExportReport, ImportOptions, ImportReport};
+pub use alf_core::adapter::{
+    ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
+};
 pub use alf_core::Adapter;
 
 pub mod config_parser;
@@ -33,6 +35,10 @@ pub mod import;
 pub mod markdown_parser;
 pub mod principals_parser;
 pub mod sqlite_extractor;
+
+// Dry-run enumeration entry points.
+pub use export::{enumerate, enumerate_workspace, EnumerationResult};
+pub use import::enumerate_archive;
 
 // ---------------------------------------------------------------------------
 // Adapter implementation
@@ -65,5 +71,13 @@ impl Adapter for ZeroClawAdapter {
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
         import::import(alf_file, workspace, options.vault_key)
+    }
+
+    fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {
+        export::enumerate_workspace(workspace)
+    }
+
+    fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
+        import::enumerate_archive(alf_file)
     }
 }

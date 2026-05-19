@@ -370,6 +370,17 @@ impl<R: Read + Seek> AlfReader<R> {
         Ok(buf)
     }
 
+    /// Uncompressed byte size of a raw archive entry.
+    ///
+    /// Read from the ZIP central directory — no decompression, O(1) per call.
+    pub fn entry_size(&mut self, path: &str) -> Result<u64, ArchiveError> {
+        let entry = self
+            .archive
+            .by_name(path)
+            .map_err(|_| ArchiveError::MissingEntry(path.into()))?;
+        Ok(entry.size())
+    }
+
     /// List all file paths in the archive.
     pub fn file_names(&self) -> Vec<String> {
         (0..self.archive.len())

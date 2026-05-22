@@ -1,3 +1,22 @@
+## [0.1.7] — 2026-05-18
+
+### Added
+
+- **`alf export --dry-run`** — enumerate the exact files that would be archived, with sizes, as JSON (`files`, `total_size`, `excluded_by_alfignore`). Writes no `.alf`, makes no network call, and does not persist `.alf-agent-id` — a pure, read-only preview.
+- **`alf restore --dry-run`** — fetch and decode the cloud archive and list the files that *would* be written (`would_write`), touching neither the target workspace nor `~/.alf/state/`. Makes the same network calls as a real restore; composes with `--at-sequence N` to preview a point-in-time restore.
+- **`.alfignore`** — an optional `.gitignore`-syntax file at the workspace root that filters paths out of the export set. Honored identically by `alf export`, `alf sync`, and `alf export --dry-run`; directory patterns and negation (`!pattern`) supported via the `ignore` crate. A malformed `.alfignore` warns and is skipped rather than failing the export. Excluding a structural file (e.g. `SOUL.md`) warns rather than blocks. The vault file at `~/.alf/vault/credentials.json` is outside the workspace and is never affected.
+- **`alf check`** reports **`alfignore.present`** — whether a `.alfignore` exists at the workspace root.
+- Dry-run / `.alfignore` walkthrough steps added to **`scripts/integration_walkthrough.py`** and **`scripts/integration_walkthrough_for_vault.py`**.
+
+### Changed
+
+- **`alf export` JSON** gains an **`excluded_by_alfignore`** count — workspace files dropped by a `.alfignore` (`0` when none is present).
+- **`alf-core`:** new `Adapter::enumerate_workspace` / `Adapter::enumerate_archive` trait methods (default implementations reject the call, so existing `Adapter` implementors are unaffected) backing the two `--dry-run` paths; new `FileEntry`, `WorkspaceEnumeration`, `ArchiveEnumeration` types; `ExportReport` gains `excluded_by_alfignore`; new `AlfReader::entry_size` reads an entry's uncompressed size from the ZIP central directory. `enumerate()` is now the single source of truth for the export file list in both the OpenClaw and ZeroClaw adapters.
+
+### Security
+
+- Addresses the ClawHub **ASI06** (HIGH) and **ASI08** (MEDIUM) findings: the set of files leaving the machine on export, and the set an `import`/`restore` would write, are now fully previewable *before* either happens — and `.alfignore` gives the operator direct, version-controllable control over the upload set. `--dry-run` performs no writes (export) and no workspace/state writes (restore), so the safety guarantee is not hollow.
+
 ## [0.1.6] — 2026-05-16
 
 ### Added

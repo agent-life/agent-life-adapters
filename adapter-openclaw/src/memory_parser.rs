@@ -121,6 +121,8 @@ fn classify_memory_type(relative_path: &str) -> MemoryType {
         MemoryType::Summary
     } else if lower.contains("gating-policies") || lower.contains("gating_policies") {
         MemoryType::Procedural
+    } else if lower.contains("procedures/") {
+        MemoryType::Procedural
     } else if lower.starts_with("memory/project-") {
         MemoryType::Semantic
     } else {
@@ -140,6 +142,8 @@ fn classify_namespace(relative_path: &str) -> String {
     } else if lower.starts_with("memory/project-") {
         "project".to_string()
     } else if lower.contains("gating-policies") || lower.contains("gating_policies") {
+        "procedural".to_string()
+    } else if lower.contains("procedures/") {
         "procedural".to_string()
     } else {
         "workspace".to_string()
@@ -537,6 +541,18 @@ Text.
         assert_eq!(
             classify_namespace("memory/active-context.md"),
             "active-context"
+        );
+    }
+
+    #[test]
+    fn classify_procedures_folder() {
+        assert_eq!(
+            classify_memory_type("memory/procedures/morning-standup.md"),
+            MemoryType::Procedural
+        );
+        assert_eq!(
+            classify_namespace("memory/procedures/morning-standup.md"),
+            "procedural"
         );
     }
 

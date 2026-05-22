@@ -248,6 +248,7 @@ If a section's heading text changes but its position stays the same, the ID stay
 | `memory/active-context.md` | `Summary` | Working memory is a distilled snapshot of current state. |
 | `memory/project-{slug}.md` | `Semantic` | Institutional knowledge that persists across sessions. |
 | `memory/gating-policies.md` | `Procedural` | Rules about how to do (or not do) things. |
+| `memory/procedures/**/*.md` | `Procedural` | Standalone procedure docs (workflows, standup templates, etc.). |
 | Other `memory/**/*.md` | `Semantic` | Conservative default for unrecognized files. |
 | Session transcript (if exported) | `Episodic` | Conversation logs are time-bound events. |
 
@@ -260,6 +261,7 @@ If a section's heading text changes but its position stays the same, the ID stay
 | `memory/active-context.md` | `"active-context"` |
 | `memory/project-*.md` | `"project"` |
 | `memory/gating-policies.md` | `"procedural"` |
+| `memory/procedures/**/*.md` | `"procedural"` |
 | Other `memory/**/*.md` | `"workspace"` |
 | Session transcripts | `"session"` |
 

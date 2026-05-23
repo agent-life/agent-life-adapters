@@ -2,10 +2,18 @@ use assert_cmd::cargo::cargo_bin_cmd;
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::sync::OnceLock;
 use tempfile::TempDir;
 
+/// Every `alf` subprocess runs with an isolated, clean `HOME` so the suite
+/// never reads or writes the developer's real `~/.alf/vault`. Tests that need
+/// their own HOME (e.g. to seed state) override it with a later `.env("HOME", …)`.
 fn alf_cmd() -> Command {
-    cargo_bin_cmd!("alf")
+    static TEST_HOME: OnceLock<TempDir> = OnceLock::new();
+    let home = TEST_HOME.get_or_init(|| TempDir::new().unwrap());
+    let mut cmd = cargo_bin_cmd!("alf");
+    cmd.env("HOME", home.path());
+    cmd
 }
 
 #[test]

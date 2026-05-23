@@ -4,6 +4,8 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+mod common;
+
 fn assert_files_match(src: &Path, dst: &Path, files: &[&str]) {
     for file in files {
         let src_path = src.join(file);
@@ -53,6 +55,7 @@ const COMMUNITY_FILES: &[&str] = &[
 
 #[test]
 fn round_trip_minimal_workspace() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/minimal");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");
@@ -68,6 +71,7 @@ fn round_trip_minimal_workspace() {
 
 #[test]
 fn round_trip_standard_workspace() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");
@@ -83,6 +87,7 @@ fn round_trip_standard_workspace() {
 
 #[test]
 fn round_trip_community_patterns() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/community-patterns");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");
@@ -98,6 +103,7 @@ fn round_trip_community_patterns() {
 
 #[test]
 fn round_trip_empty_workspace() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/empty");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");

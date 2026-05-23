@@ -528,7 +528,21 @@ mod tests {
     use crate::export;
     use rusqlite::Connection;
     use std::fs;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    /// Point `HOME` at a clean temp dir for the whole test process, set once
+    /// before any vault access. `import()` writes credentials to `$HOME/.alf/vault`
+    /// and auth profiles under `$HOME`; without this, these tests would rewrite
+    /// the developer's real vault. Call at the start of any import test.
+    fn isolate_home() {
+        static TEST_HOME: OnceLock<TempDir> = OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let home = TempDir::new().unwrap();
+            std::env::set_var("HOME", home.path());
+            home
+        });
+    }
 
     fn create_zeroclaw_home(
         config_toml: &str,
@@ -578,6 +592,7 @@ mod tests {
 
     #[test]
     fn round_trip_sqlite_workspace() {
+        isolate_home();
         let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
         let (dir, ws) = create_zeroclaw_home(
             config,
@@ -616,6 +631,7 @@ mod tests {
 
     #[test]
     fn import_creates_workspace_dirs() {
+        isolate_home();
         let config = "[memory]\nbackend = \"markdown\"";
         let (dir, ws) = create_zeroclaw_home(
             config,

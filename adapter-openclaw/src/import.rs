@@ -545,6 +545,7 @@ mod tests {
     use super::*;
     use crate::export;
     use std::fs;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
 
     fn create_workspace(files: &[(&str, &str)]) -> TempDir {
@@ -559,8 +560,22 @@ mod tests {
         dir
     }
 
+    /// Point `HOME` at a clean temp dir for the whole test process, set once
+    /// before any vault access. `import()` writes credentials to `$HOME/.alf/vault`
+    /// and auth profiles to `$HOME/.openclaw/...`; without this, these tests would
+    /// rewrite the developer's real vault. Call at the start of any import test.
+    fn isolate_home() {
+        static TEST_HOME: OnceLock<TempDir> = OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let home = TempDir::new().unwrap();
+            std::env::set_var("HOME", home.path());
+            home
+        });
+    }
+
     #[test]
     fn round_trip_with_raw_sources() {
+        isolate_home();
         // Create a workspace, export, then import into a fresh directory
         let ws = create_workspace(&[
             ("SOUL.md", "# Clawd\n\nA helpful lobster."),
@@ -604,6 +619,7 @@ mod tests {
 
     #[test]
     fn import_creates_workspace_dirs() {
+        isolate_home();
         let ws = create_workspace(&[
             ("SOUL.md", "# Bot\n\nTest."),
             ("IDENTITY.md", "# Identity\n\nName: Bot"),

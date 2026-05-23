@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::Cursor;
+use std::sync::OnceLock;
 
 use adapter_openclaw::OpenClawAdapter;
 use alf_core::archive::{AlfReader, DeltaMemoryEntry, DeltaWriter};
@@ -48,8 +49,23 @@ fn create_workspace(
     ws
 }
 
+/// Point `HOME` at a clean, isolated temp dir for the whole test process, set
+/// exactly once before any vault access. `export()` reads `$HOME/.alf/vault`
+/// and `import()` writes it, so without this the suite would read or clobber
+/// the developer's real vault. Every test calls `export_workspace` before any
+/// import, so isolating here covers the binary.
+fn isolate_home() {
+    static TEST_HOME: OnceLock<TempDir> = OnceLock::new();
+    TEST_HOME.get_or_init(|| {
+        let home = TempDir::new().unwrap();
+        std::env::set_var("HOME", home.path());
+        home
+    });
+}
+
 /// Export a workspace to an .alf archive via the OpenClaw adapter.
 fn export_workspace(workspace: &std::path::Path, output: &std::path::Path) -> Vec<u8> {
+    isolate_home();
     let adapter = OpenClawAdapter;
     adapter.export(workspace, output).expect("export failed");
     fs::read(output).expect("failed to read exported .alf")

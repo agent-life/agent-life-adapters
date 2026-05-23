@@ -4,8 +4,11 @@ use std::fs;
 use std::path::Path;
 use tempfile::TempDir;
 
+mod common;
+
 #[test]
 fn import_creates_directory_structure() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");
@@ -25,6 +28,7 @@ fn import_creates_directory_structure() {
 
 #[test]
 fn import_writes_agent_id() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");
@@ -49,6 +53,7 @@ fn import_writes_agent_id() {
 
 #[test]
 fn import_overwrites_existing() {
+    common::isolate_home();
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("export.alf");

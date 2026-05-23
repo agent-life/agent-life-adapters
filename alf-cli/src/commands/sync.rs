@@ -24,8 +24,9 @@ use crate::output;
 use crate::state::{local_base_exists, local_base_path, state_file_path, AgentState};
 
 use alf_core::archive::{AlfReader, DeltaWriter};
-use alf_core::delta::compute_delta;
+use alf_core::delta::{compute_delta, diff_credentials};
 use alf_core::manifest::{ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaSyncCursor};
+use alf_core::CredentialsDocument;
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -55,6 +56,23 @@ struct SyncChanges {
     creates: usize,
     updates: usize,
     deletes: usize,
+    /// Layer 4 (credentials) changes carried by this delta. Omitted when the
+    /// vault was unchanged.
+    #[serde(skip_serializing_if = "CredentialChanges::is_zero")]
+    credentials: CredentialChanges,
+}
+
+#[derive(Serialize)]
+struct CredentialChanges {
+    creates: usize,
+    updates: usize,
+    deletes: usize,
+}
+
+impl CredentialChanges {
+    fn is_zero(&self) -> bool {
+        self.creates == 0 && self.updates == 0 && self.deletes == 0
+    }
 }
 
 /// Pure decision function for `alf sync` branching.
@@ -353,13 +371,21 @@ fn execute_delta(
     })?;
     let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
     let prev_records = prev_reader.read_all_memory()?;
+    let prev_creds = prev_reader.read_credentials()?;
 
     let mut curr_reader = AlfReader::new(Cursor::new(alf_bytes))?;
     let curr_records = curr_reader.read_all_memory()?;
+    // The freshly-exported archive already carries the live vault (Layer 4),
+    // so we diff it here against the previous base — never re-reading the vault
+    // file and never decrypting. Diff is by credential `id` (see
+    // `diff_credentials`), which is what defeats the fresh-nonce-per-encryption
+    // churn that would otherwise re-upload everything each sync.
+    let curr_creds = curr_reader.read_credentials()?;
 
     let delta_entries = compute_delta(&prev_records, &curr_records);
+    let cred_diff = diff_credentials(prev_creds.as_ref(), curr_creds.as_ref());
 
-    if delta_entries.is_empty() {
+    if delta_entries.is_empty() && cred_diff.is_empty() {
         if human {
             println!(
                 "{} No changes detected — already up to date",
@@ -395,6 +421,14 @@ fn execute_delta(
     output::progress(&format!(
         "  Delta: {creates} creates, {updates} updates, {deletes} deletes"
     ));
+    if !cred_diff.is_empty() {
+        output::progress(&format!(
+            "  Credentials: {} creates, {} updates, {} deletes",
+            cred_diff.created.len(),
+            cred_diff.updated.len(),
+            cred_diff.deleted.len()
+        ));
+    }
 
     let delta_manifest = DeltaManifest {
         alf_version: "1.0.0".into(),
@@ -413,6 +447,9 @@ fn execute_delta(
             new_timestamp: None,
             extra: HashMap::new(),
         },
+        // This inventory is a placeholder: DeltaWriter::finish() rebuilds it
+        // from whatever was actually written below (see set_credentials /
+        // add_memory_deltas).
         changes: ChangeInventory {
             identity: None,
             principals: None,
@@ -425,7 +462,24 @@ fn execute_delta(
 
     let delta_buf = Cursor::new(Vec::new());
     let mut delta_writer = DeltaWriter::new(delta_buf, delta_manifest)?;
-    delta_writer.add_memory_deltas(&delta_entries)?;
+    if !delta_entries.is_empty() {
+        delta_writer.add_memory_deltas(&delta_entries)?;
+    }
+    if !cred_diff.is_empty() {
+        // Design: carry the full current Layer 4 whenever any credential
+        // changed; rebuild does a full replace. The by-id diff above gates
+        // this, so steady-state syncs attach nothing.
+        match &curr_creds {
+            Some(doc) => delta_writer.set_credentials(doc)?,
+            // Every credential was deleted: the exported archive omits the
+            // layer, so attach an empty document to make rebuild replace the
+            // base set with nothing.
+            None => delta_writer.set_credentials(&CredentialsDocument {
+                credentials: Vec::new(),
+                extra: HashMap::new(),
+            })?,
+        }
+    }
     let delta_buf = delta_writer.finish()?;
     let delta_bytes = delta_buf.into_inner();
 
@@ -461,6 +515,11 @@ fn execute_delta(
                 creates,
                 updates,
                 deletes,
+                credentials: CredentialChanges {
+                    creates: cred_diff.created.len(),
+                    updates: cred_diff.updated.len(),
+                    deletes: cred_diff.deleted.len(),
+                },
             }),
             snapshot_path: snapshot_path.to_string_lossy().into(),
             no_changes: false,

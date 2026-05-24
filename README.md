@@ -560,7 +560,11 @@ INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localho
 
 **Vault-focused** (`scripts/integration_walkthrough_for_vault.py`) covers Layer 4: zero-knowledge boundary, on-disk vs cloud representation, snapshot upload with `credentials.json`, optional `alf vault list`, and cleanup. Same `.env` variables as the main script.
 
-Unlike the Rust E2E tests (which verify API contracts), the walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
+**Workspace coverage** (`scripts/integration_walkthrough_for_workspace.py`) covers Layer 5 (WP3 — `alf add`): how an agent explicitly opts arbitrary files into sync (ALF never auto-walks a workspace), where the tracked-file whitelist and removal log live (`.alf-include.json` / `.alf-sync-log.md`, both synced so they travel on restore), and how a change to a tracked file triggers a fresh snapshot (a non-destructive rollover) while memory-only changes still ride deltas. Drives the real `alf` CLI against the live service and verifies each effect in Neon + S3. Same `.env` variables as the main script.
+
+**Memory & chunking** (`scripts/integration_walkthrough_for_memory.py`) covers Layer 3: the source-handler table that decides each file's `memory_type`, `namespace`, and chunking strategy (`OneRecordPerFile` vs the fence-aware, empty-body-dropping `SplitByHeading`). It seeds a demo workspace, runs the real `alf export`, and shows per file how many records came out — contrasted with what the old structure-blind splitter produced (e.g. a procedure `6→1`, a daily journal `4→2` with the H1 date header no longer a record). Unlike the others it is **fully local**: no `.env`, service, Neon, or S3 — only a built `alf` binary.
+
+Unlike the Rust E2E tests (which verify API contracts), the service-backed walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
 
 ```bash
 # Install dependencies (one time)
@@ -574,6 +578,12 @@ python3 scripts/integration_walkthrough.py --no-pause
 
 # Vault walkthrough (separate test agent UUID)
 python3 scripts/integration_walkthrough_for_vault.py --no-pause
+
+# Workspace-coverage walkthrough (WP3 — alf add; separate test agent UUID)
+python3 scripts/integration_walkthrough_for_workspace.py --no-pause
+
+# Memory & chunking walkthrough (fully local — only needs a built `alf`, no deps/.env)
+python3 scripts/integration_walkthrough_for_memory.py --no-pause
 
 # Custom report path
 python3 scripts/integration_walkthrough.py --report results/report.md

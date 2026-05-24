@@ -113,6 +113,18 @@ Instead, in the delta path, `alf sync` compares the tracked files (and the inclu
 
 Deletions are handled before export: if a tracked file no longer exists on disk, `alf sync` removes it from `.alf-include.json` and appends a note to `.alf-sync-log.md` (so the agent can later answer "what happened to notes.txt"). That removal is itself a tracked change, so it re-snapshots; on restore the file is simply absent.
 
+### 6.2 Memory record chunking and delta granularity (WP2)
+
+What becomes a *memory record* — and therefore what a delta can carry — is decided per file by the OpenClaw adapter's source-handler table (`SOURCE_HANDLERS` in [`adapter-openclaw/src/memory_parser.rs`](../adapter-openclaw/src/memory_parser.rs), first match wins). Each location maps to a `memory_type`, a `namespace`, and a chunking strategy: `OneRecordPerFile` (procedures, `memory/curated/`, active-context, and any other `memory/*.md`) or a fence-aware `SplitByHeading` (daily journals, `MEMORY.md`). `SplitByHeading` ignores `## ` lines inside ` ``` ` code fences and drops empty-bodied sections — including a leading `# date` header — so a daily file yields one record per real entry, not a spurious date-header fragment. Full mapping: [adapter-openclaw/README.md](../adapter-openclaw/README.md#mapping-openclaw-memory-to-alf).
+
+Record IDs are **positional** — `UUID v5(origin_file + ":" + section_index)` — and `compute_delta` diffs memory by id, so chunking directly shapes the delta:
+
+- Editing a section's body → an **update** for that id.
+- Appending a new `## ` entry at the end of a daily file → a single **create** (earlier records' indices are unchanged).
+- Inserting or removing a section in the **middle** of a file shifts every later section's index, so each later record gets a new id: the delta shows N deletes + N creates rather than one insert. This is an accepted tradeoff — mid-file edits are rare, and `OneRecordPerFile` files (procedures/curated) are always index 0 and so insertion-stable. A content-addressed id scheme is a possible future "stable memory IDs" change.
+
+**One-time effect on upgrade to 0.1.8.** The first sync from the fixed adapter re-chunks existing daily / `MEMORY.md` files. Any that previously emitted a `# date` header record or empty `## ` sections will show those records **deleted** and the survivors **renumbered** — a single larger-than-usual delta, then stable. The Phase 5 indexer's truncate-and-reload absorbs this server-side; no migration is required.
+
 ## 7. State transitions in `sync.rs`
 
 ```mermaid

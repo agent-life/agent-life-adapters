@@ -10,17 +10,22 @@
 
 - **`alf sync` now carries credential (Layer 4) changes in deltas.** Previously credentials reached the cloud only in a full snapshot, so a credential added with `alf vault add` *after* the first sync was silently never uploaded — and was lost when restoring on another machine. Sync now diffs the vault **by credential `id`** (re-encryption uses a fresh nonce, so byte comparison would re-upload everything) and includes created/updated/deleted credentials in each delta; the sync result reports the counts. Re-keying the whole vault is handled gracefully (all records reported as updated by id).
 - **A change to a tracked file triggers a re-snapshot.** Arbitrary tracked files are opaque bytes the delta format can't carry, so when a tracked file — or `.alf-include.json` / `.alf-sync-log.md` — changes, `alf sync` uploads a fresh full snapshot instead of a delta. The service treats this as a clean, **non-destructive rollover** at the current sequence (prior snapshots/deltas retained for point-in-time restore). Memory-only syncs still push efficient deltas. See `docs/how_alf_syncs.md` §6.1.
+- **OpenClaw memory chunking is now path-aware (source-handler table).** A declarative table in `adapter-openclaw` maps each workspace location to a `memory_type`, `namespace`, and chunking strategy — `OneRecordPerFile` (procedures, `memory/curated/`, active-context, and any other `memory/*.md`) or a fence-aware `SplitByHeading` (daily journals, `MEMORY.md`, and the legacy gating-policies / project files). Replaces the previous "split every Markdown file on `## `" heuristic.
 - **`alf-core`:** new `diff_credentials` / `CredentialsDiff` (by-id credential diff, mirroring `compute_delta`); `ExportReport` gains `missing_includes` (tracked files no longer on disk).
 
 ### Fixed
 
 - **Credential vault now syncs incrementally.** Fixes the gap where credentials added after an agent's first snapshot never propagated (observed: an agent on the Docker runtime whose vault never reached the cloud while a mac agent's did, purely because of snapshot timing).
+- **Procedure and curated memory files no longer shred.** A self-contained `memory/procedures/*.md` (e.g. a standup procedure) now produces **one** `procedural` record instead of one fragment per `## ` heading.
+- **Daily journals no longer emit a spurious date-header record.** A leading `# Saturday, May 23rd, 2026` H1 (and any `## ` section with an empty body) is dropped rather than becoming its own record — one record per real entry. Heading detection is also fence-aware: a `## ` line inside a ` ``` ` code block is no longer treated as a section boundary. Round-trip is unaffected — the exact file bytes remain under `raw/openclaw/`, so only the structured Layer-3 view changes.
 - **Test isolation.** Export/import test suites now redirect `HOME` to a temp dir, so running the suite on a machine with a real `~/.alf/vault` can no longer read it into a test archive or rewrite it.
 
 ### Documentation
 
 - **`docs/how_alf_syncs.md`** — new **§6.1** documenting the tracked-file re-snapshot trigger and the prune/log-on-delete behavior; corrected the prior "never re-uploads a snapshot" note (snapshot rollover is now a deliberate, non-destructive path).
 - **`docs/cli-reference.md`**, the top-level **`README.md`**, **`adapter-openclaw/README.md`**, and **`skills/agent-life/SKILL.md`** updated for `alf add` and the include-list / re-snapshot model.
+- **Memory chunking docs:** `adapter-openclaw/README.md`'s record-boundary table rewritten to the source-handler model (named chunking strategies, fence-awareness, empty-body/H1-header drop), and **`docs/how_alf_syncs.md`** gains a memory-record chunking section.
+- **`scripts/integration_walkthrough_for_memory.py`** — a fully local (no service) walkthrough of the memory-type + chunking model: seeds a demo workspace, runs `alf export`, and contrasts the per-file record counts with what the old splitter produced.
 
 ## [0.1.7] — 2026-05-18
 

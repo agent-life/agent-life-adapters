@@ -45,6 +45,8 @@ const STANDARD_FILES: &[&str] = &[
     "memory/active-context.md",
     "memory/project-clawsmith.md",
     "memory/gating-policies.md",
+    "memory/procedures/morning-standup.md",
+    "memory/curated/postgres-rls.md",
 ];
 
 const COMMUNITY_FILES: &[&str] = &[

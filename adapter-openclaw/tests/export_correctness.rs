@@ -76,6 +76,36 @@ fn memory_record_classification() {
 }
 
 #[test]
+fn procedure_file_is_single_record() {
+    // WP2: a multi-heading procedure (with a fenced `## ` line) must collapse to
+    // ONE procedural record, not shred into one fragment per heading.
+    let fixture = Path::new("tests/fixtures/standard");
+    let tmp = TempDir::new().unwrap();
+    let alf_path = tmp.path().join("export.alf");
+
+    let adapter = OpenClawAdapter;
+    adapter.export(fixture, &alf_path).expect("export failed");
+
+    let file = std::fs::File::open(&alf_path).unwrap();
+    let buf_reader = std::io::BufReader::new(file);
+    let mut reader = AlfReader::new(buf_reader).expect("open failed");
+    let records = reader.read_all_memory().expect("read memory failed");
+
+    let procedure: Vec<_> = records
+        .iter()
+        .filter(|r| r.source.origin_file.as_deref() == Some("memory/procedures/morning-standup.md"))
+        .collect();
+
+    assert_eq!(
+        procedure.len(),
+        1,
+        "procedure file should produce exactly one record"
+    );
+    assert_eq!(procedure[0].memory_type, MemoryType::Procedural);
+    assert_eq!(procedure[0].namespace, "procedural");
+}
+
+#[test]
 fn identity_and_principals_populated() {
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();

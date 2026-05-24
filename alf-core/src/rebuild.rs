@@ -437,6 +437,98 @@ mod tests {
         reader.read_identity().unwrap()
     }
 
+    // -- Credential helpers ----------------------------------------------------
+
+    fn make_credential(
+        suffix: u8,
+        ciphertext: &str,
+        nonce: &str,
+    ) -> crate::credentials::CredentialRecord {
+        use crate::credentials::{CredentialRecord, CredentialType, EncryptionMetadata};
+        let mut id_bytes = [0u8; 16];
+        id_bytes[15] = suffix;
+        CredentialRecord {
+            id: uuid::Uuid::from_bytes(id_bytes),
+            agent_id: make_agent_metadata().id,
+            service: "test".into(),
+            credential_type: CredentialType::Account,
+            encrypted_payload: ciphertext.into(),
+            encryption: EncryptionMetadata {
+                algorithm: "xchacha20-poly1305".into(),
+                nonce: nonce.into(),
+                kdf: None,
+                kdf_params: None,
+                extra: HashMap::new(),
+            },
+            created_at: Utc::now(),
+            label: None,
+            description: None,
+            capabilities_granted: vec![],
+            updated_at: None,
+            last_rotated_at: None,
+            expires_at: None,
+            tags: vec![],
+            extra: HashMap::new(),
+        }
+    }
+
+    fn make_credentials_doc(
+        records: Vec<crate::credentials::CredentialRecord>,
+    ) -> crate::credentials::CredentialsDocument {
+        crate::credentials::CredentialsDocument {
+            credentials: records,
+            extra: HashMap::new(),
+        }
+    }
+
+    /// Build a snapshot whose only layer is credentials.
+    fn build_snapshot_creds(creds: &crate::credentials::CredentialsDocument) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut writer = AlfWriter::new(buf, make_manifest()).unwrap();
+        writer.set_credentials(creds).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    /// Build a delta carrying credentials (and nothing else).
+    fn build_delta_creds(
+        base_sequence: u64,
+        creds: &crate::credentials::CredentialsDocument,
+    ) -> Vec<u8> {
+        let delta_manifest = DeltaManifest {
+            alf_version: "1.0.0".into(),
+            created_at: Utc::now(),
+            agent: DeltaAgentRef {
+                id: make_agent_metadata().id,
+                source_runtime: Some("test".into()),
+                extra: HashMap::new(),
+            },
+            sync: DeltaSyncCursor {
+                base_sequence,
+                new_sequence: base_sequence + 1,
+                base_timestamp: None,
+                new_timestamp: None,
+                extra: HashMap::new(),
+            },
+            changes: ChangeInventory {
+                identity: None,
+                principals: None,
+                credentials: None,
+                memory: None,
+                extra: HashMap::new(),
+            },
+            extra: HashMap::new(),
+        };
+        let buf = Cursor::new(Vec::new());
+        let mut writer = DeltaWriter::new(buf, delta_manifest).unwrap();
+        writer.set_credentials(creds).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn read_credentials(bytes: &[u8]) -> Option<crate::credentials::CredentialsDocument> {
+        let mut reader = AlfReader::new(Cursor::new(bytes)).unwrap();
+        reader.read_credentials().unwrap()
+    }
+
     // -- Tests ----------------------------------------------------------------
 
     #[test]
@@ -691,5 +783,106 @@ mod tests {
         // Verify total records
         let total: u64 = memory.partitions.iter().map(|p| p.record_count).sum();
         assert_eq!(total, 4);
+    }
+
+    #[test]
+    fn rebuild_replaces_credentials_on_rekey() {
+        // Base: 3 credentials. Delta: same 3 ids, re-keyed (every ciphertext
+        // and nonce changed). Rebuild must carry the re-keyed envelopes.
+        let base = build_snapshot_creds(&make_credentials_doc(vec![
+            make_credential(1, "old-ct-1", "old-n-1"),
+            make_credential(2, "old-ct-2", "old-n-2"),
+            make_credential(3, "old-ct-3", "old-n-3"),
+        ]));
+        let delta = build_delta_creds(
+            0,
+            &make_credentials_doc(vec![
+                make_credential(1, "new-ct-1", "new-n-1"),
+                make_credential(2, "new-ct-2", "new-n-2"),
+                make_credential(3, "new-ct-3", "new-n-3"),
+            ]),
+        );
+
+        let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
+        let creds = read_credentials(&rebuilt).expect("credentials present");
+        assert_eq!(creds.credentials.len(), 3);
+        for c in &creds.credentials {
+            assert!(
+                c.encrypted_payload.starts_with("new-ct-"),
+                "re-keyed ciphertext expected, got {}",
+                c.encrypted_payload
+            );
+        }
+    }
+
+    #[test]
+    fn credential_added_after_base_propagates_via_delta() {
+        // Mirrors WP1 (b): base has 3 credentials, a 4th is added. The by-id
+        // diff reports exactly one create; the delta carries the full current
+        // Layer 4 (Design A); rebuild yields all four.
+        let base_doc = make_credentials_doc(vec![
+            make_credential(1, "ct-1", "n-1"),
+            make_credential(2, "ct-2", "n-2"),
+            make_credential(3, "ct-3", "n-3"),
+        ]);
+        let mut curr_doc = base_doc.clone();
+        curr_doc.credentials.push(make_credential(4, "ct-4", "n-4"));
+
+        let diff = crate::delta::diff_credentials(Some(&base_doc), Some(&curr_doc));
+        assert_eq!(diff.created.len(), 1, "exactly one new credential");
+        assert!(diff.updated.is_empty(), "unchanged three not re-listed");
+        assert!(diff.deleted.is_empty());
+
+        let base = build_snapshot_creds(&base_doc);
+        let delta = build_delta_creds(0, &curr_doc); // Design A: full current Layer 4
+        let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
+
+        let creds = read_credentials(&rebuilt).expect("credentials present");
+        assert_eq!(creds.credentials.len(), 4);
+        let mut id4 = [0u8; 16];
+        id4[15] = 4;
+        assert!(creds
+            .credentials
+            .iter()
+            .any(|c| c.id == uuid::Uuid::from_bytes(id4)));
+    }
+
+    #[test]
+    fn rebuild_applies_credential_delete() {
+        // Base: 3 credentials. Delta: 2 of them (id 2 dropped). Rebuilt has 2.
+        let base = build_snapshot_creds(&make_credentials_doc(vec![
+            make_credential(1, "ct-1", "n-1"),
+            make_credential(2, "ct-2", "n-2"),
+            make_credential(3, "ct-3", "n-3"),
+        ]));
+        let delta = build_delta_creds(
+            0,
+            &make_credentials_doc(vec![
+                make_credential(1, "ct-1", "n-1"),
+                make_credential(3, "ct-3", "n-3"),
+            ]),
+        );
+
+        let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
+        let creds = read_credentials(&rebuilt).expect("credentials present");
+        assert_eq!(creds.credentials.len(), 2);
+        let mut dropped_id = [0u8; 16];
+        dropped_id[15] = 2;
+        let dropped = uuid::Uuid::from_bytes(dropped_id);
+        assert!(creds.credentials.iter().all(|c| c.id != dropped));
+    }
+
+    #[test]
+    fn rebuild_applies_all_credentials_deleted() {
+        // Base: 1 credential. Delta: empty credentials document (all deleted).
+        // Rebuilt must NOT carry the base credential forward.
+        let base = build_snapshot_creds(&make_credentials_doc(vec![make_credential(
+            1, "ct-1", "n-1",
+        )]));
+        let delta = build_delta_creds(0, &make_credentials_doc(vec![]));
+
+        let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
+        let count = read_credentials(&rebuilt).map_or(0, |d| d.credentials.len());
+        assert_eq!(count, 0);
     }
 }

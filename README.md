@@ -92,6 +92,7 @@ agent-life-adapters/
 │       ├── vault_key.rs        # Resolve vault key from flags / env / default paths
 │       └── commands/
 │           ├── mod.rs          # Command dispatch
+│           ├── add.rs          # alf add — track an arbitrary workspace file for sync
 │           ├── check.rs        # alf check — environment diagnostics, workspace auto-discovery
 │           ├── export.rs       # alf export — dispatch to runtime adapter
 │           ├── help.rs         # alf help — overview, status, files, troubleshoot
@@ -224,6 +225,12 @@ alf export --runtime <runtime> --workspace <path> [--output <path>]
 Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
 
 ```
+alf add <path> --runtime <runtime> --workspace <path>
+```
+
+Track an arbitrary workspace file so sync includes it. ALF never auto-walks a workspace — the agent opts each file in explicitly. The tracked set is recorded in `<workspace>/.alf-include.json` (itself synced, so it travels on restore); tracked files round-trip byte-identically under `raw/openclaw/`. Deleting a tracked file and running `alf sync` prunes it and appends a note to `.alf-sync-log.md`.
+
+```
 alf import --runtime <runtime> --workspace <path> <alf-file> [--vault-key-file …]
 ```
 
@@ -233,7 +240,7 @@ Import an `.alf` file into a framework workspace. Creates or populates the works
 alf sync --runtime <runtime> --workspace <path> [--recover] [--force-first-sync]
 ```
 
-Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags.
+Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags. Credential (Layer 4) changes ride deltas (diffed by `id`); a change to a file tracked via `alf add` instead triggers a fresh snapshot (a non-destructive rollover), since opaque files can't ride a delta. See [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) §6.1.
 
 ```
 alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>] [--vault-key-file …]
@@ -279,9 +286,17 @@ api_url = "https://api.agent-life.ai"
 api_key = "alf_..."
 
 [defaults]
-runtime = "openclaw"
-workspace = "/home/user/.openclaw/workspace"  # optional, auto-discovered by alf check
+runtime = "openclaw"                          # used when -r is omitted (default: openclaw)
+workspace = "/home/user/.openclaw/workspace"  # used when -w is omitted
 ```
+
+`-r`/`-w` are optional on every command — when omitted they fall back to these `[defaults]`
+(precedence: CLI flag › `[defaults]` › `openclaw` for runtime; workspace errors if neither is set).
+
+Set **`ALF_HOME`** to relocate alf's whole tree off `$HOME`: when set, `~/.alf` (config, sync
+state, vault) and `~/.openclaw` resolve under `$ALF_HOME` (e.g. `ALF_HOME=/data` → config at
+`/data/.alf/config.toml`). Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — the
+original behavior. Useful when an agent process rewrites `$HOME`.
 
 Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout, and [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) for the canonical reference on the sync data model, branch logic, ephemeral-runtime corner cases (E1–E8), and the operator runbook for recovery (`alf sync --recover`).
 
@@ -553,7 +568,11 @@ INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localho
 
 **Vault-focused** (`scripts/integration_walkthrough_for_vault.py`) covers Layer 4: zero-knowledge boundary, on-disk vs cloud representation, snapshot upload with `credentials.json`, optional `alf vault list`, and cleanup. Same `.env` variables as the main script.
 
-Unlike the Rust E2E tests (which verify API contracts), the walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
+**Workspace coverage** (`scripts/integration_walkthrough_for_workspace.py`) covers Layer 5 (WP3 — `alf add`): how an agent explicitly opts arbitrary files into sync (ALF never auto-walks a workspace), where the tracked-file whitelist and removal log live (`.alf-include.json` / `.alf-sync-log.md`, both synced so they travel on restore), and how a change to a tracked file triggers a fresh snapshot (a non-destructive rollover) while memory-only changes still ride deltas. Drives the real `alf` CLI against the live service and verifies each effect in Neon + S3. Same `.env` variables as the main script.
+
+**Memory & chunking** (`scripts/integration_walkthrough_for_memory.py`) covers Layer 3: the source-handler table that decides each file's `memory_type`, `namespace`, and chunking strategy (`OneRecordPerFile` vs the fence-aware, empty-body-dropping `SplitByHeading`). It seeds a demo workspace, runs the real `alf export`, and shows per file how many records came out — contrasted with what the old structure-blind splitter produced (e.g. a procedure `6→1`, a daily journal `4→2` with the H1 date header no longer a record). Unlike the others it is **fully local**: no `.env`, service, Neon, or S3 — only a built `alf` binary.
+
+Unlike the Rust E2E tests (which verify API contracts), the service-backed walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
 
 ```bash
 # Install dependencies (one time)
@@ -567,6 +586,12 @@ python3 scripts/integration_walkthrough.py --no-pause
 
 # Vault walkthrough (separate test agent UUID)
 python3 scripts/integration_walkthrough_for_vault.py --no-pause
+
+# Workspace-coverage walkthrough (WP3 — alf add; separate test agent UUID)
+python3 scripts/integration_walkthrough_for_workspace.py --no-pause
+
+# Memory & chunking walkthrough (fully local — only needs a built `alf`, no deps/.env)
+python3 scripts/integration_walkthrough_for_memory.py --no-pause
 
 # Custom report path
 python3 scripts/integration_walkthrough.py --report results/report.md

@@ -1,3 +1,4 @@
+pub mod add;
 pub mod check;
 pub mod export;
 pub mod help;

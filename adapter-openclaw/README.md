@@ -194,16 +194,24 @@ This section defines the exact mapping from OpenClaw's on-disk memory structures
 
 ### Record Boundary Strategy
 
-OpenClaw's memory files are continuous Markdown, not discrete records. The adapter must define record boundaries. The strategy differs by file type:
+OpenClaw's memory files are continuous Markdown, not discrete records. The adapter must define record boundaries. Rather than apply one heuristic to every file, a path-ordered **source-handler table** (`SOURCE_HANDLERS` in [`src/memory_parser.rs`](src/memory_parser.rs), first match wins) maps each location to a `memory_type`, a `namespace`, and one of two chunking strategies:
 
-| Source File | Splitting Strategy | Rationale |
+- **`OneRecordPerFile`** — the whole file becomes a single record. Used for self-contained documents.
+- **`SplitByHeading` (H2, fence-aware)** — one record per `## ` heading (content before the first heading is its own record). It is **fence-aware** — a `## ` line inside a ` ``` ` fenced code block is *not* a split point — and drops **empty-bodied sections**, so a leading `# date` header (e.g. `# Saturday, May 23rd, 2026`) or a `## ` with no content under it never becomes its own record. A file with no headings yields one record.
+
+| Source File | Chunking Strategy | Rationale |
 |-------------|-------------------|-----------|
-| `memory/YYYY-MM-DD.md` | Split on `## ` headings (H2). Each heading and its body becomes one record. If no headings, the entire file is one record. | Daily logs are structured around session entries or time-of-day sections. H2 is the natural record boundary. |
-| `MEMORY.md` | Split on `## ` headings (H2). Each section becomes one record. If no headings, the entire file is one record. | Curated memory is organized into topical sections. |
-| `memory/active-context.md` | Entire file is one record. | Working memory is a single coherent snapshot. |
-| `memory/project-{slug}.md` | Split on `## ` headings. | Project files follow the same section-based pattern. |
-| `memory/gating-policies.md` | Each table row becomes one record (if table-formatted), otherwise split on H2. | Gating policies are discrete rules. |
-| Other `memory/**/*.md` | Split on `## ` headings, fallback to entire file. | Conservative default for unknown community files. |
+| `memory/YYYY-MM-DD.md` (daily) | `SplitByHeading` | Daily logs are structured around timed/session entries; H2 is the natural boundary. |
+| `MEMORY.md` | `SplitByHeading` | Curated memory is organized into topical sections. |
+| `memory/procedures/*.md` | `OneRecordPerFile` | A procedure is one self-contained workflow; splitting it shreds a coherent document. |
+| `memory/curated/*.md` | `OneRecordPerFile` | Each curated knowledge file is a single topic. |
+| `memory/active-context.md` | `OneRecordPerFile` | Working memory is a single coherent snapshot. |
+| `memory/gating-policies.md` | `SplitByHeading` | Legacy; each policy section is a discrete rule. |
+| `memory/project-{slug}.md` | `SplitByHeading` | Legacy; project files follow the section-based pattern. |
+| Other `memory/*.md` (catch-all) | `OneRecordPerFile` | One record per file — don't fragment unknown community files. |
+| Non-Markdown under `memory/` | Skipped (no structured record) | Preserved byte-for-byte under `raw/openclaw/` via `alf add`; not parsed into memory. |
+
+Dropping a header from a `SplitByHeading` file never loses data: the exact file bytes are preserved under `raw/openclaw/` and restored verbatim, so only the structured Layer-3 view is affected.
 
 ### Stable Record ID Generation
 
@@ -245,9 +253,11 @@ If a section's heading text changes but its position stays the same, the ID stay
 |--------|--------------|-----------|
 | `memory/YYYY-MM-DD.md` | `Episodic` | Daily logs capture time-bound observations and events. |
 | `MEMORY.md` | `Semantic` | Curated long-term knowledge, facts, and decisions. |
+| `memory/curated/**/*.md` | `Semantic` | Curated knowledge documents, one per file. |
 | `memory/active-context.md` | `Summary` | Working memory is a distilled snapshot of current state. |
 | `memory/project-{slug}.md` | `Semantic` | Institutional knowledge that persists across sessions. |
 | `memory/gating-policies.md` | `Procedural` | Rules about how to do (or not do) things. |
+| `memory/procedures/**/*.md` | `Procedural` | Standalone procedure docs (workflows, standup templates, etc.). |
 | Other `memory/**/*.md` | `Semantic` | Conservative default for unrecognized files. |
 | Session transcript (if exported) | `Episodic` | Conversation logs are time-bound events. |
 
@@ -257,9 +267,11 @@ If a section's heading text changes but its position stays the same, the ID stay
 |----------------|-------------|
 | `memory/YYYY-MM-DD.md` | `"daily"` |
 | `MEMORY.md` | `"curated"` |
+| `memory/curated/**/*.md` | `"curated"` |
 | `memory/active-context.md` | `"active-context"` |
 | `memory/project-*.md` | `"project"` |
 | `memory/gating-policies.md` | `"procedural"` |
+| `memory/procedures/**/*.md` | `"procedural"` |
 | Other `memory/**/*.md` | `"workspace"` |
 | Session transcripts | `"session"` |
 
@@ -324,6 +336,8 @@ raw/openclaw/memory/active-context.md
 ```
 
 This ensures zero information loss. Even if the structured parsing misses nuances in a user's custom formatting, the raw files can always be re-parsed by a future improved adapter or imported directly by an OpenClaw-to-OpenClaw restore.
+
+**Agent-tracked arbitrary files (`alf add`).** Beyond the known files above, the agent can opt arbitrary workspace files into the raw set with `alf add <path>` — a `notes.txt`, a nested `reports/q1.md`, a binary. The adapter never auto-walks the workspace; tracked paths are recorded in `<workspace>/.alf-include.json` and added to `raw/openclaw/` (raw only — no semantic parse), restored byte-identically. The include list and the removal log `.alf-sync-log.md` are themselves preserved in `raw/openclaw/`, so the tracked set and its history travel on restore. Because opaque files can't ride an incremental delta, a change to any tracked file makes `alf sync` upload a fresh snapshot (a non-destructive rollover); see [docs/how_alf_syncs.md](../docs/how_alf_syncs.md) §6.1.
 
 
 ## Gaps, Risks, and Design Decisions

@@ -349,11 +349,9 @@ fn quarter_end(year: i32, quarter: u32) -> NaiveDate {
 // Agent vault (Layer 4)
 // ---------------------------------------------------------------------------
 
-/// Best-effort home directory.
+/// Best-effort home directory (honors `ALF_HOME`).
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
+    alf_core::home_dir()
 }
 
 /// Load the agent-managed ALF vault — the `CredentialsDocument` the agent
@@ -639,6 +637,8 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
         excluded_by_alfignore,
+        // ZeroClaw has no `alf add` include list yet (OpenClaw-only for now).
+        missing_includes: Vec::new(),
     })
 }
 

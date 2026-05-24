@@ -30,6 +30,9 @@ pub struct ExportReport {
     /// Number of workspace files dropped by a `.alfignore` filter (0 when no
     /// `.alfignore` is present).
     pub excluded_by_alfignore: u32,
+    /// Paths in the agent's include list (`alf add`) that no longer exist on
+    /// disk at export time. `alf sync` prunes these and logs the removal.
+    pub missing_includes: Vec<String>,
 }
 
 /// Summary of an import operation.

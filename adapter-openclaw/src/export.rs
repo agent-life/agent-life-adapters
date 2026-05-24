@@ -4,7 +4,7 @@
 //! groups memory records into time-based partitions, preserves raw source
 //! files, and writes the archive using `AlfWriter`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -89,11 +89,9 @@ fn detect_openclaw_version() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Best-effort home directory.
+/// Best-effort home directory (honors `ALF_HOME`).
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
+    alf_core::home_dir()
 }
 
 // ---------------------------------------------------------------------------
@@ -117,6 +115,9 @@ pub struct EnumerationResult {
     pub files: Vec<FileEntry>,
     pub excluded_by_alfignore: u32,
     pub alfignore_warnings: Vec<String>,
+    /// Paths in the agent's include list (`alf add`) that no longer exist on
+    /// disk. Reported, not pruned — `alf sync` prunes them and logs the removal.
+    pub missing_includes: Vec<String>,
 }
 
 /// Load `<workspace>/.alfignore` into a gitignore matcher.
@@ -224,10 +225,66 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
         }
     }
 
+    // Agent-managed include list — arbitrary files the agent opted into via
+    // `alf add`. ALF never auto-discovers; only explicitly-tracked files are
+    // added (raw only — no semantic parse). A malformed list degrades to empty
+    // with a warning rather than blocking the backup (same posture as
+    // `.alfignore`).
+    let mut missing_includes = Vec::new();
+    let mut seen: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
+    let include = match crate::include::IncludeList::load(workspace) {
+        Ok(list) => list,
+        Err(err) => {
+            warnings.push(format!(
+                "{} could not be read ({err}); tracked files not synced this run",
+                crate::include::INCLUDE_FILE
+            ));
+            crate::include::IncludeList::default()
+        }
+    };
+    for rel in include.paths() {
+        if seen.contains(&rel) {
+            continue; // already captured (e.g. a ROOT_FILE or memory/ file)
+        }
+        let abs = workspace.join(&rel);
+        if !abs.is_file() {
+            missing_includes.push(rel);
+            continue;
+        }
+        if is_alfignored(&matcher, &rel) {
+            excluded += 1;
+            continue;
+        }
+        let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        files.push(FileEntry {
+            path: rel.clone(),
+            size,
+        });
+        seen.insert(rel);
+    }
+
+    // The include list and sync log themselves travel as raw so the agent's
+    // sync config and removal history persist across machines on restore.
+    for sentinel in [crate::include::INCLUDE_FILE, crate::include::SYNC_LOG_FILE] {
+        if seen.contains(sentinel) {
+            continue;
+        }
+        let abs = workspace.join(sentinel);
+        if abs.is_file() {
+            let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            files.push(FileEntry {
+                path: sentinel.to_string(),
+                size,
+            });
+            seen.insert(sentinel.to_string());
+        }
+    }
+
     Ok(EnumerationResult {
         files,
         excluded_by_alfignore: excluded,
         alfignore_warnings: warnings,
+        missing_includes,
     })
 }
 
@@ -251,13 +308,22 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
     let agent_id = resolve_agent_id_readonly(workspace)?;
     let memory_records = memory_parser::collect_all_memory(workspace, agent_id)?.len() as u64;
 
+    // Surface (but do not prune — this is read-only) tracked files that have
+    // gone missing, so a dry-run preview shows what `alf sync` would drop.
+    let mut warnings = enumeration.alfignore_warnings;
+    for rel in &enumeration.missing_includes {
+        warnings.push(format!(
+            "tracked file {rel} no longer exists (will be removed from sync on next `alf sync`)"
+        ));
+    }
+
     Ok(WorkspaceEnumeration {
         agent_name,
         memory_records,
         files: enumeration.files,
         excluded_by_alfignore: enumeration.excluded_by_alfignore,
         total_size,
-        warnings: enumeration.alfignore_warnings,
+        warnings,
     })
 }
 
@@ -488,6 +554,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     // Raw sources — `enumerate` is the single source of truth for the file set.
     let enumeration = enumerate(workspace)?;
     let excluded_by_alfignore = enumeration.excluded_by_alfignore;
+    let missing_includes = enumeration.missing_includes.clone();
     let mut raw_source_names = Vec::with_capacity(enumeration.files.len());
     for entry in &enumeration.files {
         let data = fs::read(workspace.join(&entry.path))
@@ -514,6 +581,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
         excluded_by_alfignore,
+        missing_includes,
     })
 }
 
@@ -811,5 +879,103 @@ mod tests {
         assert!(enumerated_paths(&result).contains(&"SOUL.md".to_string()));
         assert!(enumerated_paths(&result).contains(&"memory/2026-01-15.md".to_string()));
         assert_eq!(result.excluded_by_alfignore, 0);
+    }
+
+    // -- Include list (`alf add`) -----------------------------------------
+
+    use crate::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
+
+    /// A tracked arbitrary file (root + nested) is enumerated into raw, and the
+    /// include list itself travels.
+    #[test]
+    fn include_tracks_arbitrary_files() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("notes.txt", "hello"),
+            ("my-project/data.csv", "a,b\n1,2\n"),
+            ("untracked.txt", "should not sync"),
+        ]);
+        let mut list = IncludeList::default();
+        list.add("notes.txt");
+        list.add("my-project/data.csv");
+        list.save(&ws).unwrap();
+
+        let paths = enumerated_paths(&enumerate(&ws).unwrap());
+        assert!(paths.contains(&"notes.txt".to_string()));
+        assert!(paths.contains(&"my-project/data.csv".to_string()));
+        // The include list itself is preserved so it travels on restore.
+        assert!(paths.contains(&INCLUDE_FILE.to_string()));
+        // Arbitrary files NOT opted in are never auto-discovered.
+        assert!(!paths.contains(&"untracked.txt".to_string()));
+    }
+
+    /// A listed-but-missing tracked file is reported (not enumerated, not an error).
+    #[test]
+    fn include_missing_file_is_reported_not_enumerated() {
+        let (_dir, ws) = create_workspace(&[("SOUL.md", "soul"), ("kept.txt", "k")]);
+        let mut list = IncludeList::default();
+        list.add("kept.txt");
+        list.add("gone.txt"); // never created
+        list.save(&ws).unwrap();
+
+        let result = enumerate(&ws).unwrap();
+        let paths = enumerated_paths(&result);
+        assert!(paths.contains(&"kept.txt".to_string()));
+        assert!(!paths.contains(&"gone.txt".to_string()));
+        assert_eq!(result.missing_includes, vec!["gone.txt".to_string()]);
+    }
+
+    /// An empty tracked file is enumerated (zero-byte is valid).
+    #[test]
+    fn include_empty_file_is_enumerated() {
+        let (_dir, ws) = create_workspace(&[("SOUL.md", "soul"), ("empty.txt", "")]);
+        let mut list = IncludeList::default();
+        list.add("empty.txt");
+        list.save(&ws).unwrap();
+
+        let result = enumerate(&ws).unwrap();
+        let entry = result
+            .files
+            .iter()
+            .find(|f| f.path == "empty.txt")
+            .expect("empty.txt enumerated");
+        assert_eq!(entry.size, 0);
+    }
+
+    /// Tracking a path already captured by ROOT_FILES does not duplicate it.
+    #[test]
+    fn include_does_not_duplicate_known_file() {
+        let (_dir, ws) = create_workspace(&[("SOUL.md", "soul")]);
+        let mut list = IncludeList::default();
+        list.add("SOUL.md");
+        list.save(&ws).unwrap();
+
+        let paths = enumerated_paths(&enumerate(&ws).unwrap());
+        assert_eq!(paths.iter().filter(|p| *p == "SOUL.md").count(), 1);
+    }
+
+    /// The sync log, when present, travels as raw.
+    #[test]
+    fn include_sync_log_travels() {
+        let (_dir, ws) = create_workspace(&[("SOUL.md", "soul")]);
+        fs::write(ws.join(SYNC_LOG_FILE), "- 2026-01-01: removed x\n").unwrap();
+
+        let paths = enumerated_paths(&enumerate(&ws).unwrap());
+        assert!(paths.contains(&SYNC_LOG_FILE.to_string()));
+    }
+
+    /// A malformed include list degrades to empty + warning (never blocks backup).
+    #[test]
+    fn include_malformed_degrades_with_warning() {
+        let (_dir, ws) = create_workspace(&[("SOUL.md", "soul")]);
+        fs::write(ws.join(INCLUDE_FILE), "{ not json").unwrap();
+
+        let result = enumerate(&ws).unwrap();
+        // SOUL.md still enumerated despite the broken include list.
+        assert!(enumerated_paths(&result).contains(&"SOUL.md".to_string()));
+        assert!(result
+            .alfignore_warnings
+            .iter()
+            .any(|w| w.contains(INCLUDE_FILE)));
     }
 }

@@ -17,6 +17,7 @@ use colored::Colorize;
 use std::path::PathBuf;
 use std::process;
 
+use crate::config::Config;
 use crate::vault_key::VaultKeyArgs;
 
 #[derive(Parser)]
@@ -50,11 +51,11 @@ enum Command {
     Export {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory
         #[arg(short, long)]
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
 
         /// Output .alf file path [default: ./<agent-name>.alf]
         #[arg(short, long)]
@@ -63,6 +64,29 @@ enum Command {
         /// Preview the files that would be archived without writing anything
         #[arg(long)]
         dry_run: bool,
+    },
+
+    /// Track an arbitrary workspace file so sync includes it
+    #[command(
+        long_about = "Add records a workspace file in the agent's include list \
+        (.alf-include.json) so the next `alf sync` includes it under raw/openclaw/. \
+        ALF does not auto-discover arbitrary files — the agent opts each one in \
+        explicitly. The path is interpreted relative to the workspace.\n\n\
+        Deleting the file and running `alf sync` removes it from the include list \
+        and appends a note to .alf-sync-log.md.\n\n\
+        Example: alf add notes.txt -r openclaw -w ./my-agent"
+    )]
+    Add {
+        /// Path to the workspace file to track (relative to the workspace)
+        path: String,
+
+        /// Agent framework runtime (openclaw)
+        #[arg(short, long)]
+        runtime: Option<String>,
+
+        /// Path to the agent workspace directory
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
     },
 
     /// Import an .alf archive into an agent workspace
@@ -78,11 +102,11 @@ enum Command {
     Import {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory
         #[arg(short, long)]
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
 
         /// Path to the .alf file to import
         alf_file: PathBuf,
@@ -128,11 +152,11 @@ enum Command {
     Sync {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory
         #[arg(short, long)]
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
 
         /// Pull cloud snapshot + deltas to repair a missing local base snapshot
         #[arg(long)]
@@ -161,11 +185,11 @@ enum Command {
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory
         #[arg(short, long)]
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
 
         /// Agent ID to restore (if omitted, uses the single tracked agent from ~/.alf/state/)
         #[arg(short, long)]
@@ -195,11 +219,11 @@ enum Command {
     Purge {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory (used for CLI consistency; not modified)
         #[arg(short, long)]
-        workspace: PathBuf,
+        workspace: Option<PathBuf>,
 
         /// Agent ID to purge (if omitted, uses the single tracked agent from ~/.alf/state/)
         #[arg(short, long)]
@@ -229,7 +253,7 @@ enum Command {
     Check {
         /// Agent framework runtime (openclaw, zeroclaw)
         #[arg(short, long)]
-        runtime: String,
+        runtime: Option<String>,
 
         /// Path to the agent workspace directory (auto-discovered if omitted)
         #[arg(short, long)]
@@ -542,14 +566,35 @@ fn main() {
             workspace,
             output,
             dry_run,
-        } => commands::export::run(&runtime, &workspace, output.as_deref(), dry_run),
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::export::run(&runtime, &workspace, output.as_deref(), dry_run)
+        })(),
+
+        Command::Add {
+            path,
+            runtime,
+            workspace,
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::add::run(&runtime, &workspace, &path)
+        })(),
 
         Command::Import {
             runtime,
             workspace,
             alf_file,
             key,
-        } => commands::import::run(&runtime, &alf_file, &workspace, &key.to_args()),
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::import::run(&runtime, &alf_file, &workspace, &key.to_args())
+        })(),
 
         Command::Validate {
             alf_file,
@@ -561,7 +606,12 @@ fn main() {
             workspace,
             recover,
             force_first_sync,
-        } => commands::sync::run(&runtime, &workspace, recover, force_first_sync),
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::sync::run(&runtime, &workspace, recover, force_first_sync)
+        })(),
 
         Command::Restore {
             runtime,
@@ -570,26 +620,38 @@ fn main() {
             at_sequence,
             dry_run,
             key,
-        } => commands::restore::run(
-            &runtime,
-            &workspace,
-            agent.as_deref(),
-            at_sequence,
-            dry_run,
-            &key.to_args(),
-        ),
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::restore::run(
+                &runtime,
+                &workspace,
+                agent.as_deref(),
+                at_sequence,
+                dry_run,
+                &key.to_args(),
+            )
+        })(),
 
         Command::Purge {
             runtime,
             workspace,
             agent,
-        } => commands::purge::run(&runtime, &workspace, agent.as_deref()),
+        } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
+            let workspace = config.resolve_workspace(workspace)?;
+            commands::purge::run(&runtime, &workspace, agent.as_deref())
+        })(),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
 
-        Command::Check { runtime, workspace } => {
+        Command::Check { runtime, workspace } => (|| -> anyhow::Result<()> {
+            let config = Config::load()?;
+            let runtime = config.resolve_runtime(runtime);
             commands::check::run(&runtime, workspace.as_deref())
-        }
+        })(),
 
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
 

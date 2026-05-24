@@ -7,6 +7,7 @@
 //! See §4.3 of the ALF specification.
 
 use crate::archive::DeltaMemoryEntry;
+use crate::credentials::{CredentialRecord, CredentialsDocument};
 use crate::manifest::DeltaOperation;
 use crate::memory::MemoryRecord;
 
@@ -66,6 +67,74 @@ pub fn compute_delta(old: &[MemoryRecord], new: &[MemoryRecord]) -> Vec<DeltaMem
     result.extend(updates);
     result.extend(deletes);
     result
+}
+
+/// The set of credential changes between two credential documents, keyed by
+/// credential `id`.
+///
+/// Credentials are AEAD-encrypted client-side with a fresh nonce per
+/// encryption, so the same plaintext re-encrypts to different ciphertext.
+/// Diffs are therefore computed by `id`, never by ciphertext bytes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CredentialsDiff {
+    /// IDs present in `new` but not `old`.
+    pub created: Vec<Uuid>,
+    /// IDs in both but with a different serialized record (covers re-key,
+    /// where every envelope changes but the `id` is stable).
+    pub updated: Vec<Uuid>,
+    /// IDs present in `old` but not `new`.
+    pub deleted: Vec<Uuid>,
+}
+
+impl CredentialsDiff {
+    /// True when there are no credential changes.
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.updated.is_empty() && self.deleted.is_empty()
+    }
+}
+
+/// Compute the [`CredentialsDiff`] between an old and new credentials document.
+///
+/// A `None` document is treated as the empty set, so this handles the cases
+/// where a layer-4 was absent before (first credential) or has become absent
+/// (last credential deleted). Comparison is by `id`:
+/// - IDs in `new` but not `old` → `created`
+/// - IDs in `old` but not `new` → `deleted`
+/// - IDs in both, different serialized record → `updated`
+/// - IDs in both, identical → omitted
+pub fn diff_credentials(
+    old: Option<&CredentialsDocument>,
+    new: Option<&CredentialsDocument>,
+) -> CredentialsDiff {
+    let empty: Vec<CredentialRecord> = Vec::new();
+    let old_records = old.map(|d| &d.credentials).unwrap_or(&empty);
+    let new_records = new.map(|d| &d.credentials).unwrap_or(&empty);
+
+    let old_map: HashMap<Uuid, &CredentialRecord> =
+        old_records.iter().map(|c| (c.id, c)).collect();
+    let new_map: HashMap<Uuid, &CredentialRecord> =
+        new_records.iter().map(|c| (c.id, c)).collect();
+
+    let mut diff = CredentialsDiff::default();
+
+    for record in new_records {
+        match old_map.get(&record.id) {
+            None => diff.created.push(record.id),
+            Some(old_record) => {
+                if !credentials_equal(old_record, record) {
+                    diff.updated.push(record.id);
+                }
+            }
+        }
+    }
+
+    for record in old_records {
+        if !new_map.contains_key(&record.id) {
+            diff.deleted.push(record.id);
+        }
+    }
+
+    diff
 }
 
 /// Apply a set of delta entries to a base set of memory records.
@@ -146,6 +215,17 @@ fn records_equal(a: &MemoryRecord, b: &MemoryRecord) -> bool {
         return true;
     }
     // Slow path: compare via JSON (handles f64 edge cases)
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(va), Ok(vb)) => va == vb,
+        _ => false,
+    }
+}
+
+/// Compare two credential records for equality, mirroring [`records_equal`].
+fn credentials_equal(a: &CredentialRecord, b: &CredentialRecord) -> bool {
+    if a == b {
+        return true;
+    }
     match (serde_json::to_value(a), serde_json::to_value(b)) {
         (Ok(va), Ok(vb)) => va == vb,
         _ => false,
@@ -325,6 +405,122 @@ mod tests {
         assert_eq!(delta[0].operation, DeltaOperation::Create);
         assert_eq!(delta[1].operation, DeltaOperation::Update);
         assert_eq!(delta[2].operation, DeltaOperation::Delete);
+    }
+
+    // -- diff_credentials ---------------------------------------------------
+
+    fn make_credential(id: Uuid, ciphertext: &str, nonce: &str) -> CredentialRecord {
+        use crate::credentials::{CredentialType, EncryptionMetadata};
+        let now = Utc.with_ymd_and_hms(2026, 2, 15, 12, 0, 0).unwrap();
+        CredentialRecord {
+            id,
+            agent_id: Uuid::nil(),
+            service: "test".into(),
+            credential_type: CredentialType::Account,
+            encrypted_payload: ciphertext.into(),
+            encryption: EncryptionMetadata {
+                algorithm: "xchacha20-poly1305".into(),
+                nonce: nonce.into(),
+                kdf: None,
+                kdf_params: None,
+                extra: HashMap::new(),
+            },
+            created_at: now,
+            label: None,
+            description: None,
+            capabilities_granted: vec![],
+            updated_at: None,
+            last_rotated_at: None,
+            expires_at: None,
+            tags: vec![],
+            extra: HashMap::new(),
+        }
+    }
+
+    fn make_doc(records: Vec<CredentialRecord>) -> CredentialsDocument {
+        CredentialsDocument {
+            credentials: records,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn diff_credentials_none_to_none() {
+        assert!(diff_credentials(None, None).is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_first_credentials() {
+        // No prior layer-4 -> 3 credentials = 3 creates.
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        let new = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+
+        let diff = diff_credentials(None, Some(&new));
+        assert_eq!(diff.created.len(), 3);
+        assert!(diff.updated.is_empty());
+        assert!(diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_add_one_by_id() {
+        // 3 unchanged + 1 new = exactly 1 create; unchanged 3 not re-emitted.
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let new_id = Uuid::now_v7();
+        let mut new_records: Vec<_> = ids.iter().map(|id| make_credential(*id, "ct", "n")).collect();
+        new_records.push(make_credential(new_id, "ct4", "n4"));
+        let new = make_doc(new_records);
+
+        let diff = diff_credentials(Some(&old), Some(&new));
+        assert_eq!(diff.created, vec![new_id]);
+        assert!(diff.updated.is_empty());
+        assert!(diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_rekey_updates_all_by_id() {
+        // Same ids, every ciphertext + nonce changed (re-key) = all updated.
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        let old = make_doc(ids.iter().map(|id| make_credential(*id, "old-ct", "old-n")).collect());
+        let new = make_doc(ids.iter().map(|id| make_credential(*id, "new-ct", "new-n")).collect());
+
+        let diff = diff_credentials(Some(&old), Some(&new));
+        assert_eq!(diff.updated.len(), 3);
+        assert!(diff.created.is_empty());
+        assert!(diff.deleted.is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_delete_one() {
+        let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
+        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let new = make_doc(ids[..2].iter().map(|id| make_credential(*id, "ct", "n")).collect());
+
+        let diff = diff_credentials(Some(&old), Some(&new));
+        assert_eq!(diff.deleted, vec![ids[2]]);
+        assert!(diff.created.is_empty());
+        assert!(diff.updated.is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_delete_last_to_none() {
+        // Deleting the final credential => current layer-4 absent (None).
+        let id = Uuid::now_v7();
+        let old = make_doc(vec![make_credential(id, "ct", "n")]);
+
+        let diff = diff_credentials(Some(&old), None);
+        assert_eq!(diff.deleted, vec![id]);
+        assert!(diff.created.is_empty());
+        assert!(diff.updated.is_empty());
+    }
+
+    #[test]
+    fn diff_credentials_identical_no_change() {
+        let ids: Vec<Uuid> = (0..2).map(|_| Uuid::now_v7()).collect();
+        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let new = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+
+        assert!(diff_credentials(Some(&old), Some(&new)).is_empty());
     }
 
     // -- apply_delta --------------------------------------------------------

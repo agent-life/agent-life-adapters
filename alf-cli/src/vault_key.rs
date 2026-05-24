@@ -176,7 +176,7 @@ fn default_passphrase_salt(runtime: &str) -> &'static [u8] {
 /// `~/.openclaw/state/.alf-vault-key` or `~/.zeroclaw/state/.alf-vault-key`.
 /// Returns `Ok(None)` for unknown runtimes (no default file applies).
 pub fn default_key_path(runtime: &str) -> Result<Option<PathBuf>> {
-    let home = home_dir().context("Could not determine home directory")?;
+    let home = alf_core::home_dir().context("Could not determine home directory")?;
     let path = match runtime {
         "openclaw" => home.join(".openclaw").join("state").join(".alf-vault-key"),
         "zeroclaw" => home.join(".zeroclaw").join("state").join(".alf-vault-key"),
@@ -192,23 +192,8 @@ pub fn default_key_path(runtime: &str) -> Result<Option<PathBuf>> {
 /// this file into the archive's Layer 4 on `alf sync`. Unlike the vault key,
 /// this file holds only ciphertext, so it is safe to sync.
 pub fn default_vault_path() -> Result<PathBuf> {
-    let home = home_dir().context("Could not determine home directory")?;
+    let home = alf_core::home_dir().context("Could not determine home directory")?;
     Ok(home.join(".alf").join("vault").join("credentials.json"))
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
 }
 
 #[cfg(test)]

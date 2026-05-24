@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::context;
 use crate::output;
 
+use alf_core::CredentialsDocument;
 use anyhow::Result;
 use colored::Colorize;
 use serde::Serialize;
@@ -20,6 +21,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct CheckResult {
+    version: String,
     ok: bool,
     runtime: String,
     ready_to_sync: bool,
@@ -29,6 +31,8 @@ struct CheckResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     openclaw: Option<OpenClawInfo>,
     alf: AlfInfo,
+    env: EnvInfo,
+    vault: VaultInfo,
     issues: Vec<Issue>,
     suggestions: Vec<String>,
 }
@@ -90,7 +94,33 @@ struct AlfInfo {
     agent_tracked: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     last_synced_sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_synced_at: Option<String>,
     service_reachable: bool,
+}
+
+/// Snapshot of environment variables relevant to alf. Secret-bearing vars are
+/// reported as presence booleans only — their values are never serialized.
+#[derive(Serialize)]
+struct EnvInfo {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    home: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alf_home: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    alf_human: Option<String>,
+    alf_api_key_set: bool,
+    alf_vault_key_set: bool,
+    alf_vault_passphrase_set: bool,
+}
+
+/// Location and state of the agent's credential vault (`~/.alf/vault/credentials.json`).
+#[derive(Serialize)]
+struct VaultInfo {
+    path: String,
+    exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    credential_count: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -109,21 +139,6 @@ struct ResolvedWorkspace {
     path: PathBuf,
     source: String,
     openclaw_configured_path: Option<String>,
-}
-
-fn home_dir() -> Option<PathBuf> {
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
-    }
 }
 
 fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace {
@@ -159,7 +174,7 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
     }
 
     // Priority 4: ~/.openclaw/workspace (default)
-    let default_path = home_dir()
+    let default_path = alf_core::home_dir()
         .map(|h| h.join(".openclaw").join("workspace"))
         .unwrap_or_else(|| PathBuf::from(".openclaw/workspace"));
 
@@ -172,7 +187,7 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
 
 /// Read `agents.defaults.workspace` from `~/.openclaw/openclaw.json`.
 fn read_openclaw_workspace() -> Option<String> {
-    let home = home_dir()?;
+    let home = alf_core::home_dir()?;
     let config_path = home.join(".openclaw").join("openclaw.json");
     let content = fs::read_to_string(&config_path).ok()?;
     let json: serde_json::Value = serde_json::from_str(&content).ok()?;
@@ -350,7 +365,7 @@ fn collect_issues(
     }
 
     if resolved.openclaw_configured_path.is_none() {
-        let home = home_dir().unwrap_or_default();
+        let home = alf_core::home_dir().unwrap_or_default();
         let oc_config = home.join(".openclaw").join("openclaw.json");
         if !oc_config.exists() {
             issues.push(Issue {
@@ -463,7 +478,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let openclaw = if runtime == "openclaw" {
         Some(OpenClawInfo {
             config_found: resolved.openclaw_configured_path.is_some()
-                || home_dir()
+                || alf_core::home_dir()
                     .map(|h| h.join(".openclaw").join("openclaw.json").exists())
                     .unwrap_or(false),
             workspace_configured: resolved.openclaw_configured_path.clone(),
@@ -477,6 +492,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let api_key_set = status.api_key_set;
     let agent_tracked = !status.agents.is_empty();
     let last_synced_sequence = status.agents.first().map(|a| a.last_synced_sequence);
+    let last_synced_at = status.agents.first().and_then(|a| a.last_synced_at.clone());
 
     let service_reachable = if api_key_set && agent_tracked {
         let client = ApiClient::from_config(&config).ok();
@@ -501,6 +517,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         api_key_set,
         agent_tracked,
         last_synced_sequence,
+        last_synced_at,
         service_reachable,
     };
 
@@ -515,6 +532,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     };
 
     let mut result = CheckResult {
+        version: env!("CARGO_PKG_VERSION").into(),
         ok: !has_errors,
         runtime: runtime.into(),
         ready_to_sync,
@@ -523,6 +541,8 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         alfignore,
         openclaw,
         alf: alf_info,
+        env: gather_env(),
+        vault: gather_vault(),
         issues,
         suggestions: Vec::new(),
     };
@@ -549,6 +569,7 @@ fn print_human(result: &CheckResult) {
     }
     println!();
 
+    println!("  alf:       {}", result.version);
     println!("  Runtime:   {}", result.runtime);
     println!(
         "  Workspace: {} (source: {})",
@@ -587,6 +608,59 @@ fn print_human(result: &CheckResult) {
     println!("    API key:    {}", yn(result.alf.api_key_set));
     println!("    Tracked:    {}", yn(result.alf.agent_tracked));
     println!("    Service:    {}", yn(result.alf.service_reachable));
+    if let Some(seq) = result.alf.last_synced_sequence {
+        println!(
+            "    Last synced: seq {} ({})",
+            seq,
+            result
+                .alf
+                .last_synced_at
+                .as_deref()
+                .unwrap_or("time unknown")
+        );
+    }
+    println!();
+
+    println!("  Vault:");
+    println!("    Path:        {}", result.vault.path);
+    println!("    Exists:      {}", yn(result.vault.exists));
+    if let Some(n) = result.vault.credential_count {
+        println!("    Credentials: {n}");
+    }
+    println!();
+
+    println!("  Environment:");
+    println!(
+        "    HOME:                 {}",
+        result.env.home.as_deref().unwrap_or("(unset)")
+    );
+    if let Some(ref ah) = result.env.alf_home {
+        println!("    ALF_HOME:             {ah}");
+    }
+    println!(
+        "    ALF_API_KEY:          {}",
+        if result.env.alf_api_key_set {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    println!(
+        "    ALF_VAULT_KEY:        {}",
+        if result.env.alf_vault_key_set {
+            "set"
+        } else {
+            "unset"
+        }
+    );
+    println!(
+        "    ALF_VAULT_PASSPHRASE: {}",
+        if result.env.alf_vault_passphrase_set {
+            "set"
+        } else {
+            "unset"
+        }
+    );
     println!();
 
     if !result.issues.is_empty() {
@@ -619,6 +693,46 @@ fn yn(b: bool) -> &'static str {
         "yes"
     } else {
         "no"
+    }
+}
+
+/// Snapshot alf-relevant env vars. Secret-bearing vars are reduced to presence
+/// only — their values are never read into the result.
+fn gather_env() -> EnvInfo {
+    let val = |k: &str| std::env::var(k).ok().filter(|s| !s.is_empty());
+    let set = |k: &str| std::env::var_os(k).map(|v| !v.is_empty()).unwrap_or(false);
+    EnvInfo {
+        home: val("HOME").or_else(|| val("USERPROFILE")),
+        alf_home: val("ALF_HOME"),
+        alf_human: val("ALF_HUMAN"),
+        alf_api_key_set: set("ALF_API_KEY"),
+        alf_vault_key_set: set("ALF_VAULT_KEY"),
+        alf_vault_passphrase_set: set("ALF_VAULT_PASSPHRASE"),
+    }
+}
+
+/// Locate the credential vault and, if present, count its records. Never fails:
+/// a missing or malformed vault yields `credential_count: None`.
+fn gather_vault() -> VaultInfo {
+    match crate::vault_key::default_vault_path() {
+        Ok(path) => {
+            let exists = path.is_file();
+            let credential_count = exists
+                .then(|| fs::read_to_string(&path).ok())
+                .flatten()
+                .and_then(|raw| serde_json::from_str::<CredentialsDocument>(&raw).ok())
+                .map(|doc| doc.credentials.len());
+            VaultInfo {
+                path: path.to_string_lossy().into_owned(),
+                exists,
+                credential_count,
+            }
+        }
+        Err(_) => VaultInfo {
+            path: "(unknown)".into(),
+            exists: false,
+            credential_count: None,
+        },
     }
 }
 
@@ -748,5 +862,75 @@ mod tests {
         assert!(!resources.memory_dir);
         assert!(resources.daily_logs.is_none());
         assert!(resources.agent_id.is_none());
+    }
+
+    #[test]
+    fn gather_env_redacts_secrets() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_api = std::env::var_os("ALF_API_KEY");
+        let prev_vk = std::env::var_os("ALF_VAULT_KEY");
+        let prev_pp = std::env::var_os("ALF_VAULT_PASSPHRASE");
+
+        std::env::set_var("ALF_API_KEY", "super-secret-key");
+        std::env::set_var("ALF_VAULT_KEY", "vault-secret-value");
+        std::env::remove_var("ALF_VAULT_PASSPHRASE");
+
+        let env = gather_env();
+        assert!(env.alf_api_key_set);
+        assert!(env.alf_vault_key_set);
+        assert!(!env.alf_vault_passphrase_set);
+
+        // Contract: secret VALUES must never be serialized — only presence.
+        let json = serde_json::to_string(&env).unwrap();
+        assert!(!json.contains("super-secret-key"), "API key value leaked");
+        assert!(
+            !json.contains("vault-secret-value"),
+            "vault key value leaked"
+        );
+
+        restore_var("ALF_API_KEY", prev_api);
+        restore_var("ALF_VAULT_KEY", prev_vk);
+        restore_var("ALF_VAULT_PASSPHRASE", prev_pp);
+    }
+
+    #[test]
+    fn gather_vault_reports_presence_and_count() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_alf_home = std::env::var_os("ALF_HOME");
+
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+
+        // No vault file yet.
+        let v = gather_vault();
+        assert!(!v.exists);
+        assert_eq!(v.credential_count, None);
+
+        // A well-formed (empty) vault parses and counts.
+        let vault = tmp
+            .path()
+            .join(".alf")
+            .join("vault")
+            .join("credentials.json");
+        std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        std::fs::write(&vault, r#"{"credentials":[]}"#).unwrap();
+        let v = gather_vault();
+        assert!(v.exists);
+        assert_eq!(v.credential_count, Some(0));
+
+        // Malformed JSON: present but uncounted, never panics.
+        std::fs::write(&vault, "{ not json").unwrap();
+        let v = gather_vault();
+        assert!(v.exists);
+        assert_eq!(v.credential_count, None);
+
+        restore_var("ALF_HOME", prev_alf_home);
+    }
+
+    fn restore_var(key: &str, prev: Option<std::ffi::OsString>) {
+        match prev {
+            Some(v) => std::env::set_var(key, v),
+            None => std::env::remove_var(key),
+        }
     }
 }

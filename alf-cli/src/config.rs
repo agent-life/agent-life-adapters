@@ -73,15 +73,40 @@ impl Default for DefaultsConfig {
 }
 
 impl Config {
-    /// Returns the path to the config directory (`~/.alf/`).
+    /// Returns the path to the config directory (`~/.alf/`, or `$ALF_HOME/.alf`).
     pub fn dir() -> Result<PathBuf> {
-        let home = home_dir().context("Could not determine home directory")?;
+        let home = alf_core::home_dir().context("Could not determine home directory")?;
         Ok(home.join(".alf"))
     }
 
     /// Returns the path to the config file (`~/.alf/config.toml`).
     pub fn path() -> Result<PathBuf> {
         Ok(Self::dir()?.join("config.toml"))
+    }
+
+    /// Resolve the runtime: the CLI flag if given, else `[defaults] runtime`
+    /// (which itself defaults to `"openclaw"`). Never fails.
+    pub fn resolve_runtime(&self, flag: Option<String>) -> String {
+        flag.unwrap_or_else(|| self.defaults.runtime.clone())
+    }
+
+    /// Resolve the workspace: the CLI flag if given, else `[defaults] workspace`,
+    /// else an actionable error naming the config file.
+    pub fn resolve_workspace(&self, flag: Option<PathBuf>) -> Result<PathBuf> {
+        if let Some(w) = flag {
+            return Ok(w);
+        }
+        match self.defaults.workspace.as_deref().filter(|s| !s.is_empty()) {
+            Some(w) => Ok(PathBuf::from(w)),
+            None => {
+                let cfg = Self::path()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "~/.alf/config.toml".to_string());
+                anyhow::bail!(
+                    "No workspace specified. Pass -w <path> or set [defaults] workspace in {cfg}."
+                )
+            }
+        }
     }
 
     /// Load config from disk, or return defaults if the file doesn't exist.
@@ -138,24 +163,6 @@ impl Config {
         write_private(path, &content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
         Ok(())
-    }
-}
-
-/// Cross-platform home directory lookup.
-fn home_dir() -> Option<PathBuf> {
-    // std::env::home_dir is deprecated but dirs crate is heavy.
-    // Use HOME on Unix, USERPROFILE on Windows.
-    #[cfg(unix)]
-    {
-        std::env::var_os("HOME").map(PathBuf::from)
-    }
-    #[cfg(windows)]
-    {
-        std::env::var_os("USERPROFILE").map(PathBuf::from)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        None
     }
 }
 
@@ -293,5 +300,45 @@ mod tests {
         Config::default().save_to(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn resolve_runtime_flag_wins() {
+        assert_eq!(
+            Config::default().resolve_runtime(Some("zeroclaw".into())),
+            "zeroclaw"
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_falls_back_to_default() {
+        assert_eq!(Config::default().resolve_runtime(None), "openclaw");
+        let mut custom = Config::default();
+        custom.defaults.runtime = "zeroclaw".into();
+        assert_eq!(custom.resolve_runtime(None), "zeroclaw");
+    }
+
+    #[test]
+    fn resolve_workspace_flag_wins() {
+        let ws = Config::default()
+            .resolve_workspace(Some(PathBuf::from("/tmp/ws")))
+            .unwrap();
+        assert_eq!(ws, PathBuf::from("/tmp/ws"));
+    }
+
+    #[test]
+    fn resolve_workspace_uses_default() {
+        let mut config = Config::default();
+        config.defaults.workspace = Some("/tmp/default-ws".into());
+        assert_eq!(
+            config.resolve_workspace(None).unwrap(),
+            PathBuf::from("/tmp/default-ws")
+        );
+    }
+
+    #[test]
+    fn resolve_workspace_errors_when_unset() {
+        let err = Config::default().resolve_workspace(None).unwrap_err();
+        assert!(err.to_string().contains("workspace"));
     }
 }

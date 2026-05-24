@@ -286,13 +286,8 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = std::env::var_os("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".alf")
-                .join("vault")
-                .join("credentials.json")
-        })
+    let target = alf_core::home_dir()
+        .map(|h| h.join(".alf").join("vault").join("credentials.json"))
         .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
 
     if let Some(parent) = target.parent() {
@@ -528,7 +523,21 @@ mod tests {
     use crate::export;
     use rusqlite::Connection;
     use std::fs;
+    use std::sync::OnceLock;
     use tempfile::TempDir;
+
+    /// Point `HOME` at a clean temp dir for the whole test process, set once
+    /// before any vault access. `import()` writes credentials to `$HOME/.alf/vault`
+    /// and auth profiles under `$HOME`; without this, these tests would rewrite
+    /// the developer's real vault. Call at the start of any import test.
+    fn isolate_home() {
+        static TEST_HOME: OnceLock<TempDir> = OnceLock::new();
+        TEST_HOME.get_or_init(|| {
+            let home = TempDir::new().unwrap();
+            std::env::set_var("HOME", home.path());
+            home
+        });
+    }
 
     fn create_zeroclaw_home(
         config_toml: &str,
@@ -578,6 +587,7 @@ mod tests {
 
     #[test]
     fn round_trip_sqlite_workspace() {
+        isolate_home();
         let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
         let (dir, ws) = create_zeroclaw_home(
             config,
@@ -616,6 +626,7 @@ mod tests {
 
     #[test]
     fn import_creates_workspace_dirs() {
+        isolate_home();
         let config = "[memory]\nbackend = \"markdown\"";
         let (dir, ws) = create_zeroclaw_home(
             config,

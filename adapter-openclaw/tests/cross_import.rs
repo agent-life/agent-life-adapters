@@ -5,6 +5,8 @@ use std::io::{Read, Write};
 use std::path::Path;
 use tempfile::TempDir;
 
+mod common;
+
 fn build_cross_runtime_archive(out_path: &Path) {
     let tmp = TempDir::new().unwrap();
     let workspace = tmp.path().join("workspace");
@@ -51,6 +53,7 @@ fn build_cross_runtime_archive(out_path: &Path) {
 
 #[test]
 fn cross_import_reconstructs_files() {
+    common::isolate_home();
     let tmp = TempDir::new().unwrap();
     let alf_path = tmp.path().join("cross.alf");
     build_cross_runtime_archive(&alf_path);

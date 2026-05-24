@@ -1,15 +1,3 @@
-## [0.1.9] — unreleased
-
-### Added
-
-- **`ALF_HOME` environment variable.** Overrides the home base alf derives its paths from: when set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` resolve under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts config at `/data/.alf/config.toml`. Gives the CLI a stable anchor when an agent process rewrites `$HOME`. Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — fully backward compatible. A new `alf_core::home_dir()` is the single resolution point shared by the CLI and both adapters.
-- **`alf check` reports more.** The output now includes the CLI `version`, an `env` block (`HOME`, `ALF_HOME`, `ALF_HUMAN` values plus `ALF_API_KEY` / `ALF_VAULT_KEY` / `ALF_VAULT_PASSPHRASE` as presence-only booleans — secret values are never printed), a `vault` block (path, existence, credential count), and `alf.last_synced_at` alongside the existing sequence.
-
-### Changed
-
-- **Config `[defaults]` are now honored by every command.** `--runtime` and `--workspace` are optional on `export`, `add`, `import`, `sync`, `restore`, `purge`, and `check`; when omitted they fall back to `[defaults] runtime` / `[defaults] workspace` in `~/.alf/config.toml`. Precedence is CLI flag › config default › built-in (`runtime` defaults to `openclaw`; a missing `workspace` now produces an actionable error instead of a bare clap "required" message). Previously `defaults.runtime` was read by no command and `defaults.workspace` applied only to `alf check`.
-- **`alf-core`:** new `home_dir()` (honors `ALF_HOME`); the three duplicated home-resolution helpers in the CLI plus the adapters' `dirs_home()` now route through it.
-
 ## [0.1.8] — 2026-05-23
 
 ### Added
@@ -17,6 +5,9 @@
 - **`alf add <path>`** — explicitly track an arbitrary workspace file so the next `alf sync` includes it under `raw/openclaw/` (restored byte-identically on another machine). ALF never auto-walks or slurps a workspace; the agent opts each file in. The whitelist/inventory lives at the workspace root in **`.alf-include.json`**, which is itself synced — so the tracked set travels on restore. The path is interpreted relative to the workspace; absolute paths, `..`-escapes, and the alf-managed sentinel files are rejected.
 - **Workspace removal log (`.alf-sync-log.md`)** — when a tracked file is deleted, the next `alf sync` prunes it from `.alf-include.json` and appends a dated note to `.alf-sync-log.md`. The log is synced and agent-readable, so the agent can later answer "what happened to `notes.txt`?".
 - **`scripts/integration_walkthrough_for_workspace.py`** — end-to-end walkthrough of `alf add` and the tracked-file re-snapshot lifecycle (add → re-snapshot, memory edit → delta, delete → prune + log + re-snapshot), verified against the live service in Neon + S3.
+- 
+- **`ALF_HOME` environment variable.** Overrides the home base alf derives its paths from: when set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` resolve under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts config at `/data/.alf/config.toml`. Gives the CLI a stable anchor when an agent process rewrites `$HOME`. Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — fully backward compatible. A new `alf_core::home_dir()` is the single resolution point shared by the CLI and both adapters.
+- **`alf check` reports more.** The output now includes the CLI `version`, an `env` block (`HOME`, `ALF_HOME`, `ALF_HUMAN` values plus `ALF_API_KEY` / `ALF_VAULT_KEY` / `ALF_VAULT_PASSPHRASE` as presence-only booleans — secret values are never printed), a `vault` block (path, existence, credential count), and `alf.last_synced_at` alongside the existing sequence.
 
 ### Changed
 
@@ -24,6 +15,8 @@
 - **A change to a tracked file triggers a re-snapshot.** Arbitrary tracked files are opaque bytes the delta format can't carry, so when a tracked file — or `.alf-include.json` / `.alf-sync-log.md` — changes, `alf sync` uploads a fresh full snapshot instead of a delta. The service treats this as a clean, **non-destructive rollover** at the current sequence (prior snapshots/deltas retained for point-in-time restore). Memory-only syncs still push efficient deltas. See `docs/how_alf_syncs.md` §6.1.
 - **OpenClaw memory chunking is now path-aware (source-handler table).** A declarative table in `adapter-openclaw` maps each workspace location to a `memory_type`, `namespace`, and chunking strategy — `OneRecordPerFile` (procedures, `memory/curated/`, active-context, and any other `memory/*.md`) or a fence-aware `SplitByHeading` (daily journals, `MEMORY.md`, and the legacy gating-policies / project files). Replaces the previous "split every Markdown file on `## `" heuristic.
 - **`alf-core`:** new `diff_credentials` / `CredentialsDiff` (by-id credential diff, mirroring `compute_delta`); `ExportReport` gains `missing_includes` (tracked files no longer on disk).
+- **Config `[defaults]` are now honored by every command.** `--runtime` and `--workspace` are optional on `export`, `add`, `import`, `sync`, `restore`, `purge`, and `check`; when omitted they fall back to `[defaults] runtime` / `[defaults] workspace` in `~/.alf/config.toml`. Precedence is CLI flag › config default › built-in (`runtime` defaults to `openclaw`; a missing `workspace` now produces an actionable error instead of a bare clap "required" message). Previously `defaults.runtime` was read by no command and `defaults.workspace` applied only to `alf check`.
+- **`alf-core`:** new `home_dir()` (honors `ALF_HOME`); the three duplicated home-resolution helpers in the CLI plus the adapters' `dirs_home()` now route through it.
 
 ### Fixed
 

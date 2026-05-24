@@ -1,3 +1,15 @@
+## [0.1.9] — unreleased
+
+### Added
+
+- **`ALF_HOME` environment variable.** Overrides the home base alf derives its paths from: when set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` resolve under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts config at `/data/.alf/config.toml`. Gives the CLI a stable anchor when an agent process rewrites `$HOME`. Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — fully backward compatible. A new `alf_core::home_dir()` is the single resolution point shared by the CLI and both adapters.
+- **`alf check` reports more.** The output now includes the CLI `version`, an `env` block (`HOME`, `ALF_HOME`, `ALF_HUMAN` values plus `ALF_API_KEY` / `ALF_VAULT_KEY` / `ALF_VAULT_PASSPHRASE` as presence-only booleans — secret values are never printed), a `vault` block (path, existence, credential count), and `alf.last_synced_at` alongside the existing sequence.
+
+### Changed
+
+- **Config `[defaults]` are now honored by every command.** `--runtime` and `--workspace` are optional on `export`, `add`, `import`, `sync`, `restore`, `purge`, and `check`; when omitted they fall back to `[defaults] runtime` / `[defaults] workspace` in `~/.alf/config.toml`. Precedence is CLI flag › config default › built-in (`runtime` defaults to `openclaw`; a missing `workspace` now produces an actionable error instead of a bare clap "required" message). Previously `defaults.runtime` was read by no command and `defaults.workspace` applied only to `alf check`.
+- **`alf-core`:** new `home_dir()` (honors `ALF_HOME`); the three duplicated home-resolution helpers in the CLI plus the adapters' `dirs_home()` now route through it.
+
 ## [0.1.8] — 2026-05-23
 
 ### Added

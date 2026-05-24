@@ -1,7 +1,7 @@
 ---
 name: agent-life
 description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from cloud, or migrate agent state.
-version: 1.7.0
+version: 1.8.0
 metadata:
   openclaw:
     requires:
@@ -20,6 +20,9 @@ metadata:
       - name: ALF_HUMAN
         required: false
         description: Set to 1 for human-readable stdout instead of JSON.
+      - name: ALF_HOME
+        required: false
+        description: Override the home base for ~/.alf and ~/.openclaw (config, sync state, vault). Falls back to $HOME when unset. Set this if the agent's $HOME is unstable.
       - name: ALF_INSTALL_DIR
         required: false
         description: Override install directory used by install.sh.
@@ -335,6 +338,7 @@ The `ALF_API_KEY` authenticates to your agent-life.ai account. It can only acces
 | --- | --- |
 | `ALF_API_KEY` | API key for agent-life.ai (fallback if not in config) |
 | `ALF_HUMAN` | Set to `1` for human-readable output instead of JSON |
+| `ALF_HOME` | Override the home base for `~/.alf` and `~/.openclaw` (config, sync state, vault); falls back to `$HOME` when unset. Use when the agent's `$HOME` is unstable |
 | `ALF_INSTALL_DIR` | Override install directory for install.sh |
 | `ALF_VERSION` | Pin install.sh to a specific release |
 | `ALF_ALLOW_UNVERIFIED` | Set to `1` to let install.sh proceed when SHA256 verification cannot complete (default: fail) |

@@ -14,6 +14,9 @@ pub fn isolate_home() {
     TEST_HOME.get_or_init(|| {
         let home = TempDir::new().unwrap();
         std::env::set_var("HOME", home.path());
+        // ALF_HOME would override HOME in alf_core::home_dir(); clear it so the
+        // temp HOME is authoritative for the test process.
+        std::env::remove_var("ALF_HOME");
         home
     });
 }

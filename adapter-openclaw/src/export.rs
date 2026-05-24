@@ -89,11 +89,9 @@ fn detect_openclaw_version() -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Best-effort home directory.
+/// Best-effort home directory (honors `ALF_HOME`).
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
+    alf_core::home_dir()
 }
 
 // ---------------------------------------------------------------------------

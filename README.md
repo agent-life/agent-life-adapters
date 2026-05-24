@@ -286,9 +286,17 @@ api_url = "https://api.agent-life.ai"
 api_key = "alf_..."
 
 [defaults]
-runtime = "openclaw"
-workspace = "/home/user/.openclaw/workspace"  # optional, auto-discovered by alf check
+runtime = "openclaw"                          # used when -r is omitted (default: openclaw)
+workspace = "/home/user/.openclaw/workspace"  # used when -w is omitted
 ```
+
+`-r`/`-w` are optional on every command — when omitted they fall back to these `[defaults]`
+(precedence: CLI flag › `[defaults]` › `openclaw` for runtime; workspace errors if neither is set).
+
+Set **`ALF_HOME`** to relocate alf's whole tree off `$HOME`: when set, `~/.alf` (config, sync
+state, vault) and `~/.openclaw` resolve under `$ALF_HOME` (e.g. `ALF_HOME=/data` → config at
+`/data/.alf/config.toml`). Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — the
+original behavior. Useful when an agent process rewrites `$HOME`.
 
 Sync state is stored per agent in `~/.alf/state/{agent_id}.toml` (last_synced_sequence, last_synced_at) and snapshot files as `~/.alf/state/{agent_id}-snapshot.alf`. See `alf help files` for the full layout, and [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) for the canonical reference on the sync data model, branch logic, ephemeral-runtime corner cases (E1–E8), and the operator runbook for recovery (`alf sync --recover`).
 

@@ -286,13 +286,8 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = std::env::var_os("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".alf")
-                .join("vault")
-                .join("credentials.json")
-        })
+    let target = alf_core::home_dir()
+        .map(|h| h.join(".alf").join("vault").join("credentials.json"))
         .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
 
     if let Some(parent) = target.parent() {

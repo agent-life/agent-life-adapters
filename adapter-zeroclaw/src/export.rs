@@ -349,11 +349,9 @@ fn quarter_end(year: i32, quarter: u32) -> NaiveDate {
 // Agent vault (Layer 4)
 // ---------------------------------------------------------------------------
 
-/// Best-effort home directory.
+/// Best-effort home directory (honors `ALF_HOME`).
 fn dirs_home() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
+    alf_core::home_dir()
 }
 
 /// Load the agent-managed ALF vault — the `CredentialsDocument` the agent

@@ -298,9 +298,8 @@ fn restore_credentials(
     // Write to ~/.openclaw/agents/main/agent/auth-profiles.json if HOME
     // exists; otherwise drop a copy at workspace/.alf-restored-auth-profiles.json
     // so the user can move it manually.
-    let openclaw_target = std::env::var_os("HOME").map(|h| {
-        std::path::PathBuf::from(h)
-            .join(".openclaw")
+    let openclaw_target = alf_core::home_dir().map(|h| {
+        h.join(".openclaw")
             .join("agents")
             .join("main")
             .join("agent")
@@ -345,13 +344,8 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = std::env::var_os("HOME")
-        .map(|h| {
-            std::path::PathBuf::from(h)
-                .join(".alf")
-                .join("vault")
-                .join("credentials.json")
-        })
+    let target = alf_core::home_dir()
+        .map(|h| h.join(".alf").join("vault").join("credentials.json"))
         .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
 
     if let Some(parent) = target.parent() {

@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.1.6 | Updated: 2026-05-16
+> Version: 0.1.9 | Updated: 2026-05-24
 > HTML: <https://agent-life.ai/docs/cli>
 > Markdown: <https://agent-life.ai/docs/cli.md>
 
@@ -16,6 +16,32 @@
 
 All commands output structured JSON to stdout by default. Progress messages go to stderr.
 Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
+
+## Environment variables
+
+| Variable | Effect |
+|---|---|
+| `ALF_HOME` | Overrides the home base alf derives its paths from. When set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` are resolved under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts the config at `/data/.alf/config.toml`. Use it when the agent's `$HOME` is unstable. Unset ⇒ falls back to `$HOME` (`%USERPROFILE%` on Windows), i.e. the original behavior. |
+| `ALF_HUMAN` | `1` switches stdout from JSON to human-readable text (same as `--human`). |
+| `ALF_API_KEY` | API key, used when `service.api_key` is absent from `~/.alf/config.toml`. |
+| `ALF_VAULT_KEY` | Default env var name for a base64 vault key (see [Vault key flags](#vault-key-flags)). |
+| `ALF_VAULT_PASSPHRASE` | Passphrase for Argon2id key derivation. |
+
+## Runtime and workspace defaults
+
+`--runtime` (`-r`) and `--workspace` (`-w`) are optional on every command. When a flag is
+omitted it falls back to the `[defaults]` table in `~/.alf/config.toml`:
+
+    [defaults]
+    runtime = "openclaw"            # used when -r is omitted (built-in fallback: "openclaw")
+    workspace = "/path/to/agent"    # used when -w is omitted
+
+Precedence is **CLI flag › `[defaults]` › built-in**. `runtime` always resolves (to `openclaw`
+when nothing is set); `workspace` has no built-in default, so a command that needs one fails with
+an actionable error when neither the flag nor `[defaults] workspace` supplies it. (`alf check`
+additionally falls back to `~/.openclaw/openclaw.json` then `~/.openclaw/workspace` — see below.)
+Because of this, the per-command "Required" columns mark `-r`/`-w` as **No**: they are mandatory
+on the command line only when no config default is set.
 
 ## Quick Reference
 
@@ -68,7 +94,7 @@ Run this first before any other command — it tells you whether sync will work 
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | No | Workspace path (auto-discovered if omitted) |
 
 ### Workspace Auto-Discovery
@@ -114,11 +140,31 @@ The `workspace.source` field in the output reports which method was used: `"flag
         "api_key_set": true,
         "agent_tracked": true,
         "last_synced_sequence": 5,
+        "last_synced_at": "2026-03-12T09:00:00Z",
         "service_reachable": true
+      },
+      "env": {
+        "home": "/home/user",
+        "alf_home": "/data/alf",
+        "alf_api_key_set": true,
+        "alf_vault_key_set": false,
+        "alf_vault_passphrase_set": false
+      },
+      "vault": {
+        "path": "/home/user/.alf/vault/credentials.json",
+        "exists": true,
+        "credential_count": 3
       },
       "issues": [],
       "suggestions": ["Run: alf sync -r openclaw -w /home/user/.openclaw/workspace"]
     }
+
+Field notes:
+
+- `version` — the `alf` CLI version (`CARGO_PKG_VERSION`), distinct from the archive's `alf_version` format version.
+- `env` — `home`, `alf_home`, and `alf_human` are omitted when the corresponding variable is unset. The three `*_set` booleans report **presence only**; secret values are never included in the output.
+- `vault` — `path` honors `ALF_HOME`; `credential_count` is omitted when the vault file is absent or unparseable (`exists` still reflects the file's presence).
+- `alf.last_synced_at` / `last_synced_sequence` — omitted when the agent has never synced.
 
 ### JSON Output (issues found)
 
@@ -199,8 +245,8 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
-| `--workspace` | `-w` | Yes | Path to the agent workspace directory |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | No | Path to the agent workspace directory |
 | `--output` | `-o` | No | Output file path (default: auto-generated in current directory) |
 
 ### JSON Output (success)
@@ -231,8 +277,8 @@ The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synce
 | Flag | Short | Required | Description |
 |---|---|---|---|
 | `<path>` | | Yes | Path to the workspace file to track (relative to the workspace) |
-| `--runtime` | `-r` | Yes | `openclaw` |
-| `--workspace` | `-w` | Yes | Path to the agent workspace directory |
+| `--runtime` | `-r` | No | `openclaw` |
+| `--workspace` | `-w` | No | Path to the agent workspace directory |
 
 The path must be an existing file inside the workspace; absolute paths, `..`-escapes, and the alf-managed sentinels (`.alf-include.json`, `.alf-sync-log.md`) are rejected.
 
@@ -266,8 +312,8 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
-| `--workspace` | `-w` | Yes | Path to the agent workspace directory |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | No | Path to the agent workspace directory |
 | `--recover` | | No | When the state file says we have synced before but the local base snapshot is missing, pull the cloud snapshot+deltas to repair the base, then take the normal delta path. Does not touch the workspace. No-op when the local base is already present. |
 | `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
 
@@ -378,8 +424,8 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
-| `--workspace` | `-w` | Yes | Path to the target workspace directory |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | No | Path to the target workspace directory |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags); needed only to decrypt legacy archives into the runtime |
@@ -438,8 +484,8 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
-| `--workspace` | `-w` | Yes | Path to the agent workspace directory (validated; not modified) |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | No | Path to the agent workspace directory (validated; not modified) |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
 
 ### JSON Output (success)
@@ -467,8 +513,8 @@ Import an `.alf` archive into a framework workspace.
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | Yes | `openclaw` or `zeroclaw` |
-| `--workspace` | `-w` | Yes | Path to the target workspace directory |
+| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--workspace` | `-w` | No | Path to the target workspace directory |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags) |
 | `--vault-key-env` | | No | |
 | `--vault-passphrase-file` | | No | |

@@ -32,9 +32,9 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use colored::Colorize;
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 
 #[derive(Serialize)]
@@ -211,6 +211,20 @@ pub fn run(
         output::progress(&format!("  Workspace: {}", workspace.display()));
     }
 
+    // WP3: prune tracked files (added via `alf add`) that the agent has since
+    // deleted, recording each removal in `.alf-sync-log.md` — BEFORE export so
+    // the cleaned include list and the log are captured in this sync. OpenClaw
+    // only for now (it owns the include-list workspace convention).
+    if runtime == "openclaw" {
+        let removed = adapter_openclaw::prune_and_log_missing(workspace)?;
+        for rel in &removed {
+            output::progress(&format!(
+                "  Removed {rel} from sync (file no longer present; logged to {})",
+                adapter_openclaw::SYNC_LOG_FILE
+            ));
+        }
+    }
+
     // Export workspace to a temp file to discover the agent ID.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("snapshot.alf");
@@ -382,6 +396,39 @@ fn execute_delta(
     // churn that would otherwise re-upload everything each sync.
     let curr_creds = curr_reader.read_credentials()?;
 
+    // WP3: arbitrary tracked files (added via `alf add`) are opaque bytes the
+    // delta format can't carry. If any tracked file — or the include list / sync
+    // log — changed vs the base snapshot, upload a full snapshot instead of a
+    // delta. The service treats this as a clean, non-destructive rollover (new
+    // base at the current sequence; prior deltas retained for point-in-time).
+    if tracked_files_changed(runtime, &mut prev_reader, &mut curr_reader)? {
+        output::progress("  Tracked workspace files changed — uploading full snapshot...");
+        let upload = client.upload_snapshot(agent_id, alf_bytes)?;
+        persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
+        if human {
+            let state_path = state_file_path(agent_id)?;
+            let label = if recovered {
+                "Re-snapshot uploaded (recovered; tracked files changed)"
+            } else {
+                "Re-snapshot uploaded (tracked files changed)"
+            };
+            println!("{} {} (sequence: {})", "✓".green().bold(), label, upload.sequence);
+            println!("  Snapshot base: {}", snapshot_path.display());
+            println!("  State file:    {}", state_path.display());
+        } else {
+            output::json(&SyncResult {
+                ok: true,
+                sequence: upload.sequence,
+                delta: false,
+                changes: None,
+                snapshot_path: snapshot_path.to_string_lossy().into(),
+                no_changes: false,
+                recovered,
+            });
+        }
+        return Ok(());
+    }
+
     let delta_entries = compute_delta(&prev_records, &curr_records);
     let cred_diff = diff_credentials(prev_creds.as_ref(), curr_creds.as_ref());
 
@@ -528,6 +575,61 @@ fn execute_delta(
     }
 
     Ok(())
+}
+
+/// Whether any agent-tracked file (`alf add`) — or the include list / sync log
+/// itself — differs between the base snapshot and the current export. Tracked
+/// files are opaque bytes the delta format can't carry, so a change here means
+/// `alf sync` must re-snapshot rather than push a delta. Non-OpenClaw runtimes
+/// have no include list, so this is always `false` for them.
+fn tracked_files_changed<P, C>(
+    runtime: &str,
+    prev: &mut AlfReader<P>,
+    curr: &mut AlfReader<C>,
+) -> Result<bool>
+where
+    P: Read + Seek,
+    C: Read + Seek,
+{
+    if runtime != "openclaw" {
+        return Ok(false);
+    }
+    Ok(read_tracked_map(prev, runtime)? != read_tracked_map(curr, runtime)?)
+}
+
+/// Build `{ tracked-relative-path -> bytes }` from an archive: the files listed
+/// in its `raw/{runtime}/.alf-include.json`, plus the include list and sync log
+/// themselves. Comparing two such maps detects added/modified/removed tracked
+/// files and any change to the tracked set or removal history.
+fn read_tracked_map<R: Read + Seek>(
+    reader: &mut AlfReader<R>,
+    runtime: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let names: HashSet<String> = reader.file_names().into_iter().collect();
+    let prefix = format!("raw/{runtime}/");
+
+    let mut rels: Vec<String> = Vec::new();
+    let include_archive_path = format!("{prefix}{}", adapter_openclaw::INCLUDE_FILE);
+    if names.contains(&include_archive_path) {
+        let bytes = reader.read_raw_entry(&include_archive_path)?;
+        if let Ok(list) = serde_json::from_slice::<adapter_openclaw::IncludeList>(&bytes) {
+            rels = list.paths();
+        }
+    }
+    // Track the include list + sync log themselves so any edit to the tracked
+    // set or removal history also refreshes the cloud copy.
+    rels.push(adapter_openclaw::INCLUDE_FILE.to_string());
+    rels.push(adapter_openclaw::SYNC_LOG_FILE.to_string());
+
+    let mut map = BTreeMap::new();
+    for rel in rels {
+        let archive_path = format!("{prefix}{rel}");
+        if names.contains(&archive_path) {
+            let bytes = reader.read_raw_entry(&archive_path)?;
+            map.insert(rel, bytes);
+        }
+    }
+    Ok(map)
 }
 
 // ---------------------------------------------------------------------------
@@ -706,5 +808,72 @@ mod tests {
         let saved = AgentState::load_from(&state_path, agent_id).unwrap();
         assert_eq!(saved.last_synced_sequence, Some(42));
         assert!(saved.last_synced_at.is_some());
+    }
+
+    /// WP3: tracked-file change detection drives the re-snapshot decision —
+    /// a modified tracked file flips it on; a memory-only change does not.
+    #[test]
+    fn tracked_change_detection_distinguishes_tracked_vs_memory() {
+        use adapter_openclaw::{IncludeList, OpenClawAdapter};
+        use alf_core::Adapter;
+
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let home = tempfile::TempDir::new().unwrap();
+        std::env::set_var("HOME", home.path());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("SOUL.md"), "# A\n\nsoul").unwrap();
+        fs::write(ws.join("MEMORY.md"), "## Fact\n\nv1").unwrap();
+        fs::write(ws.join("notes.txt"), "v1").unwrap();
+        let mut list = IncludeList::default();
+        list.add("notes.txt");
+        list.save(&ws).unwrap();
+
+        let adapter = OpenClawAdapter;
+        let export_to = |name: &str| -> Vec<u8> {
+            let p = tmp.path().join(name);
+            adapter.export(&ws, &p).unwrap();
+            fs::read(&p).unwrap()
+        };
+        let changed = |a: &[u8], b: &[u8]| -> bool {
+            tracked_files_changed(
+                "openclaw",
+                &mut AlfReader::new(Cursor::new(a)).unwrap(),
+                &mut AlfReader::new(Cursor::new(b)).unwrap(),
+            )
+            .unwrap()
+        };
+
+        let base = export_to("base.alf");
+        assert!(!changed(&base, &base), "identical archives: no tracked change");
+
+        // Modify the tracked file → re-snapshot.
+        fs::write(ws.join("notes.txt"), "v2-modified").unwrap();
+        let modified = export_to("modified.alf");
+        assert!(changed(&base, &modified), "modified tracked file → change");
+
+        // Memory-only change (tracked file identical) → NO re-snapshot.
+        fs::write(ws.join("MEMORY.md"), "## Fact\n\nv2-memory-only").unwrap();
+        let mem_only = export_to("mem.alf");
+        assert!(
+            !changed(&modified, &mem_only),
+            "memory-only change must not trigger a re-snapshot"
+        );
+
+        // Non-openclaw runtime never re-snapshots on this path.
+        assert!(!tracked_files_changed(
+            "zeroclaw",
+            &mut AlfReader::new(Cursor::new(&base)).unwrap(),
+            &mut AlfReader::new(Cursor::new(&modified)).unwrap(),
+        )
+        .unwrap());
+
+        match prev_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 }

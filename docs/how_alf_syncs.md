@@ -103,7 +103,15 @@ The CLI talks to two relevant endpoints in [`agent-life-service/lambda-snapshot-
 Two consequences worth noting:
 
 - **The first snapshot is at sequence 0.** Because `agents.latest_sequence` initialises to 0 and `insert_snapshot` reuses that value. So `last_synced_sequence == 0` does **not** mean "fresh agent" — it means "first snapshot has been uploaded." That ambiguity is exactly why `last_synced_sequence` is an `Option<u64>` in the state file rather than a bare `u64`. `None` is "never synced"; `Some(0)` is "synced once."
-- **Re-uploading a snapshot advances the snapshot floor.** If the CLI uploads a fresh snapshot when the cloud already has deltas, `latest_snapshot_seq` jumps forward and the older deltas become invisible to `restore` (the server filters `sequence > latest_snapshot_seq`). This is why `alf sync` never silently re-uploads a snapshot when the local state suggests a delta should be possible.
+- **Re-uploading a snapshot advances the snapshot floor.** If the CLI uploads a fresh snapshot when the cloud already has deltas, `latest_snapshot_seq` jumps forward and the older deltas become invisible to the *default* `restore` (the server filters `sequence > latest_snapshot_seq`). Prior snapshots and deltas are **retained** in the DB, so point-in-time restore (`--at-sequence N`) still works. A fresh snapshot is therefore a non-destructive **rollover**, not a history wipe — provided it contains the full current state. `alf sync` only does this deliberately (never to upload an empty/stale workspace); see §6.1.
+
+### 6.1 Re-snapshot on tracked-file change (WP3)
+
+Arbitrary files the agent opts into syncing via `alf add` (tracked in `<workspace>/.alf-include.json`, stored under `raw/openclaw/`) are **opaque bytes** — the delta format carries only memory records and credentials, not arbitrary files. So when a tracked file is added, modified, or removed, `alf sync` cannot express that as a delta.
+
+Instead, in the delta path, `alf sync` compares the tracked files (and the include list / `.alf-sync-log.md`) in the freshly-exported archive against the local base snapshot. If anything tracked changed, it **uploads a full snapshot** (a rollover at the current sequence) rather than pushing a delta. The new snapshot is the complete current state, so superseding the intervening deltas for the default restore is correct and lossless. A memory-only sync still pushes an efficient delta.
+
+Deletions are handled before export: if a tracked file no longer exists on disk, `alf sync` removes it from `.alf-include.json` and appends a note to `.alf-sync-log.md` (so the agent can later answer "what happened to notes.txt"). That removal is itself a tracked change, so it re-snapshots; on restore the file is simply absent.
 
 ## 7. State transitions in `sync.rs`
 

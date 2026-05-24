@@ -327,6 +327,8 @@ raw/openclaw/memory/active-context.md
 
 This ensures zero information loss. Even if the structured parsing misses nuances in a user's custom formatting, the raw files can always be re-parsed by a future improved adapter or imported directly by an OpenClaw-to-OpenClaw restore.
 
+**Agent-tracked arbitrary files (`alf add`).** Beyond the known files above, the agent can opt arbitrary workspace files into the raw set with `alf add <path>` — a `notes.txt`, a nested `reports/q1.md`, a binary. The adapter never auto-walks the workspace; tracked paths are recorded in `<workspace>/.alf-include.json` and added to `raw/openclaw/` (raw only — no semantic parse), restored byte-identically. The include list and the removal log `.alf-sync-log.md` are themselves preserved in `raw/openclaw/`, so the tracked set and its history travel on restore. Because opaque files can't ride an incremental delta, a change to any tracked file makes `alf sync` upload a fresh snapshot (a non-destructive rollover); see [docs/how_alf_syncs.md](../docs/how_alf_syncs.md) §6.1.
+
 
 ## Gaps, Risks, and Design Decisions
 

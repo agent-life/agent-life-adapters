@@ -32,12 +32,18 @@ pub use alf_core::Adapter;
 pub mod export;
 pub mod identity_parser;
 pub mod import;
+pub mod include;
 pub mod memory_parser;
 pub mod principals_parser;
 
 // Dry-run enumeration entry points.
 pub use export::{enumerate, enumerate_workspace, EnumerationResult};
 pub use import::enumerate_archive;
+
+// Agent-managed include list (`alf add`).
+pub use include::{
+    normalize_include_path, prune_and_log_missing, IncludeList, INCLUDE_FILE, SYNC_LOG_FILE,
+};
 
 // ---------------------------------------------------------------------------
 // Adapter implementation

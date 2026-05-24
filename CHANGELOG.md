@@ -1,3 +1,27 @@
+## [0.1.8] — 2026-05-23
+
+### Added
+
+- **`alf add <path>`** — explicitly track an arbitrary workspace file so the next `alf sync` includes it under `raw/openclaw/` (restored byte-identically on another machine). ALF never auto-walks or slurps a workspace; the agent opts each file in. The whitelist/inventory lives at the workspace root in **`.alf-include.json`**, which is itself synced — so the tracked set travels on restore. The path is interpreted relative to the workspace; absolute paths, `..`-escapes, and the alf-managed sentinel files are rejected.
+- **Workspace removal log (`.alf-sync-log.md`)** — when a tracked file is deleted, the next `alf sync` prunes it from `.alf-include.json` and appends a dated note to `.alf-sync-log.md`. The log is synced and agent-readable, so the agent can later answer "what happened to `notes.txt`?".
+- **`scripts/integration_walkthrough_for_workspace.py`** — end-to-end walkthrough of `alf add` and the tracked-file re-snapshot lifecycle (add → re-snapshot, memory edit → delta, delete → prune + log + re-snapshot), verified against the live service in Neon + S3.
+
+### Changed
+
+- **`alf sync` now carries credential (Layer 4) changes in deltas.** Previously credentials reached the cloud only in a full snapshot, so a credential added with `alf vault add` *after* the first sync was silently never uploaded — and was lost when restoring on another machine. Sync now diffs the vault **by credential `id`** (re-encryption uses a fresh nonce, so byte comparison would re-upload everything) and includes created/updated/deleted credentials in each delta; the sync result reports the counts. Re-keying the whole vault is handled gracefully (all records reported as updated by id).
+- **A change to a tracked file triggers a re-snapshot.** Arbitrary tracked files are opaque bytes the delta format can't carry, so when a tracked file — or `.alf-include.json` / `.alf-sync-log.md` — changes, `alf sync` uploads a fresh full snapshot instead of a delta. The service treats this as a clean, **non-destructive rollover** at the current sequence (prior snapshots/deltas retained for point-in-time restore). Memory-only syncs still push efficient deltas. See `docs/how_alf_syncs.md` §6.1.
+- **`alf-core`:** new `diff_credentials` / `CredentialsDiff` (by-id credential diff, mirroring `compute_delta`); `ExportReport` gains `missing_includes` (tracked files no longer on disk).
+
+### Fixed
+
+- **Credential vault now syncs incrementally.** Fixes the gap where credentials added after an agent's first snapshot never propagated (observed: an agent on the Docker runtime whose vault never reached the cloud while a mac agent's did, purely because of snapshot timing).
+- **Test isolation.** Export/import test suites now redirect `HOME` to a temp dir, so running the suite on a machine with a real `~/.alf/vault` can no longer read it into a test archive or rewrite it.
+
+### Documentation
+
+- **`docs/how_alf_syncs.md`** — new **§6.1** documenting the tracked-file re-snapshot trigger and the prune/log-on-delete behavior; corrected the prior "never re-uploads a snapshot" note (snapshot rollover is now a deliberate, non-destructive path).
+- **`docs/cli-reference.md`**, the top-level **`README.md`**, **`adapter-openclaw/README.md`**, and **`skills/agent-life/SKILL.md`** updated for `alf add` and the include-list / re-snapshot model.
+
 ## [0.1.7] — 2026-05-18
 
 ### Added

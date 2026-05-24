@@ -24,6 +24,7 @@ Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable col
 | `alf check` | Pre-flight environment diagnostics | No (but checks if set) |
 | `alf login` | Store API key | No |
 | `alf export` | Workspace → .alf archive | No |
+| `alf add` | Track an arbitrary workspace file so sync includes it | No |
 | `alf sync` | Incremental sync to cloud | Yes |
 | `alf restore` | Download and restore from cloud | Yes |
 | `alf purge` | Delete cloud sync data and agent registration | Yes |
@@ -215,11 +216,47 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 ---
 
+## alf add
+
+Track an arbitrary workspace file so `alf sync` includes it. Known files (SOUL.md, IDENTITY.md, `memory/`…) are always covered; `alf add` extends coverage to anything else — a report, a CSV — without ALF ever auto-walking or slurping the whole workspace.
+
+The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synced, so it travels on restore). Tracked files are preserved byte-identically under `raw/openclaw/` and written back on restore. Deleting a tracked file and running `alf sync` prunes it from the list and appends a note to **`.alf-sync-log.md`**.
+
+### Usage
+
+    alf add <path> -r <runtime> -w <workspace>
+
+### Flags
+
+| Flag | Short | Required | Description |
+|---|---|---|---|
+| `<path>` | | Yes | Path to the workspace file to track (relative to the workspace) |
+| `--runtime` | `-r` | Yes | `openclaw` |
+| `--workspace` | `-w` | Yes | Path to the agent workspace directory |
+
+The path must be an existing file inside the workspace; absolute paths, `..`-escapes, and the alf-managed sentinels (`.alf-include.json`, `.alf-sync-log.md`) are rejected.
+
+### JSON Output (success)
+
+    {
+      "ok": true,
+      "added": true,
+      "path": "notes.txt"
+    }
+
+`added` is `false` if the file was already tracked (idempotent).
+
+---
+
 ## alf sync
 
 Incremental sync to the cloud. First sync uploads a full snapshot; subsequent syncs upload deltas.
 
 The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.alf/state/{agent_id}.toml` (`None` ⇒ never synced; `Some(N)` ⇒ synced at sequence N), and whether `~/.alf/state/{agent_id}-snapshot.alf` exists on disk. See [how_alf_syncs.md](how_alf_syncs.md) for the full data model, branch table, and ephemeral-runtime corner cases.
+
+**Credentials (Layer 4) sync incrementally.** Each delta carries credentials added/changed/removed since the last sync (diffed by credential `id`), so a credential added with `alf vault add` propagates on the next sync — not only at snapshot time.
+
+**Tracked-file changes re-snapshot.** Arbitrary files added via [`alf add`](#alf-add) are opaque bytes the delta format can't carry, so when a tracked file (or the include list / sync log) changes, `alf sync` uploads a fresh full snapshot — a non-destructive rollover at the current sequence (prior history retained for point-in-time restore). Memory-only syncs still push efficient deltas. See [how_alf_syncs.md](how_alf_syncs.md) §6.1.
 
 ### Usage
 
@@ -242,11 +279,18 @@ Sync takes no vault-key flags: it carries the agent's ALF vault (Layer 4) into t
       "ok": true,
       "sequence": 5,
       "delta": true,
-      "changes": { "creates": 2, "updates": 1, "deletes": 0 },
+      "changes": {
+        "creates": 2,
+        "updates": 1,
+        "deletes": 0,
+        "credentials": { "creates": 1, "updates": 0, "deletes": 0 }
+      },
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
       "no_changes": false,
       "recovered": false
     }
+
+`changes.creates/updates/deletes` count **memory** records; the `credentials` sub-object (omitted when zero) counts Layer 4 changes carried by this delta. A tracked-file change instead produces a re-snapshot (`"delta": false`).
 
 ### JSON Output (success — no changes)
 

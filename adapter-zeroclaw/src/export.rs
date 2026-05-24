@@ -639,6 +639,8 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
         excluded_by_alfignore,
+        // ZeroClaw has no `alf add` include list yet (OpenClaw-only for now).
+        missing_includes: Vec::new(),
     })
 }
 

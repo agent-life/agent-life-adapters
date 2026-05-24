@@ -65,6 +65,29 @@ enum Command {
         dry_run: bool,
     },
 
+    /// Track an arbitrary workspace file so sync includes it
+    #[command(
+        long_about = "Add records a workspace file in the agent's include list \
+        (.alf-include.json) so the next `alf sync` includes it under raw/openclaw/. \
+        ALF does not auto-discover arbitrary files — the agent opts each one in \
+        explicitly. The path is interpreted relative to the workspace.\n\n\
+        Deleting the file and running `alf sync` removes it from the include list \
+        and appends a note to .alf-sync-log.md.\n\n\
+        Example: alf add notes.txt -r openclaw -w ./my-agent"
+    )]
+    Add {
+        /// Path to the workspace file to track (relative to the workspace)
+        path: String,
+
+        /// Agent framework runtime (openclaw)
+        #[arg(short, long)]
+        runtime: String,
+
+        /// Path to the agent workspace directory
+        #[arg(short, long)]
+        workspace: PathBuf,
+    },
+
     /// Import an .alf archive into an agent workspace
     #[command(
         long_about = "Import unpacks an .alf file into the given workspace directory. \
@@ -543,6 +566,12 @@ fn main() {
             output,
             dry_run,
         } => commands::export::run(&runtime, &workspace, output.as_deref(), dry_run),
+
+        Command::Add {
+            path,
+            runtime,
+            workspace,
+        } => commands::add::run(&runtime, &workspace, &path),
 
         Command::Import {
             runtime,

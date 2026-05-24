@@ -92,6 +92,7 @@ agent-life-adapters/
 │       ├── vault_key.rs        # Resolve vault key from flags / env / default paths
 │       └── commands/
 │           ├── mod.rs          # Command dispatch
+│           ├── add.rs          # alf add — track an arbitrary workspace file for sync
 │           ├── check.rs        # alf check — environment diagnostics, workspace auto-discovery
 │           ├── export.rs       # alf export — dispatch to runtime adapter
 │           ├── help.rs         # alf help — overview, status, files, troubleshoot
@@ -224,6 +225,12 @@ alf export --runtime <runtime> --workspace <path> [--output <path>]
 Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
 
 ```
+alf add <path> --runtime <runtime> --workspace <path>
+```
+
+Track an arbitrary workspace file so sync includes it. ALF never auto-walks a workspace — the agent opts each file in explicitly. The tracked set is recorded in `<workspace>/.alf-include.json` (itself synced, so it travels on restore); tracked files round-trip byte-identically under `raw/openclaw/`. Deleting a tracked file and running `alf sync` prunes it and appends a note to `.alf-sync-log.md`.
+
+```
 alf import --runtime <runtime> --workspace <path> <alf-file> [--vault-key-file …]
 ```
 
@@ -233,7 +240,7 @@ Import an `.alf` file into a framework workspace. Creates or populates the works
 alf sync --runtime <runtime> --workspace <path> [--recover] [--force-first-sync]
 ```
 
-Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags.
+Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags. Credential (Layer 4) changes ride deltas (diffed by `id`); a change to a file tracked via `alf add` instead triggers a fresh snapshot (a non-destructive rollover), since opaque files can't ride a delta. See [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) §6.1.
 
 ```
 alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>] [--vault-key-file …]

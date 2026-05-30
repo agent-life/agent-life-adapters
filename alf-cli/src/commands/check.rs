@@ -141,13 +141,15 @@ struct ResolvedWorkspace {
     openclaw_configured_path: Option<String>,
 }
 
-fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace {
+fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
+    let oc_path = read_openclaw_workspace();
+
     // Priority 1: -w flag
     if let Some(ws) = flag {
         return ResolvedWorkspace {
             path: ws.to_path_buf(),
             source: "flag".into(),
-            openclaw_configured_path: read_openclaw_workspace(),
+            openclaw_configured_path: oc_path,
         };
     }
 
@@ -157,14 +159,33 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
             return ResolvedWorkspace {
                 path: PathBuf::from(ws),
                 source: "alf_config".into(),
-                openclaw_configured_path: read_openclaw_workspace(),
+                openclaw_configured_path: oc_path,
             };
         }
     }
 
-    let oc_path = read_openclaw_workspace();
+    // Priority 3 + 4: runtime-specific discovery.
+    if runtime == "zeroclaw" {
+        // ZeroClaw keeps its workspace at `workspace_dir` in
+        // ~/.zeroclaw/config.toml; default to ~/.zeroclaw when unset.
+        if let Some(ws) = read_zeroclaw_workspace() {
+            return ResolvedWorkspace {
+                path: PathBuf::from(ws),
+                source: "zeroclaw_config".into(),
+                openclaw_configured_path: oc_path,
+            };
+        }
+        let default_path = alf_core::home_dir()
+            .map(|h| h.join(".zeroclaw"))
+            .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
+        return ResolvedWorkspace {
+            path: default_path,
+            source: "default".into(),
+            openclaw_configured_path: oc_path,
+        };
+    }
 
-    // Priority 3: agents.defaults.workspace in ~/.openclaw/openclaw.json
+    // OpenClaw: agents.defaults.workspace in ~/.openclaw/openclaw.json
     if let Some(ref ws) = oc_path {
         return ResolvedWorkspace {
             path: PathBuf::from(ws),
@@ -173,7 +194,7 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
         };
     }
 
-    // Priority 4: ~/.openclaw/workspace (default)
+    // Default: ~/.openclaw/workspace
     let default_path = alf_core::home_dir()
         .map(|h| h.join(".openclaw").join("workspace"))
         .unwrap_or_else(|| PathBuf::from(".openclaw/workspace"));
@@ -183,6 +204,34 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
         source: "default".into(),
         openclaw_configured_path: oc_path,
     }
+}
+
+/// Read `workspace_dir` from `~/.zeroclaw/config.toml`.
+///
+/// `workspace_dir` is a top-level key in ZeroClaw's V3 config, so a lightweight
+/// line scan is enough — and avoids pulling a TOML parser into `alf-cli` just
+/// for this. Stops at the first table header so a same-named key inside a
+/// `[section]` can't be misread as the top-level one.
+fn read_zeroclaw_workspace() -> Option<String> {
+    let home = alf_core::home_dir()?;
+    let config_path = home.join(".zeroclaw").join("config.toml");
+    let content = fs::read_to_string(&config_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break; // entered a [table]; top-level keys are above this
+        }
+        if let Some(rest) = trimmed.strip_prefix("workspace_dir") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read `agents.defaults.workspace` from `~/.openclaw/openclaw.json`.
@@ -436,7 +485,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     output::progress(&format!("Checking {} environment...", runtime));
 
     // Resolve workspace
-    let resolved = resolve_workspace(workspace_arg, &config);
+    let resolved = resolve_workspace(workspace_arg, &config, runtime);
 
     let ws_path = &resolved.path;
     let ws_exists = ws_path.is_dir();
@@ -749,7 +798,7 @@ mod tests {
     fn resolve_workspace_flag_wins() {
         let config = Config::default();
         let flag_path = PathBuf::from("/custom/workspace");
-        let resolved = resolve_workspace(Some(&flag_path), &config);
+        let resolved = resolve_workspace(Some(&flag_path), &config, "openclaw");
 
         assert_eq!(resolved.path, PathBuf::from("/custom/workspace"));
         assert_eq!(resolved.source, "flag");
@@ -759,7 +808,7 @@ mod tests {
     fn resolve_workspace_alf_config_second() {
         let mut config = Config::default();
         config.defaults.workspace = Some("/alf-configured/workspace".into());
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         assert_eq!(resolved.path, PathBuf::from("/alf-configured/workspace"));
         assert_eq!(resolved.source, "alf_config");
@@ -782,7 +831,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         // Restore HOME before asserting
         match prev {
@@ -802,7 +851,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
 
         let config = Config::default();
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),
@@ -814,6 +863,56 @@ mod tests {
             tmp.path().join(".openclaw").join("workspace")
         );
         assert_eq!(resolved.source, "default");
+    }
+
+    #[test]
+    fn resolve_workspace_zeroclaw_reads_workspace_dir() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ALF_HOME");
+
+        let zc_dir = tmp.path().join(".zeroclaw");
+        fs::create_dir_all(&zc_dir).unwrap();
+        fs::write(
+            zc_dir.join("config.toml"),
+            "schema_version = 3\nworkspace_dir = \"/custom/zc/workspace\"\n\n[memory]\nworkspace_dir = \"/should/not/win\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.defaults.workspace = None;
+        let resolved = resolve_workspace(None, &config, "zeroclaw");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.path, PathBuf::from("/custom/zc/workspace"));
+        assert_eq!(resolved.source, "zeroclaw_config");
+    }
+
+    #[test]
+    fn resolve_workspace_zeroclaw_default_fallback() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ALF_HOME");
+
+        let mut config = Config::default();
+        config.defaults.workspace = None;
+        let resolved = resolve_workspace(None, &config, "zeroclaw");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.source, "default");
+        assert!(resolved.path.ends_with(".zeroclaw"));
     }
 
     #[test]

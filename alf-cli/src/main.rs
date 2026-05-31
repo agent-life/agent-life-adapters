@@ -37,6 +37,9 @@ struct Cli {
     command: Command,
 }
 
+// clap subcommand enums are constructed once at startup, so the size spread
+// between variants (some carry many flags) is not worth boxing.
+#[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Command {
     /// Export an agent workspace to an .alf archive

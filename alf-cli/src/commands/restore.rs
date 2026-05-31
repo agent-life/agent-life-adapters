@@ -620,7 +620,7 @@ mod tests {
     #[test]
     fn merge_with_no_deltas_keeps_records() {
         let a = make_record(1, "A");
-        let snap = build_minimal_snapshot(&[a.clone()]);
+        let snap = build_minimal_snapshot(std::slice::from_ref(&a));
         let merged = merge_snapshot_with_deltas(&snap, &[]).unwrap();
         let contents = read_record_contents(&merged);
         assert_eq!(contents, vec!["A".to_string()]);

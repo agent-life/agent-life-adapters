@@ -1,3 +1,14 @@
+## [0.1.9] — 2026-05-31
+
+### Added
+
+- **`alf check -r zeroclaw` now discovers the ZeroClaw workspace.** When no `-w` flag or `[defaults] workspace` is set, `check` reads `workspace_dir` from `~/.zeroclaw/config.toml` (a top-level key in ZeroClaw's V3 schema), falling back to `~/.zeroclaw`. OpenClaw discovery (`~/.openclaw/openclaw.json` → `~/.openclaw/workspace`) is unchanged; workspace resolution is now runtime-aware rather than always assuming OpenClaw.
+- **`adapter-zeroclaw` integration test suites.** The crate previously had only inline unit tests; it now has `round_trip` (export → import fidelity for the root Markdown files + redacted `config.toml`), `dry_run` (`enumerate_workspace` / `enumerate_archive` previews), and `cross_import` (reconstruct a ZeroClaw workspace from a generic, raw-source-less ALF archive). The cross-import fixture is built directly from `alf-core` — not via a sibling adapter — so each adapter still depends only on its own runtime and `alf-core`.
+
+### Changed
+
+- **Workspace clippy clean under `--all-targets -- -D warnings`.** Tidied pre-existing lints across `adapter-openclaw`, `adapter-zeroclaw`, and `alf-cli` (redundant closures → method refs, `and_then(|x| Some(y))` → `map`, `sort_by(cmp)` → `sort_by_key`, manual modulo → `is_multiple_of`, derived `Default for Config`, `len() > 0` → `!is_empty()`, `map_or(false, …)` → `is_some_and`). Behavior is unchanged.
+
 ## [0.1.8] — 2026-05-23
 
 ### Added

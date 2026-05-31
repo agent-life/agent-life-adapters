@@ -1,4 +1,8 @@
 //! Shared test helpers for the ZeroClaw adapter integration suites.
+//!
+//! Each integration test is its own crate, so a helper used by some suites but
+//! not others reads as dead code in the suites that skip it. Allow it here.
+#![allow(dead_code)]
 
 use std::fs;
 use std::path::Path;

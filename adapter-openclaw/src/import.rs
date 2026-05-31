@@ -520,7 +520,7 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
         fs::write(&target, content)?;
     }
 
-    if all_records.len() > 0 {
+    if !all_records.is_empty() {
         warnings.push(format!(
             "Reconstructed {} memory record(s) from structured data.",
             all_records.len()

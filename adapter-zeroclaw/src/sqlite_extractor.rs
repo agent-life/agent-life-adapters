@@ -67,7 +67,7 @@ pub fn extract_from_sqlite(
     }
 
     // Sort by created_at ascending
-    records.sort_by(|a, b| a.temporal.created_at.cmp(&b.temporal.created_at));
+    records.sort_by_key(|r| r.temporal.created_at);
 
     Ok(records)
 }
@@ -122,11 +122,9 @@ fn map_row_to_record(
     let is_auto_save = row.key.starts_with(AUTO_SAVE_PREFIX);
     let (memory_type, namespace) = classify_category(&row.category);
 
-    let extraction_method = if is_auto_save {
-        ExtractionMethod::AgentWritten
-    } else {
-        ExtractionMethod::AgentWritten
-    };
+    // ZeroClaw entries are agent-written whether or not they came from an
+    // auto-save; `is_auto_save` still drives the source classification below.
+    let extraction_method = ExtractionMethod::AgentWritten;
 
     let mut embeddings = Vec::new();
     if let Some(blob) = row.embedding {
@@ -226,7 +224,7 @@ fn try_parse_embedding(
     }
 
     // Try as packed f32 (4 bytes each)
-    if blob.len() % 4 == 0 {
+    if blob.len().is_multiple_of(4) {
         let vector: Vec<f64> = blob
             .chunks_exact(4)
             .map(|chunk| {
@@ -254,7 +252,7 @@ fn try_parse_embedding(
     }
 
     // Try as packed f64 (8 bytes each)
-    if blob.len() % 8 == 0 {
+    if blob.len().is_multiple_of(8) {
         let vector: Vec<f64> = blob
             .chunks_exact(8)
             .map(|chunk| {

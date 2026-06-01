@@ -3,7 +3,7 @@
 //! Discovers the workspace, verifies resources, and reports readiness to sync.
 //! This is the first command an agent should run.
 
-use crate::api_client::ApiClient;
+use crate::api_client::{AgentInfo, ApiClient};
 use crate::config::Config;
 use crate::context;
 use crate::output;
@@ -121,6 +121,15 @@ struct VaultInfo {
     exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_count: Option<usize>,
+    /// Server-side credential count (delta-folded) from `GET /v1/agents/:id`.
+    /// `None` when the service is unreachable or no agent is tracked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_credential_count: Option<usize>,
+    /// `Some(true)` when the local and server credential counts match,
+    /// `Some(false)` on divergence (vault not fully synced), `None` when not
+    /// comparable. Lets an agent self-verify and self-heal after a sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parity_ok: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -571,19 +580,22 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let last_synced_sequence = status.agents.first().map(|a| a.last_synced_sequence);
     let last_synced_at = status.agents.first().and_then(|a| a.last_synced_at.clone());
 
+    // Fetch the server's view of the agent once: it confirms connectivity AND
+    // yields the delta-folded credential count used for vault parity (WS-B).
+    let server_agent: Option<AgentInfo> = if api_key_set && agent_tracked {
+        ApiClient::from_config(&config).ok().and_then(|c| {
+            status
+                .agents
+                .first()
+                .and_then(|a| c.get_agent(a.agent_id).ok())
+        })
+    } else {
+        None
+    };
     let service_reachable = if api_key_set && agent_tracked {
-        let client = ApiClient::from_config(&config).ok();
-        client
-            .and_then(|c| {
-                status
-                    .agents
-                    .first()
-                    .and_then(|a| c.get_agent(a.agent_id).ok())
-            })
-            .is_some()
+        server_agent.is_some()
     } else if api_key_set {
-        // No agents tracked yet, but key is set — try a simple connectivity check
-        // by attempting to create a client (validates config)
+        // No agents tracked yet, but key is set — validate config connectivity.
         ApiClient::from_config(&config).is_ok()
     } else {
         false
@@ -598,8 +610,37 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         service_reachable,
     };
 
+    // Vault parity (WS-B): compare the local vault count to the server's
+    // delta-folded credential count. Divergence ⇒ the vault has not fully synced
+    // (e.g. credentials added but not yet pushed, or a diverged local base).
+    let mut vault = gather_vault();
+    vault.server_credential_count = server_agent
+        .as_ref()
+        .and_then(|a| a.layer_counts.as_ref())
+        .map(|lc| lc.credentials as usize);
+    vault.parity_ok = match (vault.credential_count, vault.server_credential_count) {
+        (Some(local), Some(server)) => Some(local == server),
+        _ => None,
+    };
+
     // Collect issues
-    let issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved, runtime);
+    let mut issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved, runtime);
+    if vault.parity_ok == Some(false) {
+        issues.push(Issue {
+            severity: "warning".into(),
+            code: "vault_not_synced".into(),
+            message: format!(
+                "Local vault has {} credential(s) but the cloud shows {} — the vault has not fully synced.",
+                vault.credential_count.unwrap_or(0),
+                vault.server_credential_count.unwrap_or(0)
+            ),
+            suggestion: format!(
+                "Run `alf sync --recover -r {} -w {}` to re-derive the delta against cloud truth.",
+                runtime,
+                ws_path.display()
+            ),
+        });
+    }
 
     let has_errors = issues.iter().any(|i| i.severity == "error");
     let ready_to_sync = !has_errors && ws_exists;
@@ -619,7 +660,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         openclaw,
         alf: alf_info,
         env: gather_env(),
-        vault: gather_vault(),
+        vault,
         issues,
         suggestions: Vec::new(),
     };
@@ -703,6 +744,12 @@ fn print_human(result: &CheckResult) {
     println!("    Exists:      {}", yn(result.vault.exists));
     if let Some(n) = result.vault.credential_count {
         println!("    Credentials: {n}");
+    }
+    if let Some(n) = result.vault.server_credential_count {
+        println!("    Cloud:       {n}");
+    }
+    if let Some(ok) = result.vault.parity_ok {
+        println!("    Synced:      {}", yn(ok));
     }
     println!();
 
@@ -803,12 +850,16 @@ fn gather_vault() -> VaultInfo {
                 path: path.to_string_lossy().into_owned(),
                 exists,
                 credential_count,
+                server_credential_count: None,
+                parity_ok: None,
             }
         }
         Err(_) => VaultInfo {
             path: "(unknown)".into(),
             exists: false,
             credential_count: None,
+            server_credential_count: None,
+            parity_ok: None,
         },
     }
 }

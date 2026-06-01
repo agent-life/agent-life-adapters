@@ -151,6 +151,22 @@ Output:
 
     {"ok":true,"sequence":5,"delta":true,"changes":{"creates":2,"updates":1,"deletes":0},"snapshot_path":"/home/user/.alf/state/abc-snapshot.alf","no_changes":false}
 
+The `changes` object also reports `credentials`, `principals`, and `identity` when those layers changed in the delta (each omitted when unchanged), so a vault edit or identity update shows up here too.
+
+### Verify the vault reached the cloud (and self-heal)
+
+`alf check` compares your local vault against the cloud and reports parity, so you can confirm a credential actually synced — and repair it if not, with no human step:
+
+    check=$(alf check -r openclaw)
+    ws=$(echo "$check" | jq -r '.workspace.path')
+    parity=$(echo "$check" | jq -r '.vault.parity_ok')   # true | false | null
+    if [ "$parity" = "false" ]; then
+        # Local vault holds credentials the cloud is missing (e.g. a diverged base).
+        alf sync --recover -r openclaw -w "$ws"           # non-destructive self-heal
+    fi
+
+`parity_ok: null` means the comparison wasn't possible (service unreachable, or no agent tracked yet) — not a failure. `alf sync --recover` re-pulls the cloud state and re-derives the delta against it; it never deletes anything and leaves the workspace untouched. Run `alf check` again afterward to confirm `vault.parity_ok` is `true`.
+
 ### Restore safely
 
 Restoring downloads cloud state into a workspace directory. To avoid overwriting a live workspace, use one of the safe-restore paths below before the destructive command.

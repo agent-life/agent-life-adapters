@@ -24,9 +24,9 @@ use crate::output;
 use crate::state::{local_base_exists, local_base_path, state_file_path, AgentState};
 
 use alf_core::archive::{AlfReader, DeltaWriter};
-use alf_core::delta::{compute_delta, diff_credentials};
+use alf_core::delta::{compute_delta, diff_credentials, diff_principals, identity_changed};
 use alf_core::manifest::{ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaSyncCursor};
-use alf_core::CredentialsDocument;
+use alf_core::{CredentialsDocument, PrincipalsDocument};
 
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -58,18 +58,29 @@ struct SyncChanges {
     deletes: usize,
     /// Layer 4 (credentials) changes carried by this delta. Omitted when the
     /// vault was unchanged.
-    #[serde(skip_serializing_if = "CredentialChanges::is_zero")]
-    credentials: CredentialChanges,
+    #[serde(skip_serializing_if = "LayerChanges::is_zero")]
+    credentials: LayerChanges,
+    /// Layer 2 (principals) changes carried by this delta. Omitted when
+    /// unchanged.
+    #[serde(skip_serializing_if = "LayerChanges::is_zero")]
+    principals: LayerChanges,
+    /// Whether Layer 1 (identity) changed in this delta. Omitted when false.
+    #[serde(skip_serializing_if = "is_false")]
+    identity: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 #[derive(Serialize)]
-struct CredentialChanges {
+struct LayerChanges {
     creates: usize,
     updates: usize,
     deletes: usize,
 }
 
-impl CredentialChanges {
+impl LayerChanges {
     fn is_zero(&self) -> bool {
         self.creates == 0 && self.updates == 0 && self.deletes == 0
     }
@@ -92,8 +103,14 @@ pub(crate) fn decide_sync_mode(
 ) -> SyncMode {
     match (state.last_synced_sequence, base_present, recover) {
         (None, _, _) => SyncMode::FirstSync,
-        (Some(n), true, _) => SyncMode::Delta { base_sequence: n },
-        (Some(n), false, true) => SyncMode::Recover { base_sequence: n },
+        // `--recover` wins even when a local base is present: it re-pulls the
+        // cloud-reconstructed base and re-derives the delta against cloud truth.
+        // This is the unattended self-heal for a diverged/poisoned local base
+        // (case E9) — no operator `rm base` step needed. Non-destructive: the
+        // workspace is untouched and the base is only overwritten after a
+        // successful cloud fetch.
+        (Some(n), _, true) => SyncMode::Recover { base_sequence: n },
+        (Some(n), true, false) => SyncMode::Delta { base_sequence: n },
         (Some(n), false, false) => SyncMode::BailMissingBase {
             last_synced_sequence: n,
         },
@@ -166,9 +183,10 @@ pub(crate) enum SyncMode {
     /// `--recover` was not passed. Bail with an actionable error pointing to
     /// `alf sync --recover`.
     BailMissingBase { last_synced_sequence: u64 },
-    /// State says we have synced before, the local base is missing, and
-    /// `--recover` was passed. Pull the cloud base, then take the delta
-    /// path at `base_sequence`.
+    /// State says we have synced before and `--recover` was passed (whether or
+    /// not a local base exists). Pull the cloud-reconstructed base — overwriting
+    /// any stale/diverged local base — then take the delta path at
+    /// `base_sequence`. This is the unattended self-heal for case E9.
     Recover { base_sequence: u64 },
 }
 
@@ -385,6 +403,8 @@ fn execute_delta(
     let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
     let prev_records = prev_reader.read_all_memory()?;
     let prev_creds = prev_reader.read_credentials()?;
+    let prev_identity = prev_reader.read_identity()?;
+    let prev_principals = prev_reader.read_principals()?;
 
     let mut curr_reader = AlfReader::new(Cursor::new(alf_bytes))?;
     let curr_records = curr_reader.read_all_memory()?;
@@ -394,6 +414,11 @@ fn execute_delta(
     // `diff_credentials`), which is what defeats the fresh-nonce-per-encryption
     // churn that would otherwise re-upload everything each sync.
     let curr_creds = curr_reader.read_credentials()?;
+    // Layers 1 (identity) and 2 (principals) can also change between syncs.
+    // Diffs ignore the `updated_at` the adapter re-stamps on every export, so an
+    // unchanged identity/principals set does not produce a spurious delta.
+    let curr_identity = curr_reader.read_identity()?;
+    let curr_principals = curr_reader.read_principals()?;
 
     // WP3: arbitrary tracked files (added via `alf add`) are opaque bytes the
     // delta format can't carry. If any tracked file — or the include list / sync
@@ -430,8 +455,10 @@ fn execute_delta(
 
     let delta_entries = compute_delta(&prev_records, &curr_records);
     let cred_diff = diff_credentials(prev_creds.as_ref(), curr_creds.as_ref());
+    let princ_diff = diff_principals(prev_principals.as_ref(), curr_principals.as_ref());
+    let id_changed = identity_changed(prev_identity.as_ref(), curr_identity.as_ref());
 
-    if delta_entries.is_empty() && cred_diff.is_empty() {
+    if delta_entries.is_empty() && cred_diff.is_empty() && princ_diff.is_empty() && !id_changed {
         if human {
             println!(
                 "{} No changes detected — already up to date",
@@ -474,6 +501,17 @@ fn execute_delta(
             cred_diff.updated.len(),
             cred_diff.deleted.len()
         ));
+    }
+    if !princ_diff.is_empty() {
+        output::progress(&format!(
+            "  Principals: {} creates, {} updates, {} deletes",
+            princ_diff.created.len(),
+            princ_diff.updated.len(),
+            princ_diff.deleted.len()
+        ));
+    }
+    if id_changed {
+        output::progress("  Identity changed");
     }
 
     let delta_manifest = DeltaManifest {
@@ -526,6 +564,36 @@ fn execute_delta(
             })?,
         }
     }
+    // Layer 1: carry the full current identity when it changed (single-doc
+    // replace on rebuild). A `None` curr_identity (identity removed) is left
+    // out — the format has no "delete identity" and every agent has one.
+    if id_changed {
+        if let Some(doc) = &curr_identity {
+            delta_writer.set_identity(doc, doc.version)?;
+        }
+    }
+    // Layer 2: same full-replace design as credentials — carry the whole current
+    // principals set whenever any principal changed; empty doc when all removed.
+    // `changed_ids` records which principals moved (created/updated/deleted).
+    if !princ_diff.is_empty() {
+        let changed_ids: Vec<uuid::Uuid> = princ_diff
+            .created
+            .iter()
+            .chain(princ_diff.updated.iter())
+            .chain(princ_diff.deleted.iter())
+            .copied()
+            .collect();
+        match &curr_principals {
+            Some(doc) => delta_writer.set_principals(doc, changed_ids)?,
+            None => delta_writer.set_principals(
+                &PrincipalsDocument {
+                    principals: Vec::new(),
+                    extra: HashMap::new(),
+                },
+                changed_ids,
+            )?,
+        }
+    }
     let delta_buf = delta_writer.finish()?;
     let delta_bytes = delta_buf.into_inner();
 
@@ -561,11 +629,17 @@ fn execute_delta(
                 creates,
                 updates,
                 deletes,
-                credentials: CredentialChanges {
+                credentials: LayerChanges {
                     creates: cred_diff.created.len(),
                     updates: cred_diff.updated.len(),
                     deletes: cred_diff.deleted.len(),
                 },
+                principals: LayerChanges {
+                    creates: princ_diff.created.len(),
+                    updates: princ_diff.updated.len(),
+                    deletes: princ_diff.deleted.len(),
+                },
+                identity: id_changed,
             }),
             snapshot_path: snapshot_path.to_string_lossy().into(),
             no_changes: false,
@@ -656,7 +730,7 @@ mod tests {
         assert_eq!(decide_sync_mode(&s, true, true), SyncMode::FirstSync);
     }
 
-    /// Branch B — synced + base present: delta path. --recover is a no-op.
+    /// Branch B — synced + base present, no --recover: delta path.
     #[test]
     fn decide_delta_when_base_present() {
         let s = state_with(Some(7));
@@ -664,10 +738,18 @@ mod tests {
             decide_sync_mode(&s, true, false),
             SyncMode::Delta { base_sequence: 7 }
         );
+    }
+
+    /// Branch B' — synced + base present + --recover: self-heal (RC-11). Recover
+    /// wins even with a healthy base so a diverged/poisoned base can be repaired
+    /// unattended, without an operator deleting the base file first.
+    #[test]
+    fn decide_recover_when_base_present_and_recover() {
+        let s = state_with(Some(7));
         assert_eq!(
             decide_sync_mode(&s, true, true),
-            SyncMode::Delta { base_sequence: 7 },
-            "--recover should be a no-op when the local base is healthy"
+            SyncMode::Recover { base_sequence: 7 },
+            "--recover must re-pull cloud truth even when a local base exists"
         );
     }
 
@@ -723,6 +805,7 @@ mod tests {
                 source_runtime: Some("openclaw".into()),
                 created_at: "2026-05-09T00:00:00Z".into(),
                 latest_sequence,
+                layer_counts: None,
             },
             already_existed,
         }

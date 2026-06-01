@@ -236,16 +236,17 @@ The result is that **upgrading to 0.1.8 does not self-heal.** 0.1.8's credential
 
 - This is the case behind the production observation: an agent on the Docker runtime whose vault never reached the cloud while a mac agent's did, purely because of snapshot timing.
 - Affects any agent that added vault credentials *after* its first sync on a CLI ≤ 0.1.6 and later upgraded.
-- Migration path: reset the diff base to the true cloud state so the live vault surfaces as `creates`. **Note the trap:** `alf sync --recover` alone is a no-op here, because `decide_sync_mode` ignores `--recover` whenever the local base is present (`(Some(N), true, _) => Delta`; see §9). You must delete the local base first. See the §11 runbook entry below.
-- Outcome: one explicit recovery operation per affected agent; no data loss (the recovery uploads a fresh credential-bearing delta at the next sequence).
+- Migration path (0.1.9+): run **`alf sync --recover`** once. It re-pulls the cloud-reconstructed base — overwriting the poisoned local base — and re-derives the delta against cloud truth, so the live vault surfaces as `creates`. No need to delete the base file first; `--recover` is now effective with a base present (see §9). On a pre-0.1.9 CLI, `--recover` no-ops when a base exists, so you must `rm` the local base first — see the §11 runbook.
+- Self-detect: `alf check` reports `vault.parity_ok: false` (and a `vault_not_synced` warning) when the local vault count exceeds the cloud's, so an agent can trigger the recovery itself.
+- Outcome: one recovery operation per affected agent; no data loss (the recovery uploads a fresh credential-bearing delta at the next sequence).
 
 ## 9. What `--recover` does (and does not)
 
-`alf sync --recover` does exactly one thing beyond a normal sync: when the local base is missing, it calls the cloud's `restore` endpoint, merges the snapshot and any deltas, and writes the result to `~/.alf/state/{agent_id}-snapshot.alf`. It does **not** touch the workspace.
+`alf sync --recover` does one thing beyond a normal sync: it calls the cloud's `restore` endpoint, merges the snapshot and any deltas, and writes the result to `~/.alf/state/{agent_id}-snapshot.alf`, then takes the normal delta path against that freshly-pulled base. It does **not** touch the workspace.
 
 If you need to repopulate the workspace itself from the cloud (e.g. you have a fresh container with an empty `/config/.openclaw/workspace`), use `alf restore`, not `alf sync --recover`.
 
-If `--recover` is passed but the local base is already healthy, the flag is a no-op.
+**`--recover` is effective whether or not a local base already exists** (changed in 0.1.9). When a base is present it is **overwritten** with the cloud-reconstructed base before the delta is computed — so a stale or diverged ("poisoned") local base is repaired against cloud truth. This is the unattended self-heal for case E9: no operator needs to delete the base file first. It is non-destructive — the workspace is untouched and the base is replaced only after a successful cloud fetch.
 
 The recovery emits a distinct human-readable progress line and includes `"recovered": true` in the JSON output, so suspend logs can distinguish a recovered sync from a regular delta sync.
 
@@ -307,19 +308,19 @@ This is **E7**. Another writer advanced the agent's sequence in the cloud.
 
 ### Symptom: local vault has credentials but the cloud shows 0 credentials
 
-This is **E9**. The vault was added after first sync on a pre-0.1.8 CLI, so it was never uploaded; the local base is poisoned (it contains the vault the cloud lacks), so a plain `alf sync` — and even `alf sync --recover` on its own — detects no credential change.
+This is **E9**. The vault was added after first sync on a pre-0.1.8 CLI, so it was never uploaded; the local base is poisoned (it contains the vault the cloud lacks), so a plain `alf sync` detects no credential change.
 
-The fix is to point the credential diff at the *true cloud state* by deleting the local base, then recovering:
+`alf check` flags this directly: `vault.parity_ok: false` plus a `vault_not_synced` warning whose suggestion is the fix.
+
+**On 0.1.9+ — one command, no file deletion:**
 
 1. Connect to the runtime (`fly ssh console -a <app>` or `fly machine exec`).
-2. Resolve the home base: `$ALF_HOME` if set (the Docker runtime usually sets it to `/config`), else `$HOME`. The state dir is `<base>/.alf/state/`.
-3. Delete the poisoned local base: `rm <base>/.alf/state/<agent-id>-snapshot.alf` (leave `<agent-id>.toml` in place).
-4. Recover: `alf sync --recover -r openclaw -w /config/.openclaw/workspace`. With the base now missing, `decide_sync_mode` enters the recover branch: it pulls the cloud snapshot+deltas (which lack Layer 4) into a fresh base, then diffs the live vault against it — every credential surfaces as a `create` and is uploaded as a new delta.
-5. Verify: the sync JSON reports credential creates, and the dashboard's Credentials tab (or `alf check`'s `vault` block compared against cloud) now shows N items instead of 0.
+2. `alf sync --recover -r openclaw -w /config/.openclaw/workspace`. `--recover` re-pulls the cloud-reconstructed base (overwriting the poisoned local base), then diffs the live vault against cloud truth — every credential surfaces as a `create` and is uploaded as a new delta. Non-destructive; the workspace is untouched.
+3. Verify: `alf check` now shows `vault.parity_ok: true`, and the dashboard's Credentials tab shows N items.
 
-An agent running inside the runtime can execute steps 3–5 itself; only the vault file and the local base under `~/.alf` are touched, and the workspace is left alone.
+An agent running inside the runtime can execute this itself (steps 2–3); only the local base under `~/.alf` is touched.
 
-Alternative (less surgical): `alf add <any workspace file>` forces a full re-snapshot (§6.1), and a full snapshot carries Layer 4 — but it leaves a tracked-file artifact behind, so the delete-base + `--recover` path above is preferred.
+**On a pre-0.1.9 CLI**, `--recover` no-ops when a base is present, so first delete the poisoned base, then recover: resolve the home base (`$ALF_HOME` if set — the Docker runtime usually sets it to `/config` — else `$HOME`), `rm <base>/.alf/state/<agent-id>-snapshot.alf` (leave `<agent-id>.toml`), then run the `--recover` command above.
 
 ### Symptom: nothing wrong, just want to inspect state
 

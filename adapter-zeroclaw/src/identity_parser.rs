@@ -11,7 +11,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{Identity, Linguistics, Names, ProseIdentity, Psychology, StructuredIdentity};
@@ -89,10 +88,16 @@ fn parse_openclaw_identity(workspace: &Path, agent_id: Uuid) -> Result<Option<Id
         .unwrap_or_else(|| "Unknown".to_string());
 
     Ok(Some(Identity {
-        id: Uuid::new_v4(),
+        // Deterministic id + mtime so an unchanged identity re-exports
+        // identically (no spurious delta every sync). See alf_core::ids.
+        id: alf_core::ids::identity_id(agent_id),
         agent_id,
         version: 1,
-        updated_at: Utc::now(),
+        updated_at: alf_core::ids::newest_mtime([
+            workspace.join("SOUL.md"),
+            workspace.join("IDENTITY.md"),
+            workspace.join("AGENTS.md"),
+        ]),
         structured: Some(StructuredIdentity {
             names: Some(Names {
                 primary: name,
@@ -262,10 +267,16 @@ fn parse_aieos_identity(
     };
 
     Ok(Some(Identity {
-        id: Uuid::new_v4(),
+        // Deterministic id + mtime so an unchanged identity re-exports
+        // identically (no spurious delta every sync). See alf_core::ids.
+        id: alf_core::ids::identity_id(agent_id),
         agent_id,
         version: 1,
-        updated_at: Utc::now(),
+        updated_at: alf_core::ids::newest_mtime([
+            workspace.join("SOUL.md"),
+            workspace.join("IDENTITY.md"),
+            workspace.join("AGENTS.md"),
+        ]),
         structured: Some(StructuredIdentity {
             names: Some(Names {
                 primary: agent_name,

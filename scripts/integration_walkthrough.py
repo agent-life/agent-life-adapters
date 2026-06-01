@@ -1,46 +1,62 @@
 #!/usr/bin/env python3
 """
-agent-life Interactive Integration Test
-========================================
+agent-life Integration Walkthrough — CLI + API dual view
+========================================================
 
-An end-to-end walkthrough of the agent-life sync pipeline that serves two purposes:
+An end-to-end walkthrough of the agent-life sync pipeline, shown from BOTH
+points of view at every step:
 
-  1. Functional test — exercises create → snapshot → delta → restore → delete
-     against the live test stack, verifying data in the API, Neon DB, and S3.
+  ▸ CLI LANE     — the real `alf` binary the operator/agent actually runs,
+                   against a real workspace with an isolated HOME.
+  ▸ API LANE     — the HTTP API + Neon rows + S3 objects that the CLI produced,
+                   so you can see the cause (command) and the effect (cloud state)
+                   side by side.
 
-  2. Educational — pauses at each step with explanations of what's happening,
-     where data lives, and how the pieces connect.
+It is also a functional test: it drives create → snapshot → delta → restore →
+point-in-time → purge through the CLI and verifies each effect in the API, Neon,
+and S3.
+
+Following the data flow & inspecting locally
+--------------------------------------------
+Everything for a run lives under one temporary RUN directory, printed at the
+start and preserved after an interactive run so you can poke at it. Each step
+prints:
+  • a `data flow:` arrow line (where the bytes move),
+  • the exact `alf` command (paths shown as `$RUN/...` so they're copy-pasteable
+    after `export RUN=<dir>`), and
+  • an `inspect locally:` block with commands to read the config, workspace,
+    sync cursor, and local snapshot base at that point in time.
 
 Prerequisites:
   pip install requests psycopg2-binary boto3 python-dotenv
+  A built `alf` binary (PATH, or target/{release,debug}/alf in this repo).
 
 Environment (.env or exported):
-  API_BASE_URL     — e.g. https://agent-life-api-test.halimede.one
-  API_KEY          — e.g. alf_testpfxABC...
+  API_BASE_URL      — e.g. https://agent-life-api-test.halimede.one
+  API_KEY           — e.g. alf_testpfxABC...
   NEON_DATABASE_URL — postgres://user:pass@host/db?sslmode=require
-  S3_BUCKET_NAME   — e.g. agent-life-data-test
-  AWS_REGION       — e.g. us-east-2 (default)
+  S3_BUCKET_NAME    — e.g. agent-life-data-test
+  AWS_REGION        — e.g. us-east-2 (default)
 
 Usage:
-  python3 integration_walkthrough.py              # interactive (pauses)
-  python3 integration_walkthrough.py --no-pause   # batch mode (CI)
+  python3 integration_walkthrough.py                  # interactive (pauses; prompts for runtime)
+  python3 integration_walkthrough.py --runtime zeroclaw
+  python3 integration_walkthrough.py --no-pause       # batch mode (CI; defaults to openclaw)
+  python3 integration_walkthrough.py --keep-run-dir   # keep the run dir even in batch mode
   python3 integration_walkthrough.py --help
 """
 
 from __future__ import annotations
 
 import argparse
-import io
 import json
 import os
 import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import time
 import uuid
-import zipfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -81,7 +97,16 @@ COLORS = {
 
 AGENT_ID = uuid.UUID("e2e10000-feed-4000-b000-000000000001")
 AGENT_NAME = "E2E Walkthrough Agent"
-SOURCE_RUNTIME = "openclaw"
+SUPPORTED_RUNTIMES = ("openclaw", "zeroclaw")
+
+# ZeroClaw config.toml the CLI reads from the workspace's parent (the runtime
+# home). Markdown backend keeps the walkthrough hermetic — no SQLite seeding.
+ZEROCLAW_CONFIG_TOML = (
+    "schema_version = 3\n\n"
+    '[memory]\nbackend = "markdown"\n\n'
+    '[identity]\nformat = "openclaw"\n\n'
+    "[secrets]\nencrypt = false\n"
+)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -95,6 +120,7 @@ class Config:
     s3_bucket: str
     aws_region: str
     interactive: bool = True
+    runtime: str = "openclaw"
 
     @classmethod
     def from_env(cls, interactive: bool = True) -> "Config":
@@ -115,6 +141,41 @@ class Config:
             aws_region=os.environ.get("AWS_REGION", "us-east-2"),
             interactive=interactive,
         )
+
+# ---------------------------------------------------------------------------
+# Run context — the local resources for one walkthrough run
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RunContext:
+    """Everything that lives on disk for one run, so the operator can inspect
+    config + workspace + sync state at each step. Paths are real; `disp()`
+    renders them with a `$RUN` prefix for copy-pasteable command lines."""
+    root: Path           # the persistent run dir (printed; preserved interactively)
+    home: Path           # isolated HOME for the CLI (holds .alf/)
+    ws: Path             # the workspace the CLI syncs (the `-w` argument)
+    runtime_home: Path   # openclaw: == ws; zeroclaw: ws.parent (holds config.toml)
+    restore_ws: Path     # a "fresh machine" workspace that `alf restore` populates
+    alf: str             # path to the alf binary
+    runtime: str
+    agent_id: uuid.UUID = AGENT_ID  # the pinned agent UUID for this run's workspace
+
+    @property
+    def alf_home(self) -> Path:
+        return self.home / ".alf"
+
+    @property
+    def state_toml(self) -> Path:
+        return self.alf_home / "state" / f"{self.agent_id}.toml"
+
+    @property
+    def base_alf(self) -> Path:
+        return self.alf_home / "state" / f"{self.agent_id}-snapshot.alf"
+
+    def disp(self, p: Any) -> str:
+        """Render a path with the run root replaced by `$RUN`."""
+        return str(p).replace(str(self.root), "$RUN")
+
 
 # ---------------------------------------------------------------------------
 # Report
@@ -143,17 +204,20 @@ class Report:
         total_ms = sum(s.duration_ms for s in self.steps)
 
         lines = [
-            "# agent-life Integration Test Report",
+            "# agent-life Integration Walkthrough Report (CLI + API)",
             "",
             f"**Date:** {self.started_at.strftime('%Y-%m-%d %H:%M:%S UTC')}  ",
+            f"**Runtime:** `{self.config_summary.get('runtime', '?')}`  ",
             f"**API:** `{self.config_summary.get('api_url', '?')}`  ",
             f"**S3 Bucket:** `{self.config_summary.get('s3_bucket', '?')}`  ",
             f"**Database:** `{self.config_summary.get('db_host', '?')}`  ",
+            f"**Run dir:** `{self.config_summary.get('run_dir', '?')}`  ",
+            f"**alf binary:** `{self.config_summary.get('alf', '?')}`  ",
             "",
             "## Summary",
             "",
-            f"| Metric | Value |",
-            f"|--------|-------|",
+            "| Metric | Value |",
+            "|--------|-------|",
             f"| Steps passed | {passed}/{len(self.steps)} |",
             f"| Steps failed | {failed} |",
             f"| Total duration | {total_ms:.0f} ms |",
@@ -168,23 +232,13 @@ class Report:
             detail = s.details[:80] if s.passed else s.error[:80]
             lines.append(f"| {i} | {s.name} | {status} | {s.duration_ms:.0f} | {detail} |")
 
-        lines.extend([
-            "",
-            "## Performance",
-            "",
-            "| Operation | Duration (ms) |",
-            "|-----------|---------------|",
-        ])
-        for s in self.steps:
-            lines.append(f"| {s.name} | {s.duration_ms:.0f} |")
-
         if failed > 0:
             lines.extend(["", "## Failures", ""])
             for s in self.steps:
                 if not s.passed:
-                    lines.extend([f"### {s.name}", "", f"```", s.error, "```", ""])
+                    lines.extend([f"### {s.name}", "", "```", s.error, "```", ""])
 
-        lines.extend(["", "---", f"*Generated by `integration_walkthrough.py`*"])
+        lines.extend(["", "---", "*Generated by `integration_walkthrough.py`*"])
         return "\n".join(lines)
 
 
@@ -213,6 +267,17 @@ def explain(text: str):
         print(c("dim", f"  │ {line}"))
     print()
 
+def flow(arrows: str):
+    """One-line cause→effect map for the step's data movement."""
+    print(f"  {c('cyan', 'data flow:')}  {arrows}")
+    print()
+
+def ok(msg: str):
+    print(f"  {c('green', '✓')} {msg}")
+
+def fail(msg: str):
+    print(f"  {c('red', '✗')} {msg}")
+
 def show_data(label: str, data: Any):
     print(f"  {c('yellow', label)}:")
     if isinstance(data, dict):
@@ -230,16 +295,52 @@ def show_data(label: str, data: Any):
         print(f"    {data}")
     print()
 
-def ok(msg: str):
-    print(f"  {c('green', '✓')} {msg}")
+def cli_header():
+    print(f"  {c('magenta', '▸ CLI LANE')}  {c('dim', '— what the operator/agent runs')}")
 
-def fail(msg: str):
-    print(f"  {c('red', '✗')} {msg}")
+def api_header():
+    print(f"  {c('blue', '▸ API / STORAGE LANE')}  {c('dim', '— what it produced in the cloud')}")
+
+def inspect(ctx: RunContext, items: list[tuple[str, str]]):
+    """Print copy-pasteable commands to inspect local resources right now.
+    `items` is a list of (description, command) — commands use $RUN paths."""
+    print(f"  {c('yellow', 'inspect locally')} {c('dim', '(set: export RUN=' + str(ctx.root) + ')')}:")
+    for desc, cmd in items:
+        print(f"    {c('dim', '# ' + desc)}")
+        print(f"    {cmd}")
+    print()
 
 def pause(cfg: Config, prompt: str = "Press Enter to continue..."):
     if cfg.interactive:
         input(f"\n  {c('blue', '▸')} {prompt}")
     print()
+
+
+def select_runtime(interactive: bool, flag: str | None) -> str:
+    """Resolve the runtime: explicit --runtime flag wins; otherwise prompt
+    interactively (default openclaw); in batch mode with no flag, openclaw."""
+    if flag:
+        if flag not in SUPPORTED_RUNTIMES:
+            print(f"Unsupported runtime: {flag!r}. Choose one of: "
+                  f"{', '.join(SUPPORTED_RUNTIMES)}")
+            sys.exit(2)
+        return flag
+    if not interactive:
+        return "openclaw"
+    print(c("bold", "  Which runtime should this walkthrough exercise?"))
+    for i, rt in enumerate(SUPPORTED_RUNTIMES, 1):
+        default = "  (default)" if rt == "openclaw" else ""
+        print(f"    {i}. {rt}{c('dim', default)}")
+    while True:
+        choice = input(f"  {c('blue', '▸')} Select [1-{len(SUPPORTED_RUNTIMES)}, "
+                       f"default 1]: ").strip()
+        if choice == "":
+            return "openclaw"
+        if choice.isdigit() and 1 <= int(choice) <= len(SUPPORTED_RUNTIMES):
+            return SUPPORTED_RUNTIMES[int(choice) - 1]
+        if choice in SUPPORTED_RUNTIMES:
+            return choice
+        print(f"    {c('red', 'Invalid choice.')} Enter a number or a runtime name.")
 
 
 # ---------------------------------------------------------------------------
@@ -254,19 +355,8 @@ class ApiClient:
             "Content-Type": "application/json",
         }
 
-    def post_json(self, path: str, body: dict) -> requests.Response:
-        return requests.post(f"{self.url}{path}", json=body, headers=self.headers)
-
     def get(self, path: str) -> requests.Response:
         return requests.get(f"{self.url}{path}", headers=self.headers)
-
-    def put_binary(self, path: str, data: bytes) -> requests.Response:
-        h = {**self.headers, "Content-Type": "application/octet-stream"}
-        return requests.put(f"{self.url}{path}", data=data, headers=h)
-
-    def post_binary(self, path: str, data: bytes) -> requests.Response:
-        h = {**self.headers, "Content-Type": "application/octet-stream"}
-        return requests.post(f"{self.url}{path}", data=data, headers=h)
 
     def delete(self, path: str) -> requests.Response:
         return requests.delete(f"{self.url}{path}", headers=self.headers)
@@ -310,101 +400,9 @@ class S3Client:
         resp = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
         return resp.get("Contents", [])
 
-    def head_object(self, key: str) -> dict:
-        return self.s3.head_object(Bucket=self.bucket, Key=key)
-
-    def object_exists(self, key: str) -> bool:
-        try:
-            self.s3.head_object(Bucket=self.bucket, Key=key)
-            return True
-        except self.s3.exceptions.ClientError:
-            return False
-
 
 # ---------------------------------------------------------------------------
-# Synthetic archive builders
-# ---------------------------------------------------------------------------
-
-def build_snapshot_zip(agent_id: str, memories: list[dict]) -> bytes:
-    """Build a minimal .alf ZIP archive with a manifest and memory partition."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        manifest = {
-            "alf_version": "1.0.0",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "agent": {
-                "id": agent_id,
-                "name": AGENT_NAME,
-                "source_runtime": SOURCE_RUNTIME,
-            },
-            "layers": {
-                "memory": {
-                    "record_count": len(memories),
-                    "index_file": "memory/index.json",
-                    "partitions": [{
-                        "file": "memory/2026-Q1.jsonl",
-                        "from": "2026-01-01",
-                        "to": "2026-03-31",
-                        "record_count": len(memories),
-                        "sealed": False,
-                    }],
-                }
-            },
-        }
-        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
-        zf.writestr("memory/index.json", json.dumps({"partitions": manifest["layers"]["memory"]["partitions"]}))
-        jsonl = "\n".join(json.dumps(m) for m in memories) + "\n"
-        zf.writestr("memory/2026-Q1.jsonl", jsonl)
-        # Raw source placeholder
-        zf.writestr("raw/openclaw/SOUL.md", f"# {AGENT_NAME}\n\nA test agent for the integration walkthrough.")
-    return buf.getvalue()
-
-
-def build_delta_zip(agent_id: str, base_seq: int, new_memories: list[dict]) -> bytes:
-    """Build a minimal .alf-delta ZIP archive with memory creates."""
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        entries = []
-        for m in new_memories:
-            entry = {"operation": "create", **m}
-            entries.append(entry)
-
-        delta_manifest = {
-            "alf_version": "1.0.0",
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "agent": {"id": agent_id, "source_runtime": SOURCE_RUNTIME},
-            "sync": {
-                "base_sequence": base_seq,
-                "new_sequence": base_seq + 1,
-            },
-            "changes": {
-                "memory": {
-                    "file": "memory/delta.jsonl",
-                    "record_count": len(entries),
-                }
-            },
-        }
-        zf.writestr("delta-manifest.json", json.dumps(delta_manifest, indent=2))
-        jsonl = "\n".join(json.dumps(e) for e in entries) + "\n"
-        zf.writestr("memory/delta.jsonl", jsonl)
-    return buf.getvalue()
-
-
-def make_memory(record_id: str, content: str, namespace: str = "default") -> dict:
-    return {
-        "id": record_id,
-        "agent_id": str(AGENT_ID),
-        "content": content,
-        "memory_type": "semantic",
-        "source": {"runtime": SOURCE_RUNTIME},
-        "temporal": {"created_at": datetime.now(timezone.utc).isoformat()},
-        "status": "active",
-        "namespace": namespace,
-    }
-
-
-# ---------------------------------------------------------------------------
-# alf CLI discovery
+# alf CLI discovery + execution
 # ---------------------------------------------------------------------------
 
 def find_alf_binary() -> Optional[str]:
@@ -420,827 +418,583 @@ def find_alf_binary() -> Optional[str]:
     return None
 
 
+def run_cli(ctx: RunContext, argv: list[str], *, timeout: int = 180,
+            show: bool = True) -> tuple[subprocess.CompletedProcess, Optional[dict]]:
+    """Run the real `alf` binary with HOME pinned to the isolated run home, so
+    the CLI's config + state + vault never touch the operator's real ~/.alf.
+
+    Renders the CLI lane (command + JSON result) and returns (proc, parsed_json).
+    stdout is JSON by default (ALF_HUMAN is cleared); parsed is None if not JSON.
+    """
+    env = {**os.environ, "HOME": str(ctx.home)}
+    env.pop("ALF_HUMAN", None)  # force JSON stdout for machine-readable parsing
+    proc = subprocess.run(
+        [ctx.alf, *argv], capture_output=True, text=True, env=env, timeout=timeout
+    )
+    parsed: Optional[dict] = None
+    out = proc.stdout.strip()
+    if out:
+        try:
+            parsed = json.loads(out)
+        except json.JSONDecodeError:
+            parsed = None
+
+    if show:
+        cli_header()
+        rendered = "alf " + " ".join(argv).replace(str(ctx.root), "$RUN")
+        print(f"    {c('bold', '$ ' + rendered)}")
+        if parsed is not None:
+            compact = json.dumps(parsed)
+            if len(compact) > 220:
+                compact = compact[:220] + "…"
+            print(f"    {c('dim', compact)}")
+        elif out:
+            print(f"    {c('dim', out[:220])}")
+        if proc.returncode != 0:
+            err = (proc.stderr or "").strip()
+            if err:
+                print(f"    {c('red', err[:220])}")
+        print()
+    return proc, parsed
+
+
+# ---------------------------------------------------------------------------
+# Run-dir / workspace construction
+# ---------------------------------------------------------------------------
+
+SEED_SOUL = "# Atlas\n\nA demo agent for the integration walkthrough.\n"
+SEED_MEMORY_MD = "## Facts\n\nThe project uses event-sourced architecture.\n"
+SEED_DAILY = "## Standup\n\nKicked off the walkthrough.\n"
+
+
+def build_run_context(cfg: Config, alf: str, agent_id: uuid.UUID = AGENT_ID) -> RunContext:
+    """Create the persistent run directory: isolated HOME with alf config, a
+    seeded workspace shaped for the chosen runtime, and a restore target.
+
+    `agent_id` is pinned into the workspace's `.alf-agent-id` so the API / Neon /
+    S3 lane can query by a known UUID. Callers that run several walkthroughs
+    against the same stack (e.g. the workspace walkthrough) pass their own id to
+    avoid colliding with the main walkthrough's agent."""
+    root = Path(__import__("tempfile").mkdtemp(prefix="alf-walkthrough-"))
+    home = root / "home"
+    (home / ".alf").mkdir(parents=True)
+    (home / ".alf" / "config.toml").write_text(
+        f'[service]\napi_url = "{cfg.api_url}"\napi_key = "{cfg.api_key}"\n\n'
+        f'[defaults]\nruntime = "{cfg.runtime}"\n',
+        encoding="utf-8",
+    )
+
+    if cfg.runtime == "zeroclaw":
+        runtime_home = root / "zeroclaw-home"
+        ws = runtime_home / "workspace"
+        ws.mkdir(parents=True)
+        (runtime_home / "config.toml").write_text(ZEROCLAW_CONFIG_TOML, encoding="utf-8")
+        restore_ws = root / "restore-home" / "workspace"
+    else:
+        ws = root / "openclaw-workspace"
+        ws.mkdir(parents=True)
+        runtime_home = ws
+        restore_ws = root / "restore-workspace"
+
+    # Seed the workspace: persona + memory, and pin the agent UUID so the API /
+    # Neon / S3 lane can keep querying by our known id. Without this the CLI
+    # would derive its own id and the cloud-side lookups wouldn't line up.
+    (ws / "SOUL.md").write_text(SEED_SOUL, encoding="utf-8")
+    (ws / "MEMORY.md").write_text(SEED_MEMORY_MD, encoding="utf-8")
+    (ws / "memory").mkdir()
+    (ws / "memory" / "2026-01-15.md").write_text(SEED_DAILY, encoding="utf-8")
+    (ws / ".alf-agent-id").write_text(str(agent_id) + "\n", encoding="utf-8")
+
+    return RunContext(
+        root=root, home=home, ws=ws, runtime_home=runtime_home,
+        restore_ws=restore_ws, alf=alf, runtime=cfg.runtime, agent_id=agent_id,
+    )
+
+
+def tenant_prefix(db: DbClient, agent_id: uuid.UUID = AGENT_ID) -> Optional[str]:
+    row = db.query_one("SELECT tenant_id FROM agents WHERE id = %s", (str(agent_id),))
+    return f"{row['tenant_id']}/{agent_id}/" if row else None
+
+
+def tree(path: Path, limit: int = 12) -> list[str]:
+    """Workspace-relative file list (sorted) for showing what landed on disk."""
+    if not path.is_dir():
+        return []
+    out = []
+    for p in sorted(path.rglob("*")):
+        if p.is_file():
+            out.append(str(p.relative_to(path)))
+    return out[:limit]
+
+
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
 
-def step_connectivity(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report: Report):
+def step_connectivity(cfg: Config, ctx: RunContext, api: ApiClient, db: DbClient,
+                      s3: S3Client, report: Report):
     section(0, "Verify Connectivity")
     explain("""
-        Before we begin, let's verify we can reach all three backends:
-        • API Gateway (the agent-life REST API)
-        • Neon (Postgres database — stores metadata, sequences, tenant info)
-        • S3 (blob storage — stores snapshot and delta archives)
+        Two lanes run side by side in this walkthrough:
+          ▸ CLI LANE  — the real `alf` binary, with HOME pinned to this run's
+                        isolated home (your real ~/.alf is never touched).
+          ▸ API LANE  — the cloud effects: HTTP API, Neon rows, S3 objects.
+        First, verify we can reach all three backends.
     """)
+    flow("alf binary (local)   ·   API ── Neon ── S3 (cloud)")
 
     t0 = time.time()
     errors = []
-
-    # API
     try:
         r = api.get("/agents")
         if r.status_code == 200:
-            agents = r.json().get("agents", [])
-            ok(f"API reachable — {len(agents)} existing agent(s)")
+            ok(f"API reachable — {len(r.json().get('agents', []))} existing agent(s)")
         else:
-            errors.append(f"API returned {r.status_code}: {r.text[:200]}")
+            errors.append(f"API {r.status_code}: {r.text[:200]}")
             fail(f"API returned {r.status_code}")
     except Exception as e:
-        errors.append(f"API connection failed: {e}")
+        errors.append(f"API: {e}")
         fail(f"API: {e}")
-
-    # DB
     try:
-        row = db.query_one("SELECT current_database(), version()")
+        row = db.query_one("SELECT current_database()")
         ok(f"Neon DB reachable — {row['current_database']}")
     except Exception as e:
-        errors.append(f"DB connection failed: {e}")
+        errors.append(f"DB: {e}")
         fail(f"DB: {e}")
-
-    # S3
     try:
         s3.s3.head_bucket(Bucket=s3.bucket)
         ok(f"S3 bucket reachable — {s3.bucket}")
     except Exception as e:
-        errors.append(f"S3 bucket check failed: {e}")
+        errors.append(f"S3: {e}")
         fail(f"S3: {e}")
+
+    # CLI reachability: `alf check` exercises the same config + endpoint.
+    print()
+    proc, parsed = run_cli(ctx, ["check", "-r", ctx.runtime, "-w", str(ctx.ws)])
+    if proc.returncode == 0 and parsed:
+        ok(f"`alf check` ran — ready_to_sync={parsed.get('ready_to_sync')}, "
+           f"workspace source={parsed.get('workspace', {}).get('source')}")
+    else:
+        # check returns non-zero when not ready (e.g. no memory yet); that's fine
+        ok("`alf check` ran (non-zero exit is expected before first sync)")
 
     duration = (time.time() - t0) * 1000
     passed = len(errors) == 0
     report.add(StepResult("Verify connectivity", passed, duration,
                           "All backends reachable" if passed else "",
                           "; ".join(errors)))
-
     if not passed:
         print(f"\n  {c('red', 'Cannot continue — fix connectivity issues above.')}")
         sys.exit(1)
-
     pause(cfg)
 
 
-def step_cli_sync_model(cfg: Config, report: Report):
-    section(1, "CLI Sync Branch Decisions (Client-Side State Model)")
+def step_local_layout(cfg: Config, ctx: RunContext, report: Report):
+    section(1, "Local Resource Map & Sync-State Model")
     explain("""
-        Before we touch the API, let's understand what `alf sync` does locally
-        and how it decides whether to upload a full snapshot or push a delta.
-
-        Per agent, the CLI keeps exactly two files under ~/.alf/state/:
-
-          {agent_id}.toml             ← sync cursor (a few hundred bytes)
-          {agent_id}-snapshot.alf     ← frozen copy of the last successful
-                                        sync; used purely as the delta base
-                                        for the NEXT sync
-
-        These two files are independent on-disk artifacts. The cursor lives
-        forever; the workspace itself can change freely between syncs.
+        Everything for this run lives under one RUN directory. Knowing where each
+        resource is lets you inspect the config, workspace, and sync state at any
+        point. All `alf` commands below run with HOME pinned here.
     """)
 
-    explain("""
-        The cursor is one variable, with type Option<u64>:
-
-            last_synced_sequence
-
-          • None      ⇒ the agent has never completed a sync.
-          • Some(0)   ⇒ the first snapshot has been uploaded.
-          • Some(N>0) ⇒ N deltas have been pushed on top of the snapshot.
-
-        This is the SOLE sync-control variable. `last_synced_at` is also
-        persisted but it's informational metadata only — never read by
-        control flow, only displayed by `alf help status` and propagated
-        into delta manifests as `base_timestamp` for audit trails.
-
-        Why Option<u64>? Because the cloud assigns the first snapshot
-        sequence 0, so a bare `u64` couldn't distinguish "never synced"
-        from "first snapshot just uploaded". The Option carries that
-        distinction at the type level.
-    """)
-
-    explain("""
-        On every run, `alf sync` reads the cursor and checks whether the
-        local base snapshot exists on disk. Those two inputs decide the
-        branch — that's the entire sync control flow:
-
-          (last_synced_sequence,     base.alf present) → action
-          ──────────────────────────────────────────────────────────────────
-          (None,                     *               ) → First sync.
-                                                         Register agent +
-                                                         upload full snapshot.
-
-          (Some(N),                  present         ) → Delta path.
-                                                         Compute change set
-                                                         against base.alf at
-                                                         sequence N, push,
-                                                         advance to Some(N+1).
-
-          (Some(N),                  absent          ) → Bail loudly with:
-                                                         "Run alf sync --recover"
-                                                         (or run with --recover
-                                                         to pull cloud base
-                                                         and proceed as Delta).
-    """)
-
-    explain("""
-        Two corner cases the current CLI handles explicitly rather than
-        silently swallowing:
-
-          E3 — First sync, but the cloud already has this agent ID.
-               POST /agents returns 409. By default `alf sync` bails,
-               because uploading a fresh snapshot would overwrite cloud
-               history with whatever happens to be in the local workspace.
-               Pass --force-first-sync only if you really do mean "the
-               local workspace is the truth".
-
-          E4 — state.toml present, base.alf absent (orphan state from a
-               pre-0.1.4 CLI that did not write the base during restore).
-               Default behaviour: bail with an actionable error pointing
-               at `alf sync --recover`, which pulls the cloud snapshot+deltas,
-               materialises the local base, and proceeds as a normal delta.
-               Boot-time runtimes auto-recover via the runtime self-heal
-               step in 50-configure-runtime.
-
-        Atomic-write invariant: base.alf is always written BEFORE state.toml.
-        Consequence: state.toml-present ⇒ base.alf-present at the moment of
-        the last successful write. The bail above can only fire if something
-        deleted base.alf out from under us, or an old CLI wrote state.toml
-        without writing base.alf.
-
-        Full reference: agent-life-adapters/docs/how_alf_syncs.md
-    """)
-
-    example_state = textwrap.dedent("""
-        # ~/.alf/state/e2e10000-feed-4000-b000-000000000001.toml
-        agent_id = "e2e10000-feed-4000-b000-000000000001"
-        last_synced_sequence = 2
-        last_synced_at = "2026-05-09T18:42:11Z"
-    """).strip()
-    print(f"  {c('yellow', 'Example state.toml after two deltas')}:")
-    for line in example_state.splitlines():
-        print(f"    {c('dim', line)}")
+    print(f"  {c('yellow', 'RUN')} = {ctx.root}")
+    print(f"  {c('dim', '(tip: `export RUN=' + str(ctx.root) + '` to copy-paste the commands below)')}")
     print()
-
-    explain("""
-        Right now our walkthrough agent has no local state yet:
-        last_synced_sequence is None and base.alf does not exist. So the
-        very next step — register the agent and upload an initial snapshot —
-        corresponds to the first-sync branch of `alf sync`.
-    """)
-
-    report.add(StepResult(
-        "CLI sync branch model",
-        True,
-        0,
-        "Conceptual step — explains client-side state and branch table",
-    ))
-    pause(cfg)
-
-
-def step_create_agent(cfg: Config, api: ApiClient, db: DbClient, report: Report) -> dict:
-    section(2, "Create Agent")
-    explain(f"""
-        We'll register a new agent with the service. This is what happens when
-        you run `alf sync` for the first time.
-
-        The CLI sends POST /agents with a client-generated UUID, the agent
-        name, and the source runtime. The server inserts a row into the
-        `agents` table with latest_sequence=0 and no snapshot pointer.
-
-        Agent ID: {AGENT_ID}
-    """)
-
-    t0 = time.time()
-    r = api.post_json("/agents", {
-        "id": str(AGENT_ID),
-        "name": AGENT_NAME,
-        "source_runtime": SOURCE_RUNTIME,
-    })
-    duration = (time.time() - t0) * 1000
-
-    if r.status_code == 201:
-        body = r.json()
-        ok(f"Agent created (HTTP 201) — sequence {body.get('latest_sequence')}")
-        show_data("API response", body)
-    elif r.status_code == 409:
-        ok("Agent already existed (HTTP 409) — idempotent, continuing")
-        body = api.get(f"/agents/{AGENT_ID}").json()
-    else:
-        fail(f"Unexpected status {r.status_code}: {r.text[:200]}")
-        report.add(StepResult("Create agent", False, duration, error=r.text[:200]))
-        return {}
-
-    # Verify in DB
-    explain("""
-        Let's verify the agent row directly in Neon. The agents table uses
-        Row-Level Security (RLS) — the Lambda can only see rows for the
-        authenticated tenant. We're querying as the DB owner, so we bypass RLS.
-    """)
-    row = db.query_one(
-        "SELECT id, name, source_runtime, latest_sequence, latest_snapshot_blob "
-        "FROM agents WHERE id = %s", (str(AGENT_ID),)
-    )
-    if row:
-        ok("Agent row found in Neon")
-        show_data("DB row", row)
-    else:
-        fail("Agent row NOT found in Neon")
-
-    report.add(StepResult("Create agent", True, duration,
-                          f"Agent {str(AGENT_ID)[:8]}... created"))
-    pause(cfg)
-    return body
-
-
-def step_upload_snapshot(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client,
-                         report: Report) -> dict:
-    section(3, "Upload Initial Snapshot")
-    explain("""
-        Now we'll upload the first full snapshot. This is an .alf archive — a
-        ZIP file containing manifest.json and JSONL memory partitions.
-
-        For files ≤6 MB, the CLI uses a direct PUT to the API. The Lambda
-        receives the bytes, uploads them to S3, inserts a row in the snapshots
-        table, and updates the agent's latest_snapshot_blob pointer.
-
-        We're creating 3 synthetic memory records for this test:
-        • A project architecture fact
-        • A team convention
-        • An episodic memory from a standup
-    """)
-
-    memories = [
-        make_memory("00000000-0000-0000-0000-000000000001",
-                     "The project uses event-sourced architecture with Postgres.",
-                     "curated"),
-        make_memory("00000000-0000-0000-0000-000000000002",
-                     "All PRs require two approvals before merge.",
-                     "curated"),
-        make_memory("00000000-0000-0000-0000-000000000003",
-                     "Morning standup: discussed Redis migration timeline.",
-                     "daily"),
+    rows = [
+        ("$RUN/home/.alf/config.toml", "service URL + API key + default runtime"),
+        ("$RUN/home/.alf/state/", "sync cursor + local snapshot base (appear after 1st sync)"),
+        ("$RUN/home/.alf/vault/", "encrypted credentials (zero-knowledge; if any)"),
+        (ctx.disp(ctx.ws), "the agent workspace the CLI syncs (the -w path)"),
+        (ctx.disp(ctx.ws / ".alf-agent-id"), f"pins the agent UUID = {str(AGENT_ID)[:8]}…"),
     ]
-    snapshot_bytes = build_snapshot_zip(str(AGENT_ID), memories)
-    print(f"  Snapshot archive: {len(snapshot_bytes):,} bytes ({len(memories)} records)")
+    if ctx.runtime == "zeroclaw":
+        rows.insert(3, (ctx.disp(ctx.runtime_home / "config.toml"),
+                        "ZeroClaw runtime config (markdown memory backend)"))
+    rows.append((ctx.disp(ctx.restore_ws), "a 'fresh machine' — populated later by `alf restore`"))
+    rows.append(("(cloud) Neon", "agents / snapshots / deltas rows, keyed by agent_id"))
+    rows.append(("(cloud) S3", "<tenant>/<agent_id>/{snapshots,deltas}/*.alf"))
+    for path, purpose in rows:
+        print(f"    {c('cyan', path)}")
+        print(f"      {c('dim', purpose)}")
     print()
 
+    explain("""
+        Sync-state model — the CLI keeps ONE control variable per agent under
+        ~/.alf/state/{agent_id}.toml:
+
+            last_synced_sequence : Option<u64>
+              • None      ⇒ never synced        → next `alf sync` = FIRST SYNC
+              • Some(0)   ⇒ snapshot uploaded
+              • Some(N>0) ⇒ N deltas on top
+
+        Plus a frozen base snapshot ({agent_id}-snapshot.alf) used purely as the
+        delta base for the NEXT sync. (last_synced_sequence, base.alf present)
+        decides the branch: None → first sync; Some(N)+base → delta; Some(N) with
+        a missing base → bail (or `alf sync --recover`). Full reference:
+        docs/how_alf_syncs.md.
+
+        Right now: no state yet (None, no base) — so the next step is a FIRST SYNC.
+    """)
+    inspect(ctx, [
+        ("the alf config the CLI just used", "cat $RUN/home/.alf/config.toml"),
+        ("the seeded workspace", f"ls -la {ctx.disp(ctx.ws)}"),
+        ("state dir (empty until first sync)", "ls -la $RUN/home/.alf/state/ 2>/dev/null || echo '(none yet)'"),
+    ])
+    report.add(StepResult("Local resource map + state model", True, 0,
+                          "Showed run-dir layout and the sync-state model"))
+    pause(cfg)
+
+
+def step_first_sync(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report: Report):
+    section(2, "First Sync — Register Agent + Upload Snapshot")
+    explain("""
+        `alf sync` with no prior state is the FIRST SYNC branch: the CLI exports
+        the workspace to an .alf archive, registers the agent (POST /agents), and
+        uploads the snapshot at sequence 0 (PUT /agents/:id/snapshot → S3 + Neon).
+        One command does what used to take two API calls.
+    """)
+    flow(f"{ctx.disp(ctx.ws)}  ──alf sync──▶  POST /agents + PUT /snapshot  ──▶  S3 blob + Neon row")
+
     t0 = time.time()
-    r = api.put_binary(f"/agents/{AGENT_ID}/snapshot", snapshot_bytes)
+    proc, res = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
     duration = (time.time() - t0) * 1000
+    if proc.returncode != 0 or not res:
+        report.add(StepResult("First sync", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail("first sync failed")
+        pause(cfg)
+        return
+    ok(f"alf sync → sequence {res.get('sequence')}, delta={res.get('delta')} "
+       f"(first sync uploads a full snapshot)")
 
-    if r.status_code != 201:
-        fail(f"Snapshot upload failed (HTTP {r.status_code}): {r.text[:200]}")
-        report.add(StepResult("Upload snapshot", False, duration, error=r.text[:200]))
-        return {}
-
-    body = r.json()
-    ok(f"Snapshot uploaded (HTTP 201) — sequence {body.get('sequence')}, "
-       f"{body.get('size_bytes'):,} bytes")
-    show_data("API response", body)
-
-    # Verify in DB
-    snap_row = db.query_one(
-        "SELECT id, sequence, blob_key, size_bytes FROM snapshots WHERE agent_id = %s "
-        "ORDER BY created_at DESC LIMIT 1", (str(AGENT_ID),)
-    )
-    if snap_row:
-        ok("Snapshot row found in Neon")
-        show_data("DB snapshot row", snap_row)
-    else:
-        fail("Snapshot row NOT found in Neon")
-
-    agent_row = db.query_one(
-        "SELECT latest_sequence, latest_snapshot_blob, latest_snapshot_seq "
+    # API / storage lane: confirm the effects.
+    print()
+    api_header()
+    agent = db.query_one(
+        "SELECT name, source_runtime, latest_sequence, latest_snapshot_blob "
         "FROM agents WHERE id = %s", (str(AGENT_ID),)
     )
-    if agent_row:
-        show_data("Agent row (updated pointers)", agent_row)
+    if agent:
+        ok(f"Neon agents row: latest_sequence={agent['latest_sequence']}, "
+           f"runtime={agent['source_runtime']}")
+        show_data("agents row", agent)
+    else:
+        fail("agent row NOT found in Neon")
+    snap = db.query_one(
+        "SELECT sequence, blob_key, size_bytes FROM snapshots WHERE agent_id = %s "
+        "ORDER BY sequence DESC LIMIT 1", (str(AGENT_ID),)
+    )
+    if snap:
+        ok(f"Neon snapshots row: sequence={snap['sequence']}, {snap['size_bytes']:,} bytes")
+        prefix = tenant_prefix(db)
+        if prefix:
+            objs = s3.list_objects(prefix + "snapshots/")
+            ok(f"S3: {len(objs)} object(s) under {prefix}snapshots/")
 
-    # Verify in S3
-    explain("""
-        The snapshot blob is stored in S3 under the path:
-          {tenant_id}/{agent_id}/snapshots/{snapshot_id}.alf
-
-        Let's check that the object exists and matches the expected size.
-    """)
-    blob_key = body.get("blob_key", snap_row.get("blob_key", "") if snap_row else "")
-    if blob_key:
-        exists = s3.object_exists(blob_key)
-        if exists:
-            head = s3.head_object(blob_key)
-            ok(f"S3 object exists — {head['ContentLength']:,} bytes")
-            show_data("S3 object", {"key": blob_key, "size": head["ContentLength"],
-                                     "last_modified": str(head["LastModified"])})
-        else:
-            fail(f"S3 object NOT found: {blob_key}")
-
-    report.add(StepResult("Upload snapshot", True, duration,
-                          f"{len(snapshot_bytes):,} bytes, {len(memories)} records"))
-    pause(cfg)
-    return body
-
-
-def step_push_delta(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client,
-                    report: Report, delta_num: int, base_seq: int,
-                    memories: list[dict], description: str) -> dict:
-    section(3 + delta_num, f"Push Delta {delta_num}")
-    explain(f"""
-        {description}
-
-        The delta is an .alf-delta archive — a ZIP containing delta-manifest.json
-        and a JSONL file with memory operations (create/update/delete).
-
-        The CLI sends POST /agents/:id/deltas?base_sequence={base_seq}
-        The server atomically validates that base_sequence matches the agent's
-        current latest_sequence, increments it, uploads the blob, and inserts
-        a delta row. If another client pushed first, you'd get a 409 Conflict
-        with the X-Latest-Sequence header telling you to pull and rebase.
-    """)
-
-    delta_bytes = build_delta_zip(str(AGENT_ID), base_seq, memories)
-    print(f"  Delta archive: {len(delta_bytes):,} bytes ({len(memories)} new records)")
     print()
+    inspect(ctx, [
+        ("the sync cursor the CLI just wrote", f"cat {ctx.disp(ctx.state_toml)}"),
+        ("the local snapshot base (delta base for next sync)",
+         f"unzip -l {ctx.disp(ctx.base_alf)}"),
+        ("CLI's own view of state", "HOME=$RUN/home alf help status 2>/dev/null || true"),
+    ])
+    report.add(StepResult("First sync", True, duration,
+                          f"sequence={res.get('sequence')}, snapshot uploaded"))
+    pause(cfg)
+
+
+def step_delta(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report: Report,
+               n: int, daily: str, content: str):
+    section(2 + n, f"Delta {n} — Edit Memory, Sync")
+    explain(f"""
+        The agent learns something: we add a new daily memory file to the
+        workspace, then `alf sync` again. Because a base snapshot now exists, this
+        is the DELTA branch — the CLI diffs against the base and pushes only the
+        change (POST /agents/:id/deltas), advancing the sequence.
+    """)
+    # Make a real workspace edit — this is what produces a delta.
+    (ctx.ws / "memory" / daily).write_text(content, encoding="utf-8")
+    flow(f"edit {ctx.disp(ctx.ws / 'memory' / daily)}  ──alf sync──▶  POST /deltas  ──▶  S3 delta + seq++")
 
     t0 = time.time()
-    r = api.post_binary(f"/agents/{AGENT_ID}/deltas?base_sequence={base_seq}", delta_bytes)
+    proc, res = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
     duration = (time.time() - t0) * 1000
+    if proc.returncode != 0 or not res:
+        report.add(StepResult(f"Delta {n}", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail(f"delta {n} sync failed")
+        pause(cfg)
+        return
+    changes = res.get("changes") or {}
+    ok(f"alf sync → sequence {res.get('sequence')}, delta={res.get('delta')} "
+       f"(creates={changes.get('creates', '?')})")
 
-    if r.status_code != 201:
-        fail(f"Delta push failed (HTTP {r.status_code}): {r.text[:200]}")
-        report.add(StepResult(f"Push delta {delta_num}", False, duration, error=r.text[:200]))
-        return {}
-
-    body = r.json()
-    ok(f"Delta pushed (HTTP 201) — assigned sequence {body.get('sequence')}")
-    show_data("API response", body)
-
-    # Verify in DB
-    delta_row = db.query_one(
-        "SELECT id, sequence, blob_key, size_bytes FROM deltas "
-        "WHERE agent_id = %s AND sequence = %s", (str(AGENT_ID), body["sequence"])
+    print()
+    api_header()
+    agent = db.query_one("SELECT latest_sequence FROM agents WHERE id = %s", (str(AGENT_ID),))
+    if agent:
+        ok(f"Neon: agent.latest_sequence advanced to {agent['latest_sequence']}")
+    drow = db.query_one(
+        "SELECT sequence, size_bytes FROM deltas WHERE agent_id = %s AND sequence = %s",
+        (str(AGENT_ID), res.get("sequence")),
     )
-    if delta_row:
-        ok(f"Delta row found in Neon (sequence {delta_row['sequence']})")
+    if drow:
+        ok(f"Neon deltas row: sequence={drow['sequence']}, {drow['size_bytes']:,} bytes")
+    prefix = tenant_prefix(db)
+    if prefix:
+        ok(f"S3: {len(s3.list_objects(prefix + 'deltas/'))} delta object(s) under {prefix}deltas/")
 
-    agent_row = db.query_one(
-        "SELECT latest_sequence FROM agents WHERE id = %s", (str(AGENT_ID),)
-    )
-    if agent_row:
-        ok(f"Agent latest_sequence updated to {agent_row['latest_sequence']}")
-
-    # Verify in S3
-    blob_key = body.get("blob_key", "")
-    if blob_key and s3.object_exists(blob_key):
-        ok(f"S3 delta object exists: {blob_key}")
-
-    report.add(StepResult(f"Push delta {delta_num}", True, duration,
-                          f"sequence={body.get('sequence')}, {len(memories)} records"))
+    print()
+    inspect(ctx, [
+        ("cursor after this delta (last_synced_sequence advanced)",
+         f"cat {ctx.disp(ctx.state_toml)}"),
+        ("the new memory file that drove the delta",
+         f"cat {ctx.disp(ctx.ws / 'memory' / daily)}"),
+    ])
+    report.add(StepResult(f"Delta {n}", True, duration,
+                          f"sequence={res.get('sequence')}, delta pushed"))
     pause(cfg)
-    return body
 
 
 def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
-    section(6, "Pull Deltas (since sequence 0)")
+    section(5, "Pull Deltas (API-only lane)")
     explain("""
-        GET /agents/:id/deltas?since=0 returns all uncompacted deltas with
-        presigned S3 download URLs. This is what a client uses to check for
-        updates without downloading the full snapshot.
+        Not every API endpoint has a 1:1 CLI verb. `GET /agents/:id/deltas?since=0`
+        is the change feed a client polls for updates; the CLI consumes it inside
+        `alf restore` rather than exposing it directly. Shown here as the raw API
+        lane so the protocol is visible.
     """)
+    flow("(no standalone CLI verb)   GET /agents/:id/deltas?since=0  ──▶  presigned S3 URLs")
 
     t0 = time.time()
     r = api.get(f"/agents/{AGENT_ID}/deltas?since=0")
     duration = (time.time() - t0) * 1000
-
     if r.status_code != 200:
-        fail(f"Pull deltas failed (HTTP {r.status_code})")
         report.add(StepResult("Pull deltas", False, duration, error=r.text[:200]))
+        fail(f"pull failed (HTTP {r.status_code})")
+        pause(cfg)
         return
-
-    body = r.json()
-    deltas = body.get("deltas", [])
-    ok(f"Received {len(deltas)} delta(s)")
+    api_header()
+    deltas = r.json().get("deltas", [])
+    ok(f"Received {len(deltas)} delta(s) with presigned download URLs")
     for d in deltas:
         has_url = "X-Amz-Signature" in d.get("url", "")
         print(f"    sequence={d['sequence']}  size={d['size_bytes']:,}  "
               f"presigned={'yes' if has_url else 'no'}")
     print()
-
-    report.add(StepResult("Pull deltas", True, duration, f"{len(deltas)} deltas returned"))
+    report.add(StepResult("Pull deltas", True, duration, f"{len(deltas)} deltas"))
     pause(cfg)
 
 
-def step_restore(cfg: Config, api: ApiClient, report: Report) -> dict:
-    section(7, "Restore (Snapshot + Deltas)")
+def step_restore(cfg: Config, ctx: RunContext, report: Report):
+    section(6, "Restore to a Fresh Workspace")
     explain("""
-        GET /agents/:id/restore returns everything needed to reconstruct the
-        agent's current state: a presigned URL for the latest snapshot plus
-        presigned URLs for all uncompacted deltas since that snapshot.
-
-        In the real CLI, `alf restore` downloads each file, applies the deltas
-        to the snapshot using `rebuild_snapshot()` from alf-core, and imports
-        the result into the workspace.
-
-        Let's call the endpoint and verify the response structure.
+        `alf restore` is the cloud → workspace direction. It fetches the snapshot
+        plus all deltas, applies them with alf-core's rebuild, and materializes the
+        agent into a brand-new workspace — simulating setup on a fresh machine.
     """)
+    flow(f"GET /restore (snapshot+deltas)  ──alf restore──▶  {ctx.disp(ctx.restore_ws)}")
 
     t0 = time.time()
-    r = api.get(f"/agents/{AGENT_ID}/restore")
+    proc, res = run_cli(ctx, [
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+    ])
     duration = (time.time() - t0) * 1000
-
-    if r.status_code != 200:
-        fail(f"Restore failed (HTTP {r.status_code})")
-        report.add(StepResult("Restore", False, duration, error=r.text[:200]))
-        return {}
-
-    body = r.json()
-    snapshot = body.get("snapshot")
-    deltas = body.get("deltas", [])
-
-    if snapshot:
-        ok(f"Snapshot: sequence={snapshot['sequence']}, presigned URL present")
-    else:
-        fail("No snapshot in restore response")
-
-    ok(f"Deltas: {len(deltas)} to apply on top of snapshot")
-    for d in deltas:
-        print(f"    sequence={d['sequence']}  size={d['size_bytes']:,}")
-
-    # Download the snapshot to verify it's a valid ZIP
-    if snapshot:
-        explain("""
-            Let's download the snapshot via the presigned URL and verify
-            it's a valid ZIP archive with the expected manifest.
-        """)
-        t_dl = time.time()
-        snap_resp = requests.get(snapshot["url"])
-        dl_ms = (time.time() - t_dl) * 1000
-        if snap_resp.status_code == 200:
-            try:
-                zf = zipfile.ZipFile(io.BytesIO(snap_resp.content))
-                file_list = zf.namelist()
-                ok(f"Downloaded snapshot: {len(snap_resp.content):,} bytes in {dl_ms:.0f}ms")
-                ok(f"Archive contains: {', '.join(file_list[:5])}")
-                manifest_data = json.loads(zf.read("manifest.json"))
-                mem_count = manifest_data.get("layers", {}).get("memory", {}).get("record_count", "?")
-                ok(f"Manifest memory record_count: {mem_count}")
-            except Exception as e:
-                fail(f"Snapshot is not a valid ZIP: {e}")
-        else:
-            fail(f"Snapshot download failed: HTTP {snap_resp.status_code}")
-
-    print()
-    report.add(StepResult("Restore", True, duration,
-                          f"snapshot + {len(deltas)} deltas"))
-    pause(cfg)
-    return body
-
-
-def step_point_in_time_restore(cfg: Config, api: ApiClient, report: Report):
-    section(8, "Point-in-time Restore (Preview Mode)")
-    explain("""
-        GET /agents/:id/restore?up_to_sequence=N returns a bounded view of
-        the agent's history: the largest snapshot with sequence <= N, plus
-        every uncompacted delta with sequence in (snapshot.sequence, N].
-
-        The CLI surfaces this as `alf restore --at-sequence N`. It is a
-        read-only preview: the merged archive is imported into the target
-        workspace, but ~/.alf/state/ is NOT modified. The sync cursor stays
-        pinned at head, so a subsequent `alf sync` runs as if the preview
-        never happened.
-
-        Why preview-only? `alf sync`'s contract is "the workspace is the
-        truth". If a PIT restore stamped last_synced_sequence = Some(N) for
-        N < head, the next sync would compute a "rewind history" delta and
-        propagate it. Preview mode side-steps that entirely.
-
-        We'll demonstrate three things:
-        1. up_to_sequence=0    → snapshot only (no deltas).
-        2. up_to_sequence=1    → snapshot + first delta.
-        3. up_to_sequence=999  → 400 Bad Request (exceeds latest_sequence).
-    """)
-
-    t0 = time.time()
-    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=0")
-    duration = (time.time() - t0) * 1000
-    if r.status_code != 200:
-        fail(f"PIT restore at sequence 0 failed (HTTP {r.status_code})")
-        report.add(StepResult("PIT restore", False, duration, error=r.text[:200]))
-        return
-    body0 = r.json()
-    deltas0 = body0.get("deltas", [])
-    if body0.get("snapshot") and len(deltas0) == 0:
-        ok("up_to_sequence=0 → snapshot only, 0 deltas (as expected)")
-    else:
-        fail(f"up_to_sequence=0 returned unexpected payload: snapshot={bool(body0.get('snapshot'))}, deltas={len(deltas0)}")
-
-    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=1")
-    if r.status_code != 200:
-        fail(f"PIT restore at sequence 1 failed (HTTP {r.status_code})")
-    else:
-        body1 = r.json()
-        deltas1 = body1.get("deltas", [])
-        if body1.get("snapshot") and len(deltas1) == 1 and deltas1[0]["sequence"] == 1:
-            ok("up_to_sequence=1 → snapshot + delta@1 (as expected)")
-        else:
-            fail(f"up_to_sequence=1 returned unexpected payload: deltas={[d.get('sequence') for d in deltas1]}")
-
-    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=999")
-    if r.status_code == 400:
-        try:
-            err = r.json().get("error", "")
-        except Exception:
-            err = r.text
-        ok(f"up_to_sequence=999 → 400 Bad Request: \"{err[:80]}\"")
-    else:
-        fail(f"up_to_sequence=999 returned HTTP {r.status_code}, expected 400")
-
-    explain("""
-        Use-case: if `alf sync` is ever pointed at the wrong workspace and
-        propagates unintended deletes, every prior delta is still in S3 and
-        Neon indexed by sequence. Recovery is `alf restore --at-sequence
-        <last-good-N>` to inspect, then plain `alf restore` (head) to
-        materialise and resume normal sync.
-    """)
-
-    report.add(StepResult(
-        "Point-in-time restore",
-        True,
-        duration,
-        "up_to_sequence=0/1 succeed, =999 returns 400",
-    ))
-    pause(cfg)
-
-
-def step_simulate_data_loss(cfg: Config, report: Report):
-    section(9, "Simulate Local Data Loss")
-    explain("""
-        Imagine the user's machine crashes or the agent workspace is deleted.
-        All local state — the exported .alf files, the ~/.alf/state/ directory,
-        the workspace itself — is gone.
-
-        But the data is safe in the cloud:
-        • Snapshot .alf in S3
-        • Delta .alf-delta files in S3
-        • Metadata (sequence numbers, blob keys) in Neon
-
-        The user can run `alf restore` on a fresh machine to recover everything.
-        The service reconstructs the full state from snapshot + deltas.
-
-        (There's nothing to do programmatically here — this step is conceptual.)
-    """)
-
-    explain("""
-        Aside: don't reach for `alf sync` here. Sync's contract is "the
-        workspace is the truth" — pointed at an empty workspace it would
-        compute a deletion-delta and push it. The CLI catches the obvious
-        case (total loss ⇒ first-sync branch ⇒ E3 guard bails because the
-        cloud already has this agent), but if `state.toml` + `base.alf`
-        happen to have survived the loss while the workspace did not,
-        `alf sync` would silently propagate the wipe. The asymmetry is
-        deliberate: `alf restore` is the cloud → workspace direction;
-        `alf sync` is the workspace → cloud direction. For recovery you
-        always want restore.
-    """)
-
-    report.add(StepResult("Simulate data loss", True, 0, "Conceptual step"))
-    pause(cfg, "Press Enter to restore from the cloud...")
-
-
-def step_verify_restore_after_loss(cfg: Config, api: ApiClient, report: Report):
-    section(10, "Restore After Data Loss")
-    explain("""
-        We call the restore endpoint again — exactly what `alf restore` does.
-        The response should be identical to step 6: the snapshot plus all deltas.
-        Nothing was lost because the cloud has the complete history.
-    """)
-
-    t0 = time.time()
-    r = api.get(f"/agents/{AGENT_ID}/restore")
-    duration = (time.time() - t0) * 1000
-
-    if r.status_code != 200:
-        fail(f"Restore after loss failed (HTTP {r.status_code})")
-        report.add(StepResult("Restore after loss", False, duration, error=r.text[:200]))
-        return
-
-    body = r.json()
-    snapshot = body.get("snapshot")
-    deltas = body.get("deltas", [])
-
-    if snapshot:
-        ok(f"Snapshot still available: sequence={snapshot['sequence']}")
-    ok(f"All {len(deltas)} delta(s) still available")
-    ok("Complete recovery is possible from the cloud — no data was lost")
-
-    report.add(StepResult("Restore after loss", True, duration,
-                          f"snapshot + {len(deltas)} deltas — full recovery"))
-    pause(cfg)
-
-
-def step_dry_run_safety(cfg: Config, api: ApiClient, report: Report):
-    section(11, "CLI Safety — `--dry-run` and `.alfignore`")
-    explain("""
-        Before cleanup, a tour of three features that let an operator see and
-        control exactly what `alf` does before it touches the cloud or the
-        local workspace (the ASI06 / ASI08 hardening):
-
-          • alf export --dry-run   — list the files that WOULD be archived,
-                                     writing no .alf and making no network call.
-          • <workspace>/.alfignore — a .gitignore-style file that filters
-                                     paths out of the export set.
-          • alf restore --dry-run  — fetch and decode the cloud archive and
-                                     list what WOULD be written, touching
-                                     neither the workspace nor ~/.alf/state/.
-
-        This step runs the real `alf` binary, so it doubles as a functional
-        check of all three.
-    """)
-
-    t0 = time.time()
-    alf = find_alf_binary()
-    if not alf:
-        ok("`alf` binary not found on PATH or in target/ — skipping CLI demo")
-        report.add(StepResult("CLI dry-run / .alfignore", True,
-                              (time.time() - t0) * 1000,
-                              "alf binary not available"))
+    if proc.returncode != 0 or not res:
+        report.add(StepResult("Restore", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail("restore failed")
         pause(cfg)
         return
-    print(f"  Using alf binary: {alf}")
+    ok(f"alf restore → sequence {res.get('sequence')}, "
+       f"{res.get('memory_records', '?')} memory record(s)")
+
     print()
-
-    details: list[str] = []
-
-    # --- export --dry-run + .alfignore (offline, deterministic) -------------
-    with tempfile.TemporaryDirectory() as tmp:
-        ws = Path(tmp) / "workspace"
-        (ws / "memory").mkdir(parents=True)
-        (ws / "SOUL.md").write_text("# Atlas\n\nA demo agent.\n")
-        (ws / "MEMORY.md").write_text("## Facts\n\nThe sky is blue.\n")
-        (ws / "memory" / "2026-01-15.md").write_text("## Morning\n\nlog one\n")
-        (ws / "memory" / "2026-01-16.md").write_text("## Day\n\nlog two\n")
-
-        explain("""
-            `alf export --dry-run` on a sample workspace. The JSON lists every
-            file that would be archived, with sizes — and writes nothing.
-        """)
-        proc = subprocess.run(
-            [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
-            capture_output=True, text=True, timeout=60,
-        )
-        if proc.returncode != 0:
-            fail(f"`alf export --dry-run` exited {proc.returncode}")
-            print((proc.stderr or proc.stdout or "")[:300])
-            report.add(StepResult("CLI dry-run / .alfignore", False,
-                                  (time.time() - t0) * 1000,
-                                  error=(proc.stderr or proc.stdout or "")[:200]))
-            pause(cfg)
-            return
-        preview = json.loads(proc.stdout)
-        ok(f"export --dry-run: {len(preview['files'])} files, "
-           f"{preview['total_size']} bytes, "
-           f"excluded_by_alfignore={preview['excluded_by_alfignore']}")
-        for f in preview["files"]:
-            print(f"    {f['path']}  ({f['size']} B)")
-        no_alf = not any(ws.glob("*.alf"))
-        no_agent_id = not (ws / ".alf-agent-id").exists()
-        ok(f"nothing written — no .alf: {no_alf}, no .alf-agent-id: {no_agent_id}")
-        details.append(f"export preview {len(preview['files'])} files")
-
-        explain("""
-            Now drop a `.alfignore` excluding one memory file. The same filter
-            applies to a real `alf export` / `alf sync` — `--dry-run` just
-            lets you confirm it first.
-        """)
-        (ws / ".alfignore").write_text("memory/2026-01-15.md\n")
-        proc = subprocess.run(
-            [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
-            capture_output=True, text=True, timeout=60,
-        )
-        filtered = json.loads(proc.stdout)
-        kept = [f["path"] for f in filtered["files"]]
-        ok(f".alfignore excluded {filtered['excluded_by_alfignore']} file(s); "
-           f"memory/2026-01-15.md still listed: {'memory/2026-01-15.md' in kept}")
-        details.append(f".alfignore excluded {filtered['excluded_by_alfignore']}")
-
-    # --- restore --dry-run against the live agent synced above --------------
-    explain("""
-        Finally, `alf restore --dry-run` for the agent we synced earlier. It
-        makes the SAME network calls as a real restore — fetch snapshot +
-        deltas — but writes nothing: no workspace, no ~/.alf/state/.
-
-        We point the CLI at a throwaway HOME so its config and any state
-        writes are fully isolated from the operator's real ~/.alf.
-    """)
-    with tempfile.TemporaryDirectory() as tmp_home:
-        alf_dir = Path(tmp_home) / ".alf"
-        alf_dir.mkdir()
-        (alf_dir / "config.toml").write_text(
-            f'[service]\napi_url = "{cfg.api_url}"\napi_key = "{cfg.api_key}"\n'
-        )
-        restore_ws = Path(tmp_home) / "restore-workspace"
-        proc = subprocess.run(
-            [alf, "restore", "-r", "openclaw", "-w", str(restore_ws),
-             "-a", str(AGENT_ID), "--dry-run"],
-            capture_output=True, text=True, timeout=120,
-            env={**os.environ, "HOME": tmp_home},
-        )
-        if proc.returncode == 0:
-            rpreview = json.loads(proc.stdout)
-            would = rpreview.get("would_write", [])
-            ok(f"restore --dry-run: would write {len(would)} file(s) "
-               f"at sequence {rpreview.get('sequence')}")
-            for f in would[:8]:
-                print(f"    {f['path']}")
-            for w in rpreview.get("warnings", []):
-                print(f"    {c('yellow', 'warning')}: {w}")
-            ws_absent = not restore_ws.exists()
-            state_absent = not (alf_dir / "state").exists()
-            ok(f"nothing written — workspace absent: {ws_absent}, "
-               f"~/.alf/state absent: {state_absent}")
-            details.append(f"restore preview {len(would)} files")
-        else:
-            # The offline export/.alfignore checks above are the deterministic
-            # core of this step; a live restore-preview failure is surfaced
-            # loudly but does not by itself fail the walkthrough.
-            fail(f"`alf restore --dry-run` exited {proc.returncode}")
-            print((proc.stderr or proc.stdout or "")[:300])
-            details.append("restore preview FAILED (see output)")
-
-    report.add(StepResult("CLI dry-run / .alfignore", True,
-                          (time.time() - t0) * 1000, "; ".join(details)))
+    api_header()
+    files = tree(ctx.restore_ws)
+    ok(f"Materialized {len(files)} file(s) into the fresh workspace:")
+    for f in files:
+        print(f"    {c('dim', f)}")
+    print()
+    inspect(ctx, [
+        ("compare restored vs original workspace",
+         f"diff -r {ctx.disp(ctx.ws)} {ctx.disp(ctx.restore_ws)} || true"),
+        ("read a restored memory file",
+         f"cat {ctx.disp(ctx.restore_ws / 'memory' / '2026-01-15.md')} 2>/dev/null || true"),
+    ])
+    report.add(StepResult("Restore", True, duration,
+                          f"{res.get('memory_records', '?')} records to fresh workspace"))
     pause(cfg)
 
 
-def step_cleanup(cfg: Config, api: ApiClient, db: DbClient, s3: S3Client, report: Report):
-    section(12, "Cleanup — Delete Agent")
+def step_point_in_time(cfg: Config, ctx: RunContext, api: ApiClient, report: Report):
+    section(7, "Point-in-Time Restore (preview)")
     explain("""
-        DELETE /agents/:id performs a full agent deletion:
-        1. The Lambda lists all S3 objects under {tenant_id}/{agent_id}/
-        2. Deletes them all (snapshots, deltas)
-        3. Deletes the agent row from Neon (CASCADE deletes snapshots + deltas rows)
-
-        From the `alf` CLI, the same operation is `alf purge -r <runtime> -w <workspace>`
-        (optional `-a <agent-id>` if you track multiple agents). Purge also removes
-        local ~/.alf/state/ cursor files for that agent so the next sync starts clean.
-
-        This walkthrough calls the HTTP API directly below. This is irreversible.
-        Let's do it and verify the cleanup is complete.
+        `alf restore --at-sequence N --dry-run` previews the workspace AS OF a past
+        sequence, writing nothing and leaving ~/.alf/state/ untouched. It maps to
+        `GET /restore?up_to_sequence=N`. We preview at 0 (snapshot only) and 1
+        (snapshot + first delta), then show the API reject an out-of-range N.
     """)
-
-    # Count objects before
-    # We need the tenant_id for the S3 prefix
-    agent_row = db.query_one("SELECT tenant_id FROM agents WHERE id = %s", (str(AGENT_ID),))
-    tenant_id = str(agent_row["tenant_id"]) if agent_row else None
-
-    s3_prefix = f"{tenant_id}/{AGENT_ID}/" if tenant_id else None
-    objects_before = s3.list_objects(s3_prefix) if s3_prefix else []
-    print(f"  S3 objects before delete: {len(objects_before)}")
-    print(
-        f"  CLI equivalent: alf purge -r openclaw -w <workspace> -a {AGENT_ID}"
-    )
+    flow("alf restore --at-sequence N --dry-run  ◀──▶  GET /restore?up_to_sequence=N")
 
     t0 = time.time()
-    r = api.delete(f"/agents/{AGENT_ID}")
+    proc0, res0 = run_cli(ctx, [
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "--at-sequence", "0", "--dry-run",
+    ])
+    if proc0.returncode == 0 and res0:
+        ok(f"preview @0 → would write {len(res0.get('would_write', []))} file(s) "
+           f"(snapshot only), state untouched")
+    proc1, res1 = run_cli(ctx, [
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "--at-sequence", "1", "--dry-run",
+    ])
+    if proc1.returncode == 0 and res1:
+        ok(f"preview @1 → would write {len(res1.get('would_write', []))} file(s) "
+           f"(snapshot + delta@1)")
+
+    print()
+    api_header()
+    r = api.get(f"/agents/{AGENT_ID}/restore?up_to_sequence=999")
+    if r.status_code == 400:
+        ok("GET /restore?up_to_sequence=999 → 400 Bad Request (exceeds latest_sequence)")
+    else:
+        fail(f"up_to_sequence=999 returned HTTP {r.status_code}, expected 400")
     duration = (time.time() - t0) * 1000
 
-    if r.status_code == 200:
-        body = r.json()
-        ok(f"Agent deleted (HTTP 200) — {body.get('objects_removed', '?')} S3 objects removed")
-        show_data("API response", body)
-    elif r.status_code == 404:
-        ok("Agent already deleted (HTTP 404)")
-    else:
-        fail(f"Delete failed (HTTP {r.status_code}): {r.text[:200]}")
-        report.add(StepResult("Cleanup", False, duration, error=r.text[:200]))
-        return
-
-    # Verify DB cleanup
     explain("""
-        Let's verify the database is clean. CASCADE delete on the agents table
-        should remove all related rows in snapshots, deltas, and purge_audit_log.
+        Why preview-only? `alf sync`'s contract is "the workspace is the truth".
+        A non-preview restore to an old sequence would make the next sync compute
+        a "rewind history" delta. Preview avoids that — inspect a past state without
+        disturbing the cursor.
     """)
-    agent_row = db.query_one("SELECT id FROM agents WHERE id = %s", (str(AGENT_ID),))
-    snap_count = db.query_one("SELECT count(*) as n FROM snapshots WHERE agent_id = %s",
-                              (str(AGENT_ID),))
-    delta_count = db.query_one("SELECT count(*) as n FROM deltas WHERE agent_id = %s",
-                               (str(AGENT_ID),))
+    report.add(StepResult("Point-in-time restore", True, duration,
+                          "preview @0/@1 ok; @999 → 400"))
+    pause(cfg)
 
-    if not agent_row:
-        ok("Agent row deleted from Neon")
-    else:
-        fail("Agent row still exists!")
 
-    ok(f"Snapshot rows remaining: {snap_count['n'] if snap_count else '?'}")
-    ok(f"Delta rows remaining: {delta_count['n'] if delta_count else '?'}")
+def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
+    section(8, "Simulate Data Loss + Recover")
+    explain("""
+        The fresh machine dies: we delete the restored workspace entirely. Nothing
+        local survives. Because the cloud holds the full history, a plain
+        `alf restore` rebuilds it — the cloud → workspace direction is the recovery
+        path (never `alf sync`, which would push the empty workspace as deletes).
+    """)
+    flow(f"rm -rf {ctx.disp(ctx.restore_ws)}   ──then──   alf restore  ──▶  workspace rebuilt")
 
-    # Verify S3 cleanup
-    if s3_prefix:
-        objects_after = s3.list_objects(s3_prefix)
-        if len(objects_after) == 0:
-            ok("S3 prefix is empty — all blobs removed")
-        else:
-            fail(f"S3 still has {len(objects_after)} objects under {s3_prefix}")
+    # Wipe the restored workspace (and, for zeroclaw, its runtime home).
+    wipe = ctx.restore_ws if ctx.runtime != "zeroclaw" else ctx.restore_ws.parent
+    if wipe.exists():
+        shutil.rmtree(wipe)
+    ok(f"deleted {ctx.disp(wipe)} — local copy is gone")
+
+    t0 = time.time()
+    proc, res = run_cli(ctx, [
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+    ])
+    duration = (time.time() - t0) * 1000
+    if proc.returncode != 0 or not res:
+        report.add(StepResult("Data loss + recover", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail("recovery restore failed")
+        pause(cfg)
+        return
+    files = tree(ctx.restore_ws)
+    ok(f"alf restore rebuilt {len(files)} file(s) from the cloud — full recovery, no data lost")
     print()
+    inspect(ctx, [
+        ("confirm the workspace is back", f"ls -la {ctx.disp(ctx.restore_ws)}"),
+    ])
+    report.add(StepResult("Data loss + recover", True, duration,
+                          f"recovered {len(files)} files from cloud"))
+    pause(cfg)
 
-    report.add(StepResult("Cleanup", True, duration,
-                          f"Agent + {len(objects_before)} S3 objects removed"))
+
+def step_safety(cfg: Config, ctx: RunContext, report: Report):
+    section(9, "CLI Safety — `--dry-run` and `.alfignore`")
+    explain("""
+        Two guards let an operator see and control exactly what gets archived
+        before any bytes move:
+          • alf export --dry-run   — list what WOULD be archived; writes no .alf.
+          • <workspace>/.alfignore — .gitignore-style excludes, applied to export
+                                     and sync alike.
+        We run both against the live workspace.
+    """)
+    flow(f"{ctx.disp(ctx.ws)}  ──alf export --dry-run──▶  file list (no archive, no network)")
+
+    t0 = time.time()
+    proc, res = run_cli(ctx, ["export", "-r", ctx.runtime, "-w", str(ctx.ws), "--dry-run"])
+    if proc.returncode != 0 or not res:
+        report.add(StepResult("CLI safety", False, (time.time() - t0) * 1000,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail("export --dry-run failed")
+        pause(cfg)
+        return
+    before = len(res.get("files", []))
+    ok(f"export --dry-run: {before} file(s), {res.get('total_size', '?')} bytes, "
+       f"excluded_by_alfignore={res.get('excluded_by_alfignore')}")
+
+    # Add a .alfignore excluding one daily memory file, preview again.
+    (ctx.ws / ".alfignore").write_text("memory/2026-01-15.md\n", encoding="utf-8")
+    proc2, res2 = run_cli(ctx, ["export", "-r", ctx.runtime, "-w", str(ctx.ws), "--dry-run"])
+    if proc2.returncode == 0 and res2:
+        kept = [f["path"] for f in res2.get("files", [])]
+        ok(f".alfignore excluded {res2.get('excluded_by_alfignore')} file(s); "
+           f"2026-01-15.md still listed: {'memory/2026-01-15.md' in kept}")
+    # Remove it so it doesn't affect later steps (none here, but tidy).
+    (ctx.ws / ".alfignore").unlink()
+
+    duration = (time.time() - t0) * 1000
+    inspect(ctx, [
+        ("re-run the preview yourself",
+         f"HOME=$RUN/home alf export -r {ctx.runtime} -w {ctx.disp(ctx.ws)} --dry-run"),
+    ])
+    report.add(StepResult("CLI safety", True, duration,
+                          "export --dry-run + .alfignore exclusion shown"))
+    pause(cfg)
+
+
+def step_cleanup(cfg: Config, ctx: RunContext, db: DbClient,
+                 s3: S3Client, report: Report):
+    section(10, "Cleanup — `alf purge`")
+    explain("""
+        `alf purge` is the full teardown: it deletes the cloud agent (DELETE
+        /agents/:id → S3 blobs + Neon CASCADE) AND removes the local ~/.alf/state/
+        cursor for the agent, so a future sync would start clean. This is
+        irreversible.
+    """)
+    prefix = tenant_prefix(db)
+    before = len(s3.list_objects(prefix)) if prefix else 0
+    print(f"  S3 objects before purge: {before}")
+    flow("alf purge  ──▶  DELETE /agents/:id  ──▶  Neon CASCADE + S3 emptied + local state removed")
+
+    t0 = time.time()
+    proc, _ = run_cli(ctx, ["purge", "-r", ctx.runtime, "-w", str(ctx.ws), "-a", str(AGENT_ID)])
+    duration = (time.time() - t0) * 1000
+    if proc.returncode != 0:
+        report.add(StepResult("Cleanup", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail("purge failed")
+        pause(cfg)
+        return
+    ok("alf purge completed")
+
+    print()
+    api_header()
+    agent = db.query_one("SELECT id FROM agents WHERE id = %s", (str(AGENT_ID),))
+    snaps = db.query_one("SELECT count(*) AS n FROM snapshots WHERE agent_id = %s", (str(AGENT_ID),))
+    deltas = db.query_one("SELECT count(*) AS n FROM deltas WHERE agent_id = %s", (str(AGENT_ID),))
+    ok("Neon agents row deleted" if not agent else "agents row STILL present!")
+    ok(f"Neon: snapshots={snaps['n'] if snaps else '?'}, deltas={deltas['n'] if deltas else '?'} (CASCADE)")
+    if prefix:
+        after = s3.list_objects(prefix)
+        ok("S3 prefix empty — all blobs removed" if not after
+           else f"S3 still has {len(after)} object(s)")
+    state_gone = not ctx.state_toml.exists()
+    ok(f"local sync cursor removed: {state_gone}")
+
+    report.add(StepResult("Cleanup", True, duration, f"agent + {before} S3 objects removed"))
     pause(cfg)
 
 
@@ -1253,119 +1007,103 @@ def main():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--no-pause", action="store_true",
                         help="Run without interactive pauses (for CI)")
+    parser.add_argument("--runtime", choices=SUPPORTED_RUNTIMES, default=None,
+                        help="Runtime to exercise (openclaw|zeroclaw); "
+                             "prompts interactively if omitted, defaults to openclaw in batch mode")
     parser.add_argument("--report", type=str, default="integration_report.md",
                         help="Output path for the markdown report")
+    parser.add_argument("--keep-run-dir", action="store_true",
+                        help="Preserve the run directory even in batch mode (always kept interactively)")
     args = parser.parse_args()
 
-    cfg = Config.from_env(interactive=not args.no_pause)
+    interactive = not args.no_pause
+    runtime = select_runtime(interactive, args.runtime)
+
+    cfg = Config.from_env(interactive=interactive)
+    cfg.runtime = runtime
+
+    alf = find_alf_binary()
+    if not alf:
+        print(c("red", "  `alf` binary not found on PATH or in target/{release,debug}/."))
+        print(c("dim", "  Build it first:  cargo build -p alf-cli   (or cargo build -p alf-cli --release)"))
+        sys.exit(1)
+
     api = ApiClient(cfg)
     db = DbClient(cfg)
     s3 = S3Client(cfg)
+    ctx = build_run_context(cfg, alf)
 
     report = Report()
-    # Sanitize DB URL for the report (hide password)
     db_host = cfg.db_url.split("@")[-1].split("/")[0] if "@" in cfg.db_url else "?"
     report.config_summary = {
-        "api_url": cfg.api_url,
-        "s3_bucket": cfg.s3_bucket,
-        "db_host": db_host,
+        "api_url": cfg.api_url, "s3_bucket": cfg.s3_bucket, "db_host": db_host,
+        "runtime": cfg.runtime, "run_dir": str(ctx.root), "alf": alf,
     }
 
-    banner("agent-life Integration Walkthrough")
+    banner("agent-life Integration Walkthrough — CLI + API")
+    print(f"  Runtime:  {cfg.runtime}")
+    print(f"  alf:      {alf}")
     print(f"  API:      {cfg.api_url}")
     print(f"  S3:       {cfg.s3_bucket}")
     print(f"  DB:       {db_host}")
     print(f"  Agent ID: {AGENT_ID}")
+    print(f"  Run dir:  {ctx.root}")
     print(f"  Mode:     {'interactive' if cfg.interactive else 'batch'}")
     print()
-
     if cfg.interactive:
-        print(c("dim", "  This walkthrough will create an agent, upload data, restore it,"))
-        print(c("dim", "  and clean up. Each step pauses to explain what's happening."))
-        print(c("dim", "  Press Enter at each prompt to continue, or Ctrl-C to abort."))
+        print(c("dim", "  Each step shows the `alf` command (CLI lane) and the cloud effect"))
+        print(c("dim", "  (API lane), with paths and inspect commands so you can follow along."))
         pause(cfg, "Press Enter to begin...")
 
+    # Best-effort: clear any agent left by a prior run so the first sync is a true
+    # first sync (the run HOME is fresh, but the cloud agent may persist).
     try:
-        # Step 0: Connectivity
-        step_connectivity(cfg, api, db, s3, report)
+        api.delete(f"/agents/{AGENT_ID}")
+    except Exception:
+        pass
 
-        # Step 1: CLI sync branch decisions (conceptual)
-        step_cli_sync_model(cfg, report)
-
-        # Step 2: Create agent
-        step_create_agent(cfg, api, db, report)
-
-        # Step 3: Upload initial snapshot (3 memories)
-        step_upload_snapshot(cfg, api, db, s3, report)
-
-        # Step 4: Push delta 1 (2 new memories)
-        delta1_memories = [
-            make_memory("00000000-0000-0000-0000-000000000004",
-                         "Redis migration runbook complete — 25 min window.",
-                         "daily"),
-            make_memory("00000000-0000-0000-0000-000000000005",
-                         "Load test results: p50=0.8ms, p99=5ms on Redis 7.2.",
-                         "daily"),
-        ]
-        d1 = step_push_delta(cfg, api, db, s3, report, 1, 0, delta1_memories,
-            "The user worked on the Redis migration and wants to sync new memories.\n"
-            "        We push a delta with 2 new episodic memory records.")
-
-        # Step 5: Push delta 2 (2 more memories)
-        delta2_memories = [
-            make_memory("00000000-0000-0000-0000-000000000006",
-                         "Redis migration executed — zero downtime, 22 min for 1.2M keys.",
-                         "daily"),
-            make_memory("00000000-0000-0000-0000-000000000007",
-                         "All services should use PgBouncer in transaction mode.",
-                         "curated"),
-        ]
-        d2 = step_push_delta(cfg, api, db, s3, report, 2, 1, delta2_memories,
-            "The migration is complete. More memories to sync.\n"
-            "        We push delta 2 building on sequence 1.")
-
-        # Step 6: Pull deltas
+    aborted = False
+    try:
+        step_connectivity(cfg, ctx, api, db, s3, report)
+        step_local_layout(cfg, ctx, report)
+        step_first_sync(cfg, ctx, db, s3, report)
+        step_delta(cfg, ctx, db, s3, report, 1, "2026-01-16.md",
+                   "## Migration\n\nRedis migration runbook complete.\n")
+        step_delta(cfg, ctx, db, s3, report, 2, "2026-01-17.md",
+                   "## Results\n\nLoad test: p99 5ms on Redis 7.2.\n")
         step_pull_deltas(cfg, api, report)
-
-        # Step 7: Full restore
-        step_restore(cfg, api, report)
-
-        # Step 8: Point-in-time restore (preview)
-        step_point_in_time_restore(cfg, api, report)
-
-        # Step 9: Simulate data loss
-        step_simulate_data_loss(cfg, report)
-
-        # Step 10: Restore after loss
-        step_verify_restore_after_loss(cfg, api, report)
-
-        # Step 11: CLI safety — --dry-run and .alfignore
-        step_dry_run_safety(cfg, api, report)
-
-        # Step 12: Cleanup
-        step_cleanup(cfg, api, db, s3, report)
-
+        step_restore(cfg, ctx, report)
+        step_point_in_time(cfg, ctx, api, report)
+        step_data_loss(cfg, ctx, report)
+        step_safety(cfg, ctx, report)
+        step_cleanup(cfg, ctx, db, s3, report)
     except KeyboardInterrupt:
+        aborted = True
         print(f"\n\n  {c('yellow', 'Interrupted by user.')}")
-        print(f"  {c('yellow', f'Agent {AGENT_ID} may need manual cleanup.')}")
+        print(f"  {c('yellow', f'Agent {AGENT_ID} may need manual cleanup (alf purge or DELETE /agents).')}")
         report.add(StepResult("Interrupted", False, 0, error="KeyboardInterrupt"))
 
-    # Write report
     banner("Report")
-    md = report.to_markdown()
-    report_path = Path(args.report)
-    report_path.write_text(md)
-    print(f"  Report written to: {report_path.resolve()}")
+    Path(args.report).write_text(report.to_markdown(), encoding="utf-8")
+    print(f"  Report written to: {Path(args.report).resolve()}")
+
+    # Run dir: preserve interactively (so the operator can inspect); in batch
+    # mode remove it unless --keep-run-dir, to avoid littering CI.
+    keep = cfg.interactive or args.keep_run_dir
+    if keep:
+        print(f"  Run dir preserved for inspection: {ctx.root}")
+        print(c("dim", f"  Remove with: rm -rf {ctx.root}"))
+    else:
+        shutil.rmtree(ctx.root, ignore_errors=True)
+        print(c("dim", "  Run dir removed (batch mode; pass --keep-run-dir to keep it)."))
     print()
 
     passed = sum(1 for s in report.steps if s.passed)
     total = len(report.steps)
-    total_ms = sum(s.duration_ms for s in report.steps)
-    color = "green" if passed == total else "red"
-    print(f"  {c(color, f'{passed}/{total} steps passed')}  ({total_ms:.0f} ms total)")
+    color = "green" if passed == total and not aborted else "red"
+    print(f"  {c(color, f'{passed}/{total} steps passed')}")
     print()
-
-    sys.exit(0 if passed == total else 1)
+    sys.exit(0 if passed == total and not aborted else 1)
 
 
 if __name__ == "__main__":

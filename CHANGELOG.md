@@ -2,12 +2,23 @@
 
 ### Added
 
+- **`alf add` now works for ZeroClaw — full CLI command parity between runtimes.** Tracking an arbitrary workspace file for sync (`alf add <path>`) was previously OpenClaw-only and hard-failed for ZeroClaw. The include-list machinery is runtime-agnostic, so it now lives in `alf-core` (`alf_core::include`: `IncludeList`, `IncludeEntry`, `INCLUDE_FILE`, `SYNC_LOG_FILE`, `normalize_include_path`, `prune_and_log_missing`), and both adapters' `export` pack the tracked files plus the `.alf-include.json` / `.alf-sync-log.md` sentinels under `raw/{runtime}/`. As a result `alf add`, `alf sync`'s tracked-file re-snapshot trigger, and the delete→prune→log lifecycle all behave identically for `openclaw` and `zeroclaw`. The `adapter_openclaw::{IncludeList, INCLUDE_FILE, …}` re-exports are retained, so existing imports keep compiling.
 - **`alf check -r zeroclaw` now discovers the ZeroClaw workspace.** When no `-w` flag or `[defaults] workspace` is set, `check` reads `workspace_dir` from `~/.zeroclaw/config.toml` (a top-level key in ZeroClaw's V3 schema), falling back to `~/.zeroclaw`. OpenClaw discovery (`~/.openclaw/openclaw.json` → `~/.openclaw/workspace`) is unchanged; workspace resolution is now runtime-aware rather than always assuming OpenClaw.
-- **`adapter-zeroclaw` integration test suites.** The crate previously had only inline unit tests; it now has `round_trip` (export → import fidelity for the root Markdown files + redacted `config.toml`), `dry_run` (`enumerate_workspace` / `enumerate_archive` previews), and `cross_import` (reconstruct a ZeroClaw workspace from a generic, raw-source-less ALF archive). The cross-import fixture is built directly from `alf-core` — not via a sibling adapter — so each adapter still depends only on its own runtime and `alf-core`.
+- **`alf check` config diagnostics are runtime-aware.** Checking ZeroClaw no longer emits a spurious `openclaw_config_not_found` info issue; it reports `zeroclaw_config_not_found` against `~/.zeroclaw/config.toml` instead, and the workspace-mismatch warning compares against the selected runtime's configured path.
+- **`adapter-zeroclaw` integration test suites.** The crate previously had only inline unit tests; it now has `round_trip` (export → import fidelity for the root Markdown files + redacted `config.toml`), `dry_run` (`enumerate_workspace` / `enumerate_archive` previews), `cross_import` (reconstruct a ZeroClaw workspace from a generic, raw-source-less ALF archive — built directly from `alf-core`, not via a sibling adapter, so each adapter still depends only on its own runtime and `alf-core`), and `include_tracking` (`alf add` tracked files are packed under `raw/zeroclaw/`, `missing_includes` is reported, and tracked files round-trip through import).
 
 ### Changed
 
+- **`alf add` / `alf sync` no longer gate the include list on `runtime == "openclaw"`.** Both use the shared `alf_core::include` API; `alf add` validates the runtime via the adapter registry instead of hard-rejecting non-OpenClaw runtimes. `alf-core` gains a public `include` module (additive — consumers pinning `alf-core` by git tag are unaffected until they bump the tag).
 - **Workspace clippy clean under `--all-targets -- -D warnings`.** Tidied pre-existing lints across `adapter-openclaw`, `adapter-zeroclaw`, and `alf-cli` (redundant closures → method refs, `and_then(|x| Some(y))` → `map`, `sort_by(cmp)` → `sort_by_key`, manual modulo → `is_multiple_of`, derived `Default for Config`, `len() > 0` → `!is_empty()`, `map_or(false, …)` → `is_some_and`). Behavior is unchanged.
+
+### Fixed
+
+- **`alf check` built two `issues` vectors.** A stray duplicate `let mut issues = Vec::new();` in `collect_issues` shadowed the first (harmless dead code); collapsed to one.
+
+### Version bumps
+
+- `alf-core` 0.1.1 → 0.1.2 (new public `include` module), `adapter-openclaw` 0.1.1 → 0.1.2, `adapter-zeroclaw` 0.1.1 → 0.1.2, `alf-cli` 0.1.8 → 0.1.9.
 
 ## [0.1.8] — 2026-05-23
 

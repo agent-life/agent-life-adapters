@@ -138,18 +138,26 @@ struct Issue {
 struct ResolvedWorkspace {
     path: PathBuf,
     source: String,
-    openclaw_configured_path: Option<String>,
+    /// The workspace path the runtime's own config points at, if any
+    /// (openclaw → `~/.openclaw/openclaw.json`; zeroclaw → `~/.zeroclaw/config.toml`).
+    /// Used for the workspace-mismatch warning.
+    runtime_configured_path: Option<String>,
 }
 
 fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
-    let oc_path = read_openclaw_workspace();
+    // The runtime's own configured workspace, for the mismatch diagnostic.
+    let configured = if runtime == "zeroclaw" {
+        read_zeroclaw_workspace()
+    } else {
+        read_openclaw_workspace()
+    };
 
     // Priority 1: -w flag
     if let Some(ws) = flag {
         return ResolvedWorkspace {
             path: ws.to_path_buf(),
             source: "flag".into(),
-            openclaw_configured_path: oc_path,
+            runtime_configured_path: configured,
         };
     }
 
@@ -159,7 +167,7 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
             return ResolvedWorkspace {
                 path: PathBuf::from(ws),
                 source: "alf_config".into(),
-                openclaw_configured_path: oc_path,
+                runtime_configured_path: configured,
             };
         }
     }
@@ -168,11 +176,11 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
     if runtime == "zeroclaw" {
         // ZeroClaw keeps its workspace at `workspace_dir` in
         // ~/.zeroclaw/config.toml; default to ~/.zeroclaw when unset.
-        if let Some(ws) = read_zeroclaw_workspace() {
+        if let Some(ref ws) = configured {
             return ResolvedWorkspace {
                 path: PathBuf::from(ws),
                 source: "zeroclaw_config".into(),
-                openclaw_configured_path: oc_path,
+                runtime_configured_path: configured,
             };
         }
         let default_path = alf_core::home_dir()
@@ -181,16 +189,16 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
         return ResolvedWorkspace {
             path: default_path,
             source: "default".into(),
-            openclaw_configured_path: oc_path,
+            runtime_configured_path: configured,
         };
     }
 
     // OpenClaw: agents.defaults.workspace in ~/.openclaw/openclaw.json
-    if let Some(ref ws) = oc_path {
+    if let Some(ref ws) = configured {
         return ResolvedWorkspace {
             path: PathBuf::from(ws),
             source: "openclaw.json".into(),
-            openclaw_configured_path: oc_path,
+            runtime_configured_path: configured,
         };
     }
 
@@ -202,7 +210,7 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
     ResolvedWorkspace {
         path: default_path,
         source: "default".into(),
-        openclaw_configured_path: oc_path,
+        runtime_configured_path: configured,
     }
 }
 
@@ -324,6 +332,7 @@ fn collect_issues(
     resources: &ResourceInfo,
     alf: &AlfInfo,
     resolved: &ResolvedWorkspace,
+    runtime: &str,
 ) -> Vec<Issue> {
     let mut issues = Vec::new();
 
@@ -413,36 +422,55 @@ fn collect_issues(
         });
     }
 
-    if resolved.openclaw_configured_path.is_none() {
-        let home = alf_core::home_dir().unwrap_or_default();
-        let oc_config = home.join(".openclaw").join("openclaw.json");
-        if !oc_config.exists() {
-            issues.push(Issue {
-                severity: "info".into(),
-                code: "openclaw_config_not_found".into(),
-                message: "~/.openclaw/openclaw.json not found".into(),
-                suggestion: "OpenClaw may not be installed, or uses a non-standard location".into(),
-            });
+    // Runtime config presence diagnostic. Each runtime keeps its own config
+    // (openclaw → ~/.openclaw/openclaw.json; zeroclaw → ~/.zeroclaw/config.toml),
+    // so this is selected by runtime to avoid a spurious "openclaw not installed"
+    // note when checking zeroclaw. `None` for any other runtime.
+    let home = alf_core::home_dir().unwrap_or_default();
+    let config_issue = match runtime {
+        "openclaw"
+            if resolved.runtime_configured_path.is_none()
+                && !home.join(".openclaw").join("openclaw.json").exists() =>
+        {
+            Some(("openclaw_config_not_found", "~/.openclaw/openclaw.json not found", "OpenClaw"))
         }
+        "zeroclaw" if !home.join(".zeroclaw").join("config.toml").exists() => Some((
+            "zeroclaw_config_not_found",
+            "~/.zeroclaw/config.toml not found",
+            "ZeroClaw",
+        )),
+        _ => None,
+    };
+    if let Some((code, message, name)) = config_issue {
+        issues.push(Issue {
+            severity: "info".into(),
+            code: code.into(),
+            message: message.into(),
+            suggestion: format!("{name} may not be installed, or uses a non-standard location"),
+        });
     }
 
-    // Workspace mismatch: -w differs from openclaw.json configured path
-    if ws.source == "flag" {
-        if let Some(ref oc_ws) = resolved.openclaw_configured_path {
-            let flag_canonical = PathBuf::from(&ws.path);
-            let oc_canonical = PathBuf::from(oc_ws);
-            if flag_canonical != oc_canonical {
-                issues.push(Issue {
-                    severity: "warning".into(),
-                    code: "workspace_mismatch".into(),
-                    message: format!(
-                        "-w path ({}) differs from openclaw.json configured path ({})",
-                        ws.path, oc_ws
-                    ),
-                    suggestion: "May be intentional; noting for awareness".into(),
-                });
-            }
-        }
+    // Workspace mismatch: -w differs from the runtime's configured workspace.
+    // Flattened to a single `if let` (no nested ifs) and compared as `Path`
+    // borrows so clippy is happy.
+    let mismatch = if ws.source == "flag" {
+        resolved
+            .runtime_configured_path
+            .as_deref()
+            .filter(|cfg_ws| Path::new(&ws.path) != Path::new(cfg_ws))
+    } else {
+        None
+    };
+    if let Some(cfg_ws) = mismatch {
+        issues.push(Issue {
+            severity: "warning".into(),
+            code: "workspace_mismatch".into(),
+            message: format!(
+                "-w path ({}) differs from {runtime} configured path ({cfg_ws})",
+                ws.path
+            ),
+            suggestion: "May be intentional; noting for awareness".into(),
+        });
     }
 
     issues
@@ -523,14 +551,14 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         }
     };
 
-    // OpenClaw info
+    // OpenClaw info (openclaw-only block in the JSON output).
     let openclaw = if runtime == "openclaw" {
         Some(OpenClawInfo {
-            config_found: resolved.openclaw_configured_path.is_some()
+            config_found: resolved.runtime_configured_path.is_some()
                 || alf_core::home_dir()
                     .map(|h| h.join(".openclaw").join("openclaw.json").exists())
                     .unwrap_or(false),
-            workspace_configured: resolved.openclaw_configured_path.clone(),
+            workspace_configured: resolved.runtime_configured_path.clone(),
         })
     } else {
         None
@@ -571,7 +599,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     };
 
     // Collect issues
-    let issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved);
+    let issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved, runtime);
 
     let has_errors = issues.iter().any(|i| i.severity == "error");
     let ready_to_sync = !has_errors && ws_exists;

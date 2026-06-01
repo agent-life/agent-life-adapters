@@ -223,6 +223,22 @@ This is the case behind the production failure that motivated this work.
 - More than one `*.toml` under the state directory.
 - Commands that need an agent ID (`restore`, `purge`) require `-a <agent-id>` to disambiguate. `resolve_agent_id` enforces this.
 
+### E9 — Vault never reached the cloud (pre-0.1.8 snapshot-timing + poisoned local base)
+
+The symptom: the agent has a populated local vault (`~/.alf/vault/credentials.json`, N records) but the cloud shows **0 credentials** ("Metadata only"). `alf check` is green (`ready_to_sync: true`) because it only inspects the *local* vault file — it never compares against cloud Layer 4. The web dashboard shows the giveaway: a snapshot + several deltas, but Credentials = 0 items.
+
+How an agent gets here — two facts compound:
+
+1. **Pre-0.1.8 deltas dropped Layer 4 entirely.** Credentials reached the cloud only in a full snapshot (first sync). A credential added with `alf vault add` *after* sequence 0 was silently never uploaded by any delta. (This is the gap fixed in 0.1.8 — `CHANGELOG` "Credential vault now syncs incrementally".)
+2. **The local base snapshot is poisoned.** `persist_local` copies the *full freshly-exported archive* — which always includes the live vault — over `base.alf` on **every** sync, including deltas. So the local base contains the vault even though the cloud never received it.
+
+The result is that **upgrading to 0.1.8 does not self-heal.** 0.1.8's credential delta is gated by `diff_credentials(prev_creds, curr_creds)`, where `prev_creds` is read from the *local base*. Since the poisoned local base already carries the vault and the current export carries the same vault, the by-id diff is empty → no credentials attach → the vault is never back-filled. The fix's change-detector is comparing against a local base that disagrees with the cloud.
+
+- This is the case behind the production observation: an agent on the Docker runtime whose vault never reached the cloud while a mac agent's did, purely because of snapshot timing.
+- Affects any agent that added vault credentials *after* its first sync on a CLI ≤ 0.1.6 and later upgraded.
+- Migration path: reset the diff base to the true cloud state so the live vault surfaces as `creates`. **Note the trap:** `alf sync --recover` alone is a no-op here, because `decide_sync_mode` ignores `--recover` whenever the local base is present (`(Some(N), true, _) => Delta`; see §9). You must delete the local base first. See the §11 runbook entry below.
+- Outcome: one explicit recovery operation per affected agent; no data loss (the recovery uploads a fresh credential-bearing delta at the next sequence).
+
 ## 9. What `--recover` does (and does not)
 
 `alf sync --recover` does exactly one thing beyond a normal sync: when the local base is missing, it calls the cloud's `restore` endpoint, merges the snapshot and any deltas, and writes the result to `~/.alf/state/{agent_id}-snapshot.alf`. It does **not** touch the workspace.
@@ -288,6 +304,22 @@ This is **E7**. Another writer advanced the agent's sequence in the cloud.
 
 1. `alf restore -r <runtime> -w <workspace>`.
 2. `alf sync -r <runtime> -w <workspace>`.
+
+### Symptom: local vault has credentials but the cloud shows 0 credentials
+
+This is **E9**. The vault was added after first sync on a pre-0.1.8 CLI, so it was never uploaded; the local base is poisoned (it contains the vault the cloud lacks), so a plain `alf sync` — and even `alf sync --recover` on its own — detects no credential change.
+
+The fix is to point the credential diff at the *true cloud state* by deleting the local base, then recovering:
+
+1. Connect to the runtime (`fly ssh console -a <app>` or `fly machine exec`).
+2. Resolve the home base: `$ALF_HOME` if set (the Docker runtime usually sets it to `/config`), else `$HOME`. The state dir is `<base>/.alf/state/`.
+3. Delete the poisoned local base: `rm <base>/.alf/state/<agent-id>-snapshot.alf` (leave `<agent-id>.toml` in place).
+4. Recover: `alf sync --recover -r openclaw -w /config/.openclaw/workspace`. With the base now missing, `decide_sync_mode` enters the recover branch: it pulls the cloud snapshot+deltas (which lack Layer 4) into a fresh base, then diffs the live vault against it — every credential surfaces as a `create` and is uploaded as a new delta.
+5. Verify: the sync JSON reports credential creates, and the dashboard's Credentials tab (or `alf check`'s `vault` block compared against cloud) now shows N items instead of 0.
+
+An agent running inside the runtime can execute steps 3–5 itself; only the vault file and the local base under `~/.alf` are touched, and the workspace is left alone.
+
+Alternative (less surgical): `alf add <any workspace file>` forces a full re-snapshot (§6.1), and a full snapshot carries Layer 4 — but it leaves a tracked-file artifact behind, so the delete-base + `--recover` path above is preferred.
 
 ### Symptom: nothing wrong, just want to inspect state
 

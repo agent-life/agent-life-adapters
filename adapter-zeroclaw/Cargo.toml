@@ -1,6 +1,6 @@
 [package]
 name = "adapter-zeroclaw"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "ZeroClaw framework adapter for the Agent Life Format (ALF)"
 license = "MIT"

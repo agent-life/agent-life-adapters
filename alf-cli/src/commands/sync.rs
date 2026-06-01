@@ -213,16 +213,15 @@ pub fn run(
 
     // WP3: prune tracked files (added via `alf add`) that the agent has since
     // deleted, recording each removal in `.alf-sync-log.md` — BEFORE export so
-    // the cleaned include list and the log are captured in this sync. OpenClaw
-    // only for now (it owns the include-list workspace convention).
-    if runtime == "openclaw" {
-        let removed = adapter_openclaw::prune_and_log_missing(workspace)?;
-        for rel in &removed {
-            output::progress(&format!(
-                "  Removed {rel} from sync (file no longer present; logged to {})",
-                adapter_openclaw::SYNC_LOG_FILE
-            ));
-        }
+    // the cleaned include list and the log are captured in this sync. The
+    // include list is a runtime-agnostic workspace convention (alf_core), so
+    // this applies to every runtime whose adapter packs the tracked files.
+    let removed = alf_core::prune_and_log_missing(workspace)?;
+    for rel in &removed {
+        output::progress(&format!(
+            "  Removed {rel} from sync (file no longer present; logged to {})",
+            alf_core::SYNC_LOG_FILE
+        ));
     }
 
     // Export workspace to a temp file to discover the agent ID.
@@ -580,8 +579,9 @@ fn execute_delta(
 /// Whether any agent-tracked file (`alf add`) — or the include list / sync log
 /// itself — differs between the base snapshot and the current export. Tracked
 /// files are opaque bytes the delta format can't carry, so a change here means
-/// `alf sync` must re-snapshot rather than push a delta. Non-OpenClaw runtimes
-/// have no include list, so this is always `false` for them.
+/// `alf sync` must re-snapshot rather than push a delta. The include list is a
+/// runtime-agnostic convention, so this applies to every runtime; an archive
+/// with no include list simply yields two empty maps that compare equal.
 fn tracked_files_changed<P, C>(
     runtime: &str,
     prev: &mut AlfReader<P>,
@@ -591,9 +591,6 @@ where
     P: Read + Seek,
     C: Read + Seek,
 {
-    if runtime != "openclaw" {
-        return Ok(false);
-    }
     Ok(read_tracked_map(prev, runtime)? != read_tracked_map(curr, runtime)?)
 }
 
@@ -609,17 +606,17 @@ fn read_tracked_map<R: Read + Seek>(
     let prefix = format!("raw/{runtime}/");
 
     let mut rels: Vec<String> = Vec::new();
-    let include_archive_path = format!("{prefix}{}", adapter_openclaw::INCLUDE_FILE);
+    let include_archive_path = format!("{prefix}{}", alf_core::INCLUDE_FILE);
     if names.contains(&include_archive_path) {
         let bytes = reader.read_raw_entry(&include_archive_path)?;
-        if let Ok(list) = serde_json::from_slice::<adapter_openclaw::IncludeList>(&bytes) {
+        if let Ok(list) = serde_json::from_slice::<alf_core::IncludeList>(&bytes) {
             rels = list.paths();
         }
     }
     // Track the include list + sync log themselves so any edit to the tracked
     // set or removal history also refreshes the cloud copy.
-    rels.push(adapter_openclaw::INCLUDE_FILE.to_string());
-    rels.push(adapter_openclaw::SYNC_LOG_FILE.to_string());
+    rels.push(alf_core::INCLUDE_FILE.to_string());
+    rels.push(alf_core::SYNC_LOG_FILE.to_string());
 
     let mut map = BTreeMap::new();
     for rel in rels {

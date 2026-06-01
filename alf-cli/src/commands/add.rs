@@ -2,10 +2,12 @@
 //!
 //! ALF never auto-discovers arbitrary files; the agent opts each one in
 //! explicitly. This records the file in `<workspace>/.alf-include.json`, which
-//! the next `alf sync` reads and includes in `raw/openclaw/`.
+//! the next `alf sync` reads and includes in `raw/{runtime}/`. The include-list
+//! machinery is runtime-agnostic (alf_core::include), so this works for any
+//! adapter whose `export` packs the tracked files — both openclaw and zeroclaw.
 
 use crate::output;
-use adapter_openclaw::{normalize_include_path, IncludeList};
+use alf_core::{normalize_include_path, IncludeList};
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -20,8 +22,13 @@ struct AddResult {
 }
 
 pub fn run(runtime: &str, workspace: &Path, path: &str) -> Result<()> {
-    if runtime != "openclaw" {
-        bail!("`alf add` currently supports the openclaw runtime only (got '{runtime}')");
+    // Validate the runtime so an unknown one fails clearly here rather than at
+    // sync time. The include list itself is runtime-agnostic.
+    if crate::adapter::get_adapter(runtime).is_none() {
+        bail!(
+            "Unknown runtime '{runtime}'. Supported runtimes: {}",
+            crate::adapter::supported_runtimes()
+        );
     }
     if !workspace.is_dir() {
         bail!(

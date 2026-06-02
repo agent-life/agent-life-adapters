@@ -98,6 +98,9 @@ COLORS = {
 AGENT_ID = uuid.UUID("e2e10000-feed-4000-b000-000000000001")
 AGENT_NAME = "E2E Walkthrough Agent"
 SUPPORTED_RUNTIMES = ("openclaw", "zeroclaw")
+# Default source runtime for scripts that build agent rows directly (e.g. the
+# vault walkthrough's hand-constructed snapshots, which are OpenClaw-shaped).
+SOURCE_RUNTIME = "openclaw"
 
 # ZeroClaw config.toml the CLI reads from the workspace's parent (the runtime
 # home). Markdown backend keeps the walkthrough hermetic — no SQLite seeding.
@@ -361,6 +364,16 @@ class ApiClient:
     def delete(self, path: str) -> requests.Response:
         return requests.delete(f"{self.url}{path}", headers=self.headers)
 
+    def post_json(self, path: str, body: dict) -> requests.Response:
+        return requests.post(f"{self.url}{path}", headers=self.headers, json=body)
+
+    def put_binary(self, path: str, data: bytes) -> requests.Response:
+        headers = {
+            "Authorization": self.headers["Authorization"],
+            "Content-Type": "application/octet-stream",
+        }
+        return requests.put(f"{self.url}{path}", headers=headers, data=data)
+
 
 # ---------------------------------------------------------------------------
 # DB client (direct Neon queries — bypasses RLS using owner role)
@@ -399,6 +412,16 @@ class S3Client:
     def list_objects(self, prefix: str) -> list[dict]:
         resp = self.s3.list_objects_v2(Bucket=self.bucket, Prefix=prefix)
         return resp.get("Contents", [])
+
+    def head_object(self, key: str) -> dict:
+        return self.s3.head_object(Bucket=self.bucket, Key=key)
+
+    def object_exists(self, key: str) -> bool:
+        try:
+            self.s3.head_object(Bucket=self.bucket, Key=key)
+            return True
+        except Exception:  # noqa: BLE001 - 404 (and any access error) ⇒ "not present"
+            return False
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +554,7 @@ def tree(path: Path, limit: int = 12) -> list[str]:
 # Steps
 # ---------------------------------------------------------------------------
 
-def step_connectivity(cfg: Config, ctx: RunContext, api: ApiClient, db: DbClient,
+def step_connectivity(cfg: Config, ctx: Optional[RunContext], api: ApiClient, db: DbClient,
                       s3: S3Client, report: Report):
     section(0, "Verify Connectivity")
     explain("""
@@ -568,15 +591,18 @@ def step_connectivity(cfg: Config, ctx: RunContext, api: ApiClient, db: DbClient
         errors.append(f"S3: {e}")
         fail(f"S3: {e}")
 
-    # CLI reachability: `alf check` exercises the same config + endpoint.
-    print()
-    proc, parsed = run_cli(ctx, ["check", "-r", ctx.runtime, "-w", str(ctx.ws)])
-    if proc.returncode == 0 and parsed:
-        ok(f"`alf check` ran — ready_to_sync={parsed.get('ready_to_sync')}, "
-           f"workspace source={parsed.get('workspace', {}).get('source')}")
-    else:
-        # check returns non-zero when not ready (e.g. no memory yet); that's fine
-        ok("`alf check` ran (non-zero exit is expected before first sync)")
+    # CLI reachability: `alf check` exercises the same config + endpoint. Skipped
+    # when the caller has no RunContext yet (e.g. the vault walkthrough verifies
+    # connectivity before it builds a CLI workspace).
+    if ctx is not None:
+        print()
+        proc, parsed = run_cli(ctx, ["check", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        if proc.returncode == 0 and parsed:
+            ok(f"`alf check` ran — ready_to_sync={parsed.get('ready_to_sync')}, "
+               f"workspace source={parsed.get('workspace', {}).get('source')}")
+        else:
+            # check returns non-zero when not ready (e.g. no memory yet); that's fine
+            ok("`alf check` ran (non-zero exit is expected before first sync)")
 
     duration = (time.time() - t0) * 1000
     passed = len(errors) == 0
@@ -756,8 +782,64 @@ def step_delta(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report:
     pause(cfg)
 
 
+def step_identity_principals_delta(cfg: Config, ctx: RunContext, report: Report):
+    section(5, "Delta — Identity & Principals Change")
+    explain("""
+        Memory isn't the only layer that rides a delta. When the agent edits its
+        own identity (IDENTITY.md) or adds a human principal (USER.md), `alf sync`
+        now carries those Layer 1 / Layer 2 changes in the delta too — previously
+        they were silently dropped and never reached the cloud. The change report
+        breaks the delta out per layer: `changes.identity` (bool) and
+        `changes.principals` (creates/updates/deletes).
+    """)
+    # Edit identity (adds an identity_profile + display name) and add a human
+    # principal — both new vs the base snapshot.
+    (ctx.ws / "IDENTITY.md").write_text(
+        "# Atlas\n\nThe demo agent's stated identity.\n", encoding="utf-8")
+    (ctx.ws / "USER.md").write_text(
+        "# Jordan\n\nThe human Atlas reports to.\n", encoding="utf-8")
+    flow("edit IDENTITY.md + USER.md  ──alf sync──▶  POST /deltas (Layer 1 + Layer 2)")
+
+    t0 = time.time()
+    proc, res = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+    duration = (time.time() - t0) * 1000
+    changes = (res or {}).get("changes") or {}
+    id_changed = bool(changes.get("identity"))
+    princ_creates = (changes.get("principals") or {}).get("creates", 0)
+    okay = bool(proc.returncode == 0 and res and res.get("delta") is True
+                and id_changed and princ_creates >= 1)
+    if not okay:
+        report.add(StepResult("Identity/Principals delta", False, duration,
+                              error=(proc.stderr or proc.stdout or "")[:200]))
+        fail(f"identity/principals change was not carried in the delta "
+             f"(identity={id_changed}, principals.creates={princ_creates})")
+        pause(cfg)
+        return
+    ok(f"alf sync → delta seq {res.get('sequence')}: identity changed, "
+       f"{princ_creates} principal create(s)")
+
+    # Determinism guard: re-sync with NO edit must be a no-op. Before the
+    # deterministic ids/mtime fix (0.1.9), identity/principals re-exported with
+    # fresh random ids every time and this would have churned a delta every sync.
+    explain("""
+        Re-run `alf sync` with no further edit: it must report `no_changes`.
+        That proves identity/principals export is deterministic (stable UUIDv5
+        ids + source-file mtime) — otherwise these layers would re-upload on
+        every single sync.
+    """)
+    _, res2 = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+    no_changes = bool((res2 or {}).get("no_changes"))
+    (ok if no_changes else fail)(
+        f"re-sync no_changes={no_changes} (expect true — deterministic export)")
+
+    report.add(StepResult("Identity/Principals delta", no_changes, duration,
+                          f"seq={res.get('sequence')}: identity + {princ_creates} "
+                          f"principal(s); re-sync no-op={no_changes}"))
+    pause(cfg)
+
+
 def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
-    section(5, "Pull Deltas (API-only lane)")
+    section(6, "Pull Deltas (API-only lane)")
     explain("""
         Not every API endpoint has a 1:1 CLI verb. `GET /agents/:id/deltas?since=0`
         is the change feed a client polls for updates; the CLI consumes it inside
@@ -787,7 +869,7 @@ def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
 
 
 def step_restore(cfg: Config, ctx: RunContext, report: Report):
-    section(6, "Restore to a Fresh Workspace")
+    section(7, "Restore to a Fresh Workspace")
     explain("""
         `alf restore` is the cloud → workspace direction. It fetches the snapshot
         plus all deltas, applies them with alf-core's rebuild, and materializes the
@@ -828,7 +910,7 @@ def step_restore(cfg: Config, ctx: RunContext, report: Report):
 
 
 def step_point_in_time(cfg: Config, ctx: RunContext, api: ApiClient, report: Report):
-    section(7, "Point-in-Time Restore (preview)")
+    section(8, "Point-in-Time Restore (preview)")
     explain("""
         `alf restore --at-sequence N --dry-run` previews the workspace AS OF a past
         sequence, writing nothing and leaving ~/.alf/state/ untouched. It maps to
@@ -874,7 +956,7 @@ def step_point_in_time(cfg: Config, ctx: RunContext, api: ApiClient, report: Rep
 
 
 def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
-    section(8, "Simulate Data Loss + Recover")
+    section(9, "Simulate Data Loss + Recover")
     explain("""
         The fresh machine dies: we delete the restored workspace entirely. Nothing
         local survives. Because the cloud holds the full history, a plain
@@ -912,7 +994,7 @@ def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
 
 
 def step_safety(cfg: Config, ctx: RunContext, report: Report):
-    section(9, "CLI Safety — `--dry-run` and `.alfignore`")
+    section(10, "CLI Safety — `--dry-run` and `.alfignore`")
     explain("""
         Two guards let an operator see and control exactly what gets archived
         before any bytes move:
@@ -957,7 +1039,7 @@ def step_safety(cfg: Config, ctx: RunContext, report: Report):
 
 def step_cleanup(cfg: Config, ctx: RunContext, db: DbClient,
                  s3: S3Client, report: Report):
-    section(10, "Cleanup — `alf purge`")
+    section(11, "Cleanup — `alf purge`")
     explain("""
         `alf purge` is the full teardown: it deletes the cloud agent (DELETE
         /agents/:id → S3 blobs + Neon CASCADE) AND removes the local ~/.alf/state/
@@ -1071,6 +1153,7 @@ def main():
                    "## Migration\n\nRedis migration runbook complete.\n")
         step_delta(cfg, ctx, db, s3, report, 2, "2026-01-17.md",
                    "## Results\n\nLoad test: p99 5ms on Redis 7.2.\n")
+        step_identity_principals_delta(cfg, ctx, report)
         step_pull_deltas(cfg, api, report)
         step_restore(cfg, ctx, report)
         step_point_in_time(cfg, ctx, api, report)

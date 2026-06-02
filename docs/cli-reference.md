@@ -153,7 +153,9 @@ The `workspace.source` field in the output reports which method was used: `"flag
       "vault": {
         "path": "/home/user/.alf/vault/credentials.json",
         "exists": true,
-        "credential_count": 3
+        "credential_count": 3,
+        "server_credential_count": 3,
+        "parity_ok": true
       },
       "issues": [],
       "suggestions": ["Run: alf sync -r openclaw -w /home/user/.openclaw/workspace"]
@@ -163,7 +165,7 @@ Field notes:
 
 - `version` — the `alf` CLI version (`CARGO_PKG_VERSION`), distinct from the archive's `alf_version` format version.
 - `env` — `home`, `alf_home`, and `alf_human` are omitted when the corresponding variable is unset. The three `*_set` booleans report **presence only**; secret values are never included in the output.
-- `vault` — `path` honors `ALF_HOME`; `credential_count` is omitted when the vault file is absent or unparseable (`exists` still reflects the file's presence).
+- `vault` — `path` honors `ALF_HOME`; `credential_count` is omitted when the vault file is absent or unparseable (`exists` still reflects the file's presence). `server_credential_count` is the service's delta-folded count from `GET /v1/agents/:id`, and `parity_ok` is whether it matches the local count — both omitted when the service is unreachable or no agent is tracked. When `parity_ok` is `false`, a `vault_not_synced` warning is added to `issues[]` whose suggestion is `alf sync --recover` (the credential self-heal). Counts/ids only — no plaintext leaves the machine.
 - `alf.last_synced_at` / `last_synced_sequence` — omitted when the agent has never synced.
 
 ### JSON Output (issues found)
@@ -314,7 +316,7 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 |---|---|---|---|
 | `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
-| `--recover` | | No | When the state file says we have synced before but the local base snapshot is missing, pull the cloud snapshot+deltas to repair the base, then take the normal delta path. Does not touch the workspace. No-op when the local base is already present. |
+| `--recover` | | No | Re-pull the cloud-reconstructed base (snapshot + uncompacted deltas), overwriting any local base, then take the normal delta path against it. Repairs a **missing or diverged/"poisoned"** local base — the unattended self-heal for case E9. Effective whether or not a local base already exists (since 0.1.9; previously a no-op when a base was present). Non-destructive: the workspace is untouched and the base is replaced only after a successful cloud fetch. |
 | `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
 
 Sync takes no vault-key flags: it carries the agent's ALF vault (Layer 4) into the snapshot verbatim — it is already AEAD-encrypted. See [`alf vault`](#alf-vault).
@@ -329,14 +331,16 @@ Sync takes no vault-key flags: it carries the agent's ALF vault (Layer 4) into t
         "creates": 2,
         "updates": 1,
         "deletes": 0,
-        "credentials": { "creates": 1, "updates": 0, "deletes": 0 }
+        "credentials": { "creates": 1, "updates": 0, "deletes": 0 },
+        "principals": { "creates": 1, "updates": 0, "deletes": 0 },
+        "identity": true
       },
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
       "no_changes": false,
       "recovered": false
     }
 
-`changes.creates/updates/deletes` count **memory** records; the `credentials` sub-object (omitted when zero) counts Layer 4 changes carried by this delta. A tracked-file change instead produces a re-snapshot (`"delta": false`).
+`changes.creates/updates/deletes` count **memory** records. The per-layer fields are each omitted when that layer is unchanged: `credentials` (Layer 4) and `principals` (Layer 2) count create/update/delete **by id**, and `identity` (Layer 1) is a boolean. A tracked-file change instead produces a re-snapshot (`"delta": false`).
 
 ### JSON Output (success — no changes)
 
@@ -352,7 +356,7 @@ Sync takes no vault-key flags: it carries the agent's ALF vault (Layer 4) into t
 
 ### JSON Output (success — recovered)
 
-When `--recover` was passed and the local base was actually missing, the response carries `"recovered": true` so suspend logs and other automated callers can distinguish a recovered sync from a regular delta.
+When `--recover` ran — a missing **or** diverged base was re-pulled from the cloud — the response carries `"recovered": true` so suspend logs and other automated callers can distinguish a recovered sync from a regular delta.
 
     {
       "ok": true,

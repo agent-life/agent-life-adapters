@@ -1,4 +1,4 @@
-## [0.1.9] — 2026-05-31
+## [0.1.9] — 2026-06-01
 
 ### Added
 
@@ -6,7 +6,7 @@
 - **`alf check -r zeroclaw` now discovers the ZeroClaw workspace.** When no `-w` flag or `[defaults] workspace` is set, `check` reads `workspace_dir` from `~/.zeroclaw/config.toml` (a top-level key in ZeroClaw's V3 schema), falling back to `~/.zeroclaw`. OpenClaw discovery (`~/.openclaw/openclaw.json` → `~/.openclaw/workspace`) is unchanged; workspace resolution is now runtime-aware rather than always assuming OpenClaw.
 - **`alf check` config diagnostics are runtime-aware.** Checking ZeroClaw no longer emits a spurious `openclaw_config_not_found` info issue; it reports `zeroclaw_config_not_found` against `~/.zeroclaw/config.toml` instead, and the workspace-mismatch warning compares against the selected runtime's configured path.
 - **`adapter-zeroclaw` integration test suites.** The crate previously had only inline unit tests; it now has `round_trip` (export → import fidelity for the root Markdown files + redacted `config.toml`), `dry_run` (`enumerate_workspace` / `enumerate_archive` previews), `cross_import` (reconstruct a ZeroClaw workspace from a generic, raw-source-less ALF archive — built directly from `alf-core`, not via a sibling adapter, so each adapter still depends only on its own runtime and `alf-core`), and `include_tracking` (`alf add` tracked files are packed under `raw/zeroclaw/`, `missing_includes` is reported, and tracked files round-trip through import).
-- **`alf sync` now carries identity (Layer 1) and principals (Layer 2) changes in deltas.** Previously only memory and credentials rode deltas; an agent editing its own identity/principals (e.g. `IDENTITY.md` / `USER.md`) saw "No changes detected" and the edit never reached the cloud. `alf-core` gains `diff_principals` / `PrincipalsDiff` (by-id, mirroring `diff_credentials`) and `identity_changed`; `alf sync` emits `set_identity` / `set_principals` deltas and reports the counts. **This required making identity/principals export deterministic:** both adapters previously regenerated those layers with fresh random ids (`new_v7`/`new_v4`) and `Utc::now()` on every export, which would have re-emitted them on every sync. Ids are now derived from the agent id via UUIDv5 (`alf_core::ids`) and `updated_at` from the source file mtime, so an unchanged identity/principals set re-exports identically and produces no delta.
+- **`alf sync` now carries identity (Layer 1) and principals (Layer 2) changes in deltas.** Previously only memory and credentials rode deltas; an agent editing its own identity/principals (e.g. `IDENTITY.md` / `USER.md`) saw "No changes detected" and the edit never reached the cloud. `alf-core` gains `diff_principals` / `PrincipalsDiff` (by-id, mirroring `diff_credentials`) and `identity_changed`; `alf sync` emits `set_identity` / `set_principals` deltas and reports the counts. **This required making identity/principals export deterministic:** both adapters previously regenerated those layers with fresh random ids (`new_v7`/`new_v4`) and `Utc::now()` on every export, which would have re-emitted them on every sync. Ids are now derived from the agent id via UUIDv5 (`alf_core::ids`) and `updated_at` from the source file mtime, so an unchanged identity/principals set re-exports identically and produces no delta. **Upgrade note:** the first `alf sync` on 0.1.9 after an older release emits a one-time identity/principals delta — the layer ids migrate from random (`new_v4`/`new_v7`) to deterministic, so the by-id diff sees a one-shot replace. It is harmless, carries no content change, and self-corrects on subsequent syncs.
 - **`alf check` reports vault parity with the cloud.** The `vault` block gains `server_credential_count` (the service's delta-folded count from `GET /v1/agents/:id`) and `parity_ok` (local-vs-cloud match). When they diverge, a `vault_not_synced` warning is emitted whose suggestion is the one-command self-heal (`alf sync --recover`). This lets a Haiku-class agent verify after each sync that its vault actually reached the cloud — and self-heal if not — with no operator step. Counts/ids only; no plaintext leaves the machine.
 
 ### Changed
@@ -21,7 +21,7 @@
 
 ### Version bumps
 
-- `alf-core` 0.1.1 → 0.1.3 (new public `include` and `ids` modules; `diff_principals` / `PrincipalsDiff` / `identity_changed`), `adapter-openclaw` 0.1.1 → 0.1.2, `adapter-zeroclaw` 0.1.1 → 0.1.2, `alf-cli` 0.1.8 → 0.1.9.
+- `alf-core` 0.1.1 → 0.1.3 (new public `include` and `ids` modules; `diff_principals` / `PrincipalsDiff` / `identity_changed`), `adapter-openclaw` 0.1.1 → 0.1.3, `adapter-zeroclaw` 0.1.1 → 0.1.3 (deterministic identity/principals export), `alf-cli` 0.1.8 → 0.1.9.
 
 ## [0.1.8] — 2026-05-23
 

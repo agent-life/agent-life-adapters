@@ -3,7 +3,7 @@
 //! Discovers the workspace, verifies resources, and reports readiness to sync.
 //! This is the first command an agent should run.
 
-use crate::api_client::ApiClient;
+use crate::api_client::{AgentInfo, ApiClient};
 use crate::config::Config;
 use crate::context;
 use crate::output;
@@ -121,6 +121,15 @@ struct VaultInfo {
     exists: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_count: Option<usize>,
+    /// Server-side credential count (delta-folded) from `GET /v1/agents/:id`.
+    /// `None` when the service is unreachable or no agent is tracked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_credential_count: Option<usize>,
+    /// `Some(true)` when the local and server credential counts match,
+    /// `Some(false)` on divergence (vault not fully synced), `None` when not
+    /// comparable. Lets an agent self-verify and self-heal after a sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parity_ok: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -138,16 +147,26 @@ struct Issue {
 struct ResolvedWorkspace {
     path: PathBuf,
     source: String,
-    openclaw_configured_path: Option<String>,
+    /// The workspace path the runtime's own config points at, if any
+    /// (openclaw → `~/.openclaw/openclaw.json`; zeroclaw → `~/.zeroclaw/config.toml`).
+    /// Used for the workspace-mismatch warning.
+    runtime_configured_path: Option<String>,
 }
 
-fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace {
+fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
+    // The runtime's own configured workspace, for the mismatch diagnostic.
+    let configured = if runtime == "zeroclaw" {
+        read_zeroclaw_workspace()
+    } else {
+        read_openclaw_workspace()
+    };
+
     // Priority 1: -w flag
     if let Some(ws) = flag {
         return ResolvedWorkspace {
             path: ws.to_path_buf(),
             source: "flag".into(),
-            openclaw_configured_path: read_openclaw_workspace(),
+            runtime_configured_path: configured,
         };
     }
 
@@ -157,23 +176,42 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
             return ResolvedWorkspace {
                 path: PathBuf::from(ws),
                 source: "alf_config".into(),
-                openclaw_configured_path: read_openclaw_workspace(),
+                runtime_configured_path: configured,
             };
         }
     }
 
-    let oc_path = read_openclaw_workspace();
-
-    // Priority 3: agents.defaults.workspace in ~/.openclaw/openclaw.json
-    if let Some(ref ws) = oc_path {
+    // Priority 3 + 4: runtime-specific discovery.
+    if runtime == "zeroclaw" {
+        // ZeroClaw keeps its workspace at `workspace_dir` in
+        // ~/.zeroclaw/config.toml; default to ~/.zeroclaw when unset.
+        if let Some(ref ws) = configured {
+            return ResolvedWorkspace {
+                path: PathBuf::from(ws),
+                source: "zeroclaw_config".into(),
+                runtime_configured_path: configured,
+            };
+        }
+        let default_path = alf_core::home_dir()
+            .map(|h| h.join(".zeroclaw"))
+            .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
         return ResolvedWorkspace {
-            path: PathBuf::from(ws),
-            source: "openclaw.json".into(),
-            openclaw_configured_path: oc_path,
+            path: default_path,
+            source: "default".into(),
+            runtime_configured_path: configured,
         };
     }
 
-    // Priority 4: ~/.openclaw/workspace (default)
+    // OpenClaw: agents.defaults.workspace in ~/.openclaw/openclaw.json
+    if let Some(ref ws) = configured {
+        return ResolvedWorkspace {
+            path: PathBuf::from(ws),
+            source: "openclaw.json".into(),
+            runtime_configured_path: configured,
+        };
+    }
+
+    // Default: ~/.openclaw/workspace
     let default_path = alf_core::home_dir()
         .map(|h| h.join(".openclaw").join("workspace"))
         .unwrap_or_else(|| PathBuf::from(".openclaw/workspace"));
@@ -181,8 +219,36 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config) -> ResolvedWorkspace 
     ResolvedWorkspace {
         path: default_path,
         source: "default".into(),
-        openclaw_configured_path: oc_path,
+        runtime_configured_path: configured,
     }
+}
+
+/// Read `workspace_dir` from `~/.zeroclaw/config.toml`.
+///
+/// `workspace_dir` is a top-level key in ZeroClaw's V3 config, so a lightweight
+/// line scan is enough — and avoids pulling a TOML parser into `alf-cli` just
+/// for this. Stops at the first table header so a same-named key inside a
+/// `[section]` can't be misread as the top-level one.
+fn read_zeroclaw_workspace() -> Option<String> {
+    let home = alf_core::home_dir()?;
+    let config_path = home.join(".zeroclaw").join("config.toml");
+    let content = fs::read_to_string(&config_path).ok()?;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            break; // entered a [table]; top-level keys are above this
+        }
+        if let Some(rest) = trimmed.strip_prefix("workspace_dir") {
+            let rest = rest.trim_start();
+            if let Some(value) = rest.strip_prefix('=') {
+                let value = value.trim().trim_matches('"').trim_matches('\'');
+                if !value.is_empty() {
+                    return Some(value.to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Read `agents.defaults.workspace` from `~/.openclaw/openclaw.json`.
@@ -275,6 +341,7 @@ fn collect_issues(
     resources: &ResourceInfo,
     alf: &AlfInfo,
     resolved: &ResolvedWorkspace,
+    runtime: &str,
 ) -> Vec<Issue> {
     let mut issues = Vec::new();
 
@@ -364,36 +431,55 @@ fn collect_issues(
         });
     }
 
-    if resolved.openclaw_configured_path.is_none() {
-        let home = alf_core::home_dir().unwrap_or_default();
-        let oc_config = home.join(".openclaw").join("openclaw.json");
-        if !oc_config.exists() {
-            issues.push(Issue {
-                severity: "info".into(),
-                code: "openclaw_config_not_found".into(),
-                message: "~/.openclaw/openclaw.json not found".into(),
-                suggestion: "OpenClaw may not be installed, or uses a non-standard location".into(),
-            });
+    // Runtime config presence diagnostic. Each runtime keeps its own config
+    // (openclaw → ~/.openclaw/openclaw.json; zeroclaw → ~/.zeroclaw/config.toml),
+    // so this is selected by runtime to avoid a spurious "openclaw not installed"
+    // note when checking zeroclaw. `None` for any other runtime.
+    let home = alf_core::home_dir().unwrap_or_default();
+    let config_issue = match runtime {
+        "openclaw"
+            if resolved.runtime_configured_path.is_none()
+                && !home.join(".openclaw").join("openclaw.json").exists() =>
+        {
+            Some(("openclaw_config_not_found", "~/.openclaw/openclaw.json not found", "OpenClaw"))
         }
+        "zeroclaw" if !home.join(".zeroclaw").join("config.toml").exists() => Some((
+            "zeroclaw_config_not_found",
+            "~/.zeroclaw/config.toml not found",
+            "ZeroClaw",
+        )),
+        _ => None,
+    };
+    if let Some((code, message, name)) = config_issue {
+        issues.push(Issue {
+            severity: "info".into(),
+            code: code.into(),
+            message: message.into(),
+            suggestion: format!("{name} may not be installed, or uses a non-standard location"),
+        });
     }
 
-    // Workspace mismatch: -w differs from openclaw.json configured path
-    if ws.source == "flag" {
-        if let Some(ref oc_ws) = resolved.openclaw_configured_path {
-            let flag_canonical = PathBuf::from(&ws.path);
-            let oc_canonical = PathBuf::from(oc_ws);
-            if flag_canonical != oc_canonical {
-                issues.push(Issue {
-                    severity: "warning".into(),
-                    code: "workspace_mismatch".into(),
-                    message: format!(
-                        "-w path ({}) differs from openclaw.json configured path ({})",
-                        ws.path, oc_ws
-                    ),
-                    suggestion: "May be intentional; noting for awareness".into(),
-                });
-            }
-        }
+    // Workspace mismatch: -w differs from the runtime's configured workspace.
+    // Flattened to a single `if let` (no nested ifs) and compared as `Path`
+    // borrows so clippy is happy.
+    let mismatch = if ws.source == "flag" {
+        resolved
+            .runtime_configured_path
+            .as_deref()
+            .filter(|cfg_ws| Path::new(&ws.path) != Path::new(cfg_ws))
+    } else {
+        None
+    };
+    if let Some(cfg_ws) = mismatch {
+        issues.push(Issue {
+            severity: "warning".into(),
+            code: "workspace_mismatch".into(),
+            message: format!(
+                "-w path ({}) differs from {runtime} configured path ({cfg_ws})",
+                ws.path
+            ),
+            suggestion: "May be intentional; noting for awareness".into(),
+        });
     }
 
     issues
@@ -436,7 +522,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     output::progress(&format!("Checking {} environment...", runtime));
 
     // Resolve workspace
-    let resolved = resolve_workspace(workspace_arg, &config);
+    let resolved = resolve_workspace(workspace_arg, &config, runtime);
 
     let ws_path = &resolved.path;
     let ws_exists = ws_path.is_dir();
@@ -474,14 +560,14 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         }
     };
 
-    // OpenClaw info
+    // OpenClaw info (openclaw-only block in the JSON output).
     let openclaw = if runtime == "openclaw" {
         Some(OpenClawInfo {
-            config_found: resolved.openclaw_configured_path.is_some()
+            config_found: resolved.runtime_configured_path.is_some()
                 || alf_core::home_dir()
                     .map(|h| h.join(".openclaw").join("openclaw.json").exists())
                     .unwrap_or(false),
-            workspace_configured: resolved.openclaw_configured_path.clone(),
+            workspace_configured: resolved.runtime_configured_path.clone(),
         })
     } else {
         None
@@ -494,19 +580,22 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     let last_synced_sequence = status.agents.first().map(|a| a.last_synced_sequence);
     let last_synced_at = status.agents.first().and_then(|a| a.last_synced_at.clone());
 
+    // Fetch the server's view of the agent once: it confirms connectivity AND
+    // yields the delta-folded credential count used for vault parity (WS-B).
+    let server_agent: Option<AgentInfo> = if api_key_set && agent_tracked {
+        ApiClient::from_config(&config).ok().and_then(|c| {
+            status
+                .agents
+                .first()
+                .and_then(|a| c.get_agent(a.agent_id).ok())
+        })
+    } else {
+        None
+    };
     let service_reachable = if api_key_set && agent_tracked {
-        let client = ApiClient::from_config(&config).ok();
-        client
-            .and_then(|c| {
-                status
-                    .agents
-                    .first()
-                    .and_then(|a| c.get_agent(a.agent_id).ok())
-            })
-            .is_some()
+        server_agent.is_some()
     } else if api_key_set {
-        // No agents tracked yet, but key is set — try a simple connectivity check
-        // by attempting to create a client (validates config)
+        // No agents tracked yet, but key is set — validate config connectivity.
         ApiClient::from_config(&config).is_ok()
     } else {
         false
@@ -521,8 +610,37 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         service_reachable,
     };
 
+    // Vault parity (WS-B): compare the local vault count to the server's
+    // delta-folded credential count. Divergence ⇒ the vault has not fully synced
+    // (e.g. credentials added but not yet pushed, or a diverged local base).
+    let mut vault = gather_vault();
+    vault.server_credential_count = server_agent
+        .as_ref()
+        .and_then(|a| a.layer_counts.as_ref())
+        .map(|lc| lc.credentials as usize);
+    vault.parity_ok = match (vault.credential_count, vault.server_credential_count) {
+        (Some(local), Some(server)) => Some(local == server),
+        _ => None,
+    };
+
     // Collect issues
-    let issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved);
+    let mut issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved, runtime);
+    if vault.parity_ok == Some(false) {
+        issues.push(Issue {
+            severity: "warning".into(),
+            code: "vault_not_synced".into(),
+            message: format!(
+                "Local vault has {} credential(s) but the cloud shows {} — the vault has not fully synced.",
+                vault.credential_count.unwrap_or(0),
+                vault.server_credential_count.unwrap_or(0)
+            ),
+            suggestion: format!(
+                "Run `alf sync --recover -r {} -w {}` to re-derive the delta against cloud truth.",
+                runtime,
+                ws_path.display()
+            ),
+        });
+    }
 
     let has_errors = issues.iter().any(|i| i.severity == "error");
     let ready_to_sync = !has_errors && ws_exists;
@@ -542,7 +660,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         openclaw,
         alf: alf_info,
         env: gather_env(),
-        vault: gather_vault(),
+        vault,
         issues,
         suggestions: Vec::new(),
     };
@@ -626,6 +744,12 @@ fn print_human(result: &CheckResult) {
     println!("    Exists:      {}", yn(result.vault.exists));
     if let Some(n) = result.vault.credential_count {
         println!("    Credentials: {n}");
+    }
+    if let Some(n) = result.vault.server_credential_count {
+        println!("    Cloud:       {n}");
+    }
+    if let Some(ok) = result.vault.parity_ok {
+        println!("    Synced:      {}", yn(ok));
     }
     println!();
 
@@ -726,12 +850,16 @@ fn gather_vault() -> VaultInfo {
                 path: path.to_string_lossy().into_owned(),
                 exists,
                 credential_count,
+                server_credential_count: None,
+                parity_ok: None,
             }
         }
         Err(_) => VaultInfo {
             path: "(unknown)".into(),
             exists: false,
             credential_count: None,
+            server_credential_count: None,
+            parity_ok: None,
         },
     }
 }
@@ -749,7 +877,7 @@ mod tests {
     fn resolve_workspace_flag_wins() {
         let config = Config::default();
         let flag_path = PathBuf::from("/custom/workspace");
-        let resolved = resolve_workspace(Some(&flag_path), &config);
+        let resolved = resolve_workspace(Some(&flag_path), &config, "openclaw");
 
         assert_eq!(resolved.path, PathBuf::from("/custom/workspace"));
         assert_eq!(resolved.source, "flag");
@@ -759,7 +887,7 @@ mod tests {
     fn resolve_workspace_alf_config_second() {
         let mut config = Config::default();
         config.defaults.workspace = Some("/alf-configured/workspace".into());
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         assert_eq!(resolved.path, PathBuf::from("/alf-configured/workspace"));
         assert_eq!(resolved.source, "alf_config");
@@ -782,7 +910,7 @@ mod tests {
         .unwrap();
 
         let config = Config::default();
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         // Restore HOME before asserting
         match prev {
@@ -802,7 +930,7 @@ mod tests {
         std::env::set_var("HOME", tmp.path());
 
         let config = Config::default();
-        let resolved = resolve_workspace(None, &config);
+        let resolved = resolve_workspace(None, &config, "openclaw");
 
         match prev {
             Some(v) => std::env::set_var("HOME", v),
@@ -814,6 +942,56 @@ mod tests {
             tmp.path().join(".openclaw").join("workspace")
         );
         assert_eq!(resolved.source, "default");
+    }
+
+    #[test]
+    fn resolve_workspace_zeroclaw_reads_workspace_dir() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ALF_HOME");
+
+        let zc_dir = tmp.path().join(".zeroclaw");
+        fs::create_dir_all(&zc_dir).unwrap();
+        fs::write(
+            zc_dir.join("config.toml"),
+            "schema_version = 3\nworkspace_dir = \"/custom/zc/workspace\"\n\n[memory]\nworkspace_dir = \"/should/not/win\"\n",
+        )
+        .unwrap();
+
+        let mut config = Config::default();
+        config.defaults.workspace = None;
+        let resolved = resolve_workspace(None, &config, "zeroclaw");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.path, PathBuf::from("/custom/zc/workspace"));
+        assert_eq!(resolved.source, "zeroclaw_config");
+    }
+
+    #[test]
+    fn resolve_workspace_zeroclaw_default_fallback() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ALF_HOME");
+
+        let mut config = Config::default();
+        config.defaults.workspace = None;
+        let resolved = resolve_workspace(None, &config, "zeroclaw");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.source, "default");
+        assert!(resolved.path.ends_with(".zeroclaw"));
     }
 
     #[test]

@@ -31,6 +31,25 @@ pub struct AgentInfo {
     pub source_runtime: Option<String>,
     pub created_at: String,
     pub latest_sequence: u64,
+    /// Per-layer counts the service derives from the latest snapshot **folded
+    /// with subsequent deltas** (delta-aware as of the service's read-path fix).
+    /// Absent on the `POST /v1/agents` create response; present on
+    /// `GET /v1/agents/:id`. Used by `alf check` for vault parity.
+    #[serde(default)]
+    pub layer_counts: Option<LayerCounts>,
+}
+
+/// Subset of the service's per-layer counts the CLI consumes. Only the fields
+/// `alf check` needs; unknown fields are ignored by serde.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize, Default)]
+pub struct LayerCounts {
+    #[serde(default)]
+    pub credentials: u64,
+    #[serde(default)]
+    pub principals: u64,
+    #[serde(default)]
+    pub identity: u64,
 }
 
 /// Outcome of [`ApiClient::register_agent`].

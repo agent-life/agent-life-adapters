@@ -148,6 +148,49 @@ fn identity_and_principals_populated() {
 }
 
 #[test]
+fn identity_and_principals_export_is_deterministic() {
+    // RC-09 precondition: re-exporting an unchanged workspace must yield an
+    // identical identity + principals set, so `alf sync` emits no spurious
+    // Layer 1/2 delta. Guards the deterministic ids + mtime added to the parsers.
+    let fixture = Path::new("tests/fixtures/standard");
+    let adapter = OpenClawAdapter;
+
+    let read_layers = |name: &str| {
+        let tmp = TempDir::new().unwrap();
+        let alf_path = tmp.path().join(name);
+        adapter.export(fixture, &alf_path).expect("export failed");
+        let file = std::fs::File::open(&alf_path).unwrap();
+        let mut reader = AlfReader::new(std::io::BufReader::new(file)).expect("open failed");
+        let identity = reader.read_identity().expect("read identity");
+        let principals = reader.read_principals().expect("read principals");
+        (identity, principals)
+    };
+
+    let (id1, pr1) = read_layers("a.alf");
+    let (id2, pr2) = read_layers("b.alf");
+
+    assert!(
+        !alf_core::identity_changed(id1.as_ref(), id2.as_ref()),
+        "identity must be stable across re-export (no spurious delta)"
+    );
+    assert!(
+        alf_core::diff_principals(pr1.as_ref(), pr2.as_ref()).is_empty(),
+        "principals must be stable across re-export (no spurious delta)"
+    );
+    // Ids must be derived deterministically, not random per export.
+    assert_eq!(
+        id1.unwrap().id,
+        id2.unwrap().id,
+        "identity id must be deterministic"
+    );
+    assert_eq!(
+        pr1.unwrap().principals[0].id,
+        pr2.unwrap().principals[0].id,
+        "principal id must be deterministic"
+    );
+}
+
+#[test]
 fn raw_sources_included() {
     let fixture = Path::new("tests/fixtures/standard");
     let tmp = TempDir::new().unwrap();

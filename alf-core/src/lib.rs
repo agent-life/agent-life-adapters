@@ -23,6 +23,8 @@ pub mod credentials;
 pub mod crypto;
 pub mod delta;
 pub mod identity;
+pub mod ids;
+pub mod include;
 pub mod manifest;
 pub mod partition;
 pub mod paths;
@@ -40,8 +42,15 @@ pub use crypto::{
     decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob,
     VaultKey, VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
 };
-pub use delta::{apply_delta, apply_deltas, compute_delta, diff_credentials, CredentialsDiff};
+pub use delta::{
+    apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,
+    CredentialsDiff, PrincipalsDiff,
+};
 pub use identity::*;
+pub use include::{
+    normalize_include_path, prune_and_log_missing, IncludeEntry, IncludeList, INCLUDE_FILE,
+    SYNC_LOG_FILE,
+};
 pub use manifest::*;
 pub use memory::*;
 pub use partition::{PartitionAssigner, PartitionReader, PartitionWriter};

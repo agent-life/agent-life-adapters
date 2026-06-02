@@ -11,7 +11,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{Identity, Linguistics, Names, ProseIdentity, Psychology, StructuredIdentity};
@@ -84,15 +83,21 @@ fn parse_openclaw_identity(workspace: &Path, agent_id: Uuid) -> Result<Option<Id
 
     let name = soul
         .as_deref()
-        .and_then(|c| extract_h1(c))
-        .or_else(|| identity_md.as_deref().and_then(|c| extract_h1(c)))
+        .and_then(extract_h1)
+        .or_else(|| identity_md.as_deref().and_then(extract_h1))
         .unwrap_or_else(|| "Unknown".to_string());
 
     Ok(Some(Identity {
-        id: Uuid::new_v4(),
+        // Deterministic id + mtime so an unchanged identity re-exports
+        // identically (no spurious delta every sync). See alf_core::ids.
+        id: alf_core::ids::identity_id(agent_id),
         agent_id,
         version: 1,
-        updated_at: Utc::now(),
+        updated_at: alf_core::ids::newest_mtime([
+            workspace.join("SOUL.md"),
+            workspace.join("IDENTITY.md"),
+            workspace.join("AGENTS.md"),
+        ]),
         structured: Some(StructuredIdentity {
             names: Some(Names {
                 primary: name,
@@ -166,7 +171,7 @@ fn parse_aieos_identity(
     });
 
     // Extract psychology
-    let psychology = identity_obj.get("psychology").and_then(|p| {
+    let psychology = identity_obj.get("psychology").map(|p| {
         let mut psych = Psychology {
             neural_matrix: HashMap::new(),
             personality_traits: None,
@@ -195,13 +200,13 @@ fn parse_aieos_identity(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
 
-        Some(psych)
+        psych
     });
 
     // Extract linguistics
-    let linguistics = identity_obj.get("linguistics").and_then(|l| {
+    let linguistics = identity_obj.get("linguistics").map(|l| {
         let text_style = l.get("text_style");
-        Some(Linguistics {
+        Linguistics {
             formality_level: text_style
                 .and_then(|ts| ts.get("formality_level"))
                 .and_then(|v| v.as_f64()),
@@ -213,7 +218,7 @@ fn parse_aieos_identity(
             preferred_language: None,
             idiolect: None,
             extra: HashMap::new(),
-        })
+        }
     });
 
     // Extract goals from motivations
@@ -262,10 +267,16 @@ fn parse_aieos_identity(
     };
 
     Ok(Some(Identity {
-        id: Uuid::new_v4(),
+        // Deterministic id + mtime so an unchanged identity re-exports
+        // identically (no spurious delta every sync). See alf_core::ids.
+        id: alf_core::ids::identity_id(agent_id),
         agent_id,
         version: 1,
-        updated_at: Utc::now(),
+        updated_at: alf_core::ids::newest_mtime([
+            workspace.join("SOUL.md"),
+            workspace.join("IDENTITY.md"),
+            workspace.join("AGENTS.md"),
+        ]),
         structured: Some(StructuredIdentity {
             names: Some(Names {
                 primary: agent_name,

@@ -8,8 +8,10 @@
 
 use crate::archive::DeltaMemoryEntry;
 use crate::credentials::{CredentialRecord, CredentialsDocument};
+use crate::identity::Identity;
 use crate::manifest::DeltaOperation;
 use crate::memory::MemoryRecord;
+use crate::principals::{Principal, PrincipalsDocument};
 
 use std::collections::HashMap;
 use uuid::Uuid;
@@ -135,6 +137,101 @@ pub fn diff_credentials(
     }
 
     diff
+}
+
+/// Diff between two principals documents (Layer 2), by `id`.
+///
+/// Mirrors [`CredentialsDiff`]. Principals are not encrypted, but adapters stamp
+/// a fresh `updated_at` on every export (see the openclaw/zeroclaw parsers), so
+/// the per-principal comparison ignores `updated_at` — otherwise every sync would
+/// report a spurious change.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrincipalsDiff {
+    /// IDs present in `new` but not `old`.
+    pub created: Vec<Uuid>,
+    /// IDs in both with a different record (ignoring `updated_at`).
+    pub updated: Vec<Uuid>,
+    /// IDs present in `old` but not `new`.
+    pub deleted: Vec<Uuid>,
+}
+
+impl PrincipalsDiff {
+    /// True when there are no principal changes.
+    pub fn is_empty(&self) -> bool {
+        self.created.is_empty() && self.updated.is_empty() && self.deleted.is_empty()
+    }
+}
+
+/// Compute the [`PrincipalsDiff`] between an old and new principals document.
+///
+/// A `None` document is the empty set (first principal added / last removed).
+/// Comparison is by `id`, ignoring the volatile `updated_at` timestamp.
+pub fn diff_principals(
+    old: Option<&PrincipalsDocument>,
+    new: Option<&PrincipalsDocument>,
+) -> PrincipalsDiff {
+    let empty: Vec<Principal> = Vec::new();
+    let old_records = old.map(|d| &d.principals).unwrap_or(&empty);
+    let new_records = new.map(|d| &d.principals).unwrap_or(&empty);
+
+    let old_map: HashMap<Uuid, &Principal> = old_records.iter().map(|p| (p.id, p)).collect();
+    let new_map: HashMap<Uuid, &Principal> = new_records.iter().map(|p| (p.id, p)).collect();
+
+    let mut diff = PrincipalsDiff::default();
+
+    for record in new_records {
+        match old_map.get(&record.id) {
+            None => diff.created.push(record.id),
+            Some(old_record) => {
+                if !content_eq_ignoring_updated_at(*old_record, record) {
+                    diff.updated.push(record.id);
+                }
+            }
+        }
+    }
+
+    for record in old_records {
+        if !new_map.contains_key(&record.id) {
+            diff.deleted.push(record.id);
+        }
+    }
+
+    diff
+}
+
+/// Whether the identity layer (Layer 1) changed between two archives.
+///
+/// Identity is a single document per agent — there is nothing to key by `id`, so
+/// it either changed or it didn't. `None` vs `Some` (or differing content) is a
+/// change; both absent or equal content is unchanged. Comparison ignores
+/// `updated_at` (adapters stamp `Utc::now()` on every export, so comparing it
+/// would flag every sync as a change).
+pub fn identity_changed(old: Option<&Identity>, new: Option<&Identity>) -> bool {
+    match (old, new) {
+        (None, None) => false,
+        (Some(a), Some(b)) => !content_eq_ignoring_updated_at(a, b),
+        _ => true,
+    }
+}
+
+/// Compare two serializable records with the `updated_at` field removed. Used
+/// for identity/principals, where adapters re-stamp the timestamp on every
+/// export and it is not a semantic change.
+fn content_eq_ignoring_updated_at<T: serde::Serialize>(a: &T, b: &T) -> bool {
+    fn strip(v: &mut serde_json::Value) {
+        if let Some(obj) = v.as_object_mut() {
+            obj.remove("updated_at");
+        }
+    }
+    match (serde_json::to_value(a), serde_json::to_value(b)) {
+        (Ok(mut va), Ok(mut vb)) => {
+            strip(&mut va);
+            strip(&mut vb);
+            va == vb
+        }
+        // If either fails to serialize, fall back to "changed" to stay safe.
+        _ => false,
+    }
 }
 
 /// Apply a set of delta entries to a base set of memory records.

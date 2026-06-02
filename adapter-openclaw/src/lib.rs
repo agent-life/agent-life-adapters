@@ -32,7 +32,6 @@ pub use alf_core::Adapter;
 pub mod export;
 pub mod identity_parser;
 pub mod import;
-pub mod include;
 pub mod memory_parser;
 pub mod principals_parser;
 
@@ -40,9 +39,12 @@ pub mod principals_parser;
 pub use export::{enumerate, enumerate_workspace, EnumerationResult};
 pub use import::enumerate_archive;
 
-// Agent-managed include list (`alf add`).
-pub use include::{
-    normalize_include_path, prune_and_log_missing, IncludeList, INCLUDE_FILE, SYNC_LOG_FILE,
+// Agent-managed include list (`alf add`) now lives in alf-core (runtime-agnostic
+// and shared with the ZeroClaw adapter). Re-exported here so existing
+// `adapter_openclaw::IncludeList` / `INCLUDE_FILE` call sites keep resolving.
+pub use alf_core::include::{
+    normalize_include_path, prune_and_log_missing, IncludeEntry, IncludeList, INCLUDE_FILE,
+    SYNC_LOG_FILE,
 };
 
 // ---------------------------------------------------------------------------

@@ -9,7 +9,6 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::Result;
-use chrono::Utc;
 use uuid::Uuid;
 
 use alf_core::{
@@ -37,8 +36,11 @@ pub fn build_principals(workspace: &Path, agent_id: Uuid) -> Result<Option<Princ
     let principal_name = extract_name_field(&content)
         .or_else(|| extract_h1_heading(&content))
         .unwrap_or_else(|| "User".to_string());
-    let principal_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
-    let profile_id = Uuid::new_v7(uuid::Timestamp::now(uuid::NoContext));
+    // Deterministic ids keyed by a durable role (not the display name) + mtime,
+    // so an unchanged USER.md re-exports identically (no spurious delta). The
+    // single OpenClaw human principal uses the "human" role. See alf_core::ids.
+    let principal_id = alf_core::ids::principal_id(agent_id, "human");
+    let profile_id = alf_core::ids::profile_id(principal_id);
 
     let principal = Principal {
         id: principal_id,
@@ -49,7 +51,7 @@ pub fn build_principals(workspace: &Path, agent_id: Uuid) -> Result<Option<Princ
             agent_id,
             principal_id,
             version: 1,
-            updated_at: Utc::now(),
+            updated_at: alf_core::ids::newest_mtime([&path]),
             structured: Some(StructuredProfile {
                 name: Some(principal_name),
                 principal_type: Some("human".to_string()),

@@ -3,7 +3,7 @@
 //! Orchestrates: detect backend from `config.toml` → extract memory (SQLite
 //! or Markdown) → build identity/principals/credentials → write archive.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -123,6 +123,8 @@ pub struct EnumerationResult {
     pub files: Vec<FileEntry>,
     pub excluded_by_alfignore: u32,
     pub alfignore_warnings: Vec<String>,
+    /// Paths in the agent's `alf add` include list that no longer exist on disk.
+    pub missing_includes: Vec<String>,
 }
 
 /// Where a raw-source entry's bytes come from.
@@ -132,6 +134,11 @@ enum RawContent {
     /// Synthesized bytes — ZeroClaw's redacted `config.toml`.
     Inline(Vec<u8>),
 }
+
+/// What `enumerate_raw` returns: the raw entries (each paired with where its
+/// bytes come from), the `.alfignore` exclusion count, any warnings, and the
+/// tracked-but-missing include paths.
+type RawEnumeration = (Vec<(FileEntry, RawContent)>, u32, Vec<String>, Vec<String>);
 
 /// Load `<workspace>/.alfignore` into a gitignore matcher.
 ///
@@ -178,13 +185,11 @@ fn is_alfignored(matcher: &Gitignore, rel: &str) -> bool {
 ///   `identity.json` (which may live outside the workspace entirely). A
 ///   workspace-relative `.alfignore` pattern cannot meaningfully address these,
 ///   so they are always included, never matched, and never counted.
-fn enumerate_raw(
-    workspace: &Path,
-    config: &ZeroClawConfig,
-) -> (Vec<(FileEntry, RawContent)>, u32, Vec<String>) {
+fn enumerate_raw(workspace: &Path, config: &ZeroClawConfig) -> RawEnumeration {
     let (matcher, mut warnings) = load_alfignore(workspace);
     let mut entries: Vec<(FileEntry, RawContent)> = Vec::new();
     let mut excluded: u32 = 0;
+    let mut missing_includes: Vec<String> = Vec::new();
 
     // config.toml — synthesized & redacted; unfilterable.
     let redacted = config_parser::redact_secrets(&config.raw_toml).into_bytes();
@@ -266,7 +271,64 @@ fn enumerate_raw(
         }
     }
 
-    (entries, excluded, warnings)
+    // Agent-managed include list — arbitrary files the agent opted into via
+    // `alf add` (runtime-agnostic; shared with OpenClaw via alf_core::include).
+    // ALF never auto-discovers; only explicitly-tracked files are added (raw
+    // only — no semantic parse). A malformed list degrades to empty with a
+    // warning rather than blocking the backup (same posture as `.alfignore`).
+    let mut seen: HashSet<String> = entries.iter().map(|(fe, _)| fe.path.clone()).collect();
+    let include = match alf_core::include::IncludeList::load(workspace) {
+        Ok(list) => list,
+        Err(err) => {
+            warnings.push(format!(
+                "{} could not be read ({err}); tracked files not synced this run",
+                alf_core::include::INCLUDE_FILE
+            ));
+            alf_core::include::IncludeList::default()
+        }
+    };
+    for rel in include.paths() {
+        if seen.contains(&rel) {
+            continue; // already captured (e.g. a ROOT_FILE or memory/ file)
+        }
+        let abs = workspace.join(&rel);
+        if !abs.is_file() {
+            missing_includes.push(rel);
+            continue;
+        }
+        if is_alfignored(&matcher, &rel) {
+            excluded += 1;
+            continue;
+        }
+        let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+        entries.push((FileEntry { path: rel.clone(), size }, RawContent::Disk(abs)));
+        seen.insert(rel);
+    }
+
+    // The include list and sync log themselves travel as raw so the agent's
+    // sync config and removal history persist across machines on restore.
+    for sentinel in [
+        alf_core::include::INCLUDE_FILE,
+        alf_core::include::SYNC_LOG_FILE,
+    ] {
+        if seen.contains(sentinel) {
+            continue;
+        }
+        let abs = workspace.join(sentinel);
+        if abs.is_file() {
+            let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
+            entries.push((
+                FileEntry {
+                    path: sentinel.to_string(),
+                    size,
+                },
+                RawContent::Disk(abs),
+            ));
+            seen.insert(sentinel.to_string());
+        }
+    }
+
+    (entries, excluded, warnings, missing_includes)
 }
 
 /// Enumerate the workspace files an export would preserve as raw sources.
@@ -276,11 +338,12 @@ fn enumerate_raw(
 pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
     let zc_home = zeroclaw_home(workspace);
     let config = load_config(&zc_home)?;
-    let (entries, excluded, warnings) = enumerate_raw(workspace, &config);
+    let (entries, excluded, warnings, missing_includes) = enumerate_raw(workspace, &config);
     Ok(EnumerationResult {
         files: entries.into_iter().map(|(fe, _)| fe).collect(),
         excluded_by_alfignore: excluded,
         alfignore_warnings: warnings,
+        missing_includes,
     })
 }
 
@@ -299,7 +362,7 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
 
     let zc_home = zeroclaw_home(workspace);
     let config = load_config(&zc_home)?;
-    let (entries, excluded, warnings) = enumerate_raw(workspace, &config);
+    let (entries, excluded, mut warnings, missing_includes) = enumerate_raw(workspace, &config);
     let files: Vec<FileEntry> = entries.into_iter().map(|(fe, _)| fe).collect();
     let total_size = files.iter().map(|f| f.size).sum();
 
@@ -313,6 +376,14 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
         agent_id,
         runtime_version.as_deref(),
     )?;
+
+    // Surface (but do not prune — this is read-only) tracked files that have
+    // gone missing, so a dry-run preview shows what `alf sync` would drop.
+    for rel in &missing_includes {
+        warnings.push(format!(
+            "tracked file {rel} no longer exists (will be removed from sync on next `alf sync`)"
+        ));
+    }
 
     Ok(WorkspaceEnumeration {
         agent_name,
@@ -608,7 +679,8 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     }
 
     // Raw sources — `enumerate_raw` is the single source of truth for the set.
-    let (raw_entries, excluded_by_alfignore, _warnings) = enumerate_raw(workspace, &config);
+    let (raw_entries, excluded_by_alfignore, _warnings, missing_includes) =
+        enumerate_raw(workspace, &config);
     let mut raw_source_names = Vec::with_capacity(raw_entries.len());
     for (entry, content) in raw_entries {
         let data = match content {
@@ -637,8 +709,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_path: output.to_string_lossy().to_string(),
         output_size_bytes: output_size,
         excluded_by_alfignore,
-        // ZeroClaw has no `alf add` include list yet (OpenClaw-only for now).
-        missing_includes: Vec::new(),
+        missing_includes,
     })
 }
 

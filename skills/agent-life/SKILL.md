@@ -1,7 +1,7 @@
 ---
 name: agent-life
 description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from cloud, or migrate agent state.
-version: 1.8.0
+version: 1.9.0
 metadata:
   openclaw:
     requires:
@@ -31,7 +31,7 @@ metadata:
         description: Pin install.sh to a specific release.
       - name: ALF_ALLOW_UNVERIFIED
         required: false
-        description: Set to 1 to allow install.sh to proceed when the SHA256 checksum cannot be verified. Default is to fail.
+        description: Set to 1 to allow install.sh to proceed when the SHA256 checksum cannot be verified. The default is to fail.
     homepage: https://agent-life.ai
 ---
 
@@ -56,19 +56,19 @@ Install script source: <https://github.com/agent-life/agent-life-adapters/blob/m
 
 The install script detects your platform, downloads the binary from GitHub Releases, **requires a successful SHA256 checksum verification**, and installs to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). Stdout is JSON:
 
-    {"ok":true,"version":"v0.1.7","installed_version":"alf 0.1.7","path":"/usr/local/bin/alf","checksum_verified":true}
+    {"ok":true,"version":"v0.1.9","installed_version":"alf 0.1.9","path":"/usr/local/bin/alf","checksum_verified":true}
 
 **Checksum verification is mandatory by default.** A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed at all — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case only (not recommended), in which case `checksum_verified` is `false` and a `warnings` array in the output JSON records the reason.
 
 For production use, pin to a specific release:
 
-    ALF_VERSION=v0.1.7 sh install-alf.sh
+    ALF_VERSION=v0.1.9 sh install-alf.sh
 
 Verify: `alf --version`
 
 ## Authenticate
 
-Get an API key at <https://agent-life.ai/settings/api-keys>, then store it:
+Get an API key at <https://agent-life.ai/agents/api-keys>, then store it:
 
     alf login --key <your-api-key>
 
@@ -150,6 +150,22 @@ After the first sync, subsequent syncs upload only what changed:
 Output:
 
     {"ok":true,"sequence":5,"delta":true,"changes":{"creates":2,"updates":1,"deletes":0},"snapshot_path":"/home/user/.alf/state/abc-snapshot.alf","no_changes":false}
+
+The `changes` object also reports `credentials`, `principals`, and `identity` when those layers changed in the delta (each omitted when unchanged), so a vault edit or identity update shows up here too.
+
+### Verify the vault reached the cloud (and self-heal)
+
+`alf check` compares your local vault against the cloud and reports parity, so you can confirm a credential actually synced — and repair it if not, with no human step:
+
+    check=$(alf check -r openclaw)
+    ws=$(echo "$check" | jq -r '.workspace.path')
+    parity=$(echo "$check" | jq -r '.vault.parity_ok')   # true | false | null
+    if [ "$parity" = "false" ]; then
+        # Local vault holds credentials the cloud is missing (e.g. a diverged base).
+        alf sync --recover -r openclaw -w "$ws"           # non-destructive self-heal
+    fi
+
+`parity_ok: null` means the comparison wasn't possible (service unreachable, or no agent tracked yet) — not a failure. `alf sync --recover` re-pulls the cloud state and re-derives the delta against it; it never deletes anything and leaves the workspace untouched. Run `alf check` again afterward to confirm `vault.parity_ok` is `true`.
 
 ### Restore safely
 
@@ -292,7 +308,7 @@ A `.alfignore` file at the workspace root, if present, removes paths from this s
 
 ### Credential encryption (end-to-end)
 
-Credential secrets are encrypted on your machine using XChaCha20-Poly1305 (default) or AES-256-GCM with a vault key you control. The vault key is generated and stored offline — agent-life.ai never receives it and cannot decrypt your credentials. Non-sensitive metadata (service name, label, capability tags, timestamps) is stored alongside the ciphertext for UX and auditing. Lose the vault key and the encrypted credentials are unrecoverable; back it up the same way you would back up an SSH private key. See <https://agent-life.ai/docs/vault> for vault key generation and recovery.
+Credential secrets are encrypted on your machine using XChaCha20-Poly1305 (default) or AES-256-GCM with a vault key you control. The vault key is generated and stored offline — agent-life.ai never receives it and cannot decrypt your credentials. Non-sensitive metadata (service name, label, capability tags, timestamps) is stored alongside the ciphertext for UX and auditing. Lose the vault key and the encrypted credentials are unrecoverable; back it up the same way you would back up an SSH private key. See <https://agent-life.ai/cli#alf-vault> for vault key generation and recovery.
 
 ### Install integrity
 
@@ -308,9 +324,24 @@ You can inspect exactly what will be uploaded before any data leaves your machin
 
 Nothing is uploaded until you explicitly run `alf sync`.
 
-### Config files read
+### Files read on your machine
 
-The `alf` CLI reads `~/.alf/config.toml` (its own config), `~/.openclaw/openclaw.json` (to auto-discover the workspace path), and `<workspace>/.alfignore` (if present, to filter the export set). These paths are declared in the skill's `requires.config` metadata. No other files outside the workspace directory are read.
+The `alf` CLI reads the following local files. No other files on the filesystem are read.
+
+**Under your home directory**:
+
+- `~/.alf/config.toml` — the CLI's own config (API key, API URL, defaults).
+- `~/.alf/state/{agent_id}.toml` — local sync cursor. Read on every sync, never uploaded.
+- `~/.alf/state/{agent_id}-snapshot.alf` — last snapshot, used to compute deltas. Read on every sync, never uploaded.
+- `~/.alf/vault/credentials.json` — the encrypted credential vault. Read during export; only ciphertext leaves the machine (see *Credential encryption* above).
+- `~/.openclaw/openclaw.json` — read to auto-discover the workspace path for OpenClaw runtimes.
+
+**Inside the workspace**:
+
+- The 8 root files in the upload allowlist plus `memory/` recursively (see *Exactly what is uploaded* above).
+- `.alfignore` at the workspace root, if present — read to filter the export set; never uploaded.
+
+The `requires.config` metadata in this skill's frontmatter declares only the two preexisting config files the skill expects (`~/.alf/config.toml` and `~/.openclaw/openclaw.json`); the state and vault paths are managed by `alf` itself and are created on first use.
 
 ### Storage
 
@@ -326,7 +357,7 @@ Data is retained until **you** delete it. There is no automatic expiry. Delete i
 
 ### API key scope
 
-The `ALF_API_KEY` authenticates to your agent-life.ai account. It can only access data belonging to that account. Keys can be revoked and rotated at <https://agent-life.ai/settings/api-keys>.
+The `ALF_API_KEY` authenticates to your agent-life.ai account. It can only access data belonging to that account. Keys can be revoked and rotated at <https://agent-life.ai/agents/api-keys>.
 
 ### Privacy policy
 

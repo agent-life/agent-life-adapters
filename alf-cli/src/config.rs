@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Top-level config file structure.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
     #[serde(default)]
     pub service: ServiceConfig,
@@ -43,15 +43,6 @@ fn default_api_url() -> String {
 
 fn default_runtime() -> String {
     "openclaw".into()
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            service: ServiceConfig::default(),
-            defaults: DefaultsConfig::default(),
-        }
-    }
 }
 
 impl Default for ServiceConfig {

@@ -89,7 +89,7 @@ fn cross_import_reconstructs_files() {
     let memory_files: Vec<_> = fs::read_dir(workspace.join("memory"))
         .unwrap()
         .map(|r| r.unwrap().path())
-        .filter(|p| p.extension().map_or(false, |ext| ext == "md"))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "md"))
         .collect();
 
     assert!(

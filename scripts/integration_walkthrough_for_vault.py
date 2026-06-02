@@ -13,6 +13,15 @@ snapshot as the Layer 4 `credentials.json`.
 Follows the same UX as `integration_walkthrough.py` (banner, steps, pauses,
 markdown report).
 
+MAINTENANCE NOTE (2026-06): this script had drifted from the shared
+`integration_walkthrough` module — it relied on `ApiClient.post_json` /
+`put_binary`, `S3Client.head_object` / `object_exists`, and an `iw.SOURCE_RUNTIME`
+constant that were dropped when the main walkthrough went CLI-driven. Those were
+re-added to the shared module to revive this script (sections 1-8 are still
+API/archive-construction era, while the newer Section 9 drives the real CLI). A
+broader modernization pass — porting sections 3-5 to the CLI lane like the main
+and workspace walkthroughs — is still worth doing.
+
 Prerequisites:
   pip install requests psycopg2-binary boto3 python-dotenv
 
@@ -56,6 +65,10 @@ import integration_walkthrough as iw
 # ---------------------------------------------------------------------------
 
 VAULT_AGENT_ID = uuid.UUID("e2e10000-feed-4000-b000-000000000002")
+# A throwaway sub-agent for the CLI-driven parity + self-heal section. Separate
+# from VAULT_AGENT_ID (which is API-constructed) so the real `alf sync` lifecycle
+# doesn't collide with the hand-built snapshot above.
+PARITY_AGENT_ID = uuid.UUID("e2e10000-feed-4000-b000-000000000003")
 VAULT_AGENT_NAME = "E2E Vault Walkthrough Agent"
 
 
@@ -755,6 +768,127 @@ def step_dry_run_upload_preview(cfg: iw.Config, report: iw.Report):
     iw.pause(cfg)
 
 
+def _write_vault(ctx, creds: list) -> None:
+    """Write `credentials.json` directly to the CLI's isolated vault path. Layer 4
+    is already ciphertext, so this is exactly what lands after `alf vault add` —
+    no vault key needed for `sync`/`check` to read it."""
+    vault_path = ctx.alf_home / "vault" / "credentials.json"
+    vault_path.parent.mkdir(parents=True, exist_ok=True)
+    vault_path.write_text(
+        json.dumps({"credentials": creds}, indent=2), encoding="utf-8"
+    )
+
+
+def _vault_parity(ctx) -> dict:
+    """Run `alf check` and return the local-vs-cloud vault parity it reports."""
+    _proc, res = iw.run_cli(
+        ctx, ["check", "-r", ctx.runtime, "-w", str(ctx.ws)], show=False
+    )
+    vault = (res or {}).get("vault") or {}
+    return {
+        "local": vault.get("credential_count"),
+        "server": vault.get("server_credential_count"),
+        "ok": vault.get("parity_ok"),
+    }
+
+
+def step_vault_parity_selfheal(cfg: iw.Config, api: "iw.ApiClient", report: iw.Report):
+    iw.section(9, "Vault Sync — Credential Delta, Parity & Self-Heal")
+    iw.explain("""
+        Everything above built archives by hand. This step drives the REAL `alf`
+        CLI on a throwaway sub-agent to show the live vault sync lifecycle:
+          • a credential added AFTER the first sync rides a DELTA (not a snapshot);
+          • `alf check` reports vault PARITY with the cloud (local vs the service's
+            delta-folded count);
+          • a divergence self-heals with a single `alf sync --recover` — effective
+            even with a local base present, so no operator file surgery is needed
+            (the unattended fix for case E9).
+    """)
+    alf = iw.find_alf_binary()
+    if not alf:
+        iw.fail("alf binary not found (build it: cargo build) — skipping parity demo")
+        report.add(iw.StepResult("Vault parity + self-heal", False, 0, error="alf not found"))
+        iw.pause(cfg)
+        return
+
+    ctx = iw.build_run_context(cfg, alf, PARITY_AGENT_ID)
+    creds = build_vault_credentials_document(str(PARITY_AGENT_ID))["credentials"]
+    # Idempotency: a prior crashed run may have left this sub-agent registered,
+    # which would trip the "agent already exists" first-sync guard below.
+    try:
+        api.delete(f"/agents/{PARITY_AGENT_ID}")
+    except Exception:  # noqa: BLE001 - best-effort pre-clean
+        pass
+    t0 = time.time()
+    ok_all = True
+
+    def check(cond: bool, good: str, bad: str):
+        nonlocal ok_all
+        if cond:
+            iw.ok(good)
+        else:
+            ok_all = False
+            iw.fail(bad)
+
+    try:
+        # 1) First sync — registers the sub-agent, snapshot at seq 0 (vault empty).
+        proc, res = iw.run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        check(proc.returncode == 0 and bool(res) and res.get("delta") is False,
+              f"first sync → snapshot seq {(res or {}).get('sequence')} (vault empty)",
+              f"first sync failed: {(proc.stderr or proc.stdout or '')[:160]}")
+
+        # 2) Agent adds a credential AFTER first sync → it must ride a DELTA.
+        _write_vault(ctx, creds[:1])
+        iw.flow("write vault (1 cred)  ──alf sync──▶  POST /deltas (Layer 4)")
+        proc, res = iw.run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        cred_creates = (((res or {}).get("changes") or {}).get("credentials") or {}).get("creates", 0)
+        check(bool(res) and res.get("delta") is True and cred_creates == 1,
+              f"credential rode a DELTA (seq {(res or {}).get('sequence')}, credentials.creates=1)",
+              f"credential did not ride a delta (credentials.creates={cred_creates})")
+
+        # 3) `alf check` → parity with the cloud (delta-folded server count).
+        p = _vault_parity(ctx)
+        check(p == {"local": 1, "server": 1, "ok": True},
+              "alf check → vault.parity_ok=true (local 1 == cloud 1)",
+              f"expected parity after sync, got {p}")
+
+        # 4) Diverge: add a 2nd credential but DON'T sync — the cloud is now stale.
+        _write_vault(ctx, creds[:2])
+        iw.flow("write vault (2 creds), no sync  ──alf check──▶  parity_ok=false")
+        p = _vault_parity(ctx)
+        check(p.get("ok") is False and p.get("local") == 2 and p.get("server") == 1,
+              "alf check → vault.parity_ok=false + vault_not_synced warning (local 2, cloud 1)",
+              f"expected parity divergence, got {p}")
+
+        # 5) Self-heal with a base PRESENT — the 0.1.9 `--recover` behavior (E9).
+        #    (A plain `alf sync` here would push the new credential too; the value
+        #    of `--recover` is that it ALSO repairs a *poisoned* base — one that
+        #    already contains a credential the cloud lacks — which a plain sync
+        #    would treat as "no change". See docs/how_alf_syncs.md case E9.)
+        iw.flow("alf sync --recover  ──re-pull cloud base──▶  re-diff vault ──▶ upload missing cred")
+        proc, res = iw.run_cli(ctx, ["sync", "--recover", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        check(proc.returncode == 0,
+              f"alf sync --recover → seq {(res or {}).get('sequence')}, recovered={(res or {}).get('recovered')}",
+              f"recover failed: {(proc.stderr or proc.stdout or '')[:160]}")
+
+        # 6) Parity restored.
+        p = _vault_parity(ctx)
+        check(p == {"local": 2, "server": 2, "ok": True},
+              "alf check → vault.parity_ok=true (local 2 == cloud 2) — self-healed",
+              f"expected parity restored after recover, got {p}")
+    finally:
+        # Always remove the throwaway sub-agent from the cloud.
+        try:
+            api.delete(f"/agents/{PARITY_AGENT_ID}")
+            iw.ok(f"cleaned up sub-agent {str(PARITY_AGENT_ID)[:8]}…")
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup
+            iw.fail(f"sub-agent cleanup failed (delete /agents/{PARITY_AGENT_ID}): {exc}")
+
+    report.add(iw.StepResult("Vault parity + self-heal", ok_all, (time.time() - t0) * 1000,
+                             "credential delta + alf check parity + --recover self-heal"))
+    iw.pause(cfg)
+
+
 def step_cleanup_vault_agent(
     cfg: iw.Config,
     api: iw.ApiClient,
@@ -762,7 +896,7 @@ def step_cleanup_vault_agent(
     s3: iw.S3Client,
     report: iw.Report,
 ):
-    iw.section(9, "Cleanup — Delete Vault Walkthrough Agent")
+    iw.section(10, "Cleanup — Delete Vault Walkthrough Agent")
     iw.explain(
         """
         `DELETE /agents/:id` removes the agent, cascades snapshot/delta rows, and
@@ -886,7 +1020,9 @@ def main():
         iw.pause(cfg, "Press Enter to begin...")
 
     try:
-        iw.step_connectivity(cfg, api, db, s3, report)
+        # ctx=None: the CLI lane is exercised later by the parity/self-heal
+        # section; here we only need API / Neon / S3 connectivity.
+        iw.step_connectivity(cfg, None, api, db, s3, report)
         step_vault_zero_knowledge(cfg, report)
         step_on_disk_layout(cfg, report)
         step_create_vault_agent(cfg, api, db, report)
@@ -896,6 +1032,7 @@ def main():
         step_surgical_delete_concept(cfg, report)
         step_optional_alf_vault_list(cfg, report)
         step_dry_run_upload_preview(cfg, report)
+        step_vault_parity_selfheal(cfg, api, report)
         step_cleanup_vault_agent(cfg, api, db, s3, report)
 
     except KeyboardInterrupt:

@@ -232,14 +232,14 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
     // `.alfignore`).
     let mut missing_includes = Vec::new();
     let mut seen: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
-    let include = match crate::include::IncludeList::load(workspace) {
+    let include = match alf_core::include::IncludeList::load(workspace) {
         Ok(list) => list,
         Err(err) => {
             warnings.push(format!(
                 "{} could not be read ({err}); tracked files not synced this run",
-                crate::include::INCLUDE_FILE
+                alf_core::include::INCLUDE_FILE
             ));
-            crate::include::IncludeList::default()
+            alf_core::include::IncludeList::default()
         }
     };
     for rel in include.paths() {
@@ -265,7 +265,7 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
 
     // The include list and sync log themselves travel as raw so the agent's
     // sync config and removal history persist across machines on restore.
-    for sentinel in [crate::include::INCLUDE_FILE, crate::include::SYNC_LOG_FILE] {
+    for sentinel in [alf_core::include::INCLUDE_FILE, alf_core::include::SYNC_LOG_FILE] {
         if seen.contains(sentinel) {
             continue;
         }
@@ -883,7 +883,7 @@ mod tests {
 
     // -- Include list (`alf add`) -----------------------------------------
 
-    use crate::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
+    use alf_core::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
 
     /// A tracked arbitrary file (root + nested) is enumerated into raw, and the
     /// include list itself travels.

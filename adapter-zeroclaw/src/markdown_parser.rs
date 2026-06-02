@@ -189,7 +189,7 @@ fn parse_memory_file(
     let file_mtime = fs::metadata(file_path)
         .ok()
         .and_then(|m| m.modified().ok())
-        .map(|t| DateTime::<Utc>::from(t))
+        .map(DateTime::<Utc>::from)
         .unwrap_or_else(Utc::now);
 
     let mut records = Vec::with_capacity(sections.len());
@@ -295,7 +295,7 @@ pub fn collect_markdown_memory(
         all_records.extend(records);
     }
 
-    all_records.sort_by(|a, b| a.temporal.created_at.cmp(&b.temporal.created_at));
+    all_records.sort_by_key(|r| r.temporal.created_at);
 
     Ok(all_records)
 }

@@ -1,7 +1,7 @@
 ---
 name: agent-life
 description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from cloud, or migrate agent state.
-version: 1.8.0
+version: 1.9.0
 metadata:
   openclaw:
     requires:
@@ -31,7 +31,7 @@ metadata:
         description: Pin install.sh to a specific release.
       - name: ALF_ALLOW_UNVERIFIED
         required: false
-        description: Set to 1 to allow install.sh to proceed when the SHA256 checksum cannot be verified. Default is to fail.
+        description: Set to 1 to allow install.sh to proceed when the SHA256 checksum cannot be verified. The default is to fail.
     homepage: https://agent-life.ai
 ---
 
@@ -56,13 +56,13 @@ Install script source: <https://github.com/agent-life/agent-life-adapters/blob/m
 
 The install script detects your platform, downloads the binary from GitHub Releases, **requires a successful SHA256 checksum verification**, and installs to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). Stdout is JSON:
 
-    {"ok":true,"version":"v0.1.8","installed_version":"alf 0.1.8","path":"/usr/local/bin/alf","checksum_verified":true}
+    {"ok":true,"version":"v0.1.9","installed_version":"alf 0.1.9","path":"/usr/local/bin/alf","checksum_verified":true}
 
 **Checksum verification is mandatory by default.** A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed at all — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case only (not recommended), in which case `checksum_verified` is `false` and a `warnings` array in the output JSON records the reason.
 
 For production use, pin to a specific release:
 
-    ALF_VERSION=v0.1.8 sh install-alf.sh
+    ALF_VERSION=v0.1.9 sh install-alf.sh
 
 Verify: `alf --version`
 

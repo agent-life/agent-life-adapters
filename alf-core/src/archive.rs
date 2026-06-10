@@ -26,6 +26,7 @@ use crate::principals::PrincipalsDocument;
 
 use std::collections::HashMap;
 use std::io::{BufReader, Cursor, Read, Seek, Write};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
@@ -53,6 +54,70 @@ pub enum ArchiveError {
 
     #[error("Invalid archive: {0}")]
     Invalid(String),
+}
+
+// ---------------------------------------------------------------------------
+// Path safety (archive extraction)
+// ---------------------------------------------------------------------------
+
+/// Maximum decompressed size of a single raw source entry accepted on restore.
+///
+/// Bounds memory use when extracting `raw/{runtime}/` files, defending against
+/// decompression bombs. Generous for text-based agent workspaces; fatal to a
+/// crafted entry that inflates to gigabytes.
+pub const MAX_RAW_ENTRY_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+
+/// Maximum total decompressed size across all raw source entries on a restore.
+pub const MAX_RAW_TOTAL_BYTES: u64 = 256 * 1024 * 1024; // 256 MiB
+
+/// Join an archive-relative entry path onto `base`, refusing any name that
+/// would escape `base` — the "Zip Slip" / path-traversal class (CWE-22).
+///
+/// ALF archive entry names are forward-slash separated and must stay within
+/// the extraction root. This rejects `..` segments, absolute paths (a leading
+/// `/`, a Windows drive prefix), embedded NUL bytes, and backslash separator
+/// smuggling. Returns [`ArchiveError::Invalid`] for any unsafe name.
+///
+/// Callers MUST route every archive-controlled write through this rather than
+/// `base.join(relative)`, which does not normalize `..` and silently honors
+/// absolute components.
+pub fn safe_extract_path(base: &Path, relative: &str) -> Result<PathBuf, ArchiveError> {
+    let reject = || ArchiveError::Invalid(format!("unsafe archive entry path: {relative:?}"));
+
+    if relative.is_empty() || relative.contains('\0') {
+        return Err(reject());
+    }
+
+    let mut out = base.to_path_buf();
+    let mut wrote_segment = false;
+    for segment in relative.split('/') {
+        match segment {
+            // Leading, trailing, or doubled `/` — the absolute-path / `//`
+            // injection vector once the `raw/{runtime}/` prefix is stripped.
+            "" => return Err(reject()),
+            "." => continue,
+            ".." => return Err(reject()),
+            // A backslash is a path separator on Windows; reject to block
+            // `..\..\x` style smuggling on any platform.
+            s if s.contains('\\') => return Err(reject()),
+            // A Windows drive-relative prefix like `C:` or `C:foo`.
+            s if is_windows_drive_prefix(s) => return Err(reject()),
+            s => {
+                out.push(s);
+                wrote_segment = true;
+            }
+        }
+    }
+
+    if !wrote_segment {
+        return Err(reject()); // only `.` segments — nothing safe to write
+    }
+    Ok(out)
+}
+
+fn is_windows_drive_prefix(segment: &str) -> bool {
+    let bytes = segment.as_bytes();
+    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 // ===========================================================================
@@ -370,6 +435,28 @@ impl<R: Read + Seek> AlfReader<R> {
         Ok(buf)
     }
 
+    /// Like [`read_raw_entry`](Self::read_raw_entry) but refuses to allocate
+    /// more than `max` bytes, defending against decompression bombs whose
+    /// declared size cannot be trusted. Returns [`ArchiveError::Invalid`] if
+    /// the decompressed entry exceeds `max`.
+    pub fn read_raw_entry_capped(&mut self, path: &str, max: u64) -> Result<Vec<u8>, ArchiveError> {
+        let entry = self
+            .archive
+            .by_name(path)
+            .map_err(|_| ArchiveError::MissingEntry(path.into()))?;
+        let mut buf = Vec::new();
+        // Read at most `max + 1` bytes: reading more than `max` means the
+        // entry is over budget regardless of its declared central-directory
+        // size (which a hostile archive may understate).
+        let read = entry.take(max + 1).read_to_end(&mut buf)?;
+        if read as u64 > max {
+            return Err(ArchiveError::Invalid(format!(
+                "raw entry {path:?} exceeds {max} bytes (possible decompression bomb)"
+            )));
+        }
+        Ok(buf)
+    }
+
     /// Uncompressed byte size of a raw archive entry.
     ///
     /// Read from the ZIP central directory — no decompression, O(1) per call.
@@ -672,6 +759,98 @@ mod tests {
     use uuid::Uuid;
 
     // -- Test helpers -------------------------------------------------------
+
+    // -- Path safety: Zip Slip + decompression bomb -------------------------
+
+    #[test]
+    fn safe_extract_path_accepts_plain_and_nested() {
+        let base = Path::new("/ws");
+        assert_eq!(
+            safe_extract_path(base, "SOUL.md").unwrap(),
+            Path::new("/ws/SOUL.md")
+        );
+        assert_eq!(
+            safe_extract_path(base, "memory/2026-Q1.jsonl").unwrap(),
+            Path::new("/ws/memory/2026-Q1.jsonl")
+        );
+        // `.` segments are harmless and are dropped.
+        assert_eq!(
+            safe_extract_path(base, "./a/./b").unwrap(),
+            Path::new("/ws/a/b")
+        );
+    }
+
+    #[test]
+    fn safe_extract_path_rejects_parent_traversal() {
+        let base = Path::new("/ws");
+        assert!(safe_extract_path(base, "../escape.txt").is_err());
+        assert!(safe_extract_path(base, "../../etc/passwd").is_err());
+        assert!(safe_extract_path(base, "a/../../escape.txt").is_err());
+    }
+
+    #[test]
+    fn safe_extract_path_rejects_absolute_and_double_slash() {
+        let base = Path::new("/ws");
+        assert!(safe_extract_path(base, "/etc/cron.d/evil").is_err());
+        assert!(safe_extract_path(base, "/abs.txt").is_err());
+        // A doubled slash (the absolute-injection vector after prefix strip).
+        assert!(safe_extract_path(base, "a//b").is_err());
+    }
+
+    #[test]
+    fn safe_extract_path_rejects_windows_smuggling() {
+        let base = Path::new("/ws");
+        assert!(safe_extract_path(base, "..\\..\\evil").is_err());
+        assert!(safe_extract_path(base, "C:/evil").is_err());
+        assert!(safe_extract_path(base, "C:evil").is_err());
+    }
+
+    #[test]
+    fn safe_extract_path_rejects_empty_dot_and_nul() {
+        let base = Path::new("/ws");
+        assert!(safe_extract_path(base, "").is_err());
+        assert!(safe_extract_path(base, ".").is_err()); // only `.` → nothing to write
+        assert!(safe_extract_path(base, "a\0b").is_err());
+    }
+
+    #[test]
+    fn read_raw_entry_capped_rejects_oversize() {
+        let buf = Cursor::new(Vec::new());
+        let mut writer = AlfWriter::new(buf, base_manifest()).unwrap();
+        let payload = vec![b'x'; 1000];
+        writer.add_raw_source("openclaw", "big.bin", &payload).unwrap();
+        let buf = writer.finish().unwrap();
+
+        let mut reader = AlfReader::new(Cursor::new(buf.into_inner())).unwrap();
+        // Cap below the real size → rejected as a (possible) bomb.
+        assert!(reader
+            .read_raw_entry_capped("raw/openclaw/big.bin", 999)
+            .is_err());
+        // Cap at the real size → accepted.
+        let got = reader
+            .read_raw_entry_capped("raw/openclaw/big.bin", 1000)
+            .unwrap();
+        assert_eq!(got.len(), 1000);
+    }
+
+    #[test]
+    fn add_raw_source_preserves_traversal_name() {
+        // Precondition for the adapters' Zip-Slip regression tests: a malicious
+        // archive can carry a `..` entry name — the ZIP writer stores it
+        // verbatim — so the restore-side guard is the only defense.
+        let buf = Cursor::new(Vec::new());
+        let mut writer = AlfWriter::new(buf, base_manifest()).unwrap();
+        writer
+            .add_raw_source("openclaw", "../../escape.txt", b"pwn")
+            .unwrap();
+        let buf = writer.finish().unwrap();
+
+        let reader = AlfReader::new(Cursor::new(buf.into_inner())).unwrap();
+        assert!(reader
+            .file_names()
+            .iter()
+            .any(|n| n == "raw/openclaw/../../escape.txt"));
+    }
 
     fn base_manifest() -> Manifest {
         let now = Utc.with_ymd_and_hms(2026, 2, 15, 12, 0, 0).unwrap();

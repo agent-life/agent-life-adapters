@@ -369,6 +369,7 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
     prefix: &str,
     file_names: &[String],
 ) -> Result<()> {
+    let mut total_bytes: u64 = 0;
     for name in file_names {
         if !name.starts_with(prefix) {
             continue;
@@ -378,8 +379,21 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             continue;
         }
 
-        let data = alf.read_raw_entry(name)?;
-        let target = workspace.join(relative);
+        // Reject path-traversal / absolute entry names before any write —
+        // a hostile or compromised-server archive must not escape the
+        // workspace (Zip Slip; see threat model A4.1/A1.1).
+        let target = alf_core::safe_extract_path(workspace, relative)
+            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
+
+        // Bound decompression to defend against zip bombs.
+        let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
+        total_bytes = total_bytes.saturating_add(data.len() as u64);
+        if total_bytes > alf_core::MAX_RAW_TOTAL_BYTES {
+            anyhow::bail!(
+                "raw source restore exceeds {} bytes (possible zip bomb)",
+                alf_core::MAX_RAW_TOTAL_BYTES
+            );
+        }
 
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
@@ -626,5 +640,74 @@ mod tests {
         let report = import(&alf_file, &deep_path, None).unwrap();
         assert_eq!(report.agent_name, "Bot");
         assert!(deep_path.is_dir());
+    }
+
+    // -- Zip Slip / path-traversal regression (threat model A4.1/A1.1) ------
+
+    /// Build a valid exported archive, then append one malicious raw entry
+    /// with an attacker-controlled name. Returns the workspace TempDir (kept
+    /// alive so the `.alf` is not deleted) and the path to the archive.
+    fn archive_with_malicious_entry(entry_name: &str) -> (TempDir, std::path::PathBuf) {
+        use std::io::Write as _;
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nhi"),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
+        let alf_file = ws.path().join("export.alf");
+        export::export(ws.path(), &alf_file).unwrap();
+
+        let file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&alf_file)
+            .unwrap();
+        let mut zw = zip::ZipWriter::new_append(file).unwrap();
+        zw.start_file(entry_name, zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(b"owned").unwrap();
+        zw.finish().unwrap();
+        (ws, alf_file)
+    }
+
+    #[test]
+    fn import_rejects_zip_slip_parent_traversal() {
+        isolate_home();
+        let (_keep, alf_file) = archive_with_malicious_entry("raw/openclaw/../../PWNED.txt");
+
+        let root = TempDir::new().unwrap();
+        let workspace = root.path().join("a/ws");
+        // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
+        let escaped = root.path().join("PWNED.txt");
+
+        let result = import(&alf_file, &workspace, None);
+        assert!(result.is_err(), "import must reject a path-traversal archive");
+        assert!(
+            !escaped.exists(),
+            "Zip Slip escaped the workspace: {}",
+            escaped.display()
+        );
+    }
+
+    #[test]
+    fn import_rejects_zip_slip_absolute() {
+        isolate_home();
+        let root = TempDir::new().unwrap();
+        // Absolute target kept inside our sandbox, so even a regression cannot
+        // touch the real filesystem.
+        let escaped = root.path().join("ABS_PWNED.txt");
+        let entry = format!("raw/openclaw/{}", escaped.display());
+        let (_keep, alf_file) = archive_with_malicious_entry(&entry);
+
+        let workspace = root.path().join("ws");
+        let result = import(&alf_file, &workspace, None);
+        assert!(
+            result.is_err(),
+            "import must reject an absolute-path archive entry"
+        );
+        assert!(
+            !escaped.exists(),
+            "absolute-path entry escaped: {}",
+            escaped.display()
+        );
     }
 }

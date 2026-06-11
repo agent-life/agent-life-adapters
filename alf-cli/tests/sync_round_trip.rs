@@ -108,6 +108,7 @@ fn build_delta(agent_id: uuid::Uuid, base_sequence: u64, entries: &[DeltaMemoryE
             principals: None,
             credentials: None,
             memory: None,
+            raw: None,
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
@@ -119,6 +120,99 @@ fn build_delta(agent_id: uuid::Uuid, base_sequence: u64, entries: &[DeltaMemoryE
         writer
             .add_memory_deltas(entries)
             .expect("failed to add memory deltas");
+    }
+    writer
+        .finish()
+        .expect("failed to finish delta")
+        .into_inner()
+}
+
+/// Read every `raw/{runtime}/` file from an archive, keyed by full archive path.
+fn raw_tree(alf_bytes: &[u8], runtime: &str) -> std::collections::BTreeMap<String, Vec<u8>> {
+    let mut reader = AlfReader::new(Cursor::new(alf_bytes)).expect("failed to open .alf");
+    let prefix = format!("raw/{runtime}/");
+    let names: Vec<String> = reader
+        .file_names()
+        .into_iter()
+        .filter(|p| p.starts_with(&prefix) && !p.ends_with('/'))
+        .collect();
+    let mut map = std::collections::BTreeMap::new();
+    for name in names {
+        let bytes = reader
+            .read_raw_entry(&name)
+            .expect("failed to read raw entry");
+        map.insert(name, bytes);
+    }
+    map
+}
+
+/// Diff two archives' raw trees the way `alf sync` does. Returns
+/// `(changed_with_bytes, deleted_paths)`.
+fn diff_raw(base: &[u8], curr: &[u8], runtime: &str) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    let prev = raw_tree(base, runtime);
+    let cur = raw_tree(curr, runtime);
+    let changed = cur
+        .iter()
+        .filter(|(p, b)| prev.get(*p).map(|pb| pb != *b).unwrap_or(true))
+        .map(|(p, b)| (p.clone(), b.clone()))
+        .collect();
+    let deleted = prev
+        .keys()
+        .filter(|p| !cur.contains_key(*p))
+        .cloned()
+        .collect();
+    (changed, deleted)
+}
+
+/// Build a delta carrying both memory deltas and a raw-source overlay — the
+/// shape `alf sync` produces post-fix.
+fn build_delta_with_raw(
+    agent_id: uuid::Uuid,
+    base_sequence: u64,
+    entries: &[DeltaMemoryEntry],
+    raw_changed: &[(String, Vec<u8>)],
+    raw_deleted: &[String],
+) -> Vec<u8> {
+    let manifest = DeltaManifest {
+        alf_version: "1.0.0".into(),
+        created_at: Utc::now(),
+        agent: DeltaAgentRef {
+            id: agent_id,
+            source_runtime: Some("openclaw".into()),
+            extra: HashMap::new(),
+        },
+        sync: DeltaSyncCursor {
+            base_sequence,
+            new_sequence: base_sequence + 1,
+            base_timestamp: None,
+            new_timestamp: None,
+            extra: HashMap::new(),
+        },
+        changes: ChangeInventory {
+            identity: None,
+            principals: None,
+            credentials: None,
+            memory: None,
+            raw: None,
+            extra: HashMap::new(),
+        },
+        extra: HashMap::new(),
+    };
+
+    let buf = Cursor::new(Vec::new());
+    let mut writer = DeltaWriter::new(buf, manifest).expect("failed to create delta writer");
+    if !entries.is_empty() {
+        writer
+            .add_memory_deltas(entries)
+            .expect("failed to add memory deltas");
+    }
+    for (path, data) in raw_changed {
+        writer
+            .add_raw_change(path, data)
+            .expect("failed to add raw change");
+    }
+    for path in raw_deleted {
+        writer.add_raw_deletion(path);
     }
     writer
         .finish()
@@ -310,6 +404,85 @@ fn snapshot_plus_delta_round_trip() {
     if let Some(err) = compare_records(&mutated_records, &rebuilt_records) {
         panic!("rebuilt snapshot doesn't match mutated export: {}", err);
     }
+}
+
+/// Regression for the same-runtime restore bug: a delta-only memory change must
+/// still appear on disk after `alf restore`. The adapter import prefers the
+/// verbatim `raw/{runtime}/` tree, and pre-fix that tree was frozen at the
+/// snapshot — so the delta's new daily file silently never materialized even
+/// though `memory_records` and `sequence` looked correct. The fix carries the
+/// changed raw files in the delta; rebuild overlays them. This asserts the
+/// materialized workspace, which the record-only round-trip tests above missed.
+#[test]
+fn delta_borne_files_materialize_on_restore() {
+    let tmp = TempDir::new().unwrap();
+
+    let ws = create_workspace(
+        &tmp,
+        "workspace",
+        "Atlas",
+        "## Fact\n\nBaseline.",
+        &[("2026-01-15.md", "## Standup\n\nDay 15 notes.")],
+    );
+
+    let base_path = tmp.path().join("base.alf");
+    let base_bytes = export_workspace(&ws, &base_path);
+    let base_records = read_records(&base_bytes);
+    let agent_id = {
+        let reader = AlfReader::new(Cursor::new(&base_bytes)).unwrap();
+        reader.manifest().agent.id
+    };
+
+    // Mutate: add a new daily memory file — a pure delta change (no re-snapshot).
+    fs::write(
+        ws.join("memory/2026-01-16.md"),
+        "## Migration\n\nDay 16 runbook complete.",
+    )
+    .unwrap();
+
+    let mutated_path = tmp.path().join("mutated.alf");
+    let mutated_bytes = export_workspace(&ws, &mutated_path);
+    let mutated_records = read_records(&mutated_bytes);
+
+    // Build the delta exactly as `alf sync` now does: memory delta + raw overlay.
+    let mem_entries = compute_delta(&base_records, &mutated_records);
+    let (raw_changed, raw_deleted) = diff_raw(&base_bytes, &mutated_bytes, "openclaw");
+    assert!(
+        raw_changed
+            .iter()
+            .any(|(p, _)| p.ends_with("memory/2026-01-16.md")),
+        "raw diff must include the new daily file; got {:?}",
+        raw_changed.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+    let delta_bytes = build_delta_with_raw(agent_id, 0, &mem_entries, &raw_changed, &raw_deleted);
+
+    let rebuilt = rebuild_snapshot(&base_bytes, &[delta_bytes.as_slice()]).expect("rebuild failed");
+
+    // Restore into a fresh workspace via the adapter (the raw-preferred path).
+    let rebuilt_path = tmp.path().join("rebuilt.alf");
+    fs::write(&rebuilt_path, &rebuilt).unwrap();
+    let restored_ws = tmp.path().join("restored");
+    OpenClawAdapter
+        .import(&rebuilt_path, &restored_ws)
+        .expect("import failed");
+
+    // The delta-borne file must be on disk with its content — the regression.
+    let restored_16 = restored_ws.join("memory/2026-01-16.md");
+    assert!(
+        restored_16.is_file(),
+        "delta-added daily file missing after restore (raw tree was frozen at snapshot)"
+    );
+    assert!(
+        fs::read_to_string(&restored_16)
+            .unwrap()
+            .contains("Day 16 runbook complete"),
+        "restored daily file has stale/empty content"
+    );
+    // The snapshot-era file is still present too.
+    assert!(
+        restored_ws.join("memory/2026-01-15.md").is_file(),
+        "snapshot-era daily file should remain after restore"
+    );
 }
 
 /// Baseline → mutate 1 → delta 1 → mutate 2 → delta 2 → rebuild(base + [d1, d2])

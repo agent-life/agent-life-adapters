@@ -571,6 +571,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),

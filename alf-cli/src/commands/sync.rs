@@ -458,7 +458,23 @@ fn execute_delta(
     let princ_diff = diff_principals(prev_principals.as_ref(), curr_principals.as_ref());
     let id_changed = identity_changed(prev_identity.as_ref(), curr_identity.as_ref());
 
-    if delta_entries.is_empty() && cred_diff.is_empty() && princ_diff.is_empty() && !id_changed {
+    // Diff the verbatim `raw/{runtime}/` tree so the delta carries the changed
+    // source files. The structured diffs above keep the cloud dashboard correct;
+    // this keeps a same-runtime `alf restore` correct, which rebuilds the
+    // workspace from the raw tree and would otherwise see only the frozen
+    // snapshot. Tracked files (`alf add`) already forced a re-snapshot above, so
+    // they compare equal here and contribute nothing.
+    let prev_raw = read_runtime_raw_map(&mut prev_reader, runtime)?;
+    let curr_raw = read_runtime_raw_map(&mut curr_reader, runtime)?;
+    let (raw_changed, raw_deleted) = diff_raw_trees(&prev_raw, &curr_raw);
+
+    if delta_entries.is_empty()
+        && cred_diff.is_empty()
+        && princ_diff.is_empty()
+        && !id_changed
+        && raw_changed.is_empty()
+        && raw_deleted.is_empty()
+    {
         if human {
             println!(
                 "{} No changes detected — already up to date",
@@ -513,6 +529,13 @@ fn execute_delta(
     if id_changed {
         output::progress("  Identity changed");
     }
+    if !raw_changed.is_empty() || !raw_deleted.is_empty() {
+        output::progress(&format!(
+            "  Raw sources: {} changed, {} removed",
+            raw_changed.len(),
+            raw_deleted.len()
+        ));
+    }
 
     let delta_manifest = DeltaManifest {
         alf_version: "1.0.0".into(),
@@ -539,6 +562,7 @@ fn execute_delta(
             principals: None,
             credentials: None,
             memory: None,
+            raw: None,
             extra: HashMap::new(),
         },
         extra: HashMap::new(),
@@ -593,6 +617,18 @@ fn execute_delta(
                 changed_ids,
             )?,
         }
+    }
+    // Raw source overlay: carry each changed file verbatim and record removals.
+    // `rebuild` replays these onto the snapshot's raw tree so a same-runtime
+    // restore sees the current workspace, not the frozen base.
+    for path in &raw_changed {
+        let data = curr_raw
+            .get(path)
+            .expect("raw_changed path is taken from curr_raw");
+        delta_writer.add_raw_change(path, data)?;
+    }
+    for path in &raw_deleted {
+        delta_writer.add_raw_deletion(path);
     }
     let delta_buf = delta_writer.finish()?;
     let delta_bytes = delta_buf.into_inner();
@@ -701,6 +737,49 @@ fn read_tracked_map<R: Read + Seek>(
         }
     }
     Ok(map)
+}
+
+/// Read every `raw/{runtime}/` source file from an archive, keyed by full
+/// archive path. Backs the raw-source delta: comparing the base snapshot's tree
+/// with the current export's tree yields the files a delta must carry so a
+/// same-runtime restore stays current.
+fn read_runtime_raw_map<R: Read + Seek>(
+    reader: &mut AlfReader<R>,
+    runtime: &str,
+) -> Result<BTreeMap<String, Vec<u8>>> {
+    let prefix = format!("raw/{runtime}/");
+    let names: Vec<String> = reader
+        .file_names()
+        .into_iter()
+        .filter(|p| p.starts_with(&prefix) && !p.ends_with('/'))
+        .collect();
+    let mut map = BTreeMap::new();
+    for name in names {
+        let bytes = reader.read_raw_entry(&name)?;
+        map.insert(name, bytes);
+    }
+    Ok(map)
+}
+
+/// Diff two `raw/{runtime}/` trees (full archive path -> bytes). Returns
+/// `(changed, deleted)`: `changed` are paths present in `curr` that are new or
+/// differ byte-for-byte from `prev`; `deleted` are paths in `prev` absent from
+/// `curr`. Both are full `raw/...` archive paths.
+fn diff_raw_trees(
+    prev: &BTreeMap<String, Vec<u8>>,
+    curr: &BTreeMap<String, Vec<u8>>,
+) -> (Vec<String>, Vec<String>) {
+    let changed: Vec<String> = curr
+        .iter()
+        .filter(|(path, bytes)| prev.get(*path).map(|p| p != *bytes).unwrap_or(true))
+        .map(|(path, _)| path.clone())
+        .collect();
+    let deleted: Vec<String> = prev
+        .keys()
+        .filter(|path| !curr.contains_key(*path))
+        .cloned()
+        .collect();
+    (changed, deleted)
 }
 
 // ---------------------------------------------------------------------------
@@ -955,5 +1034,51 @@ mod tests {
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    fn raw_map(pairs: &[(&str, &[u8])]) -> BTreeMap<String, Vec<u8>> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn diff_raw_trees_detects_add_update_delete() {
+        let prev = raw_map(&[
+            ("raw/openclaw/SOUL.md", b"v0"),
+            ("raw/openclaw/memory/2026-01-15.md", b"day 15"),
+            ("raw/openclaw/gone.md", b"bye"),
+        ]);
+        // SOUL.md updated, 2026-01-15 unchanged, 2026-01-16 added, gone.md removed.
+        let curr = raw_map(&[
+            ("raw/openclaw/SOUL.md", b"v1"),
+            ("raw/openclaw/memory/2026-01-15.md", b"day 15"),
+            ("raw/openclaw/memory/2026-01-16.md", b"day 16"),
+        ]);
+
+        let (changed, deleted) = diff_raw_trees(&prev, &curr);
+
+        assert_eq!(
+            changed,
+            vec![
+                "raw/openclaw/SOUL.md".to_string(),
+                "raw/openclaw/memory/2026-01-16.md".to_string(),
+            ]
+        );
+        assert_eq!(deleted, vec!["raw/openclaw/gone.md".to_string()]);
+    }
+
+    #[test]
+    fn diff_raw_trees_identical_trees_is_empty() {
+        let tree = raw_map(&[
+            ("raw/openclaw/SOUL.md", b"same"),
+            ("raw/openclaw/memory/2026-01-15.md", b"day 15"),
+        ]);
+        let (changed, deleted) = diff_raw_trees(&tree, &tree);
+        assert!(
+            changed.is_empty() && deleted.is_empty(),
+            "an unchanged workspace must not churn a raw delta (re-sync no-op)"
+        );
     }
 }

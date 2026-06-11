@@ -502,6 +502,8 @@ pub struct DeltaWriter<W: Write + Seek> {
     principals_change: Option<PrincipalsChange>,
     credentials_change: Option<CredentialsChange>,
     memory_change: Option<MemoryChange>,
+    raw_changed: Vec<String>,
+    raw_deleted: Vec<String>,
 }
 
 impl<W: Write + Seek> DeltaWriter<W> {
@@ -517,6 +519,8 @@ impl<W: Write + Seek> DeltaWriter<W> {
             principals_change: None,
             credentials_change: None,
             memory_change: None,
+            raw_changed: Vec::new(),
+            raw_deleted: Vec::new(),
         })
     }
 
@@ -588,13 +592,44 @@ impl<W: Write + Seek> DeltaWriter<W> {
         Ok(())
     }
 
+    /// Carry a changed (created or updated) raw source file in this delta.
+    ///
+    /// `archive_path` is the full `raw/{runtime}/...` path as it appears in a
+    /// snapshot; the bytes are stored at that exact path so [`rebuild`] can
+    /// overlay them onto the base raw tree. Deltas otherwise touch only the
+    /// structured layers, which on a raw-preferred restore would leave the
+    /// snapshot's frozen raw files shadowing every post-snapshot change.
+    ///
+    /// [`rebuild`]: crate::rebuild::rebuild_snapshot
+    pub fn add_raw_change(&mut self, archive_path: &str, data: &[u8]) -> Result<(), ArchiveError> {
+        self.write_entry(archive_path, data)?;
+        self.raw_changed.push(archive_path.to_string());
+        Ok(())
+    }
+
+    /// Record a raw source file removed since the base (full `raw/...` path).
+    /// Carries no bytes — rebuild drops the path from the carried-forward tree.
+    pub fn add_raw_deletion(&mut self, archive_path: &str) {
+        self.raw_deleted.push(archive_path.to_string());
+    }
+
     /// Finalize the delta archive.
     pub fn finish(mut self) -> Result<W, ArchiveError> {
+        let raw_change = if self.raw_changed.is_empty() && self.raw_deleted.is_empty() {
+            None
+        } else {
+            Some(RawChange {
+                changed: std::mem::take(&mut self.raw_changed),
+                deleted: std::mem::take(&mut self.raw_deleted),
+                extra: HashMap::new(),
+            })
+        };
         self.manifest.changes = ChangeInventory {
             identity: self.identity_change.take(),
             principals: self.principals_change.take(),
             credentials: self.credentials_change.take(),
             memory: self.memory_change.take(),
+            raw: raw_change,
             extra: HashMap::new(),
         };
 
@@ -720,6 +755,20 @@ impl<R: Read + Seek> DeltaReader<R> {
             },
             None => Ok(None),
         }
+    }
+
+    /// Read a raw source file carried in this delta, by its full `raw/...` path.
+    ///
+    /// Used by [`rebuild`](crate::rebuild::rebuild_snapshot) to overlay the
+    /// paths listed in [`RawChange::changed`] onto the base raw tree.
+    pub fn read_raw_entry(&mut self, path: &str) -> Result<Vec<u8>, ArchiveError> {
+        let mut entry = self
+            .archive
+            .by_name(path)
+            .map_err(|_| ArchiveError::MissingEntry(path.into()))?;
+        let mut buf = Vec::new();
+        entry.read_to_end(&mut buf)?;
+        Ok(buf)
     }
 }
 
@@ -1343,6 +1392,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -1411,6 +1461,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -1484,6 +1535,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),

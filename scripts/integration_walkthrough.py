@@ -49,6 +49,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shutil
@@ -523,7 +524,12 @@ def build_run_context(cfg: Config, alf: str, agent_id: uuid.UUID = AGENT_ID) -> 
     # Neon / S3 lane can keep querying by our known id. Without this the CLI
     # would derive its own id and the cloud-side lookups wouldn't line up.
     (ws / "SOUL.md").write_text(SEED_SOUL, encoding="utf-8")
-    (ws / "MEMORY.md").write_text(SEED_MEMORY_MD, encoding="utf-8")
+    # MEMORY.md is an OpenClaw memory-index file; ZeroClaw's markdown backend
+    # doesn't capture it, so seeding it there would make the synthetic workspace
+    # non-round-trippable and break the Step 7 byte-equality proof. Keep the
+    # synthetic workspace to exactly what the chosen runtime round-trips.
+    if cfg.runtime == "openclaw":
+        (ws / "MEMORY.md").write_text(SEED_MEMORY_MD, encoding="utf-8")
     (ws / "memory").mkdir()
     (ws / "memory" / "2026-01-15.md").write_text(SEED_DAILY, encoding="utf-8")
     (ws / ".alf-agent-id").write_text(str(agent_id) + "\n", encoding="utf-8")
@@ -548,6 +554,59 @@ def tree(path: Path, limit: int = 12) -> list[str]:
         if p.is_file():
             out.append(str(p.relative_to(path)))
     return out[:limit]
+
+
+# `.alf-agent-id` is the ALF agent-UUID pin. Its on-disk representation is
+# implementation-defined — `alf import` writes it without a trailing newline,
+# while the seed writes one — so it is excluded from the content hash and the
+# pin is instead verified separately by its (stripped) UUID value.
+DIGEST_EXCLUDE = (".alf-agent-id",)
+
+
+def workspace_file_hashes(
+    path: Path, exclude: tuple[str, ...] = DIGEST_EXCLUDE
+) -> dict[str, str]:
+    """Map of {workspace-relative path -> SHA256(content)} for every file."""
+    out: dict[str, str] = {}
+    if not path.is_dir():
+        return out
+    for p in sorted(path.rglob("*")):
+        if not p.is_file():
+            continue
+        rel = str(p.relative_to(path))
+        if rel in exclude:
+            continue
+        out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
+    return out
+
+
+def workspace_digest(path: Path, exclude: tuple[str, ...] = DIGEST_EXCLUDE) -> str:
+    """One recursive SHA256 over a workspace: a digest of every file's relative
+    path + content-hash, sorted for determinism. Two workspaces share a digest
+    iff they hold the same files with byte-identical contents (modulo
+    `exclude`). This is the proof that `alf restore` reproduced the workspace."""
+    h = hashlib.sha256()
+    for rel, file_hash in sorted(workspace_file_hashes(path, exclude).items()):
+        h.update(rel.encode("utf-8"))
+        h.update(b"\0")
+        h.update(file_hash.encode("ascii"))
+        h.update(b"\0")
+    return h.hexdigest()
+
+
+def workspace_diff(a: Path, b: Path) -> list[str]:
+    """Human-readable per-file differences between two workspaces (for failure
+    reporting): files only in one side, or present in both but differing."""
+    ha, hb = workspace_file_hashes(a), workspace_file_hashes(b)
+    lines: list[str] = []
+    for rel in sorted(set(ha) - set(hb)):
+        lines.append(f"only in synthetic: {rel}")
+    for rel in sorted(set(hb) - set(ha)):
+        lines.append(f"only in restored:  {rel}")
+    for rel in sorted(set(ha) & set(hb)):
+        if ha[rel] != hb[rel]:
+            lines.append(f"content differs:   {rel}")
+    return lines
 
 
 # ---------------------------------------------------------------------------
@@ -898,14 +957,40 @@ def step_restore(cfg: Config, ctx: RunContext, report: Report):
     for f in files:
         print(f"    {c('dim', f)}")
     print()
+
+    # Byte-equality proof: a recursive SHA256 over the synthetic workspace must
+    # equal the restored one. `sequence`/`memory_records` above are read from the
+    # archive's structured layers and can look correct while the materialized
+    # files are stale — this digest is what actually catches a restore that drops
+    # delta-borne files (the raw-source-delta regression this asserts against).
+    syn_digest = workspace_digest(ctx.ws)
+    res_digest = workspace_digest(ctx.restore_ws)
+    digests_match = syn_digest == res_digest
+    (ok if digests_match else fail)(
+        f"recursive SHA256 {'matches' if digests_match else 'MISMATCH'} — "
+        f"synthetic {syn_digest[:16]}…  restored {res_digest[:16]}…")
+    if not digests_match:
+        for line in workspace_diff(ctx.ws, ctx.restore_ws):
+            print(f"      {c('red', line)}")
+
+    # The agent-id pin is excluded from the content hash (its representation
+    # differs by design); verify its UUID value round-tripped instead.
+    id_file = ctx.restore_ws / ".alf-agent-id"
+    pin_ok = id_file.is_file() and id_file.read_text().strip() == str(AGENT_ID)
+    (ok if pin_ok else fail)(f".alf-agent-id pin restored = {pin_ok}")
+
     inspect(ctx, [
+        ("list per-file SHA256 of the restored workspace",
+         f"find {ctx.disp(ctx.restore_ws)} -type f ! -name .alf-agent-id "
+         f"-exec sha256sum {{}} + | sort"),
         ("compare restored vs original workspace",
          f"diff -r {ctx.disp(ctx.ws)} {ctx.disp(ctx.restore_ws)} || true"),
-        ("read a restored memory file",
-         f"cat {ctx.disp(ctx.restore_ws / 'memory' / '2026-01-15.md')} 2>/dev/null || true"),
     ])
-    report.add(StepResult("Restore", True, duration,
-                          f"{res.get('memory_records', '?')} records to fresh workspace"))
+    step_ok = digests_match and pin_ok
+    report.add(StepResult(
+        "Restore", step_ok, duration,
+        f"{res.get('memory_records', '?')} records; "
+        f"workspace SHA256 {'match' if digests_match else 'MISMATCH'}, pin={pin_ok}"))
     pause(cfg)
 
 
@@ -984,12 +1069,22 @@ def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
         return
     files = tree(ctx.restore_ws)
     ok(f"alf restore rebuilt {len(files)} file(s) from the cloud — full recovery, no data lost")
+
+    # Same byte-equality proof as Step 7: recovery must reproduce the workspace
+    # exactly, not merely "some files".
+    recovered_match = workspace_digest(ctx.ws) == workspace_digest(ctx.restore_ws)
+    (ok if recovered_match else fail)(
+        f"recovered workspace SHA256 {'matches synthetic' if recovered_match else 'MISMATCH'}")
+    if not recovered_match:
+        for line in workspace_diff(ctx.ws, ctx.restore_ws):
+            print(f"      {c('red', line)}")
     print()
     inspect(ctx, [
         ("confirm the workspace is back", f"ls -la {ctx.disp(ctx.restore_ws)}"),
     ])
-    report.add(StepResult("Data loss + recover", True, duration,
-                          f"recovered {len(files)} files from cloud"))
+    report.add(StepResult("Data loss + recover", recovered_match, duration,
+                          f"recovered {len(files)} files; "
+                          f"SHA256 {'match' if recovered_match else 'MISMATCH'}"))
     pause(cfg)
 
 

@@ -350,8 +350,9 @@ fn collect_issues(
             severity: "error".into(),
             code: "workspace_not_found".into(),
             message: format!("Workspace directory not found at {}", ws.path),
-            suggestion: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
-                .into(),
+            suggestion:
+                "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
+                    .into(),
         });
         return issues; // no point checking resources if workspace doesn't exist
     }
@@ -441,7 +442,11 @@ fn collect_issues(
             if resolved.runtime_configured_path.is_none()
                 && !home.join(".openclaw").join("openclaw.json").exists() =>
         {
-            Some(("openclaw_config_not_found", "~/.openclaw/openclaw.json not found", "OpenClaw"))
+            Some((
+                "openclaw_config_not_found",
+                "~/.openclaw/openclaw.json not found",
+                "OpenClaw",
+            ))
         }
         "zeroclaw" if !home.join(".zeroclaw").join("config.toml").exists() => Some((
             "zeroclaw_config_not_found",

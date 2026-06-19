@@ -746,11 +746,7 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             key,
         } => commands::vault::decrypt(
             &input,
-            &commands::vault::Selector {
-                id,
-                label,
-                service,
-            },
+            &commands::vault::Selector { id, label, service },
             &key.to_args(),
             &runtime,
             yes_insecure,
@@ -764,11 +760,7 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             out,
         } => commands::vault::delete(
             &input,
-            &commands::vault::Selector {
-                id,
-                label,
-                service,
-            },
+            &commands::vault::Selector { id, label, service },
             out.as_deref(),
         ),
     }

@@ -102,7 +102,10 @@ pub fn resolve(args: &VaultKeyArgs, runtime: &str) -> Result<Option<(VaultKey, K
     if let Ok(pass) = std::env::var("ALF_VAULT_PASSPHRASE") {
         if !pass.is_empty() {
             let key = derive_from_passphrase(pass.trim(), args.salt_b64.as_deref(), runtime)?;
-            return Ok(Some((key, KeySource::PassphraseEnv("ALF_VAULT_PASSPHRASE".into()))));
+            return Ok(Some((
+                key,
+                KeySource::PassphraseEnv("ALF_VAULT_PASSPHRASE".into()),
+            )));
         }
     }
 
@@ -251,7 +254,11 @@ mod tests {
         };
         let (k1, _) = resolve(&args, "openclaw").unwrap().unwrap();
         let (k2, _) = resolve(&args, "openclaw").unwrap().unwrap();
-        assert_eq!(k1.fingerprint(), k2.fingerprint(), "passphrase should be stable");
+        assert_eq!(
+            k1.fingerprint(),
+            k2.fingerprint(),
+            "passphrase should be stable"
+        );
 
         // Different runtime salt -> different key.
         let (k_z, _) = resolve(&args, "zeroclaw").unwrap().unwrap();

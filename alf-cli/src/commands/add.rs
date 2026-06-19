@@ -53,7 +53,10 @@ pub fn run(runtime: &str, workspace: &Path, path: &str) -> Result<()> {
         } else {
             println!("{} {} is already tracked", "✓".green().bold(), rel);
         }
-        println!("  Included in the next: alf sync -r {runtime} -w {}", workspace.display());
+        println!(
+            "  Included in the next: alf sync -r {runtime} -w {}",
+            workspace.display()
+        );
     } else {
         output::json(&AddResult {
             ok: true,

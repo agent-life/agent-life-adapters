@@ -54,9 +54,8 @@ pub fn run(topic: Option<&str>, _json: bool) -> Result<()> {
         "status" => print_status(),
         "files" => print_files(),
         "troubleshoot" => print_troubleshoot(),
-        "export" | "import" | "validate" | "vault" | "sync" | "restore" | "purge" | "login" | "check" => {
-            delegate_command_help(topic)
-        }
+        "export" | "import" | "validate" | "vault" | "sync" | "restore" | "purge" | "login"
+        | "check" => delegate_command_help(topic),
         _ => {
             eprintln!("Unknown topic: {}", topic);
             eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, vault, sync, restore, purge, login, check");

@@ -42,8 +42,8 @@ pub use archive::{
 };
 pub use credentials::*;
 pub use crypto::{
-    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob,
-    VaultKey, VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
+    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob, VaultKey,
+    VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
 };
 pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,

@@ -167,9 +167,7 @@ pub fn rebuild_snapshot(
             let (from, to) = PartitionAssigner::date_range_for_partition(&file_path)
                 .unwrap_or_else(|| {
                     // Fallback: use the first record's timestamp for from, no to
-                    let first = records
-                        .first()
-                        .expect("partition group is non-empty");
+                    let first = records.first().expect("partition group is non-empty");
                     let ts = first
                         .temporal
                         .observed_at

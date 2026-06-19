@@ -39,7 +39,10 @@ fn tracked_files_round_trip_byte_identical() {
         b"free-form agent notes\n"
     );
     // Tracked binary file restored byte-identical, nested dir preserved.
-    assert_eq!(fs::read(restored.join("my-project/blob.bin")).unwrap(), binary);
+    assert_eq!(
+        fs::read(restored.join("my-project/blob.bin")).unwrap(),
+        binary
+    );
     // The include list travels so the agent keeps tracking on machine B.
     assert!(restored.join(INCLUDE_FILE).is_file());
     let reloaded = IncludeList::load(&restored).unwrap();

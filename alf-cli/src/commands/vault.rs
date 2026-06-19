@@ -301,8 +301,8 @@ pub fn add(
     if let Some(s) = secret {
         secret_value = Some(s.to_string());
     } else if let Some(sf) = secret_file {
-        let raw = fs::read_to_string(sf)
-            .with_context(|| format!("Failed to read {}", sf.display()))?;
+        let raw =
+            fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
         secret_value = Some(raw.trim().to_string());
     } else if secret_value.is_none() {
         // Last resort: read the secret from stdin.
@@ -354,7 +354,9 @@ pub fn add(
         Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
         None => Uuid::nil(),
     };
-    let record_label = label.map(str::to_string).or_else(|| payload_username.clone());
+    let record_label = label
+        .map(str::to_string)
+        .or_else(|| payload_username.clone());
 
     // Every agent-added record carries `alf-vault` — the discriminator the
     // OpenClaw adapter uses to route records back to this file on import.
@@ -783,7 +785,6 @@ fn parse_credential_type(s: &str) -> CredentialType {
         other => CredentialType::Unknown(other.to_string()),
     }
 }
-
 
 // ===========================================================================
 // Tests

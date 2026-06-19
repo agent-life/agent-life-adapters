@@ -112,10 +112,8 @@ pub fn diff_credentials(
     let old_records = old.map(|d| &d.credentials).unwrap_or(&empty);
     let new_records = new.map(|d| &d.credentials).unwrap_or(&empty);
 
-    let old_map: HashMap<Uuid, &CredentialRecord> =
-        old_records.iter().map(|c| (c.id, c)).collect();
-    let new_map: HashMap<Uuid, &CredentialRecord> =
-        new_records.iter().map(|c| (c.id, c)).collect();
+    let old_map: HashMap<Uuid, &CredentialRecord> = old_records.iter().map(|c| (c.id, c)).collect();
+    let new_map: HashMap<Uuid, &CredentialRecord> = new_records.iter().map(|c| (c.id, c)).collect();
 
     let mut diff = CredentialsDiff::default();
 
@@ -550,7 +548,11 @@ mod tests {
     fn diff_credentials_first_credentials() {
         // No prior layer-4 -> 3 credentials = 3 creates.
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        let new = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let new = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
 
         let diff = diff_credentials(None, Some(&new));
         assert_eq!(diff.created.len(), 3);
@@ -562,9 +564,16 @@ mod tests {
     fn diff_credentials_add_one_by_id() {
         // 3 unchanged + 1 new = exactly 1 create; unchanged 3 not re-emitted.
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let old = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
         let new_id = Uuid::now_v7();
-        let mut new_records: Vec<_> = ids.iter().map(|id| make_credential(*id, "ct", "n")).collect();
+        let mut new_records: Vec<_> = ids
+            .iter()
+            .map(|id| make_credential(*id, "ct", "n"))
+            .collect();
         new_records.push(make_credential(new_id, "ct4", "n4"));
         let new = make_doc(new_records);
 
@@ -578,8 +587,16 @@ mod tests {
     fn diff_credentials_rekey_updates_all_by_id() {
         // Same ids, every ciphertext + nonce changed (re-key) = all updated.
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        let old = make_doc(ids.iter().map(|id| make_credential(*id, "old-ct", "old-n")).collect());
-        let new = make_doc(ids.iter().map(|id| make_credential(*id, "new-ct", "new-n")).collect());
+        let old = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "old-ct", "old-n"))
+                .collect(),
+        );
+        let new = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "new-ct", "new-n"))
+                .collect(),
+        );
 
         let diff = diff_credentials(Some(&old), Some(&new));
         assert_eq!(diff.updated.len(), 3);
@@ -590,8 +607,17 @@ mod tests {
     #[test]
     fn diff_credentials_delete_one() {
         let ids: Vec<Uuid> = (0..3).map(|_| Uuid::now_v7()).collect();
-        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
-        let new = make_doc(ids[..2].iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let old = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
+        let new = make_doc(
+            ids[..2]
+                .iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
 
         let diff = diff_credentials(Some(&old), Some(&new));
         assert_eq!(diff.deleted, vec![ids[2]]);
@@ -614,8 +640,16 @@ mod tests {
     #[test]
     fn diff_credentials_identical_no_change() {
         let ids: Vec<Uuid> = (0..2).map(|_| Uuid::now_v7()).collect();
-        let old = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
-        let new = make_doc(ids.iter().map(|id| make_credential(*id, "ct", "n")).collect());
+        let old = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
+        let new = make_doc(
+            ids.iter()
+                .map(|id| make_credential(*id, "ct", "n"))
+                .collect(),
+        );
 
         assert!(diff_credentials(Some(&old), Some(&new)).is_empty());
     }

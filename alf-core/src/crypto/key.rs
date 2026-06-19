@@ -194,13 +194,16 @@ mod tests {
     #[test]
     fn argon2_derives_stable_key() {
         let salt = b"alf-vault-salt-1";
-        let (k1, params1) = VaultKey::from_passphrase("correct horse battery staple", salt, RECOMMENDED_ARGON2)
-            .unwrap();
-        let (k2, _params2) = VaultKey::from_passphrase("correct horse battery staple", salt, RECOMMENDED_ARGON2)
-            .unwrap();
+        let (k1, params1) =
+            VaultKey::from_passphrase("correct horse battery staple", salt, RECOMMENDED_ARGON2)
+                .unwrap();
+        let (k2, _params2) =
+            VaultKey::from_passphrase("correct horse battery staple", salt, RECOMMENDED_ARGON2)
+                .unwrap();
         assert_eq!(k1.as_bytes(), k2.as_bytes());
 
-        let (k3, _) = VaultKey::from_passphrase("different passphrase", salt, RECOMMENDED_ARGON2).unwrap();
+        let (k3, _) =
+            VaultKey::from_passphrase("different passphrase", salt, RECOMMENDED_ARGON2).unwrap();
         assert_ne!(k1.as_bytes(), k3.as_bytes());
 
         assert_eq!(params1.memory_cost, Some(19_456));

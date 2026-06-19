@@ -159,7 +159,10 @@ fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -
     let preview = adapter.enumerate_workspace(workspace)?;
 
     if human {
-        println!("{} Dry run complete — no archive written", "✓".green().bold());
+        println!(
+            "{} Dry run complete — no archive written",
+            "✓".green().bold()
+        );
         println!();
         println!("  Agent:     {}", preview.agent_name);
         println!("  Memories:  {}", preview.memory_records);

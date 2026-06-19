@@ -265,7 +265,10 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
 
     // The include list and sync log themselves travel as raw so the agent's
     // sync config and removal history persist across machines on restore.
-    for sentinel in [alf_core::include::INCLUDE_FILE, alf_core::include::SYNC_LOG_FILE] {
+    for sentinel in [
+        alf_core::include::INCLUDE_FILE,
+        alf_core::include::SYNC_LOG_FILE,
+    ] {
         if seen.contains(sentinel) {
             continue;
         }
@@ -841,10 +844,8 @@ mod tests {
     /// EX-5: `.alfignore` itself never appears in the file list.
     #[test]
     fn ex5_alfignore_file_is_never_listed() {
-        let (_dir, ws) = create_workspace(&[
-            ("SOUL.md", "soul"),
-            (".alfignore", "# excludes nothing\n"),
-        ]);
+        let (_dir, ws) =
+            create_workspace(&[("SOUL.md", "soul"), (".alfignore", "# excludes nothing\n")]);
         let result = enumerate(&ws).unwrap();
         assert!(!enumerated_paths(&result).contains(&".alfignore".to_string()));
     }

@@ -30,7 +30,11 @@ use crate::ImportReport;
 ///
 /// `vault_key`, when supplied, decrypts credential records and writes a
 /// fresh `auth_profiles.json` to the workspace.
-pub fn import(alf_file: &Path, workspace: &Path, vault_key: Option<&VaultKey>) -> Result<ImportReport> {
+pub fn import(
+    alf_file: &Path,
+    workspace: &Path,
+    vault_key: Option<&VaultKey>,
+) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
     let reader = std::io::BufReader::new(file);
@@ -697,7 +701,10 @@ mod tests {
         let escaped = root.path().join("PWNED.txt");
 
         let result = import(&alf_file, &workspace, None);
-        assert!(result.is_err(), "import must reject a path-traversal archive");
+        assert!(
+            result.is_err(),
+            "import must reject a path-traversal archive"
+        );
         assert!(
             !escaped.exists(),
             "Zip Slip escaped the workspace: {}",

@@ -96,11 +96,7 @@ impl LayerChanges {
 /// `last_synced_at` is **deliberately not** an input. It is informational
 /// metadata; branching on it has historically caused ambiguity (see commit
 /// log around the E4 failure) and is forbidden by the sync-control invariant.
-pub(crate) fn decide_sync_mode(
-    state: &AgentState,
-    base_present: bool,
-    recover: bool,
-) -> SyncMode {
+pub(crate) fn decide_sync_mode(state: &AgentState, base_present: bool, recover: bool) -> SyncMode {
     match (state.last_synced_sequence, base_present, recover) {
         (None, _, _) => SyncMode::FirstSync,
         // `--recover` wins even when a local base is present: it re-pulls the
@@ -157,9 +153,8 @@ fn persist_local(
     temp_alf: &Path,
     snapshot_path: &Path,
 ) -> Result<()> {
-    fs::copy(temp_alf, snapshot_path).with_context(|| {
-        format!("Failed to persist snapshot at {}", snapshot_path.display())
-    })?;
+    fs::copy(temp_alf, snapshot_path)
+        .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
 
     let new_state = AgentState {
         agent_id,
@@ -190,12 +185,7 @@ pub(crate) enum SyncMode {
     Recover { base_sequence: u64 },
 }
 
-pub fn run(
-    runtime: &str,
-    workspace: &Path,
-    recover: bool,
-    force_first_sync: bool,
-) -> Result<()> {
+pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: bool) -> Result<()> {
     let human = output::human_mode();
 
     let config = Config::load()?;
@@ -264,9 +254,8 @@ pub fn run(
 
     let snapshot_path = local_base_path(agent_id)?;
     if let Some(parent) = snapshot_path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
-            format!("Failed to create state directory {}", parent.display())
-        })?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
     }
 
     match mode {
@@ -436,7 +425,12 @@ fn execute_delta(
             } else {
                 "Re-snapshot uploaded (tracked files changed)"
             };
-            println!("{} {} (sequence: {})", "✓".green().bold(), label, upload.sequence);
+            println!(
+                "{} {} (sequence: {})",
+                "✓".green().bold(),
+                label,
+                upload.sequence
+            );
             println!("  Snapshot base: {}", snapshot_path.display());
             println!("  State file:    {}", state_path.display());
         } else {
@@ -1007,7 +1001,10 @@ mod tests {
         };
 
         let base = export_to("base.alf");
-        assert!(!changed(&base, &base), "identical archives: no tracked change");
+        assert!(
+            !changed(&base, &base),
+            "identical archives: no tracked change"
+        );
 
         // Modify the tracked file → re-snapshot.
         fs::write(ws.join("notes.txt"), "v2-modified").unwrap();

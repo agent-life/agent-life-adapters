@@ -47,8 +47,7 @@ fn in1_dry_run_files_match_real_export() {
     let adapter = OpenClawAdapter;
 
     let preview = adapter.enumerate_workspace(ws).unwrap();
-    let preview_paths: BTreeSet<String> =
-        preview.files.iter().map(|f| f.path.clone()).collect();
+    let preview_paths: BTreeSet<String> = preview.files.iter().map(|f| f.path.clone()).collect();
 
     let out_dir = TempDir::new().unwrap();
     let out = out_dir.path().join("export.alf");
@@ -87,8 +86,7 @@ fn in3_enumerate_archive_lists_raw_entries() {
     adapter.export(ws, &out).unwrap();
 
     let enumeration = adapter.enumerate_archive(&out).unwrap();
-    let enumerated: BTreeSet<String> =
-        enumeration.files.iter().map(|f| f.path.clone()).collect();
+    let enumerated: BTreeSet<String> = enumeration.files.iter().map(|f| f.path.clone()).collect();
 
     assert_eq!(enumerated, archive_raw_paths(&out));
     // Sizes come from the archive central directory — non-zero for real files.

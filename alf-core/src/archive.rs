@@ -867,7 +867,9 @@ mod tests {
         let buf = Cursor::new(Vec::new());
         let mut writer = AlfWriter::new(buf, base_manifest()).unwrap();
         let payload = vec![b'x'; 1000];
-        writer.add_raw_source("openclaw", "big.bin", &payload).unwrap();
+        writer
+            .add_raw_source("openclaw", "big.bin", &payload)
+            .unwrap();
         let buf = writer.finish().unwrap();
 
         let mut reader = AlfReader::new(Cursor::new(buf.into_inner())).unwrap();

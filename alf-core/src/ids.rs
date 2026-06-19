@@ -77,10 +77,7 @@ mod tests {
         let agent = Uuid::from_u128(0x1234);
         // Stable across calls.
         assert_eq!(identity_id(agent), identity_id(agent));
-        assert_eq!(
-            principal_id(agent, "human"),
-            principal_id(agent, "human")
-        );
+        assert_eq!(principal_id(agent, "human"), principal_id(agent, "human"));
         let pid = principal_id(agent, "human");
         assert_eq!(profile_id(pid), profile_id(pid));
         // Distinct across kinds / roles / agents.

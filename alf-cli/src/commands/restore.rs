@@ -89,8 +89,8 @@ pub(crate) fn merge_snapshot_with_deltas(
 }
 
 fn merged_last_sequence(merged_bytes: &[u8], snapshot_sequence: u64) -> Result<u64> {
-    let reader =
-        AlfReader::new(Cursor::new(merged_bytes)).context("Failed to read merged restore archive")?;
+    let reader = AlfReader::new(Cursor::new(merged_bytes))
+        .context("Failed to read merged restore archive")?;
     Ok(reader
         .manifest()
         .sync
@@ -139,7 +139,10 @@ fn fetch_restore_payload(
         output::progress("  No additional deltas to apply.");
         Vec::new()
     } else {
-        output::progress(&format!("  Downloading {} delta(s)...", restore.deltas.len()));
+        output::progress(&format!(
+            "  Downloading {} delta(s)...",
+            restore.deltas.len()
+        ));
         let mut out = Vec::with_capacity(restore.deltas.len());
         for (i, delta_info) in restore.deltas.iter().enumerate() {
             output::progress(&format!(
@@ -571,6 +574,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),

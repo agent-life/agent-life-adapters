@@ -496,7 +496,11 @@ fn alfignore_workflow_dry_run_export_validate() {
     assert!(output_alf.exists());
 
     // 3. the archive validates.
-    let assert = alf_cmd().arg("validate").arg(&output_alf).assert().success();
+    let assert = alf_cmd()
+        .arg("validate")
+        .arg(&output_alf)
+        .assert()
+        .success();
     assert_eq!(json_stdout(&assert)["valid"], true);
 }
 

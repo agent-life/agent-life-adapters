@@ -1,0 +1,30 @@
+[package]
+name = "adapter-hermes"
+version = "0.1.0"
+edition = "2021"
+description = "Hermes (Nous Research) framework adapter for the Agent Life Format (ALF)"
+license = "MIT"
+repository = "https://github.com/agent-life/agent-life-adapters"
+
+[dependencies]
+alf-core = { path = "../alf-core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ignore = "0.4"
+# bundled = compile SQLite from source → guarantees FTS5 + trigram tokenizer,
+# and is used here for state.db WRITES (the import rebuild), not just reads.
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+# md-5 replicates Hermes's `_dir_hash` (md5 over sorted rel-path + bytes) so we
+# can tell pristine bundled skills (excluded, D5) from user-modified ones (kept).
+md-5 = "0.10"
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+zip = "2.2"

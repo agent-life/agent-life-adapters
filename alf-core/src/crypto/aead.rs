@@ -235,7 +235,8 @@ mod tests {
         let key = VaultKey::generate();
         let mut nonces = std::collections::HashSet::new();
         for _ in 0..64 {
-            let blob = encrypt_payload(b"same plaintext", &key, Algorithm::XChaCha20Poly1305).unwrap();
+            let blob =
+                encrypt_payload(b"same plaintext", &key, Algorithm::XChaCha20Poly1305).unwrap();
             assert!(nonces.insert(blob.nonce_b64.clone()), "nonce collision");
         }
     }

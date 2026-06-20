@@ -27,10 +27,7 @@ pub enum CryptoStrictness {
 }
 
 /// Known AEAD algorithms and their required nonce lengths (bytes).
-const KNOWN_ALGORITHMS: &[(&str, usize)] = &[
-    ("xchacha20-poly1305", 24),
-    ("aes-256-gcm", 12),
-];
+const KNOWN_ALGORITHMS: &[(&str, usize)] = &[("xchacha20-poly1305", 24), ("aes-256-gcm", 12)];
 
 /// OWASP-minimum Argon2id parameters (m = 19 MiB, t = 2, p = 1).
 const ARGON2_MIN_MEMORY_COST: u64 = 19_456;
@@ -461,7 +458,13 @@ pub fn validate_credentials_with(
             );
         }
 
-        validate_encryption_metadata(&cred.encryption, &cred.encrypted_payload, &p, strictness, &mut report);
+        validate_encryption_metadata(
+            &cred.encryption,
+            &cred.encrypted_payload,
+            &p,
+            strictness,
+            &mut report,
+        );
 
         // Unknown credential_type warning
         if let CredentialType::Unknown(val) = &cred.credential_type {
@@ -495,10 +498,15 @@ fn validate_encryption_metadata(
     // from older adapter exports that wrote `<not-exported>` as the
     // placeholder payload. Lenient mode warns; strict mode rejects.
     if enc.algorithm == "none" {
-        let msg = "Legacy metadata-only credential record (algorithm='none'); no ciphertext to verify";
+        let msg =
+            "Legacy metadata-only credential record (algorithm='none'); no ciphertext to verify";
         match strictness {
-            CryptoStrictness::Lenient => report.warning(format!("{record_path}.encryption.algorithm"), msg),
-            CryptoStrictness::Strict => report.error(format!("{record_path}.encryption.algorithm"), msg),
+            CryptoStrictness::Lenient => {
+                report.warning(format!("{record_path}.encryption.algorithm"), msg)
+            }
+            CryptoStrictness::Strict => {
+                report.error(format!("{record_path}.encryption.algorithm"), msg)
+            }
         }
         return;
     }
@@ -552,8 +560,12 @@ fn validate_encryption_metadata(
                 enc.algorithm
             );
             match strictness {
-                CryptoStrictness::Lenient => report.warning(format!("{record_path}.encryption.algorithm"), msg),
-                CryptoStrictness::Strict => report.error(format!("{record_path}.encryption.algorithm"), msg),
+                CryptoStrictness::Lenient => {
+                    report.warning(format!("{record_path}.encryption.algorithm"), msg)
+                }
+                CryptoStrictness::Strict => {
+                    report.error(format!("{record_path}.encryption.algorithm"), msg)
+                }
             }
         }
     }
@@ -848,7 +860,10 @@ mod tests {
         mem.partitions[0].to = Some(from.pred_opt().unwrap());
         let report = validate_manifest(&m);
         assert!(!report.is_valid());
-        assert!(report.errors().iter().any(|e| e.message.contains("before 'from'")));
+        assert!(report
+            .errors()
+            .iter()
+            .any(|e| e.message.contains("before 'from'")));
     }
 
     #[test]
@@ -1227,14 +1242,20 @@ mod tests {
         };
 
         let lenient = validate_credentials(&doc);
-        assert!(lenient.is_valid(), "legacy records should warn in lenient mode");
+        assert!(
+            lenient.is_valid(),
+            "legacy records should warn in lenient mode"
+        );
         assert!(lenient
             .warnings()
             .iter()
             .any(|w| w.message.contains("Legacy metadata-only")));
 
         let strict = validate_credentials_strict(&doc);
-        assert!(!strict.is_valid(), "legacy records should error in strict mode");
+        assert!(
+            !strict.is_valid(),
+            "legacy records should error in strict mode"
+        );
     }
 
     #[test]

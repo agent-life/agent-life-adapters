@@ -54,14 +54,26 @@ pub fn make_markdown_home(root: &Path) -> std::path::PathBuf {
         "# IDENTITY.md\n\n- **Name:** Aria\n- **Runtime:** zeroclaw\n",
     )
     .unwrap();
-    fs::write(workspace.join("AGENTS.md"), "# AGENTS.md\n\nWorkspace home.\n").unwrap();
+    fs::write(
+        workspace.join("AGENTS.md"),
+        "# AGENTS.md\n\nWorkspace home.\n",
+    )
+    .unwrap();
     fs::write(
         workspace.join("USER.md"),
         "# USER.md - About Sam\n\n- **Name:** Sam\n",
     )
     .unwrap();
-    fs::write(workspace.join("TOOLS.md"), "# TOOLS.md\n\nEmail via himalaya.\n").unwrap();
-    fs::write(workspace.join("HEARTBEAT.md"), "# HEARTBEAT.md\n\nCheck markers.\n").unwrap();
+    fs::write(
+        workspace.join("TOOLS.md"),
+        "# TOOLS.md\n\nEmail via himalaya.\n",
+    )
+    .unwrap();
+    fs::write(
+        workspace.join("HEARTBEAT.md"),
+        "# HEARTBEAT.md\n\nCheck markers.\n",
+    )
+    .unwrap();
     fs::write(
         workspace.join("memory/2026-01-15.md"),
         "# 2026-01-15\n\nSam prefers concise replies.\n",

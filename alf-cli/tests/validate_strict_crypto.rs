@@ -4,9 +4,7 @@ use alf_core::archive::AlfWriter;
 use alf_core::credentials::{
     CredentialRecord, CredentialType, CredentialsDocument, EncryptionMetadata,
 };
-use alf_core::manifest::{
-    AgentMetadata, LayerInventory, Manifest,
-};
+use alf_core::manifest::{AgentMetadata, LayerInventory, Manifest};
 use chrono::Utc;
 use std::collections::HashMap;
 use std::io::Cursor;

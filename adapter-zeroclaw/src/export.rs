@@ -296,12 +296,24 @@ fn enumerate_raw(workspace: &Path, config: &ZeroClawConfig) -> RawEnumeration {
             missing_includes.push(rel);
             continue;
         }
+        // A4.2: re-validate that a (possibly restored/edited) stored entry still
+        // resolves inside the workspace before packing it.
+        if let Err(e) = alf_core::include::safe_include_path(workspace, &rel) {
+            warnings.push(format!("ignoring tracked path {rel}: {e}"));
+            continue;
+        }
         if is_alfignored(&matcher, &rel) {
             excluded += 1;
             continue;
         }
         let size = fs::metadata(&abs).map(|m| m.len()).unwrap_or(0);
-        entries.push((FileEntry { path: rel.clone(), size }, RawContent::Disk(abs)));
+        entries.push((
+            FileEntry {
+                path: rel.clone(),
+                size,
+            },
+            RawContent::Disk(abs),
+        ));
         seen.insert(rel);
     }
 
@@ -457,22 +469,24 @@ fn load_agent_vault(vault_path: Option<&Path>) -> Result<Option<alf_core::Creden
 /// heuristic backend detection when no config file exists.
 fn load_config(zc_home: &Path) -> Result<ZeroClawConfig> {
     let config_path = zc_home.join("config.toml");
-    Ok(config_parser::parse_config(&config_path)?.unwrap_or_else(|| {
-        let backend = config_parser::detect_backend_heuristic(zc_home);
-        ZeroClawConfig {
-            memory_backend: backend,
-            auto_save: true,
-            embedding_provider: "none".into(),
-            vector_weight: 0.7,
-            keyword_weight: 0.3,
-            identity_format: config_parser::IdentityFormat::OpenClaw,
-            aieos_path: None,
-            aieos_inline: None,
-            secrets_encrypt: true,
-            credential_hints: Vec::new(),
-            raw_toml: String::new(),
-        }
-    }))
+    Ok(
+        config_parser::parse_config(&config_path)?.unwrap_or_else(|| {
+            let backend = config_parser::detect_backend_heuristic(zc_home);
+            ZeroClawConfig {
+                memory_backend: backend,
+                auto_save: true,
+                embedding_provider: "none".into(),
+                vector_weight: 0.7,
+                keyword_weight: 0.3,
+                identity_format: config_parser::IdentityFormat::OpenClaw,
+                aieos_path: None,
+                aieos_inline: None,
+                secrets_encrypt: true,
+                credential_hints: Vec::new(),
+                raw_toml: String::new(),
+            }
+        }),
+    )
 }
 
 /// Extract memory records for the configured backend (SQLite or Markdown).
@@ -710,6 +724,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_size_bytes: output_size,
         excluded_by_alfignore,
         missing_includes,
+        warnings: Vec::new(),
     })
 }
 
@@ -942,13 +957,16 @@ backend = "markdown"
             ],
         );
 
-        let enumerated: std::collections::BTreeSet<String> =
-            enumerate(&ws).unwrap().files.into_iter().map(|f| f.path).collect();
+        let enumerated: std::collections::BTreeSet<String> = enumerate(&ws)
+            .unwrap()
+            .files
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
 
         let output = dir.path().join("out.alf");
         let report = export(&ws, &output).unwrap();
-        let exported: std::collections::BTreeSet<String> =
-            report.raw_sources.into_iter().collect();
+        let exported: std::collections::BTreeSet<String> = report.raw_sources.into_iter().collect();
 
         assert_eq!(enumerated, exported);
     }

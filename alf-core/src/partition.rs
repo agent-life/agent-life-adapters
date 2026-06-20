@@ -79,12 +79,7 @@ impl PartitionAssigner {
             return None;
         }
         // Indexed by quarter-1; avoids a fallback arm after the bounds check above.
-        const RANGES: [(u32, u32, u32); 4] = [
-            (1, 3, 31),
-            (4, 6, 30),
-            (7, 9, 30),
-            (10, 12, 31),
-        ];
+        const RANGES: [(u32, u32, u32); 4] = [(1, 3, 31), (4, 6, 30), (7, 9, 30), (10, 12, 31)];
         let (start_month, end_month, end_day) = RANGES[(quarter as usize) - 1];
         Some((
             NaiveDate::from_ymd_opt(year, start_month, 1)?,

@@ -266,13 +266,18 @@ def step_memory_delta(cfg: iw.Config, ctx: iw.RunContext, db: iw.DbClient,
         teaches.
         """
     )
-    # Edit a file under memory/ — captured as a memory record by BOTH runtimes
-    # (openclaw daily log; zeroclaw markdown backend). A root-level MEMORY.md
-    # would NOT register for zeroclaw (its markdown backend only reads memory/),
-    # so the sync would be a no-op there — use memory/ for cross-runtime parity.
-    mem_file = ctx.ws / "memory" / "2026-01-16.md"
-    mem_file.write_text("## Update\n\nGrass is green; sky is blue.\n", encoding="utf-8")
-    iw.flow(f"edit {ctx.disp(mem_file)} ──alf sync──▶ POST /deltas ──▶ DELTA (seq++)")
+    # Edit a memory record (NOT a tracked file) so the sync is a DELTA, not a
+    # re-snapshot. openclaw/zeroclaw capture a file under memory/ (openclaw daily
+    # log; zeroclaw markdown backend) — a root MEMORY.md would no-op for zeroclaw.
+    # Hermes has no memory/ dir; its memory-only change is a curated §-entry.
+    if ctx.runtime == "hermes":
+        iw.hermes_runtime.append_curated(ctx.ws, "Grass is green; sky is blue.")
+        mem_disp = ctx.disp(ctx.ws / "memories" / "MEMORY.md")
+    else:
+        mem_file = ctx.ws / "memory" / "2026-01-16.md"
+        mem_file.write_text("## Update\n\nGrass is green; sky is blue.\n", encoding="utf-8")
+        mem_disp = ctx.disp(mem_file)
+    iw.flow(f"edit {mem_disp} ──alf sync──▶ POST /deltas ──▶ DELTA (seq++)")
 
     proc, res = iw.run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
     if proc.returncode != 0 or not res:

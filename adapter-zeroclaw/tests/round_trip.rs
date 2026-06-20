@@ -53,7 +53,9 @@ fn round_trip_markdown_workspace() {
     let restored = restored_home.path().join("workspace");
 
     let adapter = ZeroClawAdapter;
-    let export_report = adapter.export(&workspace, &alf_path).expect("export failed");
+    let export_report = adapter
+        .export(&workspace, &alf_path)
+        .expect("export failed");
     let import_report = adapter.import(&alf_path, &restored).expect("import failed");
 
     assert_eq!(
@@ -76,7 +78,9 @@ fn round_trip_preserves_redacted_config() {
     let restored = restored_home.path().join("workspace");
 
     let adapter = ZeroClawAdapter;
-    adapter.export(&workspace, &alf_path).expect("export failed");
+    adapter
+        .export(&workspace, &alf_path)
+        .expect("export failed");
     adapter.import(&alf_path, &restored).expect("import failed");
 
     // Raw restore writes config.toml to the ZeroClaw home (workspace parent).

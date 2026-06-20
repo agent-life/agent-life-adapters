@@ -36,11 +36,14 @@ pub use adapter::{
     Adapter, ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport,
     WorkspaceEnumeration,
 };
-pub use archive::{AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter};
+pub use archive::{
+    safe_extract_path, AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter,
+    MAX_RAW_ENTRY_BYTES, MAX_RAW_TOTAL_BYTES,
+};
 pub use credentials::*;
 pub use crypto::{
-    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob,
-    VaultKey, VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
+    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob, VaultKey,
+    VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
 };
 pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,

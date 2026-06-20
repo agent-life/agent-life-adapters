@@ -1,6 +1,6 @@
 [package]
 name = "alf-core"
-version = "0.1.3"
+version = "0.1.4"
 edition = "2021"
 description = "Core library for the Agent Life Format (ALF) — types, I/O, and validation"
 license = "MIT"

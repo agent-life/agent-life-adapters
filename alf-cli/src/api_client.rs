@@ -411,11 +411,7 @@ impl ApiClient {
     /// When `up_to_sequence` is `Some(N)`, the service returns a point-in-time
     /// view: the largest snapshot with sequence ≤ N, plus all deltas with
     /// sequence in `(snapshot.sequence, N]`. When `None`, returns head.
-    pub fn restore(
-        &self,
-        agent_id: Uuid,
-        up_to_sequence: Option<u64>,
-    ) -> Result<RestoreResponse> {
+    pub fn restore(&self, agent_id: Uuid, up_to_sequence: Option<u64>) -> Result<RestoreResponse> {
         let path = match up_to_sequence {
             Some(n) => format!("/agents/{}/restore?up_to_sequence={}", agent_id, n),
             None => format!("/agents/{}/restore", agent_id),

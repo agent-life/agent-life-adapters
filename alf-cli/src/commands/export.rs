@@ -17,6 +17,8 @@ struct ExportResult {
     memory_records: u64,
     file_size: u64,
     excluded_by_alfignore: u32,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -122,6 +124,9 @@ pub fn run(
 
         let size = format_size(report.output_size_bytes);
         println!("  File size:   {size}");
+        for w in &report.warnings {
+            println!("  {} {}", "!".yellow().bold(), w);
+        }
         println!();
         println!("  {}", report.output_path);
     } else {
@@ -133,6 +138,7 @@ pub fn run(
             memory_records: report.memory_records,
             file_size: report.output_size_bytes,
             excluded_by_alfignore: report.excluded_by_alfignore,
+            warnings: report.warnings.clone(),
         });
     }
 
@@ -159,7 +165,10 @@ fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -
     let preview = adapter.enumerate_workspace(workspace)?;
 
     if human {
-        println!("{} Dry run complete — no archive written", "✓".green().bold());
+        println!(
+            "{} Dry run complete — no archive written",
+            "✓".green().bold()
+        );
         println!();
         println!("  Agent:     {}", preview.agent_name);
         println!("  Memories:  {}", preview.memory_records);

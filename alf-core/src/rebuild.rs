@@ -64,7 +64,9 @@ pub fn rebuild_snapshot(
     let mut memory_records = base.read_all_memory()?;
     let attachments = base.read_attachments()?;
 
-    // Collect raw source files (everything under raw/)
+    // Collect raw source files (everything under raw/). Keyed by archive path so
+    // delta raw overlays (see below) can replace/remove individual files; the
+    // BTreeMap also gives a deterministic write order.
     let all_files = base.file_names();
     let raw_paths: Vec<String> = all_files
         .iter()
@@ -72,10 +74,10 @@ pub fn rebuild_snapshot(
         .cloned()
         .collect();
 
-    let mut raw_sources: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut raw_sources: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     for path in &raw_paths {
         let data = base.read_raw_entry(path)?;
-        raw_sources.push((path.clone(), data));
+        raw_sources.insert(path.clone(), data);
     }
 
     // Collect artifact files (everything under artifacts/)
@@ -123,6 +125,19 @@ pub fn rebuild_snapshot(
             memory_records = apply_delta(&memory_records, &entries);
         }
 
+        // Overlay raw source changes: drop removed paths, then insert/replace
+        // the verbatim files carried in this delta. Keeps a same-runtime,
+        // raw-preferred restore current instead of frozen at the snapshot.
+        if let Some(raw_change) = delta_manifest.changes.raw.clone() {
+            for path in &raw_change.deleted {
+                raw_sources.remove(path);
+            }
+            for path in &raw_change.changed {
+                let data = delta.read_raw_entry(path)?;
+                raw_sources.insert(path.clone(), data);
+            }
+        }
+
         // Track the highest sequence we've seen
         let delta_seq = delta_manifest.sync.new_sequence;
         if delta_seq > 0 && delta_seq > highest_sequence {
@@ -152,9 +167,7 @@ pub fn rebuild_snapshot(
             let (from, to) = PartitionAssigner::date_range_for_partition(&file_path)
                 .unwrap_or_else(|| {
                     // Fallback: use the first record's timestamp for from, no to
-                    let first = records
-                        .first()
-                        .expect("partition group is non-empty");
+                    let first = records.first().expect("partition group is non-empty");
                     let ts = first
                         .temporal
                         .observed_at
@@ -407,6 +420,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -514,6 +528,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -732,6 +747,115 @@ mod tests {
         // Verify memory has both records
         let records = reader.read_all_memory().unwrap();
         assert_eq!(records.len(), 2);
+    }
+
+    /// A delta carrying raw-source changes must overlay them onto the base raw
+    /// tree: replace updated files, add new ones, drop deleted ones. Without
+    /// this a same-runtime, raw-preferred `alf restore` rebuilds the workspace
+    /// from a raw tree frozen at the snapshot — the bug this fixes.
+    #[test]
+    fn rebuild_applies_raw_source_deltas() {
+        // Base snapshot: three raw files + one memory record.
+        let buf = Cursor::new(Vec::new());
+        let mut writer = AlfWriter::new(buf, {
+            let mut m = make_manifest();
+            m.raw_sources = vec!["test-runtime".into()];
+            m
+        })
+        .unwrap();
+        writer
+            .add_raw_source("test-runtime", "SOUL.md", b"soul v0")
+            .unwrap();
+        writer
+            .add_raw_source("test-runtime", "memory/2026-01-15.md", b"day 15")
+            .unwrap();
+        writer
+            .add_raw_source("test-runtime", "stale.md", b"remove me")
+            .unwrap();
+        let record = make_record(1, "Memory", 1);
+        let (from, to) =
+            PartitionAssigner::date_range_for_partition("memory/2026-Q1.jsonl").unwrap();
+        writer
+            .add_memory_partition(
+                MemoryPartitionInfo {
+                    file: "memory/2026-Q1.jsonl".into(),
+                    from,
+                    to: Some(to),
+                    record_count: 1,
+                    sealed: false,
+                    extra: HashMap::new(),
+                },
+                &[record],
+            )
+            .unwrap();
+        let base = writer.finish().unwrap().into_inner();
+
+        // Delta: update SOUL.md, add a new daily file, delete stale.md.
+        let delta = {
+            let delta_manifest = DeltaManifest {
+                alf_version: "1.0.0".into(),
+                created_at: Utc::now(),
+                agent: DeltaAgentRef {
+                    id: make_agent_metadata().id,
+                    source_runtime: Some("test-runtime".into()),
+                    extra: HashMap::new(),
+                },
+                sync: DeltaSyncCursor {
+                    base_sequence: 0,
+                    new_sequence: 1,
+                    base_timestamp: None,
+                    new_timestamp: None,
+                    extra: HashMap::new(),
+                },
+                changes: ChangeInventory {
+                    identity: None,
+                    principals: None,
+                    credentials: None,
+                    memory: None,
+                    raw: None,
+                    extra: HashMap::new(),
+                },
+                extra: HashMap::new(),
+            };
+            let mut dw = DeltaWriter::new(Cursor::new(Vec::new()), delta_manifest).unwrap();
+            dw.add_raw_change("raw/test-runtime/SOUL.md", b"soul v1")
+                .unwrap();
+            dw.add_raw_change("raw/test-runtime/memory/2026-01-16.md", b"day 16")
+                .unwrap();
+            dw.add_raw_deletion("raw/test-runtime/stale.md");
+            dw.finish().unwrap().into_inner()
+        };
+
+        let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
+        let mut reader = AlfReader::new(Cursor::new(&rebuilt)).unwrap();
+
+        // Updated file reflects the delta.
+        assert_eq!(
+            reader.read_raw_entry("raw/test-runtime/SOUL.md").unwrap(),
+            b"soul v1"
+        );
+        // Unchanged file carried forward from the base.
+        assert_eq!(
+            reader
+                .read_raw_entry("raw/test-runtime/memory/2026-01-15.md")
+                .unwrap(),
+            b"day 15"
+        );
+        // New file added by the delta.
+        assert_eq!(
+            reader
+                .read_raw_entry("raw/test-runtime/memory/2026-01-16.md")
+                .unwrap(),
+            b"day 16"
+        );
+        // Deleted file is gone.
+        assert!(
+            !reader
+                .file_names()
+                .iter()
+                .any(|f| f == "raw/test-runtime/stale.md"),
+            "deleted raw path should not survive rebuild"
+        );
     }
 
     #[test]

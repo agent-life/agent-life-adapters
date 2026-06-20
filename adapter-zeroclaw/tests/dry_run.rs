@@ -42,7 +42,9 @@ fn enumerate_archive_matches_export() {
     let alf_path = out.path().join("export.alf");
 
     let adapter = ZeroClawAdapter;
-    adapter.export(&workspace, &alf_path).expect("export failed");
+    adapter
+        .export(&workspace, &alf_path)
+        .expect("export failed");
 
     let enumeration = adapter
         .enumerate_archive(&alf_path)

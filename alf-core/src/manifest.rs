@@ -450,6 +450,14 @@ pub struct ChangeInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory: Option<MemoryChange>,
 
+    /// Present if any verbatim `raw/{runtime}/` source files changed. The delta
+    /// carries the changed files (so a same-runtime restore stays current) and
+    /// records any removed paths. Deltas only ever touch the structured layers
+    /// otherwise, so without this the snapshot's frozen raw tree would shadow
+    /// every post-snapshot change on a raw-preferred restore.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw: Option<RawChange>,
+
     /// Unknown fields preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
@@ -509,6 +517,27 @@ pub struct MemoryChange {
     /// Number of delta records (creates + updates + deletes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub record_count: Option<u64>,
+
+    /// Unknown fields preserved for forward compatibility.
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Raw-source layer change within a delta.
+///
+/// `changed` paths are carried inside the delta bundle at their full
+/// `raw/{runtime}/...` archive path (created or updated since the base);
+/// `deleted` paths were present in the base but removed since. Rebuild overlays
+/// `changed` onto the base raw tree and drops `deleted`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RawChange {
+    /// Full `raw/{runtime}/...` archive paths carried in this delta.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub changed: Vec<String>,
+
+    /// Full `raw/{runtime}/...` archive paths removed since the base.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deleted: Vec<String>,
 
     /// Unknown fields preserved for forward compatibility.
     #[serde(flatten)]
@@ -653,6 +682,7 @@ mod tests {
                     record_count: Some(3),
                     extra: HashMap::new(),
                 }),
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -880,6 +910,7 @@ mod tests {
                     record_count: Some(7),
                     extra: HashMap::new(),
                 }),
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),
@@ -913,6 +944,7 @@ mod tests {
                 principals: None,
                 credentials: None,
                 memory: None,
+                raw: None,
                 extra: HashMap::new(),
             },
             extra: HashMap::new(),

@@ -1,3 +1,25 @@
+## [0.1.10] — 2026-06-19
+
+### Added
+
+- **Hermes adapter (`adapter-hermes`) — back up, sync, and migrate Hermes (Nous Research) agents.** A third runtime alongside OpenClaw and ZeroClaw, selected with `-r hermes`. A Hermes *profile* (`HERMES_HOME`, default `~/.hermes`; named profiles under `~/.hermes/profiles/<name>/`) is one agent and maps to one `.alf`. The adapter maps every durable surface: **curated memory** (`memories/MEMORY.md`, `§`-delimited entries → semantic records keyed by a **content-derived UUIDv5** so the continuously-rewritten store does not churn deltas); **session history** (`state.db`: `sessions` + `messages` + FTS5) decomposed to one episodic record per session, the full structured session preserved in `raw_source_format`, and **rebuilt losslessly on restore** by replaying the source database's own captured DDL (schema-version-agnostic) and letting Hermes's triggers repopulate the FTS5 + trigram indexes — validated by a real Hermes opening the rebuilt DB; **identity** (`SOUL.md` + `config.yaml` personalities → `identity.prose`); the **human principal** (`memories/USER.md`); and **skills** (non-bundled `skills/**` → ALF artifacts via `attachments.json`, the first use of the three-tier artifact model — pristine bundled skills are excluded, user-modified/agent-created ones kept). The `state.db` binary and `.env` are never archived. One `.alf` per profile; profiles sync independently with per-profile `-w`. `alf check`/discovery honors `$HERMES_HOME`, defaulting to `~/.hermes`. Public mapping write-up: `agent-life.ai/hermes_memory.html`.
+- **`alf add --external` — track files outside the workspace, behind a security gate (D3).** Hermes's `AGENTS.md` / `.cursorrules` live in the project directory, not the agent home, so they were unreachable. `alf add --external <path>` now tracks them, but only under a directory the human has blessed with `alf add --allow-root <dir>` (host-local policy, never written into an archive), never on a non-overridable sensitive-path denylist (`~/.alf/**`, `~/.ssh/**`, `.env`, `*.pem`, `~/.hermes/.env`, …), with a typed human confirm (or `--yes-external` under a pre-blessed root), and packed under a sanitized `raw/{runtime}/external/` name. External entries restored from an archive are **inert** until the local user re-confirms them, so a hostile archive's externals do nothing. New `alf-core::include` surface: `safe_include_path`, `validate_external_source`, `is_denylisted`, `sanitized_external_name`, allowed-roots policy, and `external`/`source`/`verified` fields on `IncludeEntry` (additive — old lists load unchanged). Currently wired for the `hermes` runtime. See `docs/alf-add-external-files-security-design.md`.
+- **`alf export` / `alf sync` surface adapter advisories.** `ExportReport` gains a `warnings` channel (`alf export` JSON includes `warnings`; `alf sync` prints them). The Hermes adapter uses it to detect API keys in `~/.hermes/.env` that are **not** in the encrypted vault and point the user at `alf vault add` — turning plaintext-at-rest keys into a restorable backup — without ever copying the plaintext into the archive (D4).
+
+### Changed
+
+- **Runtime selection, discovery, and CLI help are now three-runtime aware.** The adapter registry, `alf check` workspace discovery, and the `-r`/`--runtime` help text across the CLI include `hermes` alongside `openclaw` and `zeroclaw`.
+
+### Fixed
+
+- **Export now re-validates the `alf add` include list at sync time — closes finding A4.2.** A `.alf-include.json` restored from a hostile/compromised archive (or hand-edited) could name a path outside the workspace (`../…` or absolute); export trusted the stored list and `workspace.join(rel)` would pack the escaped file on the next `alf sync`. Export now re-canonicalizes every entry (resolving symlinks), rejects anything that leaves the workspace or hits the managed sentinel files, and skips + logs the offender instead of packing it. Wired into all three adapters' `export`. This was a live finding in the already-shipped OpenClaw and ZeroClaw adapters, independent of Hermes.
+- **Restore is hardened against Zip Slip and decompression bombs.** Archive member names are sanitized before extraction (rejecting `..`, absolute paths, `//`, backslashes, Windows drive prefixes, NUL), and raw-source restore is bounded by per-entry and total size caps. (`alf_core::safe_extract_path`, `MAX_RAW_ENTRY_BYTES`, `MAX_RAW_TOTAL_BYTES`.)
+- **Same-runtime `alf restore` no longer drops post-snapshot changes.** Deltas now carry the changed `raw/{runtime}/` source files (not just structured layers), so a same-runtime restore rebuilds the current workspace rather than a frozen snapshot. The integration walkthrough and `test.sh` gained a recursive byte-equality (SHA-256) proof over the restored workspace to assert this end to end.
+
+### Version bumps
+
+- `alf-core` 0.1.3 → 0.1.4 (external-file `include` API + `safe_include_path`; `ExportReport.warnings`), `adapter-openclaw` 0.1.3 → 0.1.4, `adapter-zeroclaw` 0.1.3 → 0.1.4 (A4.2 export-time include re-validation), **`adapter-hermes` 0.1.0 (new)**, `alf-cli` 0.1.9 → 0.1.10.
+
 ## [0.1.9] — 2026-06-01
 
 ### Added

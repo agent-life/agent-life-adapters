@@ -155,10 +155,11 @@ struct ResolvedWorkspace {
 
 fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
     // The runtime's own configured workspace, for the mismatch diagnostic.
-    let configured = if runtime == "zeroclaw" {
-        read_zeroclaw_workspace()
-    } else {
-        read_openclaw_workspace()
+    // Hermes has no separate workspace — HERMES_HOME *is* the workspace.
+    let configured = match runtime {
+        "zeroclaw" => read_zeroclaw_workspace(),
+        "hermes" => None,
+        _ => read_openclaw_workspace(),
     };
 
     // Priority 1: -w flag
@@ -198,6 +199,23 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
         return ResolvedWorkspace {
             path: default_path,
             source: "default".into(),
+            runtime_configured_path: configured,
+        };
+    }
+
+    // Hermes: HERMES_HOME is the workspace; honor $HERMES_HOME, else ~/.hermes.
+    if runtime == "hermes" {
+        let default_path = std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .or_else(|| alf_core::home_dir().map(|h| h.join(".hermes")))
+            .unwrap_or_else(|| PathBuf::from(".hermes"));
+        return ResolvedWorkspace {
+            path: default_path,
+            source: if std::env::var_os("HERMES_HOME").is_some() {
+                "hermes_env".into()
+            } else {
+                "default".into()
+            },
             runtime_configured_path: configured,
         };
     }
@@ -350,8 +368,9 @@ fn collect_issues(
             severity: "error".into(),
             code: "workspace_not_found".into(),
             message: format!("Workspace directory not found at {}", ws.path),
-            suggestion: "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
-                .into(),
+            suggestion:
+                "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
+                    .into(),
         });
         return issues; // no point checking resources if workspace doesn't exist
     }
@@ -441,7 +460,11 @@ fn collect_issues(
             if resolved.runtime_configured_path.is_none()
                 && !home.join(".openclaw").join("openclaw.json").exists() =>
         {
-            Some(("openclaw_config_not_found", "~/.openclaw/openclaw.json not found", "OpenClaw"))
+            Some((
+                "openclaw_config_not_found",
+                "~/.openclaw/openclaw.json not found",
+                "OpenClaw",
+            ))
         }
         "zeroclaw" if !home.join(".zeroclaw").join("config.toml").exists() => Some((
             "zeroclaw_config_not_found",

@@ -144,6 +144,9 @@ mod tests {
             .insert("scope".into(), serde_json::json!(["read", "write"]));
         let bytes = v.to_json_bytes();
         let parsed = VaultPayload::from_json_bytes(&bytes).unwrap();
-        assert_eq!(parsed.extra.get("scope"), Some(&serde_json::json!(["read", "write"])));
+        assert_eq!(
+            parsed.extra.get("scope"),
+            Some(&serde_json::json!(["read", "write"]))
+        );
     }
 }

@@ -14,6 +14,12 @@
 #   installer    scripts/test_install.sh --linux --quick            (needs: docker, python3)
 #                  └ install.sh contract vs a mock GitHub Releases server (ubuntu only;
 #                    use --installer-full for the debian/alpine/alpine-nochecksum matrix)
+#   walkthroughs cloud e2e walkthroughs, every runtime branch, --no-pause  (needs: python3 + live .env)
+#                  └ main + workspace × {openclaw,zeroclaw,hermes}, plus the memory and
+#                    vault walkthroughs. Each combo is its own pass/fail row. SKIPPED
+#                    unless cloud creds are present (.env or API_BASE_URL/API_KEY/
+#                    NEON_DATABASE_URL/S3_BUCKET_NAME). The hermes combos clone the real
+#                    NousResearch/hermes-agent (cached at $HERMES_AGENT_DIR or /tmp).
 #
 # Usage:
 #   ./test.sh                  Default set; tiers whose tools are missing are SKIPPED.
@@ -24,8 +30,10 @@
 #   ./test.sh --list           Print the tier names and exit.
 #   ./test.sh -h | --help      Show this help.
 #
+# Run only the cloud walkthroughs (every branch, non-interactive):
+#   ./test.sh walkthroughs     Needs a .env (or exported cloud creds); skips otherwise.
+#
 # Not covered (need live credentials / services — run by hand):
-#   • cloud e2e walkthroughs   scripts/integration_walkthrough*.py   (real Neon + S3, .env)
 #   • OpenClaw Docker harness  tests/installer-openclaw/run_test.sh  (hits real GitHub Releases)
 #
 # Exit 0 = every tier that ran passed. Non-zero = at least one tier failed.
@@ -35,7 +43,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-ALL_TIERS=(fmt clippy unit integration installer)
+ALL_TIERS=(fmt clippy unit integration installer walkthroughs)
 
 # --- colours (only when stdout is a tty) ----------------------------------
 if [ -t 1 ]; then
@@ -59,7 +67,7 @@ while [ $# -gt 0 ]; do
         --installer-full)  INSTALLER_FULL=1 ;;
         --list)            printf '%s\n' "${ALL_TIERS[@]}"; exit 0 ;;
         -h|--help)         usage; exit 0 ;;
-        fmt|clippy|unit|integration|installer) SELECTED+=("$1") ;;
+        fmt|clippy|unit|integration|installer|walkthroughs) SELECTED+=("$1") ;;
         *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -76,6 +84,29 @@ fi
 # --- helpers --------------------------------------------------------------
 have()         { command -v "$1" >/dev/null 2>&1; }
 docker_ready() { have docker && docker info >/dev/null 2>&1; }
+
+# Cloud e2e walkthroughs, one row per (walkthrough × runtime branch). Format:
+# "summary-label|script|extra-args". Empty args ⇒ the walkthrough takes no
+# --runtime (single flow). Runtimes for a given walkthrough run in sequence and
+# each cleans up its agent before the next, so they can share an agent id.
+WALKTHROUGH_MATRIX=(
+    "wt:main:openclaw|integration_walkthrough.py|--runtime openclaw"
+    "wt:main:zeroclaw|integration_walkthrough.py|--runtime zeroclaw"
+    "wt:main:hermes|integration_walkthrough.py|--runtime hermes"
+    "wt:workspace:openclaw|integration_walkthrough_for_workspace.py|--runtime openclaw"
+    "wt:workspace:zeroclaw|integration_walkthrough_for_workspace.py|--runtime zeroclaw"
+    "wt:workspace:hermes|integration_walkthrough_for_workspace.py|--runtime hermes"
+    "wt:memory|integration_walkthrough_for_memory.py|"
+    "wt:vault|integration_walkthrough_for_vault.py|"
+)
+
+# The walkthroughs need live cloud creds — a .env in the repo root or the four
+# vars exported. Without them the tier is SKIPPED (FAILED under --all).
+walkthrough_creds_ready() {
+    [ -f "$ROOT/.env" ] && return 0
+    [ -n "${API_BASE_URL:-}" ] && [ -n "${API_KEY:-}" ] \
+        && [ -n "${NEON_DATABASE_URL:-}" ] && [ -n "${S3_BUCKET_NAME:-}" ]
+}
 
 RESULTS=()
 FAILED=0
@@ -133,6 +164,18 @@ for tier in "${TIERS[@]}"; do
                 run_tier installer ./scripts/test_install.sh --linux
             else
                 run_tier installer ./scripts/test_install.sh --linux --quick
+            fi ;;
+        walkthroughs)
+            if ! have python3; then
+                skip_tier walkthroughs "python3 not found"
+            elif ! walkthrough_creds_ready; then
+                skip_tier walkthroughs "no cloud creds (.env or API_BASE_URL/API_KEY/NEON_DATABASE_URL/S3_BUCKET_NAME)"
+            else
+                for entry in "${WALKTHROUGH_MATRIX[@]}"; do
+                    IFS='|' read -r wt_label wt_script wt_args <<<"$entry"
+                    # shellcheck disable=SC2086  # intentional word-split of wt_args
+                    run_tier "$wt_label" python3 "scripts/$wt_script" --no-pause $wt_args
+                done
             fi ;;
     esac
 done

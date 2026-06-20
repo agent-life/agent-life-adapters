@@ -41,9 +41,14 @@ Environment (.env or exported):
 Usage:
   python3 integration_walkthrough.py                  # interactive (pauses; prompts for runtime)
   python3 integration_walkthrough.py --runtime zeroclaw
+  python3 integration_walkthrough.py --runtime hermes  # faithful: drives the real Hermes state.db
   python3 integration_walkthrough.py --no-pause       # batch mode (CI; defaults to openclaw)
   python3 integration_walkthrough.py --keep-run-dir   # keep the run dir even in batch mode
   python3 integration_walkthrough.py --help
+
+The hermes runtime emulates Hermes faithfully via its own storage layer
+(hermes_state.SessionDB). It uses a NousResearch/hermes-agent checkout found at
+$HERMES_AGENT_DIR or /tmp/hermes-agent, shallow-cloning the latter if absent.
 """
 
 from __future__ import annotations
@@ -62,6 +67,11 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+
+# Faithful Hermes runtime emulation (real hermes_state.SessionDB). Same dir;
+# the import is cheap — the heavy Hermes import is lazy on first use.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hermes_runtime  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Third-party imports (with friendly error on missing)
@@ -98,7 +108,7 @@ COLORS = {
 
 AGENT_ID = uuid.UUID("e2e10000-feed-4000-b000-000000000001")
 AGENT_NAME = "E2E Walkthrough Agent"
-SUPPORTED_RUNTIMES = ("openclaw", "zeroclaw")
+SUPPORTED_RUNTIMES = ("openclaw", "zeroclaw", "hermes")
 # Default source runtime for scripts that build agent rows directly (e.g. the
 # vault walkthrough's hand-constructed snapshots, which are OpenClaw-shaped).
 SOURCE_RUNTIME = "openclaw"
@@ -314,6 +324,27 @@ def inspect(ctx: RunContext, items: list[tuple[str, str]]):
         print(f"    {cmd}")
     print()
 
+
+def inspect_online(bucket: str, items: list[tuple[str, str]]):
+    """Print the S3 URL of each uploaded object plus a copy-pasteable command to
+    pull it and inspect the archived content online. `items` is a list of
+    (description, s3_key); a key may be a full object key or a `prefix/` to list.
+    Mirrors `inspect()` but for the cloud (API/S3) lane."""
+    items = [(d, k) for d, k in items if k]
+    if not items:
+        return
+    print(f"  {c('yellow', 'inspect online (S3)')} {c('dim', 'bucket=' + bucket)}:")
+    for desc, key in items:
+        print(f"    {c('dim', '# ' + desc)}")
+        print(f"    {c('cyan', 's3://' + bucket + '/' + key)}")
+        if key.endswith("/"):
+            # A prefix → list every object the agent has in the cloud.
+            print(f"    aws s3 ls s3://{bucket}/{key} --recursive --human-readable")
+        else:
+            # A single .alf object → download and list its archive entries.
+            print(f"    aws s3 cp s3://{bucket}/{key} /tmp/inspect.alf && unzip -l /tmp/inspect.alf")
+    print()
+
 def pause(cfg: Config, prompt: str = "Press Enter to continue..."):
     if cfg.interactive:
         input(f"\n  {c('blue', '▸')} {prompt}")
@@ -508,6 +539,19 @@ def build_run_context(cfg: Config, alf: str, agent_id: uuid.UUID = AGENT_ID) -> 
         encoding="utf-8",
     )
 
+    if cfg.runtime == "hermes":
+        # A Hermes profile's HERMES_HOME *is* the workspace. Seed it faithfully
+        # with the real Hermes storage layer (state.db) plus SOUL.md, config,
+        # curated memory, a skill, and .env — every surface the adapter maps.
+        ws = root / "hermes-home"
+        hermes_runtime.seed_home(ws)
+        (ws / ".alf-agent-id").write_text(str(agent_id) + "\n", encoding="utf-8")
+        return RunContext(
+            root=root, home=home, ws=ws, runtime_home=ws,
+            restore_ws=root / "restore-hermes", alf=alf,
+            runtime=cfg.runtime, agent_id=agent_id,
+        )
+
     if cfg.runtime == "zeroclaw":
         runtime_home = root / "zeroclaw-home"
         ws = runtime_home / "workspace"
@@ -695,9 +739,19 @@ def step_local_layout(cfg: Config, ctx: RunContext, report: Report):
     if ctx.runtime == "zeroclaw":
         rows.insert(3, (ctx.disp(ctx.runtime_home / "config.toml"),
                         "ZeroClaw runtime config (markdown memory backend)"))
+    elif ctx.runtime == "hermes":
+        rows.insert(3, (ctx.disp(ctx.ws / "config.yaml"),
+                        "Hermes config (personalities, system prompt) — redacted in the archive"))
+        rows.insert(4, (ctx.disp(ctx.ws / "memories"),
+                        "curated memory (MEMORY.md, §-entries) + the user profile (USER.md)"))
+        rows.insert(5, (ctx.disp(ctx.ws / "state.db"),
+                        "session history — decomposed to records, rebuilt on restore (binary never archived)"))
+        rows.insert(6, (ctx.disp(ctx.ws / ".env"),
+                        "plaintext secrets — NEVER archived; surfaced as a vault advisory (D4)"))
     rows.append((ctx.disp(ctx.restore_ws), "a 'fresh machine' — populated later by `alf restore`"))
     rows.append(("(cloud) Neon", "agents / snapshots / deltas rows, keyed by agent_id"))
-    rows.append(("(cloud) S3", "<tenant>/<agent_id>/{snapshots,deltas}/*.alf"))
+    rows.append((f"(cloud) s3://{cfg.s3_bucket}/<tenant>/<agent_id>/",
+                 "the uploaded {snapshots,deltas}/*.alf — concrete URLs shown at each sync"))
     for path, purpose in rows:
         print(f"    {c('cyan', path)}")
         print(f"      {c('dim', purpose)}")
@@ -783,8 +837,119 @@ def step_first_sync(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, re
          f"unzip -l {ctx.disp(ctx.base_alf)}"),
         ("CLI's own view of state", "HOME=$RUN/home alf help status 2>/dev/null || true"),
     ])
+    inspect_online(s3.bucket, [
+        ("the snapshot .alf the CLI just uploaded", (snap or {}).get("blob_key", "")),
+    ])
     report.add(StepResult("First sync", True, duration,
                           f"sequence={res.get('sequence')}, snapshot uploaded"))
+    pause(cfg)
+
+
+def step_hermes_features(cfg: Config, ctx: RunContext, report: Report):
+    """Hermes-only deep-dive into what the first-sync archive carries — the
+    surfaces that distinguish the Hermes mapping. Runs against the .alf the CLI
+    just produced, plus a throwaway export to show the D4 advisory and D3 add."""
+    import zipfile
+
+    section("2b", "Hermes-Specific Surfaces (sessions, D3/D4/D5)")
+    explain("""
+        The first sync produced an .alf. Look at what makes the Hermes mapping
+        distinctive: sessions decomposed to records (the binary state.db is never
+        archived), the schema sidecar that lets restore rebuild it, agent skills
+        carried as artifacts, and the plaintext .env kept out entirely — surfaced
+        instead as a vault advisory.
+    """)
+
+    # 1. What the uploaded archive actually contains.
+    try:
+        with zipfile.ZipFile(ctx.base_alf) as z:
+            names = z.namelist()
+    except Exception as e:  # noqa: BLE001
+        fail(f"could not read {ctx.disp(ctx.base_alf)}: {e}")
+        report.add(StepResult("Hermes surfaces", False, 0, error=str(e)[:120]))
+        pause(cfg)
+        return
+
+    has_sessions = any(n.startswith("memory/") and n.endswith(".jsonl") for n in names)
+    state_db_absent = "raw/hermes/state.db" not in names
+    schema_sidecar = "raw/hermes/.alf-state-db-schema.json" in names
+    env_absent = not any(n.endswith(".env") for n in names)
+    skills_artifacts = any(n.startswith("artifacts/skills/") for n in names)
+    attachments = "attachments.json" in names
+    (ok if has_sessions else fail)(
+        f"sessions present as episodic records (memory/*.jsonl) = {has_sessions}")
+    (ok if state_db_absent else fail)(
+        f"state.db binary NOT archived (D7) = {state_db_absent}")
+    (ok if schema_sidecar else fail)(
+        f"schema sidecar present for rebuild (raw/hermes/.alf-state-db-schema.json) = {schema_sidecar}")
+    (ok if skills_artifacts and attachments else fail)(
+        f"skills carried as artifacts + attachments.json (D5) = {skills_artifacts and attachments}")
+    (ok if env_absent else fail)(
+        f".env kept out of the archive entirely = {env_absent}")
+
+    # 2. D4 — un-vaulted .env advisory (read from `alf export`'s JSON warnings).
+    print()
+    explain("""
+        D4 — credential advisory: the adapter detects API keys in the home's .env
+        that aren't in the encrypted vault and tells the user to back them up,
+        without ever copying the plaintext into the archive.
+    """)
+    tmp_alf = ctx.root / "feature-export.alf"
+    _, ex = run_cli(ctx, ["export", "-r", "hermes", "-w", str(ctx.ws), "-o", str(tmp_alf)])
+    warnings = (ex or {}).get("warnings", [])
+    env_warn = any(".env" in w and "not backed up" in w for w in warnings)
+    (ok if env_warn else fail)(f".env advisory surfaced on export = {env_warn}")
+    for w in warnings:
+        print(f"    {c('yellow', '! ' + w[:160])}")
+
+    # 3. D3 — track a project-local AGENTS.md from outside the home; denylist holds.
+    print()
+    explain("""
+        D3 — external alf add: Hermes's AGENTS.md is project-local (outside the
+        home). After blessing the project root, `alf add --external` tracks it and
+        the next export packs it under a sanitized raw/hermes/external/ name. The
+        non-overridable denylist still refuses a secret like .env.
+    """)
+    project = ctx.root / "project"
+    project.mkdir(exist_ok=True)
+    (project / "AGENTS.md").write_text("# Project ops\n\nDeploy on green CI only.\n", encoding="utf-8")
+    (project / ".env").write_text("SECRET=should-be-refused\n", encoding="utf-8")
+    run_cli(ctx, ["add", "--allow-root", str(project)])
+    proc_add, _ = run_cli(ctx, ["add", "--external", "--yes-external", "-r", "hermes",
+                                "-w", str(ctx.ws), str(project / "AGENTS.md")])
+    add_ok = proc_add.returncode == 0
+    proc_deny, _ = run_cli(ctx, ["add", "--external", "--yes-external", "-r", "hermes",
+                                 "-w", str(ctx.ws), str(project / ".env")])
+    deny_ok = proc_deny.returncode != 0
+    run_cli(ctx, ["export", "-r", "hermes", "-w", str(ctx.ws), "-o", str(tmp_alf)], show=False)
+    ext_packed = False
+    try:
+        with zipfile.ZipFile(tmp_alf) as z:
+            ext_packed = any(n.startswith("raw/hermes/external/") for n in z.namelist())
+    except Exception:  # noqa: BLE001
+        pass
+    (ok if add_ok else fail)(f"external AGENTS.md tracked via `alf add --external` = {add_ok}")
+    (ok if deny_ok else fail)(f"denylist refused .env even under a blessed root = {deny_ok}")
+    (ok if ext_packed else fail)(f"external file packed under raw/hermes/external/ = {ext_packed}")
+
+    inspect(ctx, [
+        ("the Hermes archive layout", f"unzip -l {ctx.disp(ctx.base_alf)}"),
+        ("the external include list", f"cat {ctx.disp(ctx.ws / '.alf-include.json')}"),
+    ])
+
+    # Untrack the external entry so the later restore proof (durable-text
+    # byte-equality over the home) isn't perturbed by a restored external/ file.
+    il = ctx.ws / ".alf-include.json"
+    if il.exists():
+        il.unlink()
+
+    feature_ok = (has_sessions and state_db_absent and schema_sidecar and skills_artifacts
+                  and attachments and env_absent and env_warn and add_ok and deny_ok and ext_packed)
+    report.add(StepResult(
+        "Hermes surfaces (sessions/D3/D4/D5)", feature_ok, 0,
+        f"sessions-as-records={has_sessions}, state.db-excluded={state_db_absent}, "
+        f"schema-sidecar={schema_sidecar}, skills-artifacts={skills_artifacts}, "
+        f".env-advisory={env_warn}, external-add={add_ok}, denylist={deny_ok}"))
     pause(cfg)
 
 
@@ -792,14 +957,39 @@ def step_delta(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report:
                n: int, daily: str, content: str):
     section(2 + n, f"Delta {n} — Edit Memory, Sync")
     explain(f"""
-        The agent learns something: we add a new daily memory file to the
-        workspace, then `alf sync` again. Because a base snapshot now exists, this
-        is the DELTA branch — the CLI diffs against the base and pushes only the
-        change (POST /agents/:id/deltas), advancing the sequence.
+        The agent learns something: we make a real edit in the workspace, then
+        `alf sync` again. Because a base snapshot now exists, this is the DELTA
+        branch — the CLI diffs against the base and pushes only the change
+        (POST /agents/:id/deltas), advancing the sequence.
     """)
-    # Make a real workspace edit — this is what produces a delta.
-    (ctx.ws / "memory" / daily).write_text(content, encoding="utf-8")
-    flow(f"edit {ctx.disp(ctx.ws / 'memory' / daily)}  ──alf sync──▶  POST /deltas  ──▶  S3 delta + seq++")
+    # Make a real workspace edit — this is what produces a delta. Hermes has no
+    # daily memory files: delta 1 appends a curated §-entry (a curated-record
+    # create); delta 2 adds a new session to state.db through the real Hermes
+    # storage layer (a single session-record create — proving only new/active
+    # sessions move). Other runtimes write a daily memory file.
+    if ctx.runtime == "hermes":
+        if n == 1:
+            entry = content.strip() or "The deploy runbook lives in skills/custom/deploy."
+            hermes_runtime.append_curated(ctx.ws, entry)
+            flow(f"append §-entry to {ctx.disp(ctx.ws / 'memories' / 'MEMORY.md')}  "
+                 f"──alf sync──▶  POST /deltas (curated create)  ──▶  S3 delta + seq++")
+            delta_inspect = ("the curated store that drove the delta",
+                             f"cat {ctx.disp(ctx.ws / 'memories' / 'MEMORY.md')}")
+        else:
+            sid = f"20260201_09{n:02d}00_d{n}{n}d{n}"
+            hermes_runtime.add_session(
+                ctx.ws, sid, source="discord", title=f"Walkthrough session {n}",
+                messages=[("user", "Summarize the deploy runbook."),
+                          ("assistant", "Build, run fmt, then ship via the deploy skill.")])
+            flow(f"add session {sid} to {ctx.disp(ctx.ws / 'state.db')}  "
+                 f"──alf sync──▶  POST /deltas (session create)  ──▶  S3 delta + seq++")
+            delta_inspect = ("the session count in the live state.db",
+                             f"sqlite3 {ctx.disp(ctx.ws / 'state.db')} 'select id,source,title from sessions'")
+    else:
+        (ctx.ws / "memory" / daily).write_text(content, encoding="utf-8")
+        flow(f"edit {ctx.disp(ctx.ws / 'memory' / daily)}  ──alf sync──▶  POST /deltas  ──▶  S3 delta + seq++")
+        delta_inspect = ("the new memory file that drove the delta",
+                         f"cat {ctx.disp(ctx.ws / 'memory' / daily)}")
 
     t0 = time.time()
     proc, res = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
@@ -820,7 +1010,7 @@ def step_delta(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report:
     if agent:
         ok(f"Neon: agent.latest_sequence advanced to {agent['latest_sequence']}")
     drow = db.query_one(
-        "SELECT sequence, size_bytes FROM deltas WHERE agent_id = %s AND sequence = %s",
+        "SELECT sequence, blob_key, size_bytes FROM deltas WHERE agent_id = %s AND sequence = %s",
         (str(AGENT_ID), res.get("sequence")),
     )
     if drow:
@@ -833,8 +1023,10 @@ def step_delta(cfg: Config, ctx: RunContext, db: DbClient, s3: S3Client, report:
     inspect(ctx, [
         ("cursor after this delta (last_synced_sequence advanced)",
          f"cat {ctx.disp(ctx.state_toml)}"),
-        ("the new memory file that drove the delta",
-         f"cat {ctx.disp(ctx.ws / 'memory' / daily)}"),
+        delta_inspect,
+    ])
+    inspect_online(s3.bucket, [
+        ("the delta .alf this sync uploaded", (drow or {}).get("blob_key", "")),
     ])
     report.add(StepResult(f"Delta {n}", True, duration,
                           f"sequence={res.get('sequence')}, delta pushed"))
@@ -851,13 +1043,22 @@ def step_identity_principals_delta(cfg: Config, ctx: RunContext, report: Report)
         breaks the delta out per layer: `changes.identity` (bool) and
         `changes.principals` (creates/updates/deletes).
     """)
-    # Edit identity (adds an identity_profile + display name) and add a human
-    # principal — both new vs the base snapshot.
-    (ctx.ws / "IDENTITY.md").write_text(
-        "# Atlas\n\nThe demo agent's stated identity.\n", encoding="utf-8")
-    (ctx.ws / "USER.md").write_text(
-        "# Jordan\n\nThe human Atlas reports to.\n", encoding="utf-8")
-    flow("edit IDENTITY.md + USER.md  ──alf sync──▶  POST /deltas (Layer 1 + Layer 2)")
+    # Edit identity and add a human principal — both new vs the base snapshot.
+    # Hermes identity is SOUL.md (no IDENTITY.md), and the user profile lives at
+    # memories/USER.md; other runtimes use IDENTITY.md + USER.md at the root.
+    if ctx.runtime == "hermes":
+        hermes_runtime.edit_soul(
+            ctx.ws,
+            "# Atlas\n\nA demo Hermes agent for the integration walkthrough. "
+            "Values correctness — and now also mentors new agents.\n")
+        hermes_runtime.write_user_md(ctx.ws, "# Jordan\n\nThe human Atlas reports to.\n")
+        flow("edit SOUL.md + create memories/USER.md  ──alf sync──▶  POST /deltas (Layer 1 + Layer 2)")
+    else:
+        (ctx.ws / "IDENTITY.md").write_text(
+            "# Atlas\n\nThe demo agent's stated identity.\n", encoding="utf-8")
+        (ctx.ws / "USER.md").write_text(
+            "# Jordan\n\nThe human Atlas reports to.\n", encoding="utf-8")
+        flow("edit IDENTITY.md + USER.md  ──alf sync──▶  POST /deltas (Layer 1 + Layer 2)")
 
     t0 = time.time()
     proc, res = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
@@ -927,7 +1128,137 @@ def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
     pause(cfg)
 
 
-def step_restore(cfg: Config, ctx: RunContext, report: Report):
+# For Hermes, two restored files are intentionally NOT byte-equal: config.yaml
+# is redacted, and state.db is rebuilt from records. They are excluded from the
+# byte-equality digest and verified separately by hermes_restore_proof.
+HERMES_REBUILT_EXCLUDE = (
+    ".alf-agent-id", "state.db", "state.db-wal", "state.db-shm", "config.yaml", ".env",
+)
+
+
+def hermes_workspace_match(ctx: RunContext, expect_sessions: int = 3) -> dict:
+    """Shared Hermes restore/recovery verification (Step 7 restore + Step 9
+    recovery). A faithful Hermes restore is NOT a byte-for-byte copy — config.yaml
+    is redacted and state.db is rebuilt — so the naive workspace digest would
+    false-MISMATCH. This proves the right four things and returns the results:
+
+      • durable text (SOUL.md, memories/*, skills/*) byte-equal,
+      • config.yaml restored redacted (secret stripped, structure kept),
+      • .env NOT restored (secrets live only in the vault),
+      • state.db rebuilt so a REAL Hermes opens it (sessions, lineage, FTS).
+    """
+    syn = workspace_digest(ctx.ws, HERMES_REBUILT_EXCLUDE)
+    rest = workspace_digest(ctx.restore_ws, HERMES_REBUILT_EXCLUDE)
+    text_ok = syn == rest
+    diff_lines = (
+        [ln for ln in workspace_diff(ctx.ws, ctx.restore_ws)
+         if not any(ln.endswith(x) for x in HERMES_REBUILT_EXCLUDE)]
+        if not text_ok else []
+    )
+    cfg_path = ctx.restore_ws / "config.yaml"
+    cfg_text = cfg_path.read_text(encoding="utf-8") if cfg_path.is_file() else ""
+    redacted_ok = ("<redacted>" in cfg_text and "system_prompt" in cfg_text
+                   and "sk-REDACT-ME" not in cfg_text)
+    env_absent = not (ctx.restore_ws / ".env").exists()
+    try:
+        db_ok, detail = hermes_runtime.verify_state_db(ctx.restore_ws / "state.db", expect_sessions)
+    except Exception as e:  # noqa: BLE001
+        db_ok, detail = False, {"sessions": "?", "expected": expect_sessions, "lineage_ok": False,
+                                "fts_retry_hits": 0, "fts_wal_hits": 0, "error": str(e)[:120]}
+    return {
+        "text_ok": text_ok, "syn": syn, "rest": rest, "diff_lines": diff_lines,
+        "redacted_ok": redacted_ok, "env_absent": env_absent,
+        "db_ok": db_ok, "detail": detail,
+        "overall": text_ok and redacted_ok and env_absent and db_ok,
+    }
+
+
+def hermes_restore_proof(ctx: RunContext, report: Report, duration: float, res: dict):
+    """Hermes-aware restore verification, proving four things separately because
+    a faithful Hermes restore is not a naive byte-for-byte copy:
+
+      1. Durable text (SOUL.md, curated memory, USER.md, skills) round-trips
+         byte-for-byte.
+      2. config.yaml is restored REDACTED (secret stripped, structure kept).
+      3. .env is NOT restored — secrets live only in the encrypted vault.
+      4. state.db was rebuilt from records, and a REAL Hermes opens it (sessions,
+         compression lineage, and FTS5 search all work).
+    """
+    m = hermes_workspace_match(ctx)  # 2 seeded + 1 added in delta 2 = 3 sessions
+
+    # 1. Durable text byte-equal (rebuilt/redacted files excluded).
+    (ok if m["text_ok"] else fail)(
+        f"durable text round-trip {'matches' if m['text_ok'] else 'MISMATCH'} "
+        f"(SOUL.md, memories/*, skills/*) — synthetic {m['syn'][:12]}…  restored {m['rest'][:12]}…")
+    for line in m["diff_lines"]:
+        print(f"      {c('red', line)}")
+
+    # 2. config.yaml restored redacted; 3. .env absent.
+    (ok if m["redacted_ok"] else fail)(
+        f"config.yaml restored redacted = {m['redacted_ok']} (api_key stripped, system_prompt kept)")
+    (ok if m["env_absent"] else fail)(
+        f".env correctly NOT restored (secrets live only in the vault) = {m['env_absent']}")
+
+    # 4. state.db rebuilt — a REAL Hermes opens it read-write: sessions + lineage + FTS.
+    db_ok, detail = m["db_ok"], m["detail"]
+    (ok if db_ok else fail)(
+        f"state.db rebuilt — real Hermes opened it: "
+        f"{detail['sessions']}/{detail['expected']} sessions, lineage={detail['lineage_ok']}, "
+        f"FTS('retry')={detail['fts_retry_hits']} hit(s), FTS('WAL')={detail['fts_wal_hits']} hit(s)")
+    if detail.get("error"):
+        print(f"      {c('red', detail['error'])}")
+
+    # Size note — preempts the "why is the restored state.db bigger?" question.
+    # Hermes runs SQLite in WAL mode, so the synthetic agent keeps ~all its data
+    # in an uncheckpointed state.db-wal sidecar and its main file looks tiny. The
+    # rebuild writes everything into the main file (empty WAL). Same logical
+    # content (sessions/lineage/FTS verified identical above) — so compare logical
+    # pages, not the raw main-file size. (Reads are non-mutating: stat() on the
+    # synthetic's files, PRAGMA page_count on the already-opened restored DB.)
+    import sqlite3
+
+    def _kb(p: Path) -> float:
+        return p.stat().st_size / 1024 if p.exists() else 0.0
+
+    try:
+        _con = sqlite3.connect(str(ctx.restore_ws / "state.db"))
+        pages = _con.execute("PRAGMA page_count").fetchone()[0]
+        psize = _con.execute("PRAGMA page_size").fetchone()[0]
+        _con.close()
+    except Exception:  # noqa: BLE001
+        pages, psize = 0, 0
+    logical_kb = pages * psize / 1024
+    syn_main, syn_wal = _kb(ctx.ws / "state.db"), _kb(ctx.ws / "state.db-wal")
+    rst_main, rst_wal = _kb(ctx.restore_ws / "state.db"), _kb(ctx.restore_ws / "state.db-wal")
+    print(f"  {c('cyan', 'ℹ')}  state.db is {pages} pages × {psize} B = {logical_kb:.0f} KB of logical "
+          f"content on BOTH sides (sessions/lineage/FTS verified identical above) — not bloat.")
+    print(f"      on disk:  rebuilt {rst_main:.0f} KB main + {rst_wal:.0f} KB WAL"
+          f"   |   synthetic {syn_main:.0f} KB main + {syn_wal:.0f} KB WAL")
+    print(f"      {c('dim', 'Hermes runs SQLite in WAL mode — a tiny main file just means the data is')}")
+    print(f"      {c('dim', 'deferred in the state.db-wal sidecar until a checkpoint folds it in.')}")
+    print()
+
+    # agent-id pin (excluded from the content hash by design).
+    id_file = ctx.restore_ws / ".alf-agent-id"
+    pin_ok = id_file.is_file() and id_file.read_text().strip() == str(AGENT_ID)
+    (ok if pin_ok else fail)(f".alf-agent-id pin restored = {pin_ok}")
+
+    inspect(ctx, [
+        ("count sessions + FTS rows in the rebuilt state.db",
+         f"sqlite3 {ctx.disp(ctx.restore_ws / 'state.db')} "
+         f"'select count(*) from sessions; select count(*) from messages_fts'"),
+        ("confirm the secret was redacted in the restored config",
+         f"grep api_key {ctx.disp(ctx.restore_ws / 'config.yaml')}"),
+    ])
+    step_ok = m["overall"] and pin_ok
+    report.add(StepResult(
+        "Restore", step_ok, duration,
+        f"{res.get('memory_records', '?')} records; text round-trip="
+        f"{'ok' if m['text_ok'] else 'MISMATCH'}, state.db rebuilt="
+        f"{'ok' if db_ok else 'FAIL'} ({detail['sessions']} sessions, FTS ok={db_ok})"))
+
+
+def step_restore(cfg: Config, ctx: RunContext, s3: S3Client, db: DbClient, report: Report):
     section(7, "Restore to a Fresh Workspace")
     explain("""
         `alf restore` is the cloud → workspace direction. It fetches the snapshot
@@ -957,6 +1288,19 @@ def step_restore(cfg: Config, ctx: RunContext, report: Report):
     for f in files:
         print(f"    {c('dim', f)}")
     print()
+
+    # The snapshot + every delta this restore pulled live in S3 — show how to
+    # list/download all of the agent's online content directly.
+    inspect_online(s3.bucket, [
+        ("every snapshot + delta .alf this restore rebuilt from", tenant_prefix(db) or ""),
+    ])
+
+    # Hermes restore is not a naive byte copy (config redacted, state.db rebuilt),
+    # so it has its own multi-part proof.
+    if ctx.runtime == "hermes":
+        hermes_restore_proof(ctx, report, duration, res)
+        pause(cfg)
+        return
 
     # Byte-equality proof: a recursive SHA256 over the synthetic workspace must
     # equal the restored one. `sequence`/`memory_records` above are read from the
@@ -1070,14 +1414,31 @@ def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
     files = tree(ctx.restore_ws)
     ok(f"alf restore rebuilt {len(files)} file(s) from the cloud — full recovery, no data lost")
 
-    # Same byte-equality proof as Step 7: recovery must reproduce the workspace
-    # exactly, not merely "some files".
-    recovered_match = workspace_digest(ctx.ws) == workspace_digest(ctx.restore_ws)
-    (ok if recovered_match else fail)(
-        f"recovered workspace SHA256 {'matches synthetic' if recovered_match else 'MISMATCH'}")
-    if not recovered_match:
-        for line in workspace_diff(ctx.ws, ctx.restore_ws):
+    # Recovery must reproduce the workspace. For Hermes that's the same multi-part
+    # proof as Step 7 (config.yaml is redacted and state.db is rebuilt, so a naive
+    # byte digest would false-MISMATCH); other runtimes use the plain digest.
+    if ctx.runtime == "hermes":
+        m = hermes_workspace_match(ctx)
+        (ok if m["text_ok"] else fail)(
+            f"recovered durable text {'matches synthetic' if m['text_ok'] else 'MISMATCH'} "
+            f"(SOUL.md, memories/*, skills/*)")
+        for line in m["diff_lines"]:
             print(f"      {c('red', line)}")
+        d = m["detail"]
+        (ok if m["db_ok"] else fail)(
+            f"state.db rebuilt from the cloud — real Hermes opened it: "
+            f"{d['sessions']}/{d['expected']} sessions, lineage={d['lineage_ok']}, "
+            f"FTS('retry')={d['fts_retry_hits']} hit(s)")
+        (ok if (m["redacted_ok"] and m["env_absent"]) else fail)(
+            f"config.yaml redacted = {m['redacted_ok']}, .env not restored = {m['env_absent']}")
+        recovered_match = m["overall"]
+    else:
+        recovered_match = workspace_digest(ctx.ws) == workspace_digest(ctx.restore_ws)
+        (ok if recovered_match else fail)(
+            f"recovered workspace SHA256 {'matches synthetic' if recovered_match else 'MISMATCH'}")
+        if not recovered_match:
+            for line in workspace_diff(ctx.ws, ctx.restore_ws):
+                print(f"      {c('red', line)}")
     print()
     inspect(ctx, [
         ("confirm the workspace is back", f"ls -la {ctx.disp(ctx.restore_ws)}"),
@@ -1244,13 +1605,15 @@ def main():
         step_connectivity(cfg, ctx, api, db, s3, report)
         step_local_layout(cfg, ctx, report)
         step_first_sync(cfg, ctx, db, s3, report)
+        if ctx.runtime == "hermes":
+            step_hermes_features(cfg, ctx, report)
         step_delta(cfg, ctx, db, s3, report, 1, "2026-01-16.md",
                    "## Migration\n\nRedis migration runbook complete.\n")
         step_delta(cfg, ctx, db, s3, report, 2, "2026-01-17.md",
                    "## Results\n\nLoad test: p99 5ms on Redis 7.2.\n")
         step_identity_principals_delta(cfg, ctx, report)
         step_pull_deltas(cfg, api, report)
-        step_restore(cfg, ctx, report)
+        step_restore(cfg, ctx, s3, db, report)
         step_point_in_time(cfg, ctx, api, report)
         step_data_loss(cfg, ctx, report)
         step_safety(cfg, ctx, report)

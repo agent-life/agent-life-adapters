@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.1.9 | Updated: 2026-05-24
+> Version: 0.1.10 | Updated: 2026-06-19
 > HTML: <https://agent-life.ai/docs/cli>
 > Markdown: <https://agent-life.ai/docs/cli.md>
 
@@ -42,6 +42,10 @@ an actionable error when neither the flag nor `[defaults] workspace` supplies it
 additionally falls back to `~/.openclaw/openclaw.json` then `~/.openclaw/workspace` — see below.)
 Because of this, the per-command "Required" columns mark `-r`/`-w` as **No**: they are mandatory
 on the command line only when no config default is set.
+
+Supported runtimes are `openclaw`, `zeroclaw`, and `hermes`. For `hermes` the workspace *is* the
+profile home (`HERMES_HOME`, default `~/.hermes`; named profiles under `~/.hermes/profiles/<name>/`),
+and `alf check` defaults `-w` to `$HERMES_HOME` or `~/.hermes`. One profile is one agent — one `.alf`.
 
 ## Quick Reference
 
@@ -94,7 +98,7 @@ Run this first before any other command — it tells you whether sync will work 
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Workspace path (auto-discovered if omitted) |
 
 ### Workspace Auto-Discovery
@@ -247,7 +251,7 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
 | `--output` | `-o` | No | Output file path (default: auto-generated in current directory) |
 
@@ -259,8 +263,11 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
       "agent_name": "Atlas",
       "alf_version": "1.0.0-rc.2",
       "memory_records": 47,
-      "file_size": 102400
+      "file_size": 102400,
+      "warnings": ["2 key(s) in ~/.hermes/.env are not backed up in the ALF vault …"]
     }
+
+`warnings` (omitted when empty) carries non-fatal adapter advisories. The Hermes adapter uses it to flag API keys in `~/.hermes/.env` that are not in the encrypted vault — vault them with [`alf vault add`](#alf-vault) so they travel with the agent. `alf sync` prints the same advisories. ALF never copies plaintext `.env` into the archive.
 
 ---
 
@@ -268,7 +275,7 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 Track an arbitrary workspace file so `alf sync` includes it. Known files (SOUL.md, IDENTITY.md, `memory/`…) are always covered; `alf add` extends coverage to anything else — a report, a CSV — without ALF ever auto-walking or slurping the whole workspace.
 
-The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synced, so it travels on restore). Tracked files are preserved byte-identically under `raw/openclaw/` and written back on restore. Deleting a tracked file and running `alf sync` prunes it from the list and appends a note to **`.alf-sync-log.md`**.
+The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synced, so it travels on restore). Tracked files are preserved byte-identically under `raw/{runtime}/` and written back on restore. Deleting a tracked file and running `alf sync` prunes it from the list and appends a note to **`.alf-sync-log.md`**.
 
 ### Usage
 
@@ -278,11 +285,25 @@ The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synce
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `<path>` | | Yes | Path to the workspace file to track (relative to the workspace) |
-| `--runtime` | `-r` | No | `openclaw` |
+| `<path>` | | No | Path to the file to track (workspace-relative, or any path with `--external`) |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
+| `--external` | | No | Track a file **outside** the workspace (e.g. a project `AGENTS.md`). Currently supported for `hermes`. |
+| `--allow-root <dir>` | | No | Bless a directory as an allowed root for `--external` adds (host-local policy, never archived). Usable on its own. |
+| `--yes-external` | | No | Skip the interactive confirm for an `--external` add (only honored when the target is already under a pre-blessed root). |
 
-The path must be an existing file inside the workspace; absolute paths, `..`-escapes, and the alf-managed sentinels (`.alf-include.json`, `.alf-sync-log.md`) are rejected.
+For an in-workspace add the path must be an existing file inside the workspace; absolute paths, `..`-escapes, and the alf-managed sentinels (`.alf-include.json`, `.alf-sync-log.md`) are rejected. Tracked files are preserved byte-identically under `raw/{runtime}/` and written back on restore.
+
+### External files (`--external`)
+
+Some agents keep durable context outside the agent home — e.g. Hermes discovers `AGENTS.md` / `.cursorrules` from the project directory. `alf add --external <path>` tracks such a file, with guardrails:
+
+- It must resolve under a directory you blessed with `alf add --allow-root <dir>`. Blessed roots are **host-local policy** (`~/.alf/external-roots`) and are never written into an archive — a restored list cannot bless new roots.
+- A non-overridable **denylist** always rejects sensitive paths regardless of flags or roots: `~/.alf/**`, `~/.ssh/**`, `~/.aws/**`, `.env` / `*.pem` / `*.key` / `id_rsa*`, and runtime secret stores (`~/.hermes/.env`, …).
+- Adding an external file requires a typed confirm; pass `--yes-external` to skip it **only** when the target is already under a pre-blessed root (so it is safe in agent-driven, non-interactive use).
+- External files pack under a sanitized `raw/{runtime}/external/<name>`. On restore they are imported **inert** — visible but not re-packed on the next `alf sync` until you re-confirm them — so a hostile archive's external entries do nothing.
+
+For safety, `alf export` / `alf sync` **re-validate the entire include list at export time**: any stored entry that no longer resolves inside the workspace (or that hits the denylist) is skipped and logged, never packed.
 
 ### JSON Output (success)
 
@@ -314,7 +335,7 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
 | `--recover` | | No | Re-pull the cloud-reconstructed base (snapshot + uncompacted deltas), overwriting any local base, then take the normal delta path against it. Repairs a **missing or diverged/"poisoned"** local base — the unattended self-heal for case E9. Effective whether or not a local base already exists (since 0.1.9; previously a no-op when a base was present). Non-destructive: the workspace is untouched and the base is replaced only after a successful cloud fetch. |
 | `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
@@ -428,7 +449,7 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the target workspace directory |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
@@ -488,7 +509,7 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory (validated; not modified) |
 | `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
 
@@ -517,7 +538,7 @@ Import an `.alf` archive into a framework workspace.
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw` or `zeroclaw` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the target workspace directory |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags) |
 | `--vault-key-env` | | No | |

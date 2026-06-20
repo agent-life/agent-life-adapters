@@ -155,10 +155,11 @@ struct ResolvedWorkspace {
 
 fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
     // The runtime's own configured workspace, for the mismatch diagnostic.
-    let configured = if runtime == "zeroclaw" {
-        read_zeroclaw_workspace()
-    } else {
-        read_openclaw_workspace()
+    // Hermes has no separate workspace — HERMES_HOME *is* the workspace.
+    let configured = match runtime {
+        "zeroclaw" => read_zeroclaw_workspace(),
+        "hermes" => None,
+        _ => read_openclaw_workspace(),
     };
 
     // Priority 1: -w flag
@@ -198,6 +199,23 @@ fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> Res
         return ResolvedWorkspace {
             path: default_path,
             source: "default".into(),
+            runtime_configured_path: configured,
+        };
+    }
+
+    // Hermes: HERMES_HOME is the workspace; honor $HERMES_HOME, else ~/.hermes.
+    if runtime == "hermes" {
+        let default_path = std::env::var_os("HERMES_HOME")
+            .map(PathBuf::from)
+            .or_else(|| alf_core::home_dir().map(|h| h.join(".hermes")))
+            .unwrap_or_else(|| PathBuf::from(".hermes"));
+        return ResolvedWorkspace {
+            path: default_path,
+            source: if std::env::var_os("HERMES_HOME").is_some() {
+                "hermes_env".into()
+            } else {
+                "default".into()
+            },
             runtime_configured_path: configured,
         };
     }

@@ -52,7 +52,7 @@ enum Command {
         Example: alf export -r openclaw -w ./my-agent -o backup.alf"
     )]
     Export {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -80,16 +80,31 @@ enum Command {
         Example: alf add notes.txt -r openclaw -w ./my-agent"
     )]
     Add {
-        /// Path to the workspace file to track (relative to the workspace)
-        path: String,
+        /// Path to the file to track (workspace-relative, or any path with --external)
+        path: Option<String>,
 
-        /// Agent framework runtime (openclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
         /// Path to the agent workspace directory
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+
+        /// Track a file OUTSIDE the workspace (D3). The file must resolve under a
+        /// blessed root (see --allow-root) and is not on the sensitive denylist.
+        #[arg(long)]
+        external: bool,
+
+        /// Bless a directory as an allowed root for --external adds (host-local
+        /// policy, never written into archives). Can be used on its own.
+        #[arg(long, value_name = "DIR")]
+        allow_root: Option<PathBuf>,
+
+        /// Skip the interactive confirm for an --external add (only honored when
+        /// the target is already under a pre-blessed root).
+        #[arg(long)]
+        yes_external: bool,
     },
 
     /// Import an .alf archive into an agent workspace
@@ -103,7 +118,7 @@ enum Command {
         Example: alf import -r openclaw -w ./restored-agent archive.alf"
     )]
     Import {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -153,7 +168,7 @@ enum Command {
         by `alf vault add`; sync carries it as-is and never reads a vault key."
     )]
     Sync {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -186,7 +201,7 @@ enum Command {
         Example: alf restore --at-sequence 3 -r openclaw -w ./preview -a <agent-id>"
     )]
     Restore {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -220,7 +235,7 @@ enum Command {
         Example: alf purge -r openclaw -w ./my-agent"
     )]
     Purge {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -254,7 +269,7 @@ enum Command {
         Example: alf check -r openclaw -w ~/custom-workspace"
     )]
     Check {
-        /// Agent framework runtime (openclaw, zeroclaw)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -356,7 +371,7 @@ enum VaultCommand {
         #[arg(short = 'a', long = "agent-id")]
         agent_id: Option<String>,
 
-        /// Runtime for default key path resolution (openclaw, zeroclaw).
+        /// Runtime for default key path resolution (openclaw, zeroclaw, hermes).
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 
@@ -431,7 +446,7 @@ enum VaultCommand {
         #[arg(long)]
         update: bool,
 
-        /// Runtime for default key + vault path resolution (openclaw, zeroclaw).
+        /// Runtime for default key + vault path resolution (openclaw, zeroclaw, hermes).
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 
@@ -580,11 +595,26 @@ fn main() {
             path,
             runtime,
             workspace,
+            external,
+            allow_root,
+            yes_external,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::add::run(&runtime, &workspace, &path)
+            // `--allow-root` on its own (no file path) needs no workspace.
+            let workspace = match config.resolve_workspace(workspace) {
+                Ok(w) => Some(w),
+                Err(_) if allow_root.is_some() && path.is_none() => None,
+                Err(e) => return Err(e),
+            };
+            commands::add::run(
+                &runtime,
+                workspace.as_deref(),
+                path.as_deref(),
+                external,
+                allow_root.as_deref(),
+                yes_external,
+            )
         })(),
 
         Command::Import {
@@ -776,7 +806,7 @@ fn error_hint(err: &anyhow::Error) -> String {
         return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
     }
     if msg.contains("Unknown runtime") {
-        return "Supported runtimes: openclaw, zeroclaw. Run 'alf help troubleshoot' for more."
+        return "Supported runtimes: openclaw, zeroclaw, hermes. Run 'alf help troubleshoot' for more."
             .into();
     }
     if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {

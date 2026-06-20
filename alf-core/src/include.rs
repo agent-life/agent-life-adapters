@@ -12,7 +12,7 @@
 //! implementation — see the OpenClaw and ZeroClaw adapters' `export`.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -32,13 +32,43 @@ pub struct IncludeList {
 }
 
 /// One tracked file in the include list.
+///
+/// In-workspace entries (the common case) carry just a workspace-relative
+/// `path`. External entries (D3 — files outside the workspace, e.g. a project
+/// `AGENTS.md`) additionally set `external`, record their absolute `source` for
+/// provenance + re-validation, and use `verified` for inert-on-restore: a
+/// `false` value means "restored from an archive, do not pack until the local
+/// user re-confirms" (so a hostile archive's external entries do nothing).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct IncludeEntry {
-    /// Workspace-relative, forward-slashed path.
+    /// For in-workspace entries: the workspace-relative, forward-slashed path.
+    /// For external entries: the sanitized archive name under `external/`.
     pub path: String,
     /// When the file was added via `alf add`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub added_at: Option<DateTime<Utc>>,
+    /// True for files tracked from outside the workspace (D3).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub external: bool,
+    /// Absolute source path (external entries only) — provenance + the path
+    /// re-validated at export against the host-local allowed roots + denylist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Whether this entry is blessed for packing. Always true for in-workspace
+    /// entries and freshly-added externals; an external entry restored from an
+    /// archive is imported `false` (inert) until the local user re-confirms.
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
+    pub verified: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+fn default_true() -> bool {
+    true
 }
 
 impl IncludeList {
@@ -76,8 +106,34 @@ impl IncludeList {
         self.files.push(IncludeEntry {
             path: rel.to_string(),
             added_at: Some(Utc::now()),
+            external: false,
+            source: None,
+            verified: true,
         });
         true
+    }
+
+    /// Add an external file (D3): `sanitized` is its archive name under
+    /// `external/`, `source_abs` its absolute on-disk path. Freshly added
+    /// externals are `verified` (the human gate happens in the CLI before this).
+    /// Idempotent on the sanitized name.
+    pub fn add_external(&mut self, sanitized: &str, source_abs: &str) -> bool {
+        if self.files.iter().any(|e| e.external && e.path == sanitized) {
+            return false;
+        }
+        self.files.push(IncludeEntry {
+            path: sanitized.to_string(),
+            added_at: Some(Utc::now()),
+            external: true,
+            source: Some(source_abs.to_string()),
+            verified: true,
+        });
+        true
+    }
+
+    /// The external entries (verified or not).
+    pub fn externals(&self) -> impl Iterator<Item = &IncludeEntry> {
+        self.files.iter().filter(|e| e.external)
     }
 
     /// Remove a workspace-relative path. Returns true if it was present.
@@ -87,9 +143,17 @@ impl IncludeList {
         self.files.len() != before
     }
 
-    /// Sorted, de-duplicated tracked paths (deterministic enumeration order).
+    /// Sorted, de-duplicated **in-workspace** tracked paths (deterministic
+    /// enumeration order). External entries (D3) are excluded — their `path` is
+    /// a sanitized archive name, not a workspace-relative path; use
+    /// [`IncludeList::externals`] for those.
     pub fn paths(&self) -> Vec<String> {
-        let mut p: Vec<String> = self.files.iter().map(|e| e.path.clone()).collect();
+        let mut p: Vec<String> = self
+            .files
+            .iter()
+            .filter(|e| !e.external)
+            .map(|e| e.path.clone())
+            .collect();
         p.sort();
         p.dedup();
         p
@@ -104,10 +168,13 @@ impl IncludeList {
 /// log write) when nothing is missing.
 pub fn prune_and_log_missing(workspace: &Path) -> Result<Vec<String>> {
     let mut list = IncludeList::load(workspace)?;
+    // Only in-workspace entries are pruned by workspace-relative existence;
+    // external entries (D3) are validated against their absolute `source` at
+    // export, not here.
     let missing: Vec<String> = list
         .files
         .iter()
-        .filter(|e| !workspace.join(&e.path).is_file())
+        .filter(|e| !e.external && !workspace.join(&e.path).is_file())
         .map(|e| e.path.clone())
         .collect();
     if missing.is_empty() {
@@ -182,6 +249,219 @@ pub fn normalize_include_path(workspace: &Path, input: &str) -> Result<String> {
     }
 
     Ok(rel_str)
+}
+
+/// Re-validate a stored include entry at **export** time — the control point
+/// that closes finding A4.2.
+///
+/// `alf add` validates a path once (via [`normalize_include_path`]), but the
+/// stored `.alf-include.json` travels in the archive and can be restored from a
+/// hostile/compromised source. Export must therefore re-check every entry, not
+/// trust the list: this canonicalizes `<workspace>/<rel>` (resolving symlinks),
+/// confirms it stays inside the workspace, and rejects the managed sentinels.
+/// Returns the canonical in-workspace file path, or an error explaining the
+/// rejection (escape, symlinked-out, sentinel, or no longer a file). Callers
+/// skip+log on error rather than packing the entry.
+pub fn safe_include_path(workspace: &Path, rel: &str) -> Result<PathBuf> {
+    let ws_canon = workspace
+        .canonicalize()
+        .with_context(|| format!("workspace not found: {}", workspace.display()))?;
+    // join() on an absolute `rel` replaces the base; canonicalize then resolves
+    // any `..`/symlinks. Either way the strip_prefix below is the real gate.
+    let abs = ws_canon
+        .join(rel)
+        .canonicalize()
+        .with_context(|| format!("tracked path not found: {rel}"))?;
+    if !abs.is_file() {
+        bail!("tracked path is not a file: {rel}");
+    }
+    let stripped = abs
+        .strip_prefix(&ws_canon)
+        .map_err(|_| anyhow::anyhow!("tracked path {rel} resolves outside the workspace"))?;
+    let rel_str = stripped.to_string_lossy().replace('\\', "/");
+    if rel_str == INCLUDE_FILE || rel_str == SYNC_LOG_FILE {
+        bail!("{rel_str} is managed by alf and cannot be tracked");
+    }
+    Ok(abs)
+}
+
+// ---------------------------------------------------------------------------
+// D3 — external-file support (allowed roots + denylist + sanitized names)
+// ---------------------------------------------------------------------------
+
+/// Host-local policy file listing the directories the human has blessed as
+/// allowed roots for external `alf add`. Newline-delimited absolute paths.
+/// **Never** written into an archive — a restored entry is honored only if it
+/// still satisfies the *local* policy.
+pub fn allowed_roots_path() -> Option<PathBuf> {
+    crate::home_dir().map(|h| h.join(".alf").join("external-roots"))
+}
+
+/// Load the blessed external roots (canonicalized; unreadable lines skipped).
+pub fn load_allowed_roots() -> Vec<PathBuf> {
+    let Some(path) = allowed_roots_path() else {
+        return Vec::new();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| Path::new(l).canonicalize().ok())
+        .collect()
+}
+
+/// Bless `dir` as an allowed external root (idempotent). Returns the canonical
+/// path that was blessed.
+pub fn add_allowed_root(dir: &Path) -> Result<PathBuf> {
+    let canon = dir
+        .canonicalize()
+        .with_context(|| format!("allowed root not found: {}", dir.display()))?;
+    if !canon.is_dir() {
+        bail!("allowed root is not a directory: {}", canon.display());
+    }
+    let path = allowed_roots_path().ok_or_else(|| anyhow::anyhow!("no home directory"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut roots = load_allowed_roots();
+    if !roots.iter().any(|r| r == &canon) {
+        roots.push(canon.clone());
+        let body: String = roots.iter().map(|r| format!("{}\n", r.display())).collect();
+        fs::write(&path, body).with_context(|| format!("Failed to write {}", path.display()))?;
+    }
+    Ok(canon)
+}
+
+/// Non-overridable sensitive-path denylist (checked against the **canonical**
+/// resolved path). Always rejected regardless of allowed roots or flags — the
+/// A1.12/A4.4 mitigation (e.g. an injected agent trying to add the vault key).
+pub fn is_denylisted(canonical: &Path) -> bool {
+    // Home-rooted sensitive directories + runtime secret stores.
+    if let Some(home) = crate::home_dir() {
+        let dirs = [
+            ".alf",
+            ".ssh",
+            ".aws",
+            ".config/gcloud",
+            ".openclaw/credentials",
+        ];
+        for d in dirs {
+            if canonical.starts_with(home.join(d)) {
+                return true;
+            }
+        }
+        for f in [".hermes/.env", ".zeroclaw/.secret_key"] {
+            if canonical == home.join(f) {
+                return true;
+            }
+        }
+    }
+    // Filename patterns.
+    let name = canonical
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.starts_with("id_rsa")
+        || name.ends_with("_ed25519")
+}
+
+/// Validate an external source path for `alf add`/export: canonicalize (resolving
+/// symlinks — the TOCTOU guard), require it to be a file under an allowed root,
+/// and reject denylisted paths. Returns the canonical path on success.
+pub fn validate_external_source(source: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
+    let canon = source
+        .canonicalize()
+        .with_context(|| format!("external file not found: {}", source.display()))?;
+    if !canon.is_file() {
+        bail!("external path is not a file: {}", canon.display());
+    }
+    if is_denylisted(&canon) {
+        bail!(
+            "{} is on the non-overridable sensitive-path denylist and cannot be added",
+            canon.display()
+        );
+    }
+    if !allowed_roots.iter().any(|root| canon.starts_with(root)) {
+        bail!(
+            "{} is not under any blessed external root; bless one with `alf add --allow-root <dir>`",
+            canon.display()
+        );
+    }
+    Ok(canon)
+}
+
+/// Sanitized, collision-resistant archive name for an external file:
+/// `<8-hex-of-source>-<safe-basename>`. The original absolute path is recorded
+/// as entry metadata; the *archive member name* is always this sanitized form,
+/// so `safe_extract_path` confines the restore write.
+pub fn sanitized_external_name(canonical_source: &Path) -> String {
+    let h = fnv1a(canonical_source.to_string_lossy().as_bytes());
+    let base: String = canonical_source
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string())
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{h:08x}-{base}")
+}
+
+/// Stable FNV-1a (32-bit) — a dependency-free name disambiguator (not crypto).
+fn fnv1a(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    hash
+}
+
+/// What an export should pack for external entries: `(archive_relative_path,
+/// canonical_source)` for every **verified** external entry that still passes
+/// validation. Unverified (inert-on-restore) and failing entries are returned as
+/// human-readable skip reasons instead — the caller logs them.
+///
+/// `archive_relative_path` is `external/<sanitized>` (the adapter prefixes
+/// `raw/{runtime}/`).
+pub fn external_entries_for_export(
+    list: &IncludeList,
+    allowed_roots: &[PathBuf],
+) -> (Vec<(String, PathBuf)>, Vec<String>) {
+    let mut packable = Vec::new();
+    let mut skipped = Vec::new();
+    for e in list.externals() {
+        let Some(source) = e.source.as_deref() else {
+            skipped.push(format!(
+                "external entry {} has no source path; skipped",
+                e.path
+            ));
+            continue;
+        };
+        if !e.verified {
+            skipped.push(format!(
+                "external entry {source} is inert (restored, not re-confirmed); not packed until re-added"
+            ));
+            continue;
+        }
+        match validate_external_source(Path::new(source), allowed_roots) {
+            Ok(canon) => packable.push((format!("external/{}", e.path), canon)),
+            Err(err) => skipped.push(format!("external entry {source} rejected at export: {err}")),
+        }
+    }
+    (packable, skipped)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,6 +575,166 @@ mod tests {
         let log = fs::read_to_string(dir.path().join(SYNC_LOG_FILE)).unwrap();
         assert!(log.contains("gone.txt"));
         assert!(log.contains("removed"));
+    }
+
+    // -- A4.2: export-time re-validation of a hostile stored include list ----
+
+    #[test]
+    fn safe_include_path_accepts_in_workspace_file() {
+        let dir = ws();
+        fs::write(dir.path().join("notes.txt"), "hi").unwrap();
+        let abs = safe_include_path(dir.path(), "notes.txt").unwrap();
+        assert!(abs.ends_with("notes.txt"));
+    }
+
+    #[test]
+    fn safe_include_path_rejects_parent_traversal() {
+        let dir = ws();
+        // A real file outside the workspace; a poisoned list names it via `..`.
+        let outside = dir.path().parent().unwrap().join("secret.txt");
+        fs::write(&outside, "x").unwrap();
+        let escape = format!("../{}", outside.file_name().unwrap().to_string_lossy());
+        assert!(
+            safe_include_path(dir.path(), &escape).is_err(),
+            "export must reject a `..`-escaping stored include entry"
+        );
+        let _ = fs::remove_file(&outside);
+    }
+
+    #[test]
+    fn safe_include_path_rejects_absolute_and_sentinels() {
+        let dir = ws();
+        assert!(safe_include_path(dir.path(), "/etc/hostname").is_err());
+        fs::write(dir.path().join(INCLUDE_FILE), "{\"files\":[]}").unwrap();
+        assert!(safe_include_path(dir.path(), INCLUDE_FILE).is_err());
+    }
+
+    #[test]
+    fn safe_include_path_rejects_symlink_escape() {
+        let dir = ws();
+        let outside = dir.path().parent().unwrap().join("escape-target.txt");
+        fs::write(&outside, "x").unwrap();
+        // A tracked "safe-looking" name that is actually a symlink out.
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, dir.path().join("link.txt")).unwrap();
+            assert!(
+                safe_include_path(dir.path(), "link.txt").is_err(),
+                "a tracked path symlinked outside the workspace must be rejected"
+            );
+        }
+        let _ = fs::remove_file(&outside);
+    }
+
+    // -- D3: external-file validation --------------------------------------
+
+    #[test]
+    fn validate_external_accepts_blessed_file() {
+        let root = ws();
+        let f = root.path().join("AGENTS.md");
+        fs::write(&f, "# ops").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        let canon = validate_external_source(&f, &roots).unwrap();
+        assert!(canon.ends_with("AGENTS.md"));
+    }
+
+    #[test]
+    fn validate_external_rejects_outside_roots() {
+        let root = ws();
+        let other = ws();
+        let f = other.path().join("AGENTS.md");
+        fs::write(&f, "x").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        assert!(validate_external_source(&f, &roots).is_err());
+    }
+
+    #[test]
+    fn validate_external_rejects_denylisted_filename() {
+        let root = ws();
+        let env = root.path().join(".env");
+        fs::write(&env, "OPENAI_API_KEY=sk").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        assert!(
+            validate_external_source(&env, &roots).is_err(),
+            ".env under a blessed root must still be denylisted"
+        );
+        let pem = root.path().join("server.pem");
+        fs::write(&pem, "----").unwrap();
+        assert!(validate_external_source(&pem, &roots).is_err());
+    }
+
+    #[test]
+    fn validate_external_rejects_symlink_escape() {
+        let root = ws();
+        let secret_dir = ws();
+        let secret = secret_dir.path().join("secret.txt");
+        fs::write(&secret, "x").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+        #[cfg(unix)]
+        {
+            let link = root.path().join("innocent.txt");
+            std::os::unix::fs::symlink(&secret, &link).unwrap();
+            assert!(
+                validate_external_source(&link, &roots).is_err(),
+                "a symlink under a blessed root pointing outside must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sanitized_name_is_stable_and_safe() {
+        let p = Path::new("/home/u/proj/AGENTS.md");
+        let a = sanitized_external_name(p);
+        let b = sanitized_external_name(p);
+        assert_eq!(a, b);
+        assert!(a.ends_with("-AGENTS.md"));
+        assert!(!a.contains('/'));
+    }
+
+    #[test]
+    fn external_export_skips_inert_and_invalid() {
+        let root = ws();
+        let good = root.path().join("AGENTS.md");
+        fs::write(&good, "ops").unwrap();
+        let roots = vec![root.path().canonicalize().unwrap()];
+
+        let mut list = IncludeList::default();
+        // Verified + valid → packable.
+        list.add_external(
+            "aa-AGENTS.md",
+            good.canonicalize().unwrap().to_str().unwrap(),
+        );
+        // Inert (restored, unverified) → skipped.
+        list.files.push(IncludeEntry {
+            path: "bb-OLD.md".into(),
+            added_at: None,
+            external: true,
+            source: Some("/some/old/OLD.md".into()),
+            verified: false,
+        });
+
+        let (packable, skipped) = external_entries_for_export(&list, &roots);
+        assert_eq!(packable.len(), 1);
+        assert!(packable[0].0.starts_with("external/"));
+        assert!(skipped.iter().any(|s| s.contains("inert")));
+    }
+
+    #[test]
+    fn legacy_include_list_deserializes_without_new_fields() {
+        // Back-compat: an old list (no external/verified) still loads.
+        let dir = ws();
+        fs::write(
+            dir.path().join(INCLUDE_FILE),
+            r#"{"files":[{"path":"notes.txt","added_at":null}]}"#,
+        )
+        .unwrap();
+        let list = IncludeList::load(dir.path()).unwrap();
+        assert_eq!(list.files.len(), 1);
+        assert!(!list.files[0].external);
+        assert!(
+            list.files[0].verified,
+            "missing verified must default to true"
+        );
     }
 
     #[test]

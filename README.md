@@ -126,6 +126,20 @@ agent-life-adapters/
 │       ├── markdown_parser.rs  # Parse memory markdown files → MemoryRecords
 │       └── sqlite_extractor.rs # Read memories table + embeddings → MemoryRecords
 │
+├── adapter-hermes/            # Hermes (Nous Research) adapter crate (library)
+│   ├── Cargo.toml
+│   └── src/
+│       ├── lib.rs              # Adapter trait implementation
+│       ├── export.rs           # Read HERMES_HOME → ALF archive (allowlisted raw/)
+│       ├── import.rs           # ALF archive → write HERMES_HOME (+ rebuild state.db)
+│       ├── config_parser.rs    # Parse config.yaml (personalities, system prompt) + redact
+│       ├── curated_parser.rs   # Parse memories/MEMORY.md (§-entries) → MemoryRecords
+│       ├── identity_parser.rs  # SOUL.md + config personalities → Identity (prose)
+│       ├── principals_parser.rs # memories/USER.md → Principals
+│       ├── session_extractor.rs # Read state.db sessions → episodic MemoryRecords
+│       ├── session_rebuilder.rs # Rebuild state.db from records on import (FTS via triggers)
+│       └── skills.rs           # Non-bundled skills → ALF artifacts (attachments.json)
+│
 ├── scripts/
 │   ├── install.sh              # Quick-install script (curl | sh)
 │   ├── test_install.sh         # Install test runner (Docker + native)
@@ -222,7 +236,7 @@ Pre-flight environment diagnostic. Discovers the agent workspace (auto-detects f
 alf export --runtime <runtime> --workspace <path> [--output <path>]
 ```
 
-Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
+Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw, hermes). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
 
 ```
 alf add <path> --runtime <runtime> --workspace <path>
@@ -341,6 +355,25 @@ Translates between ZeroClaw's SQLite-based storage, markdown memory files, and c
 **AIEOS extensions.** ZeroClaw uses the AIEOS identity schema, which defines fields not present in ALF's core schema (e.g., `emotional_model`, `reasoning_style`). These are preserved in the `aieos_extensions` passthrough object, ensuring no information loss during round-trip. Promoted fields (name, role, capabilities) are mapped to ALF's first-class fields for cross-runtime compatibility.
 
 **Raw source preservation.** The original SQLite database file is included under `raw/zeroclaw/` for lossless recovery.
+
+### `adapter-hermes` — Hermes Framework Adapter
+
+Translates between a Hermes (Nous Research) profile (`HERMES_HOME`, default `~/.hermes`; named profiles under `~/.hermes/profiles/<name>/`) and the ALF format. One profile = one agent = one `.alf`.
+
+**Export reads:**
+
+| Hermes source | ALF mapping | Notes |
+|---|---|---|
+| `memories/MEMORY.md` (`§`-entries) | Memory records (§3.1) | One semantic record per entry; content-derived UUIDv5 id, stable under Hermes's constant rewriting |
+| `state.db` (`sessions` / `messages` / FTS5) | Memory records (§3.1) | One episodic record per session; the full structured session in `raw_source_format` for lossless rebuild |
+| `SOUL.md` + `config.yaml` personalities | Identity (§3.2) | Prose identity (`identity.prose`); no structured fields fabricated |
+| `memories/USER.md` | Principals (§3.3) | Primary human principal — prose + best-effort structured fields |
+| `skills/<category>/<name>/**` | Artifacts (§3.1.9) | Non-bundled skills only (`.bundled_manifest`); `SKILL.md` + small assets in `artifacts/`, large assets by reference |
+| `~/.alf/vault` | Credentials (§3.4) | The shared ALF vault, packed verbatim; `~/.hermes/.env` keys are detected and flagged for vaulting (D4) |
+
+**Import** restores the verbatim `raw/hermes/` text and **rebuilds `state.db`** from the session records — replaying the source database's own schema and letting Hermes's triggers repopulate the FTS5 + trigram indexes, so a real Hermes opens the result. Project-local context files (`AGENTS.md`) are captured only when tracked with `alf add --external` (§3.2 operating instructions).
+
+**Raw source preservation.** `raw/hermes/` holds the durable text/config (`SOUL.md`, `memories/*.md`, redacted `config.yaml`, non-bundled `skills/`, cron). The `state.db` binary (rebuilt from records), `.env` (secrets live encrypted in Layer 4), and admin dirs (`checkpoints/`, `state-snapshots/`, `backups/`, `logs/`) are excluded.
 
 ---
 

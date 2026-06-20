@@ -33,6 +33,10 @@ pub struct ExportReport {
     /// Paths in the agent's include list (`alf add`) that no longer exist on
     /// disk at export time. `alf sync` prunes these and logs the removal.
     pub missing_includes: Vec<String>,
+    /// Non-fatal advisories surfaced to the user on export/sync — e.g. the
+    /// Hermes adapter's "`~/.hermes/.env` has N keys not backed up; vault them
+    /// with `alf vault add`" notice (D4). Empty for adapters that emit none.
+    pub warnings: Vec<String>,
 }
 
 /// Summary of an import operation.

@@ -6,6 +6,7 @@
 
 pub use alf_core::Adapter;
 
+use adapter_hermes::HermesAdapter;
 use adapter_openclaw::OpenClawAdapter;
 use adapter_zeroclaw::ZeroClawAdapter;
 
@@ -15,7 +16,11 @@ use adapter_zeroclaw::ZeroClawAdapter;
 
 /// Returns the list of all available adapters.
 pub fn available_adapters() -> Vec<Box<dyn Adapter>> {
-    vec![Box::new(OpenClawAdapter), Box::new(ZeroClawAdapter)]
+    vec![
+        Box::new(OpenClawAdapter),
+        Box::new(ZeroClawAdapter),
+        Box::new(HermesAdapter),
+    ]
 }
 
 /// Look up an adapter by runtime name.
@@ -57,14 +62,22 @@ mod tests {
     }
 
     #[test]
+    fn registry_finds_hermes() {
+        let adapter = get_adapter("hermes");
+        assert!(adapter.is_some());
+        assert_eq!(adapter.unwrap().name(), "hermes");
+    }
+
+    #[test]
     fn registry_returns_none_for_unknown() {
         assert!(get_adapter("unknown-runtime").is_none());
     }
 
     #[test]
-    fn supported_runtimes_includes_both() {
+    fn supported_runtimes_includes_all() {
         let runtimes = supported_runtimes();
         assert!(runtimes.contains("openclaw"));
         assert!(runtimes.contains("zeroclaw"));
+        assert!(runtimes.contains("hermes"));
     }
 }

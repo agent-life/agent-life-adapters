@@ -1,0 +1,20 @@
+# Standalone Phase 0 spike crate — intentionally NOT a member of the parent
+# workspace (empty [workspace] table detaches it) so it can be built/run on its
+# own without scaffolding the real adapter-hermes crate yet.
+[package]
+name = "rebuild_spike"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "rebuild_spike"
+path = "src/main.rs"
+
+[dependencies]
+# bundled = compile SQLite from source → guarantees FTS5 + trigram tokenizer,
+# exactly what the real adapter-hermes will depend on.
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde_json = "1"

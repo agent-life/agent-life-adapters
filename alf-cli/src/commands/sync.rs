@@ -242,6 +242,10 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
         "  Exported {} memory records",
         report.memory_records
     ));
+    // Surface adapter advisories (e.g. Hermes's un-vaulted `.env` notice, D4).
+    for w in &report.warnings {
+        output::progress(&format!("  ! {w}"));
+    }
 
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
     let reader = AlfReader::new(Cursor::new(&alf_bytes))?;

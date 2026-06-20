@@ -5,4 +5,5 @@ members = [
     "alf-cli",
     "adapter-openclaw",
     "adapter-zeroclaw",
+    "adapter-hermes",
 ]

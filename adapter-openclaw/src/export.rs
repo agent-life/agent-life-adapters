@@ -251,6 +251,12 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
             missing_includes.push(rel);
             continue;
         }
+        // A4.2: re-validate that a (possibly restored/edited) stored entry still
+        // resolves inside the workspace before packing it.
+        if let Err(e) = alf_core::include::safe_include_path(workspace, &rel) {
+            warnings.push(format!("ignoring tracked path {rel}: {e}"));
+            continue;
+        }
         if is_alfignored(&matcher, &rel) {
             excluded += 1;
             continue;
@@ -585,6 +591,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_size_bytes: output_size,
         excluded_by_alfignore,
         missing_includes,
+        warnings: Vec::new(),
     })
 }
 

@@ -1,0 +1,12 @@
+0|id|TEXT|0||1
+1|key|TEXT|1||0
+2|content|TEXT|1||0
+3|category|TEXT|1|'core'|0
+4|embedding|BLOB|0||0
+5|created_at|TEXT|1||0
+6|updated_at|TEXT|1||0
+7|session_id|TEXT|0||0
+8|namespace|TEXT|0|'default'|0
+9|importance|REAL|0|0.5|0
+10|superseded_by|TEXT|0||0
+11|agent_id|TEXT|1||0

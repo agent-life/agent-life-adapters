@@ -1,0 +1,7 @@
+
+ Profile          Model                        Gateway      Alias        Distribution
+ ───────────────    ───────────────────────────    ───────────    ───────────    ────────────────────
+ ◆default         anthropic/claude-opus-4.6    stopped      —            —
+  agent_a         —                            stopped      agent_a      —
+  agent_b         —                            stopped      agent_b      —
+

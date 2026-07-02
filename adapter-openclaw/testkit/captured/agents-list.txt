@@ -1,0 +1,16 @@
+Agents:
+- main (default)
+  Workspace: ~/.openclaw/workspace
+  Agent dir: ~/.openclaw/agents/main/agent
+  Routing rules: 0
+  Routing: default (no explicit rules)
+- agent_a
+  Workspace: ~/.openclaw/workspace-agent_a
+  Agent dir: ~/.openclaw/agents/agent_a/agent
+  Routing rules: 0
+- agent_b
+  Workspace: ~/.openclaw/workspace-agent_b
+  Agent dir: ~/.openclaw/agents/agent_b/agent
+  Routing rules: 0
+Routing rules map channel/account/peer to an agent. Use --bindings for full rules.
+Channel status reflects local config/creds. For live health: openclaw channels status --probe.

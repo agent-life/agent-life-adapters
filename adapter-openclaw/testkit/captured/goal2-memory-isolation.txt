@@ -1,0 +1,20 @@
+# OpenClaw GOAL 2 — both agents RUN against the LLM proxy
+# Memory is PER-AGENT workspace markdown. Each MEMORY.md holds ONLY that agent's fact:
+
+## workspace-agent_a/MEMORY.md
+# MEMORY.md - Long-Term Memory
+- **agent_a favorite color:** teal
+---
+_This file stores distilled memories, lessons learned, and important context that should persist across sessions. Updated periodically from daily memory files._
+
+## workspace-agent_b/MEMORY.md
+# MEMORY.md - Long-Term Memory
+## About agent_b
+- **Favorite animal:** otter
+
+# Per-agent session transcripts:
+./agent_a/sessions/daaad6f1-a40e-451e-b943-e9038e5c9425.jsonl
+./agent_b/sessions/67f1d32a-f1de-4615-b769-aab1ae5b3439.jsonl
+
+# Only shared SQLite is the gateway state DB (not agent memory):
+./state/openclaw.sqlite

@@ -1,0 +1,25 @@
+{
+  "agents": {
+    "list": [
+      {
+        "id": "main"
+      },
+      {
+        "id": "agent_a",
+        "name": "agent_a",
+        "workspace": "/home/agent/.openclaw/workspace-agent_a",
+        "agentDir": "/home/agent/.openclaw/agents/agent_a/agent"
+      },
+      {
+        "id": "agent_b",
+        "name": "agent_b",
+        "workspace": "/home/agent/.openclaw/workspace-agent_b",
+        "agentDir": "/home/agent/.openclaw/agents/agent_b/agent"
+      }
+    ]
+  },
+  "meta": {
+    "lastTouchedVersion": "2026.6.11",
+    "lastTouchedAt": "2026-06-30T20:03:55.031Z"
+  }
+}

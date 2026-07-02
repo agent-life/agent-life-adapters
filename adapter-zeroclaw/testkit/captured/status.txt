@@ -1,0 +1,39 @@
+🦀 ZeroClaw Status
+
+Version:     0.8.2
+Workspace:   /home/agent/.zeroclaw/data
+Config:      /home/agent/.zeroclaw/config.toml
+
+🤖 ModelProvider:      (none configured)
+📊 Observability:  none
+🧾 Trace storage:  rolling (state/runtime-trace.jsonl)
+🛡️  Agents:        agent_a=<no risk_profile>, agent_b=<no risk_profile>
+⚙️  Runtime:       native
+🔴 Service:       stopped
+💓 Heartbeat:      disabled
+🧠 Memory:         none (auto-save: on)
+
+Security (agent_a): <no risk_profile>
+Security (agent_b): <no risk_profile>
+  Cost tracking:     enabled
+  Max cost/day:      $10.00
+  Max cost/month:    $100.00
+  Spent today:       $0.0000 / $10.00
+  Spent this month:  $0.0000 / $100.00
+  OTP enabled:       false
+  E-stop enabled:    false
+
+Channels:
+  CLI:      ✅ always
+  Telegram  ❌ not configured
+  Discord   ❌ not configured
+  Matrix    ❌ not configured
+  WhatsApp Web ❌ not configured
+  Email     ❌ not configured
+  Gmail Push ❌ not configured
+  Lark      ❌ not configured
+  Webhook   ❌ not configured
+
+Peripherals:
+  Enabled:   no
+  Boards:    0

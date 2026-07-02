@@ -1,0 +1,9 @@
+embedding_cache
+agents
+memories
+memories_fts
+memories_fts_data
+memories_fts_idx
+memories_fts_docsize
+memories_fts_config
+schema_version

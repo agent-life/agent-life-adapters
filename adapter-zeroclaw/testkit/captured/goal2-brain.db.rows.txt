@@ -1,0 +1,16 @@
+# ZeroClaw GOAL 2 — both agents RUN against the LLM proxy (model minimax.minimax-m2.5)
+# Single shared DB: ~/.zeroclaw/data/memory/brain.db  (idiomatic default, no workspace_dir override)
+# Memory rows are separated ONLY by agent_id (joined to agents.alias):
+
+agent_a|2
+agent_b|2
+
+alias|key|content
+agent_a|agent_a_favorite_color|agent_a's favorite color is teal
+agent_a|user_msg_7cfaa0da-c1a9-466c-93e7-5029a5a3b850|Please remember and save to memory this fact: agent_a's favorite color
+agent_b|favorite_animal|agent_b's favorite animal is the otter
+agent_b|user_msg_cf47e702-5c37-46aa-94d3-336018353f18|Please remember and save to memory this fact: agent_b's favorite anima
+
+# All DB files created by the run:
+./data/memory/brain.db
+./data/sessions/sessions.db

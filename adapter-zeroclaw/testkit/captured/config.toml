@@ -1,0 +1,35 @@
+schema_version = 3
+
+[agents]
+
+[agents.agent_b]
+delegate_same_risk_profile = true
+enabled = true
+
+[agents.agent_a]
+delegate_same_risk_profile = true
+enabled = true
+
+[agents.agent_b.a2a]
+published = false
+
+[agents.agent_a.a2a]
+published = false
+
+[agents.agent_b.identity]
+format = "openclaw"
+
+[agents.agent_a.identity]
+format = "openclaw"
+
+[agents.agent_b.memory]
+backend = "sqlite"
+
+[agents.agent_a.memory]
+backend = "sqlite"
+
+[agents.agent_b.workspace]
+unrestricted_filesystem = false
+
+[agents.agent_a.workspace]
+unrestricted_filesystem = false

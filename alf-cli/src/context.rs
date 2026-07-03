@@ -120,19 +120,21 @@ pub mod tests {
     /// Shared lock for tests that mutate the HOME env var across modules.
     pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restore HOME, ALF_HOME, and ALF_API_KEY when dropped.
-    struct RestoreEnv {
+    /// Restore HOME, ALF_HOME, ALF_API_KEY, and ALF_AGENT when dropped.
+    pub struct RestoreEnv {
         home: Option<std::ffi::OsString>,
         alf_home: Option<std::ffi::OsString>,
         api_key: Option<std::ffi::OsString>,
+        alf_agent: Option<std::ffi::OsString>,
     }
 
     impl RestoreEnv {
-        fn snapshot() -> Self {
+        pub fn snapshot() -> Self {
             Self {
                 home: env::var_os("HOME"),
                 alf_home: env::var_os("ALF_HOME"),
                 api_key: env::var_os("ALF_API_KEY"),
+                alf_agent: env::var_os("ALF_AGENT"),
             }
         }
     }
@@ -150,6 +152,10 @@ pub mod tests {
             match &self.api_key {
                 Some(v) => env::set_var("ALF_API_KEY", v),
                 None => env::remove_var("ALF_API_KEY"),
+            }
+            match &self.alf_agent {
+                Some(v) => env::set_var("ALF_AGENT", v),
+                None => env::remove_var("ALF_AGENT"),
             }
         }
     }

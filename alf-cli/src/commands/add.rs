@@ -7,12 +7,14 @@
 //! and packed under a sanitized `raw/{runtime}/external/` name. The include-list
 //! machinery is runtime-agnostic (`alf_core::include`).
 
+use crate::config::Config;
 use crate::output;
+use crate::selector;
 use alf_core::{normalize_include_path, IncludeList};
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct AddResult {
@@ -32,18 +34,19 @@ struct BlessResult {
 
 pub fn run(
     runtime: &str,
-    workspace: Option<&Path>,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
     path: Option<&str>,
     external: bool,
     allow_root: Option<&Path>,
     yes_external: bool,
 ) -> Result<()> {
-    if crate::adapter::get_adapter(runtime).is_none() {
-        bail!(
+    let adapt = crate::adapter::get_adapter(runtime).ok_or_else(|| {
+        anyhow::anyhow!(
             "Unknown runtime '{runtime}'. Supported runtimes: {}",
             crate::adapter::supported_runtimes()
-        );
-    }
+        )
+    })?;
     let human = output::human_mode();
 
     // `--allow-root` blesses a host-local external root (policy never archived).
@@ -69,9 +72,18 @@ pub fn run(
     let path = path.ok_or_else(|| {
         anyhow::anyhow!("a file path is required (or pass --allow-root <dir> on its own)")
     })?;
-    let workspace = workspace.ok_or_else(|| {
-        anyhow::anyhow!("no workspace specified — pass -w <path> or set a default")
-    })?;
+
+    // Workspace: -w flag → the selection's workspace (lazy init applies).
+    let workspace: PathBuf = match workspace_flag {
+        Some(w) => w.to_path_buf(),
+        None => {
+            let mut config = Config::load()?;
+            let install = crate::commands::check::resolve_workspace(None, &config, runtime).path;
+            selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?
+                .workspace
+        }
+    };
+    let workspace = workspace.as_path();
 
     if !workspace.is_dir() {
         bail!(

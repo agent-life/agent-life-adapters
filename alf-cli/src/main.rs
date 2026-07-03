@@ -7,8 +7,11 @@ mod api_client;
 mod commands;
 mod config;
 mod context;
+mod discovery;
+mod errors;
 mod fs_private;
 pub mod output;
+mod selector;
 mod state;
 mod vault_key;
 
@@ -32,6 +35,11 @@ struct Cli {
     /// Output human-readable text instead of JSON
     #[arg(long, global = true, env = "ALF_HUMAN")]
     human: bool,
+
+    /// Agent to operate on: a runtime alias or an alf agent id from the
+    /// [[agents]] mapping (falls back to ALF_AGENT, then the sole enabled agent)
+    #[arg(long, global = true, value_name = "ALIAS_OR_ID")]
+    agent: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -162,6 +170,10 @@ enum Command {
         --force-first-sync: required when the cloud already has an agent with this ID but no \
         local state exists; uploads the current workspace as a fresh snapshot, overwriting \
         cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
+        The agent to sync comes from --agent (alias or id), then the ALF_AGENT environment \
+        variable, then the sole enabled agent in the [[agents]] mapping. --all syncs every \
+        enabled agent sequentially. A first sync with an empty mapping discovers and maps \
+        the install's agents automatically.\n\n\
         Example: alf sync -r openclaw -w ./my-agent\n\
         Example: alf sync --recover -r openclaw -w ./my-agent\n\n\
         Layer 4 (credentials) is the agent's explicit ALF vault, already AEAD-encrypted \
@@ -175,6 +187,10 @@ enum Command {
         /// Path to the agent workspace directory
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+
+        /// Sync every enabled agent (collects per-agent results; never fail-fast)
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
 
         /// Pull cloud snapshot + deltas to repair a missing local base snapshot
         #[arg(long)]
@@ -197,8 +213,11 @@ enum Command {
         Vault key: same behavior as `alf import` — with a resolved key, Layer 4 is decrypted into \
         the runtime; without a key, restore still applies other layers and warnings explain that \
         secrets were not restored.\n\n\
-        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>\n\
-        Example: alf restore --at-sequence 3 -r openclaw -w ./preview -a <agent-id>"
+        The agent comes from the global --agent (an alias from the [[agents]] mapping, or a \
+        UUID — an unmapped UUID restores by id onto a fresh host), then ALF_AGENT, then the \
+        sole enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
+        Example: alf restore -r openclaw -w ./my-agent --agent <alias-or-id>\n\
+        Example: alf restore --at-sequence 3 -r openclaw -w ./preview --agent <alias-or-id>"
     )]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw, hermes)
@@ -208,10 +227,6 @@ enum Command {
         /// Path to the agent workspace directory
         #[arg(short, long)]
         workspace: Option<PathBuf>,
-
-        /// Agent ID to restore (if omitted, uses the single tracked agent from ~/.alf/state/)
-        #[arg(short, long)]
-        agent: Option<String>,
 
         /// Restore the workspace as it was after sequence N. Read-only preview;
         /// ~/.alf/state/ is not modified.
@@ -232,6 +247,8 @@ enum Command {
         snapshot and delta blobs in storage for this agent and deletes the agent row. It does not \
         delete files under the workspace. It resets ~/.alf/state/ for this agent so the next \
         `alf sync` uploads a full snapshot again.\n\n\
+        The agent comes from the global --agent (alias or id), then ALF_AGENT, then the sole \
+        enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
         Example: alf purge -r openclaw -w ./my-agent"
     )]
     Purge {
@@ -242,10 +259,6 @@ enum Command {
         /// Path to the agent workspace directory (used for CLI consistency; not modified)
         #[arg(short, long)]
         workspace: Option<PathBuf>,
-
-        /// Agent ID to purge (if omitted, uses the single tracked agent from ~/.alf/state/)
-        #[arg(short, long)]
-        agent: Option<String>,
     },
 
     /// Authenticate with the agent-life service
@@ -265,6 +278,9 @@ enum Command {
         long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
         whether alf can find the workspace, memory files, API key, and service. \
         Use this before sync to diagnose configuration issues.\n\n\
+        Check also discovers the install's agents and records them in the [[agents]] \
+        mapping in ~/.alf/config.toml. Discovery is information-only: it never changes \
+        an existing agent's id or enabled flag — enabling is explicit (alf agents enable).\n\n\
         Example: alf check -r openclaw\n\
         Example: alf check -r openclaw -w ~/custom-workspace"
     )]
@@ -276,6 +292,27 @@ enum Command {
         /// Path to the agent workspace directory (auto-discovered if omitted)
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+    },
+
+    /// List discovered agents and manage which are enabled for sync
+    #[command(
+        long_about = "Agents lists the [[agents]] mapping in ~/.alf/config.toml — the agents \
+        `alf check` discovered in this install — joined with each agent's sync state from \
+        ~/.alf/state/. Subcommands enable or disable an agent for sync; both are idempotent. \
+        Disabling keeps the cloud archive and local state.\n\n\
+        Without -r, the list spans every runtime and enable/disable resolve the name across \
+        all runtimes (erroring if it is ambiguous); -r scopes to one runtime.\n\n\
+        Example: alf agents\n\
+        Example: alf agents enable main\n\
+        Example: alf agents -r zeroclaw enable default"
+    )]
+    Agents {
+        /// Scope to one runtime (openclaw, zeroclaw, hermes); default: all
+        #[arg(short, long)]
+        runtime: Option<String>,
+
+        #[command(subcommand)]
+        command: Option<AgentsCommand>,
     },
 
     /// Show help (overview, status, files, troubleshoot, or per-command)
@@ -303,6 +340,22 @@ enum Command {
     Vault {
         #[command(subcommand)]
         command: VaultCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentsCommand {
+    /// List mapped agents with their sync state (default)
+    List,
+    /// Enable an agent for sync (registers lazily on first sync)
+    Enable {
+        /// Agent alias or alf agent id
+        agent: String,
+    },
+    /// Disable an agent (cloud archive and local state are kept)
+    Disable {
+        /// Agent alias or alf agent id
+        agent: String,
     },
 }
 
@@ -578,6 +631,10 @@ fn main() {
         std::env::set_var("ALF_HUMAN", "1");
     }
 
+    // The global --agent selector, threaded into every agent-scoped command.
+    let agent_flag = cli.agent.clone();
+    let agent = agent_flag.as_deref();
+
     let result = match cli.command {
         Command::Export {
             runtime,
@@ -587,8 +644,13 @@ fn main() {
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::export::run(&runtime, &workspace, output.as_deref(), dry_run)
+            commands::export::run(
+                &runtime,
+                workspace.as_deref(),
+                agent,
+                output.as_deref(),
+                dry_run,
+            )
         })(),
 
         Command::Add {
@@ -601,15 +663,10 @@ fn main() {
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            // `--allow-root` on its own (no file path) needs no workspace.
-            let workspace = match config.resolve_workspace(workspace) {
-                Ok(w) => Some(w),
-                Err(_) if allow_root.is_some() && path.is_none() => None,
-                Err(e) => return Err(e),
-            };
             commands::add::run(
                 &runtime,
                 workspace.as_deref(),
+                agent,
                 path.as_deref(),
                 external,
                 allow_root.as_deref(),
@@ -625,8 +682,13 @@ fn main() {
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::import::run(&runtime, &alf_file, &workspace, &key.to_args())
+            commands::import::run(
+                &runtime,
+                &alf_file,
+                workspace.as_deref(),
+                agent,
+                &key.to_args(),
+            )
         })(),
 
         Command::Validate {
@@ -637,45 +699,45 @@ fn main() {
         Command::Sync {
             runtime,
             workspace,
+            all,
             recover,
             force_first_sync,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::sync::run(&runtime, &workspace, recover, force_first_sync)
+            commands::sync::run(
+                &runtime,
+                workspace.as_deref(),
+                agent,
+                all,
+                recover,
+                force_first_sync,
+            )
         })(),
 
         Command::Restore {
             runtime,
             workspace,
-            agent,
             at_sequence,
             dry_run,
             key,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
             commands::restore::run(
                 &runtime,
-                &workspace,
-                agent.as_deref(),
+                workspace.as_deref(),
+                agent,
                 at_sequence,
                 dry_run,
                 &key.to_args(),
             )
         })(),
 
-        Command::Purge {
-            runtime,
-            workspace,
-            agent,
-        } => (|| -> anyhow::Result<()> {
+        Command::Purge { runtime, workspace } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::purge::run(&runtime, &workspace, agent.as_deref())
+            commands::purge::run(&runtime, workspace.as_deref(), agent)
         })(),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
@@ -683,16 +745,40 @@ fn main() {
         Command::Check { runtime, workspace } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            commands::check::run(&runtime, workspace.as_deref())
+            commands::check::run(&runtime, workspace.as_deref(), agent)
         })(),
+
+        // No -r ⇒ span all runtimes: rows are runtime-tagged, so scoping
+        // to [defaults].runtime would strand zeroclaw/hermes rows (and
+        // break the `alf agents enable <alias>` remedies sync emits).
+        Command::Agents { runtime, command } => match command.unwrap_or(AgentsCommand::List) {
+            AgentsCommand::List => commands::agents::list(runtime.as_deref()),
+            AgentsCommand::Enable { agent } => commands::agents::enable(runtime.as_deref(), &agent),
+            AgentsCommand::Disable { agent } => {
+                commands::agents::disable(runtime.as_deref(), &agent)
+            }
+        },
 
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
 
-        Command::Vault { command } => dispatch_vault(command),
+        Command::Vault { command } => dispatch_vault(command, agent),
     };
 
     if let Err(err) = result {
-        let hint = error_hint(&err);
+        // Coded errors (WP0 agent-facing classes) carry their own remedy and a
+        // machine-readable code; everything else keeps the legacy shape.
+        if let Some(cli_err) = err.downcast_ref::<errors::CliError>() {
+            if output::human_mode() {
+                eprintln!("{} {}", "error:".red().bold(), cli_err.cause);
+                if !cli_err.remedy.is_empty() {
+                    eprintln!("{}", cli_err.remedy);
+                }
+            } else {
+                output::json_error_coded(cli_err.code, &cli_err.cause, &cli_err.remedy);
+            }
+            process::exit(1);
+        }
+        let hint = output::error_hint(&err);
         if output::human_mode() {
             eprintln!("{} {err:#}", "error:".red().bold());
             if !hint.is_empty() {
@@ -705,7 +791,7 @@ fn main() {
     }
 }
 
-fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
+fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> {
     match cmd {
         VaultCommand::Keygen { out, stdout, force } => {
             commands::vault::keygen(out.as_deref(), force, stdout)
@@ -721,18 +807,24 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             agent_id,
             runtime,
             key,
-        } => commands::vault::encrypt(
-            input.as_deref(),
-            &service,
-            &credential_type,
-            description.as_deref(),
-            label.as_deref(),
-            &tags,
-            &capabilities,
-            agent_id.as_deref(),
-            &key.to_args(),
-            &runtime,
-        ),
+        } => {
+            // WP0: default the record's agent id to the selected agent when
+            // --agent-id was not explicitly passed. Explicit --agent-id wins.
+            let selected = vault_selected_agent(&runtime, agent, agent_id.as_deref())?;
+            commands::vault::encrypt(
+                input.as_deref(),
+                &service,
+                &credential_type,
+                description.as_deref(),
+                label.as_deref(),
+                &tags,
+                &capabilities,
+                agent_id.as_deref(),
+                selected,
+                &key.to_args(),
+                &runtime,
+            )
+        }
         VaultCommand::Add {
             input,
             service,
@@ -749,23 +841,27 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             update,
             runtime,
             key,
-        } => commands::vault::add(
-            input.as_deref(),
-            &service,
-            &credential_type,
-            username.as_deref(),
-            secret.as_deref(),
-            secret_file.as_deref(),
-            secret_json.as_deref(),
-            label.as_deref(),
-            description.as_deref(),
-            &tags,
-            &fields,
-            agent_id.as_deref(),
-            update,
-            &key.to_args(),
-            &runtime,
-        ),
+        } => {
+            let selected = vault_selected_agent(&runtime, agent, agent_id.as_deref())?;
+            commands::vault::add(
+                input.as_deref(),
+                &service,
+                &credential_type,
+                username.as_deref(),
+                secret.as_deref(),
+                secret_file.as_deref(),
+                secret_json.as_deref(),
+                label.as_deref(),
+                description.as_deref(),
+                &tags,
+                &fields,
+                agent_id.as_deref(),
+                selected,
+                update,
+                &key.to_args(),
+                &runtime,
+            )
+        }
         VaultCommand::Decrypt {
             input,
             id,
@@ -796,27 +892,17 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
     }
 }
 
-/// One-line hint for known error kinds to guide users to fix or get more help.
-fn error_hint(err: &anyhow::Error) -> String {
-    let msg = err.to_string();
-    if msg.contains("API key") || msg.contains("api_key") || msg.contains("Unauthorized") {
-        return "Run 'alf login' to set an API key, or 'alf help troubleshoot' for more.".into();
+/// WP0-minimal vault selection: the global `--agent` / `ALF_AGENT` resolves
+/// via the mapping (no lazy init — no workspace context) and, when `--agent-id`
+/// was not explicitly passed, supplies the credential record's `agent_id`.
+fn vault_selected_agent(
+    runtime: &str,
+    agent: Option<&str>,
+    explicit_agent_id: Option<&str>,
+) -> anyhow::Result<Option<uuid::Uuid>> {
+    if explicit_agent_id.is_some() {
+        return Ok(None); // explicit --agent-id wins; no selection needed
     }
-    if msg.contains("No agent ID specified") || msg.contains("no agents are tracked") {
-        return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
-    }
-    if msg.contains("Unknown runtime") {
-        return "Supported runtimes: openclaw, zeroclaw, hermes. Run 'alf help troubleshoot' for more."
-            .into();
-    }
-    if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
-        return "Run 'alf help troubleshoot' for workspace and path guidance.".into();
-    }
-    if msg.contains("Local delta base missing") {
-        return "See docs/how_alf_syncs.md (case E4) for the recovery procedure.".into();
-    }
-    if msg.contains("already exists in the cloud") {
-        return "See docs/how_alf_syncs.md (case E3) before using --force-first-sync.".into();
-    }
-    String::new()
+    let config = Config::load()?;
+    selector::vault_default_agent_id(&config, runtime, agent)
 }

@@ -41,8 +41,9 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
 /// If `{workspace}/.alf-agent-id` exists, read it. Otherwise derive a
 /// deterministic UUID v5 from the canonical workspace path. Unlike
 /// [`resolve_agent_id`], a freshly-derived id is **not** persisted — this is
-/// the read-only path used by `export --dry-run`.
-fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
+/// the read-only path used by `export --dry-run` and the adapter's
+/// `Adapter::resolve_agent_id` (WP0 selector/discovery).
+pub(crate) fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;

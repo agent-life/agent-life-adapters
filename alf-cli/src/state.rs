@@ -131,18 +131,11 @@ pub fn local_base_exists(agent_id: Uuid) -> Result<bool> {
     Ok(local_base_path(agent_id)?.is_file())
 }
 
-/// Resolve an agent ID from an optional CLI argument or from the state directory.
+/// IDs of every agent tracked in `~/.alf/state/*.toml`.
 ///
-/// If `agent_arg` is `Some`, this validates and parses it as a UUID.
-/// If `None`, this looks at `~/.alf/state/*.toml`:
-/// - If exactly one agent is tracked, its ID is returned.
-/// - If zero or multiple agents are tracked, an error is returned asking for `-a`.
-pub fn resolve_agent_id(agent_arg: Option<&str>) -> Result<Uuid> {
-    if let Some(id_str) = agent_arg {
-        return Uuid::parse_str(id_str)
-            .with_context(|| format!("Invalid agent ID: '{id_str}'. Expected a UUID."));
-    }
-
+/// Used by discovery's allocation context (adopting a pre-WP0 synced agent's
+/// cloud identity on first contact) and by [`resolve_agent_id`].
+pub fn tracked_agent_ids() -> Result<Vec<Uuid>> {
     let state_dir = AgentState::state_dir()?;
     let mut ids = Vec::new();
 
@@ -164,16 +157,38 @@ pub fn resolve_agent_id(agent_arg: Option<&str>) -> Result<Uuid> {
         }
     }
 
+    Ok(ids)
+}
+
+/// Resolve an agent ID from an optional CLI argument or from the state directory.
+///
+/// If `agent_arg` is `Some`, this validates and parses it as a UUID.
+/// If `None`, this looks at `~/.alf/state/*.toml`:
+/// - If exactly one agent is tracked, its ID is returned.
+/// - If zero or multiple agents are tracked, an error is returned asking for `--agent`.
+///
+/// This is the mapping-empty cloud-op fallback used by
+/// `selector::resolve_for_cloud_op` — it keeps restore-by-state working on
+/// hosts that synced before the `[[agents]]` mapping existed.
+pub fn resolve_agent_id(agent_arg: Option<&str>) -> Result<Uuid> {
+    if let Some(id_str) = agent_arg {
+        return Uuid::parse_str(id_str)
+            .with_context(|| format!("Invalid agent ID: '{id_str}'. Expected a UUID."));
+    }
+
+    let state_dir = AgentState::state_dir()?;
+    let ids = tracked_agent_ids()?;
+
     match ids.len() {
         0 => bail!(
             "No agent ID specified and no agents are tracked in {}. \
-             Run `alf sync` first or pass -a <agent-id>.",
+             Run `alf sync` first or pass --agent <agent-id>.",
             state_dir.display()
         ),
         1 => Ok(ids[0]),
         _ => bail!(
             "No agent ID specified and multiple agents are tracked in {}. \
-             Pass -a <agent-id> to disambiguate.",
+             Pass --agent <agent-id> to disambiguate.",
             state_dir.display()
         ),
     }

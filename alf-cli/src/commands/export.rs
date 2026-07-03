@@ -1,7 +1,9 @@
 //! `alf export` — export an agent workspace to an .alf archive.
 
 use crate::adapter;
+use crate::config::Config;
 use crate::output;
+use crate::selector;
 use alf_core::FileEntry;
 use anyhow::{bail, Result};
 use colored::Colorize;
@@ -36,7 +38,8 @@ struct ExportDryRunResult {
 
 pub fn run(
     runtime: &str,
-    workspace: &Path,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
     output_arg: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
@@ -50,19 +53,43 @@ pub fn run(
         )
     })?;
 
-    if !workspace.exists() {
-        bail!(
-            "Workspace directory does not exist: {}",
-            workspace.display()
-        );
-    }
-    if !workspace.is_dir() {
-        bail!("Workspace path is not a directory: {}", workspace.display());
+    let mut config = Config::load()?;
+
+    // --dry-run writes nothing (CLI-1/IN-2) — including the mapping and the
+    // workspace's .alf-agent-id — but must preview the same workspace the real
+    // export would use. With a mapping present the selector is read-only
+    // (lazy init only fires on an empty mapping), so honor --agent/ALF_AGENT
+    // and the selection's workspace; only an empty mapping keeps the legacy
+    // selector-free path.
+    if dry_run {
+        let workspace = if config.agents_for_runtime(runtime).is_empty() {
+            config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?
+        } else {
+            let install =
+                crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+            let selected = selector::select_current_agent(
+                &mut config,
+                adapter.as_ref(),
+                runtime,
+                &install,
+                agent,
+            )?;
+            selector::effective_workspace(&selected, workspace_flag).0
+        };
+        check_workspace_dir(&workspace)?;
+        return run_dry_run(adapter.as_ref(), &workspace, human);
     }
 
-    if dry_run {
-        return run_dry_run(adapter.as_ref(), workspace, human);
-    }
+    // Selection (lazy init applies): the mapping's id becomes the archive
+    // identity. An explicit -w pointing elsewhere is an ad-hoc export and
+    // keeps the legacy id-less path.
+    let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+    let selected =
+        selector::select_current_agent(&mut config, adapter.as_ref(), runtime, &install, agent)?;
+    let (workspace, adhoc) = selector::effective_workspace(&selected, workspace_flag);
+    let workspace = workspace.as_path();
+
+    check_workspace_dir(workspace)?;
 
     let default_output;
     let output_path = match output_arg {
@@ -90,7 +117,13 @@ pub fn run(
         output::progress(&format!("Exporting {} workspace...", adapter.name()));
     }
 
-    let report = adapter.export(workspace, output_path)?;
+    let report = if adhoc {
+        adapter.export(workspace, output_path)?
+    } else {
+        let mut binding = selected.binding.clone();
+        binding.workspace = workspace.to_path_buf();
+        adapter.export_agent(&binding, selected.alf_agent_id, output_path)?
+    };
 
     if human {
         println!("{} Export complete", "✓".green().bold());
@@ -142,6 +175,19 @@ pub fn run(
         });
     }
 
+    Ok(())
+}
+
+fn check_workspace_dir(workspace: &Path) -> Result<()> {
+    if !workspace.exists() {
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.is_dir() {
+        bail!("Workspace path is not a directory: {}", workspace.display());
+    }
     Ok(())
 }
 

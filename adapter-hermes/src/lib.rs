@@ -19,6 +19,7 @@
 use std::path::Path;
 
 use anyhow::Result;
+use uuid::Uuid;
 
 pub use alf_core::adapter::{
     ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
@@ -70,5 +71,9 @@ impl Adapter for HermesAdapter {
 
     fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
         import::enumerate_archive(alf_file)
+    }
+
+    fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
+        export::resolve_agent_id_readonly(workspace)
     }
 }

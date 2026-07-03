@@ -4,13 +4,14 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{local_base_path, resolve_agent_id, AgentState};
+use crate::selector;
+use crate::state::{local_base_path, AgentState};
 
 use anyhow::Result;
 use colored::Colorize;
 use serde::Serialize;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct PurgeResult {
@@ -20,16 +21,39 @@ struct PurgeResult {
     objects_removed: u32,
 }
 
-pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<()> {
+pub fn run(runtime: &str, workspace_flag: Option<&Path>, agent_arg: Option<&str>) -> Result<()> {
     let human = output::human_mode();
 
-    let _ = adapter::get_adapter(runtime).ok_or_else(|| {
+    let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
             "Unknown runtime '{}'. Supported: {}",
             runtime,
             adapter::supported_runtimes()
         )
     })?;
+
+    let mut config = Config::load()?;
+
+    // Alias-or-id via the mapping; UUID passthrough; legacy sole-state-file
+    // fallback when the mapping is empty (same rules as restore).
+    let agent_id = selector::resolve_for_cloud_op(
+        &mut config,
+        adapt.as_ref(),
+        runtime,
+        workspace_flag,
+        agent_arg,
+    )?;
+
+    // Workspace: -w flag → the agent's mapped workspace → [defaults].workspace.
+    // Used for CLI consistency only; never modified.
+    let workspace: PathBuf = match workspace_flag {
+        Some(w) => w.to_path_buf(),
+        None => match config.agents.iter().find(|a| a.alf_agent_id == agent_id) {
+            Some(row) => PathBuf::from(&row.workspace),
+            None => config.resolve_workspace(None)?,
+        },
+    };
+    let workspace = workspace.as_path();
 
     if !workspace.exists() {
         anyhow::bail!(
@@ -38,10 +62,7 @@ pub fn run(runtime: &str, workspace: &Path, agent_arg: Option<&str>) -> Result<(
         );
     }
 
-    let config = Config::load()?;
     let client = ApiClient::from_config(&config)?;
-
-    let agent_id = resolve_agent_id(agent_arg)?;
 
     if human {
         println!(

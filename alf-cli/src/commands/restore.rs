@@ -19,7 +19,8 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{local_base_path, resolve_agent_id, AgentState};
+use crate::selector;
+use crate::state::{local_base_path, AgentState};
 use crate::vault_key::{self, VaultKeyArgs};
 
 use alf_core::archive::AlfReader;
@@ -226,7 +227,7 @@ fn fetch_point_in_time(
 
 pub fn run(
     runtime: &str,
-    workspace: &Path,
+    workspace_flag: Option<&Path>,
     agent_arg: Option<&str>,
     at_sequence: Option<u64>,
     dry_run: bool,
@@ -235,10 +236,7 @@ pub fn run(
     let human = output::human_mode();
     let preview = at_sequence.is_some();
 
-    let config = Config::load()?;
-    let client = ApiClient::from_config(&config)?;
-
-    let agent_id: Uuid = resolve_agent_id(agent_arg)?;
+    let mut config = Config::load()?;
 
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
@@ -247,6 +245,29 @@ pub fn run(
             adapter::supported_runtimes()
         )
     })?;
+
+    // Alias-or-id via the mapping; an unmapped UUID passes through verbatim
+    // (restore-by-UUID onto a fresh host); legacy sole-state-file fallback
+    // when the mapping is empty.
+    let agent_id: Uuid = selector::resolve_for_cloud_op(
+        &mut config,
+        adapt.as_ref(),
+        runtime,
+        workspace_flag,
+        agent_arg,
+    )?;
+
+    // Workspace: -w flag → the agent's mapped workspace → [defaults].workspace.
+    let workspace: PathBuf = match workspace_flag {
+        Some(w) => w.to_path_buf(),
+        None => match config.agents.iter().find(|a| a.alf_agent_id == agent_id) {
+            Some(row) => PathBuf::from(&row.workspace),
+            None => config.resolve_workspace(None)?,
+        },
+    };
+    let workspace = workspace.as_path();
+
+    let client = ApiClient::from_config(&config)?;
 
     if dry_run {
         return run_dry_run(&client, agent_id, adapt.as_ref(), at_sequence, human);

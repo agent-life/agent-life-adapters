@@ -13,9 +13,29 @@
 | Flag | Env Var | Default | Description |
 |---|---|---|---|
 | `--human` | `ALF_HUMAN=1` | off | Switch stdout from JSON to human-readable text |
+| `--agent ALIAS_OR_ID` | `ALF_AGENT` | sole enabled agent | Select the agent to operate on (see [Agent selection](#agent-selection)) |
 
 All commands output structured JSON to stdout by default. Progress messages go to stderr.
 Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
+
+### Agent selection
+
+An install can host several agents. `alf check` discovers them and records one
+`[[agents]]` row per agent in `~/.alf/config.toml` (each row carries a stable
+`alf_agent_id`, the runtime alias, the workspace, and an `enabled` flag — the only
+field users edit). Agent-scoped commands (`sync`, `export`, `import`, `add`,
+`restore`, `purge`, `vault add`/`encrypt`) pick the current agent by precedence:
+
+1. `--agent <alias-or-id>` (global flag; long-only)
+2. non-empty `ALF_AGENT` environment variable
+3. otherwise: the **sole enabled** mapped agent — with several enabled agents the
+   command errors (`agent_selection_ambiguous`) and asks for an explicit selector.
+
+A first `sync`/`export` on an empty mapping discovers and maps the install's agents
+automatically (lazy init), so the single-agent flow needs no flags. For
+`restore`/`purge`, a UUID that is not in the mapping is used verbatim
+(restore-by-UUID onto a fresh host), and an empty mapping falls back to the single
+tracked agent in `~/.alf/state/`.
 
 ## Environment variables
 
@@ -23,6 +43,7 @@ Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable col
 |---|---|
 | `ALF_HOME` | Overrides the home base alf derives its paths from. When set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` are resolved under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts the config at `/data/.alf/config.toml`. Use it when the agent's `$HOME` is unstable. Unset ⇒ falls back to `$HOME` (`%USERPROFILE%` on Windows), i.e. the original behavior. |
 | `ALF_HUMAN` | `1` switches stdout from JSON to human-readable text (same as `--human`). |
+| `ALF_AGENT` | Agent alias-or-id used when `--agent` is omitted (see [Agent selection](#agent-selection)). |
 | `ALF_API_KEY` | API key, used when `service.api_key` is absent from `~/.alf/config.toml`. |
 | `ALF_VAULT_KEY` | Default env var name for a base64 vault key (see [Vault key flags](#vault-key-flags)). |
 | `ALF_VAULT_PASSPHRASE` | Passphrase for Argon2id key derivation. |
@@ -55,8 +76,9 @@ and `alf check` defaults `-w` to `$HERMES_HOME` or `~/.hermes`. One profile is o
 | `alf login` | Store API key | No |
 | `alf export` | Workspace → .alf archive | No |
 | `alf add` | Track an arbitrary workspace file so sync includes it | No |
-| `alf sync` | Incremental sync to cloud | Yes |
+| `alf sync` | Incremental sync to cloud (`--all` syncs every enabled agent) | Yes |
 | `alf restore` | Download and restore from cloud | Yes |
+| `alf agents` | List mapped agents; enable/disable them for sync | No |
 | `alf purge` | Delete cloud sync data and agent registration | Yes |
 | `alf import` | .alf archive → workspace | No |
 | `alf validate` | Validate .alf archive | No |
@@ -329,14 +351,16 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 
 ### Usage
 
-    alf sync -r <runtime> -w <workspace> [--recover] [--force-first-sync]
+    alf sync -r <runtime> -w <workspace> [--all] [--recover] [--force-first-sync]
 
 ### Flags
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
 | `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
-| `--workspace` | `-w` | No | Path to the agent workspace directory |
+| `--workspace` | `-w` | No | Path to the agent workspace directory (default: the selected agent's mapped workspace) |
+| `--agent` | | No | Alias-or-id of the agent to sync (global flag; falls back to `ALF_AGENT`, then the sole enabled agent — see [Agent selection](#agent-selection)). Syncing a disabled agent is refused (`agent_disabled`). |
+| `--all` | | No | Sync every enabled agent sequentially, collecting per-agent results (never fail-fast). Conflicts with `--agent`. Emits one JSON object `{"ok":…,"all":true,"results":[…]}` and exits 1 when any agent failed. |
 | `--recover` | | No | Re-pull the cloud-reconstructed base (snapshot + uncompacted deltas), overwriting any local base, then take the normal delta path against it. Repairs a **missing or diverged/"poisoned"** local base — the unattended self-heal for case E9. Effective whether or not a local base already exists (since 0.1.9; previously a no-op when a base was present). Non-destructive: the workspace is untouched and the base is replaced only after a successful cloud fetch. |
 | `--force-first-sync` | | No | Allow a first sync (no local state) to proceed even when an agent with this ID already exists in the cloud. Overwrites cloud history with the current workspace. See [how_alf_syncs.md](how_alf_syncs.md) case E3 before using. |
 
@@ -358,10 +382,12 @@ Sync takes no vault-key flags: it carries the agent's ALF vault (Layer 4) into t
       },
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
       "no_changes": false,
-      "recovered": false
+      "recovered": false,
+      "agent": { "runtime_agent": "main", "alf_agent_id": "a1b2c3d4-…", "source": "sole_enabled" }
     }
 
-`changes.creates/updates/deletes` count **memory** records. The per-layer fields are each omitted when that layer is unchanged: `credentials` (Layer 4) and `principals` (Layer 2) count create/update/delete **by id**, and `identity` (Layer 1) is a boolean. A tracked-file change instead produces a re-snapshot (`"delta": false`).
+`agent` reports which agent was synced and how it was selected (`flag`, `env`,
+or `sole_enabled`). `changes.creates/updates/deletes` count **memory** records. The per-layer fields are each omitted when that layer is unchanged: `credentials` (Layer 4) and `principals` (Layer 2) count create/update/delete **by id**, and `identity` (Layer 1) is a boolean. A tracked-file change instead produces a re-snapshot (`"delta": false`).
 
 ### JSON Output (success — no changes)
 
@@ -437,7 +463,7 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 ### Usage
 
-    alf restore -r <runtime> -w <workspace> [-a <agent-id>] [--at-sequence <N>] [--vault-key-file …]
+    alf restore -r <runtime> -w <workspace> [--agent <alias-or-id>] [--at-sequence <N>] [--vault-key-file …]
 
 ### Modes
 
@@ -450,8 +476,8 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 | Flag | Short | Required | Description |
 |---|---|---|---|
 | `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
-| `--workspace` | `-w` | No | Path to the target workspace directory |
-| `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
+| `--workspace` | `-w` | No | Path to the target workspace directory (default: the selected agent's mapped workspace) |
+| `--agent` | | No | Alias-or-id (global flag; the `-a` short form was removed). An unmapped UUID is used verbatim; see [Agent selection](#agent-selection). |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags); needed only to decrypt legacy archives into the runtime |
 | `--vault-key-env` | | No | |
@@ -497,13 +523,49 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 ---
 
+## alf agents
+
+List the `[[agents]]` mapping (the agents `alf check` discovered in this install) joined with each agent's sync state, and enable/disable agents for sync. Discovery never flips `enabled` — this command is the explicit switch. Disabling keeps the cloud archive and the local state under `~/.alf/state/`; enabling does not call the service (registration stays lazy, on the agent's first `alf sync`).
+
+### Usage
+
+    alf agents                              # list every runtime's rows (default)
+    alf agents enable <agent>               # alias or alf agent id, any runtime
+    alf agents disable <agent>
+    alf agents -r <runtime> enable <agent>  # scope to one runtime
+
+Without `-r`, the list spans every runtime and `enable`/`disable` resolve the name across all runtimes; an alias mapped for more than one runtime is `agent_selection_ambiguous` and needs `-r`.
+
+### JSON Output (list)
+
+    {
+      "ok": true,
+      "mapping_path": "/home/user/.alf/config.toml",
+      "agents": [
+        {
+          "runtime": "openclaw",
+          "runtime_agent": "main",
+          "alf_agent_id": "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d",
+          "workspace": "/home/user/.openclaw/workspace",
+          "enabled": true,
+          "last_synced_sequence": 5,
+          "last_synced_at": "2026-06-30T12:00:00+00:00",
+          "snapshot_exists": true
+        }
+      ]
+    }
+
+The top-level `runtime` key appears only when `-r` filters the list. An empty mapping is an error (`no_agents`) pointing at `alf check`. `enable`/`disable` are idempotent and output `{"ok":true,"runtime":…,"runtime_agent":…,"alf_agent_id":…,"enabled":…}` (enable adds a `note` about lazy registration); an unknown selector is `agent_not_found` listing the known aliases.
+
+---
+
 ## alf purge
 
 Remove all cloud-backed snapshot and delta blobs for an agent and delete the agent registration on the service (`DELETE /v1/agents/:id`). Does not modify files under the workspace. Deletes `~/.alf/state/{agent-id}.toml` and `~/.alf/state/{agent-id}-snapshot.alf` so the next `alf sync` uploads a full snapshot again.
 
 ### Usage
 
-    alf purge -r <runtime> -w <workspace> [-a <agent-id>]
+    alf purge -r <runtime> -w <workspace> [--agent <alias-or-id>]
 
 ### Flags
 
@@ -511,7 +573,7 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 |---|---|---|---|
 | `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory (validated; not modified) |
-| `--agent` | `-a` | No | Agent ID. If omitted and exactly one agent is tracked locally, that agent is used. |
+| `--agent` | | No | Alias-or-id (global flag; the `-a` short form was removed). See [Agent selection](#agent-selection). |
 
 ### JSON Output (success)
 
@@ -711,12 +773,18 @@ When any command fails, stdout contains a JSON error object:
 
     {
       "ok": false,
+      "code": "agent_selection_ambiguous",
       "error": "descriptive error message",
       "hint": "suggested fix or next step"
     }
 
 The `hint` field is omitted when there is no specific remediation to suggest.
 The same error is also written to stderr for human visibility.
+
+`code` is present only for the machine-distinguishable multi-agent failure
+classes: `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`,
+`no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`.
+Legacy errors keep the two-field shape.
 
 ---
 
@@ -731,6 +799,14 @@ The same error is also written to stderr for human visibility.
     [defaults]
     runtime = "openclaw"                    # Default --runtime value
     workspace = ""                          # Set via alf check discovery or manually
+
+    [[agents]]                              # One row per discovered agent (alf check / first sync)
+    runtime          = "openclaw"           # optional; defaults to [defaults].runtime
+    runtime_agent    = "main"               # runtime alias
+    # runtime_agent_id = "8423010b-…"       # optional; shared-store runtimes
+    alf_agent_id     = "cfef1150-…"         # stable ALF identity — never edit
+    workspace        = "/home/u/.openclaw/workspace"
+    enabled          = true                 # the only field users edit (or use `alf agents`)
 
 ### Environment Variables
 

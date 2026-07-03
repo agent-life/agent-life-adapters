@@ -53,7 +53,7 @@ const SCHEMA_SIDECAR: &str = ".alf-state-db-schema.json";
 // Agent ID persistence
 // ---------------------------------------------------------------------------
 
-fn resolve_agent_id_readonly(home: &Path) -> Result<Uuid> {
+pub(crate) fn resolve_agent_id_readonly(home: &Path) -> Result<Uuid> {
     let id_file = home.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;

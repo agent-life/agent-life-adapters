@@ -23,20 +23,66 @@ pub fn human_mode() -> bool {
         .unwrap_or(false)
 }
 
+#[derive(Serialize)]
+struct ErrorJson<'a> {
+    ok: bool,
+    /// Machine-readable code for the WP0 failure classes (see `errors::codes`).
+    /// Omitted for uncoded (legacy) errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
+    error: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    hint: &'a str,
+}
+
 /// Emit a JSON error object to stdout for machine consumption.
 pub fn json_error(error: &str, hint: &str) {
-    #[derive(Serialize)]
-    struct ErrorJson<'a> {
-        ok: bool,
-        error: &'a str,
-        #[serde(skip_serializing_if = "str::is_empty")]
-        hint: &'a str,
-    }
     json(&ErrorJson {
         ok: false,
+        code: None,
         error,
         hint,
     });
+}
+
+/// Emit a coded JSON error object to stdout (WP0 agent-facing errors).
+pub fn json_error_coded(code: &str, error: &str, hint: &str) {
+    json(&ErrorJson {
+        ok: false,
+        code: Some(code),
+        error,
+        hint,
+    });
+}
+
+/// One-line hint for known error kinds to guide users to fix or get more help.
+/// Coded errors (`CliError`) carry their own remedy; this heuristic covers the
+/// legacy uncoded errors, and is reused per-result by `alf sync --all`.
+pub fn error_hint(err: &anyhow::Error) -> String {
+    if let Some(cli_err) = err.downcast_ref::<crate::errors::CliError>() {
+        return cli_err.remedy.clone();
+    }
+    let msg = err.to_string();
+    if msg.contains("API key") || msg.contains("api_key") || msg.contains("Unauthorized") {
+        return "Run 'alf login' to set an API key, or 'alf help troubleshoot' for more.".into();
+    }
+    if msg.contains("No agent ID specified") || msg.contains("no agents are tracked") {
+        return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
+    }
+    if msg.contains("Unknown runtime") {
+        return "Supported runtimes: openclaw, zeroclaw, hermes. Run 'alf help troubleshoot' for more."
+            .into();
+    }
+    if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
+        return "Run 'alf help troubleshoot' for workspace and path guidance.".into();
+    }
+    if msg.contains("Local delta base missing") {
+        return "See docs/how_alf_syncs.md (case E4) for the recovery procedure.".into();
+    }
+    if msg.contains("already exists in the cloud") {
+        return "See docs/how_alf_syncs.md (case E3) before using --force-first-sync.".into();
+    }
+    String::new()
 }
 
 #[cfg(test)]

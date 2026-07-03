@@ -486,7 +486,7 @@ impl ApiClient {
                 Some(seq) => bail!(
                     "Sequence conflict: your local state is at sequence {} but the \
                      server is at {}. Pull the latest changes first:\n  \
-                     alf restore -r <runtime> -w <workspace> -a {}",
+                     alf restore -r <runtime> -w <workspace> --agent {}",
                     base_sequence,
                     seq,
                     agent_id
@@ -646,6 +646,7 @@ mod tests {
                 api_key: "alf_test_key_123".into(),
             },
             defaults: DefaultsConfig::default(),
+            agents: Vec::new(),
         }
     }
 
@@ -656,6 +657,7 @@ mod tests {
                 api_key: "".into(),
             },
             defaults: DefaultsConfig::default(),
+            agents: Vec::new(),
         }
     }
 

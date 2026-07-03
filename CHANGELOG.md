@@ -1,3 +1,14 @@
+## [Unreleased]
+
+### Added
+
+- **Multi-agent core (WP0): agent model + current-agent selector.** An install can host several agents; `alf` now models them explicitly. `alf check` discovers the install's agents and records one `[[agents]]` row per agent in `~/.alf/config.toml` (stable `alf_agent_id`, runtime alias, workspace, `enabled` — the only field users edit; discovery never changes an existing row's id or enabled flag, and removed agents stay in the mapping, reported only). Agent-scoped commands select the current agent by precedence **global `--agent <alias-or-id>` → `ALF_AGENT` env → sole enabled agent**; with several enabled agents the command errors with guidance (`agent_selection_ambiguous`). A first `sync`/`export` on an empty mapping lazy-inits the mapping (no prior `check` needed), and pre-WP0 installs keep their cloud identity: first contact adopts the workspace's `.alf-agent-id`, else a sole `~/.alf/state/` id, else the adapter's deterministic derivation. New `alf agents` command (`list`/`enable`/`disable`, idempotent, registration stays lazy) and `alf sync --all` (syncs every enabled agent sequentially, collects per-agent results in one JSON object, never fail-fast). Error JSON gains an optional machine-readable `code` for the new failure classes (`agent_not_found`, `agent_disabled`, `no_agents`, `agent_id_drift`, `agent_selection_ambiguous`, `registration_failed`, `sync_upload_failed`). Sync fails closed (`agent_id_drift`) before any network call when a workspace's `.alf-agent-id` disagrees with the mapping; `alf check` reports the same drift warn-only. `alf-core` gains the runtime-agnostic contract surface: `AgentBinding`/`MemorySource`, `Adapter::{discover_agents, resolve_agent_id, export_agent, import_agent}`, `ensure_workspace_agent_id`, `verify_archive_agent` (no new dependencies).
+
+### Changed
+
+- **BREAKING: `alf restore` / `alf purge` lost their local `-a` short flag.** The selector is the global long-only `--agent` (an `-a` short would collide with `alf vault add/encrypt -a --agent-id`), widened from UUID-only to alias-or-id. An unmapped UUID still passes through verbatim (restore-by-UUID onto a fresh host), and the legacy sole-state-file fallback still applies when the mapping is empty.
+- `alf vault add`/`encrypt` default the credential record's `agent_id` to the selected agent (previously the nil UUID) when `--agent-id` is not passed; explicit `--agent-id` still wins.
+
 ## [0.1.10] — 2026-06-19
 
 ### Added

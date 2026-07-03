@@ -129,6 +129,7 @@ pub fn encrypt(
     tags: &[String],
     capabilities: &[String],
     agent_id: Option<&str>,
+    selected_agent: Option<Uuid>,
     key_args: &VaultKeyArgs,
     runtime: &str,
 ) -> Result<()> {
@@ -154,9 +155,11 @@ pub fn encrypt(
     let blob = encrypt_payload(&payload.to_json_bytes(), &key, Algorithm::XChaCha20Poly1305)
         .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
+    // WP0: an omitted --agent-id defaults to the selected agent (global
+    // --agent / ALF_AGENT / sole enabled mapping row), else the nil UUID.
     let agent_uuid = match agent_id {
         Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
-        None => Uuid::nil(),
+        None => selected_agent.unwrap_or_else(Uuid::nil),
     };
 
     let credential_type = parse_credential_type(credential_type);
@@ -242,6 +245,7 @@ pub fn add(
     tags: &[String],
     fields: &[String],
     agent_id: Option<&str>,
+    selected_agent: Option<Uuid>,
     update: bool,
     key_args: &VaultKeyArgs,
     runtime: &str,
@@ -350,9 +354,11 @@ pub fn add(
     let blob = encrypt_payload(&payload.to_json_bytes(), &key, Algorithm::XChaCha20Poly1305)
         .map_err(|e| anyhow!("Encryption failed: {e}"))?;
 
+    // WP0: an omitted --agent-id defaults to the selected agent (global
+    // --agent / ALF_AGENT / sole enabled mapping row), else the nil UUID.
     let agent_uuid = match agent_id {
         Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
-        None => Uuid::nil(),
+        None => selected_agent.unwrap_or_else(Uuid::nil),
     };
     let record_label = label
         .map(str::to_string)
@@ -998,6 +1004,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             false,
             &args,
             "openclaw",
@@ -1034,6 +1041,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             false,
             &args,
             "openclaw",
@@ -1068,6 +1076,7 @@ mod tests {
                 None,
                 &[],
                 &[],
+                None,
                 None,
                 update,
                 &args,
@@ -1115,6 +1124,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
             false,
             &args,
             "openclaw",
@@ -1153,6 +1163,7 @@ mod tests {
             None,
             &[],
             &[],
+            None,
             None,
             false,
             &args,

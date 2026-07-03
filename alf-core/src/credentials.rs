@@ -135,7 +135,10 @@ pub struct CredentialRecord {
 /// Metadata about how a credential payload was encrypted (§3.4.1).
 ///
 /// Stored in plaintext alongside the ciphertext so the decrypting party
-/// knows which algorithm and parameters to use.
+/// knows which algorithm and parameters to use. `kdf`/`kdf_params` are
+/// read-side spec compat only — alf never writes them (keys are raw
+/// 32-byte values, no KDF on the write path), but foreign or legacy
+/// writers may declare a KDF and the fields must round-trip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EncryptionMetadata {
     /// Encryption algorithm identifier (e.g., `"xchacha20-poly1305"`).

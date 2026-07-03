@@ -532,11 +532,11 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
         ));
     }
 
-    // Other layers.
+    // Other layers. Per-agent vault path (WP1): the CLI migrates any legacy
+    // install-scoped vault before export — no legacy fallback here.
     let identity = identity_parser::parse_identity(home, &config, agent_id)?;
     let principals = principals_parser::parse_principals(home, agent_id)?;
-    let vault_path =
-        alf_core::home_dir().map(|h| h.join(".alf").join("vault").join("credentials.json"));
+    let vault_path = alf_core::home_dir().map(|h| alf_core::agent_vault_path(&h, agent_id));
     let credentials = load_agent_vault(vault_path.as_deref())?;
 
     // D4: warn about plaintext `.env` keys not covered by the vault.

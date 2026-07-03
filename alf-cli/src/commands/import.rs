@@ -5,6 +5,7 @@ use crate::config::Config;
 use crate::output;
 use crate::selector;
 use crate::vault_key::{self, VaultKeyArgs};
+use crate::vault_migrate;
 use alf_core::ImportOptions;
 use anyhow::{bail, Result};
 use colored::Colorize;
@@ -91,6 +92,11 @@ pub fn run(
         }
     };
 
+    // WP1: move any legacy vault/key to the per-agent layout before the
+    // adapter restores Layer 4 — adapters have no legacy fallback, and an
+    // unmigrated legacy file would survive as a shadow vault.
+    vault_migrate::require_migrated(&config, runtime)?;
+
     let (workspace, adhoc) = match &selected {
         Some(sel) => selector::effective_workspace(sel, workspace_flag),
         None => (
@@ -113,11 +119,12 @@ pub fn run(
         output::progress(&format!("Importing into {} workspace...", adapter.name()));
     }
 
-    let resolved_key = vault_key::resolve(key_args, runtime)?;
-    if let Some((_, src)) = &resolved_key {
+    let resolved_key =
+        vault_key::resolve(key_args, runtime, selected.as_ref().map(|s| s.alf_agent_id))?;
+    if let Some((_, source)) = &resolved_key {
         output::progress(&format!(
             "Using vault key from {} — credentials will be decrypted and restored",
-            src.label()
+            source.label()
         ));
     }
     let options = ImportOptions {

@@ -1,6 +1,6 @@
 [package]
 name = "adapter-hermes"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Hermes (Nous Research) framework adapter for the Agent Life Format (ALF)"
 license = "MIT"

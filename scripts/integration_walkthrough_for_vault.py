@@ -234,8 +234,8 @@ def step_vault_zero_knowledge(cfg: iw.Config, report: iw.Report):
         The agent fills it explicitly with `alf vault add`; ALF never scrapes a
         runtime's own keystore.
 
-        • **Vault key** — raw bytes (file or env) or a passphrase stretched with
-          Argon2id. The sync service never receives it.
+        • **Vault key** — a 256-bit random key held in a file or env var.
+          The sync service never receives it.
         • **Plaintext secrets** — only on the machine that knows the vault key.
         • **Ciphertext + IV/nonce** — ride inside `credentials.json` in the `.alf`
           ZIP; structurally validated, never decrypted server-side.
@@ -284,8 +284,8 @@ def step_on_disk_layout(cfg: iw.Config, report: iw.Report):
             agent-life; unrelated to the vault key).
           • `~/.alf/state/{agent_id}.toml` + `{agent_id}-snapshot.alf` — sync
             cursor + frozen base archive used to compute deltas.
-          • **Vault key** — `~/.openclaw/state/.alf-vault-key` (or the zeroclaw
-            path), or `ALF_VAULT_KEY`, or a passphrase. Secret; never synced,
+          • **Vault key** — `~/.<runtime>/state/<agent-id>/.alf-vault-key`
+            (legacy: no agent segment), or `ALF_VAULT_KEY`. Secret; never synced,
             never inside the archive. Needed by `alf vault add` / `decrypt`,
             not by `export` / `sync`.
         """

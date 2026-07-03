@@ -1,6 +1,6 @@
 [package]
 name = "adapter-openclaw"
-version = "0.1.4"
+version = "1.0.0"
 edition = "2021"
 description = "OpenClaw framework adapter for the Agent Life Format (ALF)"
 license = "MIT"

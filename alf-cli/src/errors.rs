@@ -33,4 +33,9 @@ pub mod codes {
     pub const AGENT_ID_DRIFT: &str = "agent_id_drift";
     pub const REGISTRATION_FAILED: &str = "registration_failed";
     pub const SYNC_UPLOAD_FAILED: &str = "sync_upload_failed";
+    // WP1 per-agent vault failure classes.
+    pub const VAULT_KEY_UNRESOLVED: &str = "vault_key_unresolved";
+    pub const VAULT_ROTATE_FAILED: &str = "vault_rotate_failed";
+    pub const VAULT_ROTATE_NO_DESTINATION: &str = "vault_rotate_no_destination";
+    pub const VAULT_MIGRATION_BLOCKED: &str = "vault_migration_blocked";
 }

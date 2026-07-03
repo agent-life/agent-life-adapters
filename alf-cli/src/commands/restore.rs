@@ -22,6 +22,7 @@ use crate::output;
 use crate::selector;
 use crate::state::{local_base_path, AgentState};
 use crate::vault_key::{self, VaultKeyArgs};
+use crate::vault_migrate;
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
@@ -273,6 +274,12 @@ pub fn run(
         return run_dry_run(&client, agent_id, adapt.as_ref(), at_sequence, human);
     }
 
+    // WP1: move any legacy vault/key to the per-agent layout before the
+    // adapter writes Layer 4 — otherwise the key leg is missed on the first
+    // post-upgrade restore and the legacy file survives as a shadow vault.
+    // (After the dry-run gate: --dry-run writes nothing.)
+    vault_migrate::require_migrated(&config, runtime)?;
+
     if human {
         if let Some(n) = at_sequence {
             println!(
@@ -322,11 +329,11 @@ pub fn run(
     fs::write(&temp_alf, &final_bytes)?;
 
     output::progress("  Importing into workspace...");
-    let resolved_key = vault_key::resolve(key_args, runtime)?;
-    if let Some((_, src)) = &resolved_key {
+    let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
+    if let Some((_, source)) = &resolved_key {
         output::progress(&format!(
             "Using vault key from {} — credentials will be decrypted and restored",
-            src.label()
+            source.label()
         ));
     }
     let import_options = ImportOptions {

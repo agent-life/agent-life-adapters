@@ -6,7 +6,8 @@
 //! rewrites the OS `$HOME` — which would otherwise move `~/.alf` out from under
 //! the CLI.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Resolve the home base directory.
 ///
@@ -31,6 +32,29 @@ pub fn home_dir() -> Option<PathBuf> {
     {
         None
     }
+}
+
+/// Canonical per-agent ALF vault file:
+/// `<home>/.alf/vault/<alf_agent_id>/credentials.json`.
+///
+/// The directory name is the hyphenated lowercase UUID (the same S3-visible
+/// layout convention the sync service uses). Shared by the CLI's vault
+/// commands and every adapter's Layer-4 read/write so the composition can
+/// never drift between them.
+pub fn agent_vault_path(home: &Path, alf_agent_id: Uuid) -> PathBuf {
+    home.join(".alf")
+        .join("vault")
+        .join(alf_agent_id.to_string())
+        .join("credentials.json")
+}
+
+/// Legacy install-scoped vault file: `<home>/.alf/vault/credentials.json`.
+///
+/// Pre-WP1 installs kept a single vault here; the CLI migrates it to
+/// [`agent_vault_path`] once an `[[agents]]` mapping exists. Adapters never
+/// read this path — migration runs before any export/import.
+pub fn legacy_vault_path(home: &Path) -> PathBuf {
+    home.join(".alf").join("vault").join("credentials.json")
 }
 
 #[cfg(test)]
@@ -76,5 +100,26 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    /// Path-shape pin: the per-agent vault dir is the hyphenated lowercase
+    /// UUID — an S3-visible layout convention, not just an implementation
+    /// detail.
+    #[test]
+    fn agent_vault_path_shape_pinned() {
+        let id = Uuid::parse_str("CFEF1150-0000-4000-8000-0000000000AA").unwrap();
+        let p = agent_vault_path(Path::new("/home/u"), id);
+        assert_eq!(
+            p,
+            PathBuf::from(
+                "/home/u/.alf/vault/cfef1150-0000-4000-8000-0000000000aa/credentials.json"
+            )
+        );
+    }
+
+    #[test]
+    fn legacy_vault_path_shape_pinned() {
+        let p = legacy_vault_path(Path::new("/home/u"));
+        assert_eq!(p, PathBuf::from("/home/u/.alf/vault/credentials.json"));
     }
 }

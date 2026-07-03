@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 0.1.10 | Updated: 2026-06-19
+> Version: 1.0.0 | Updated: 2026-07-03
 > HTML: <https://agent-life.ai/docs/cli>
 > Markdown: <https://agent-life.ai/docs/cli.md>
 
@@ -46,7 +46,6 @@ tracked agent in `~/.alf/state/`.
 | `ALF_AGENT` | Agent alias-or-id used when `--agent` is omitted (see [Agent selection](#agent-selection)). |
 | `ALF_API_KEY` | API key, used when `service.api_key` is absent from `~/.alf/config.toml`. |
 | `ALF_VAULT_KEY` | Default env var name for a base64 vault key (see [Vault key flags](#vault-key-flags)). |
-| `ALF_VAULT_PASSPHRASE` | Passphrase for Argon2id key derivation. |
 
 ## Runtime and workspace defaults
 
@@ -99,11 +98,8 @@ ciphertext, so export/sync copy it verbatim (see [`alf vault`](#alf-vault)).
 |---|---|
 | `--vault-key-file PATH` | File with base64-encoded 32-byte key |
 | `--vault-key-env VAR` | Env var name holding base64 key (default var: `ALF_VAULT_KEY`) |
-| `--vault-passphrase-file PATH` | Argon2id passphrase from file |
-| `--vault-passphrase-env VAR` | Argon2id passphrase from env (e.g. `ALF_VAULT_PASSPHRASE`) |
-| `--vault-salt BASE64` | Salt for passphrase mode (optional; documented in [vault-key-management.md](vault-key-management.md)) |
 
-Default key file if none of the above apply: `~/.openclaw/state/.alf-vault-key` or `~/.zeroclaw/state/.alf-vault-key` depending on `-r` / `--runtime`.
+Default key file if none of the above apply: `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` for the selected agent (openclaw/zeroclaw; hermes has no default key path yet), falling back to the legacy install-scoped `~/.<runtime>/state/.alf-vault-key` only when no agent is mapped.
 
 ---
 
@@ -173,8 +169,7 @@ The `workspace.source` field in the output reports which method was used: `"flag
         "home": "/home/user",
         "alf_home": "/data/alf",
         "alf_api_key_set": true,
-        "alf_vault_key_set": false,
-        "alf_vault_passphrase_set": false
+        "alf_vault_key_set": false
       },
       "vault": {
         "path": "/home/user/.alf/vault/credentials.json",
@@ -481,9 +476,6 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags); needed only to decrypt legacy archives into the runtime |
 | `--vault-key-env` | | No | |
-| `--vault-passphrase-file` | | No | |
-| `--vault-passphrase-env` | | No | |
-| `--vault-salt` | | No | |
 
 ### JSON Output (success, head restore)
 
@@ -604,9 +596,6 @@ Import an `.alf` archive into a framework workspace.
 | `--workspace` | `-w` | No | Path to the target workspace directory |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags) |
 | `--vault-key-env` | | No | |
-| `--vault-passphrase-file` | | No | |
-| `--vault-passphrase-env` | | No | |
-| `--vault-salt` | | No | |
 
 ### Positional Arguments
 
@@ -675,18 +664,31 @@ Validate an `.alf` or `.alf-delta` file against the ALF JSON schemas.
 
 ## alf vault
 
-Manage the agent's **ALF vault** — `~/.alf/vault/credentials.json`, a runtime-neutral `CredentialsDocument` of per-record AEAD-encrypted credentials. The vault is the agent's own, explicit store; `alf sync` carries it into an `.alf` archive as Layer 4. **`alf vault list`** and **`alf vault delete`** do **not** need the vault key (they operate on plaintext descriptor fields only).
+Manage the agent's **ALF vault** — a runtime-neutral `CredentialsDocument` of per-record AEAD-encrypted credentials. The vault is the agent's own, explicit store; `alf sync` carries it into an `.alf` archive as Layer 4. **`alf vault list`** and **`alf vault delete`** do **not** need the vault key (they operate on plaintext descriptor fields only).
+
+**Per-agent paths (WP1).** Vault and key are scoped by agent:
+
+| File | Path |
+|---|---|
+| Vault | `~/.alf/vault/<alf-agent-id>/credentials.json` |
+| Default key (openclaw/zeroclaw) | `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` |
+
+The agent scope resolves like every other command: `--agent <alias-or-id>` → `ALF_AGENT` → the sole enabled `[[agents]]` row. Commands that consult a default vault path **stop and ask** (`agent_selection_ambiguous`) when several agents are enabled; commands given an explicit `--in` don't. Hosts with an empty mapping keep the legacy install-scoped paths (`~/.alf/vault/credentials.json`, `~/.<runtime>/state/.alf-vault-key`).
+
+**Legacy migration.** The first vault/sync/export/import/restore/check on an upgraded install moves the pre-multi-agent vault and key to the per-agent layout automatically when the owner is unambiguous (sole enabled agent). Anything ambiguous — several enabled agents, all-disabled rows, another runtime's legacy key — blocks with `vault_migration_blocked` and the exact remedy; `alf vault migrate --agent <alias-or-id>` is the explicit escape hatch. Ciphertext moves verbatim; no key is needed.
 
 ### Subcommands
 
 | Subcommand | Purpose |
 |---|---|
 | `alf vault keygen` | Generate a random 32-byte key (`--out FILE` or `--stdout`; `--force` to overwrite) |
-| `alf vault add` | Encrypt a credential and append it to the vault (`~/.alf/vault/credentials.json` by default); requires vault key |
+| `alf vault add` | Encrypt a credential and append it to the agent's vault; requires vault key |
 | `alf vault encrypt` | Read a `VaultPayload` JSON from `--in` / stdin (or a raw secret string); emit one `CredentialRecord` JSON on stdout |
-| `alf vault decrypt` | Decrypt one selected record from a vault file or an `.alf` (`--in`); requires vault key; refuses non-TTY stdout without `--yes-insecure` |
+| `alf vault decrypt` | Decrypt one selected record from the agent's vault (or `--in` file / `.alf`); requires vault key; refuses non-TTY stdout without `--yes-insecure` |
 | `alf vault list` | Print plaintext descriptors for all records (no key) |
 | `alf vault delete` | Remove one record by `--id` / `--label` / `--service` (no key); `--out` to write elsewhere |
+| `alf vault rotate-key` | Re-encrypt every record under a new key (crash-safe; see below) |
+| `alf vault migrate` | Move a legacy install-scoped vault/key to the per-agent layout (`--agent` to pick the owner, `--dry-run` to preview) |
 
 ### `alf vault add`
 
@@ -694,7 +696,7 @@ Manage the agent's **ALF vault** — `~/.alf/vault/credentials.json`, a runtime-
       [--secret VALUE | --secret-file FILE | --secret-json FILE] \
       [--label …] [--description …] [--tag …] [--field k=v] [--update] [--in FILE]
 
-Encrypts a credential under the resolved vault key and appends a `CredentialRecord` to the vault. The default target is `~/.alf/vault/credentials.json`; `--in` overrides it. `--type` / `-t` defaults to `account`. Every record is tagged `alf-vault`.
+Encrypts a credential under the resolved vault key and appends a `CredentialRecord` to the vault. The default target is the selected agent's `~/.alf/vault/<alf-agent-id>/credentials.json`; `--in` overrides it. `--type` / `-t` defaults to `account`. Every record is tagged `alf-vault`. The vault document is written atomically (temp + rename), so a crash can never truncate it.
 
 The secret comes from `--secret`, `--secret-file`, stdin, or `--secret-json` — a JSON object whose `user`/`username`/`email` and `password`/`token`/`bot_token`/`secret` fields are mapped automatically (handy for runtime config blobs); other keys fold into the encrypted payload. `--update` upserts by label so re-running is safe.
 
@@ -704,15 +706,35 @@ JSON output: `{ "ok", "id", "service", "label", "updated", "written_to", "total"
 
     alf vault encrypt -r openclaw -s <service> [-t <credential_type>] [--description …] [--label …] [--tag …] [--capability …] [--in FILE]
 
-Requires a resolved vault key. `--type` / `-t` defaults to `custom`. `--agent-id` overrides the UUID embedded in the record (default: nil UUID for ad-hoc use).
+Requires a resolved vault key. `--type` / `-t` defaults to `custom`. `--agent-id` overrides the UUID embedded in the record (default: the selected agent, else the nil UUID for ad-hoc use).
 
 ### `alf vault decrypt`
 
-Exactly one of `--id`, `--label`, or `--service` must match a single record.
+Exactly one of `--id`, `--label`, or `--service` must match a single record. Defaults to the selected agent's vault; `--in` reads any credentials.json or `.alf` archive.
 
 ### `alf vault delete`
 
-Exactly one selector; mutates the credentials document on disk (or `--out`).
+Exactly one selector; mutates the credentials document on disk (or `--out`). Defaults to the selected agent's vault.
+
+### `alf vault rotate-key`
+
+    alf vault rotate-key [-r <runtime>] [--in FILE] [--new-key-file PATH | --new-key-out PATH] [--force] [old-key flags]
+
+Decrypts every record under the **old** key (resolved with the usual flag/default-file order) and re-encrypts under a **new** one — freshly generated by default, or `--new-key-file`. One record that fails to decrypt aborts the whole rotation with the files untouched (`vault_rotate_failed`); legacy metadata-only records (`algorithm: "none"`) pass through as `skipped_legacy`. `last_rotated_at` is stamped, record ids stay stable, and the next `alf sync` carries the re-encrypted Layer 4 as ordinary updates.
+
+When the old key came from the agent's default key file, the generated key replaces it **in place, crash-safely**: the new key is written to `<keyfile>.new` first, then the vault is atomically rewritten, then the `.new` file is renamed over the key file — an interrupted run self-heals on the next invocation (`recovered: true`). Otherwise pass `--new-key-out PATH` (or `--new-key-file`), or the command refuses with `vault_rotate_no_destination`. Key material is never printed; the JSON carries fingerprints only.
+
+**Point-in-time restores of pre-rotation sequences always need the old key** — keep a copy until you no longer need that history.
+
+JSON output: `{ "ok", "vault", "agent_id", "rotated", "skipped_legacy", "old_fingerprint", "new_fingerprint", "new_key_written_to"?, "recovered"?, "next" }`.
+
+### `alf vault migrate`
+
+    alf vault migrate [-r <runtime>] [--agent <alias-or-id>] [--dry-run]
+
+Runs the legacy → per-agent migration explicitly. Without `--agent` it applies the same automatic decision the implicit triggers use (sole enabled agent, blocked otherwise); `--agent` is the human decision that resolves an ambiguous install. `--dry-run` reports the decision without writing. A diverged pair (both the legacy and the per-agent file exist with different contents) always blocks — inspect both with `alf vault list --in <path>` and move one manually.
+
+JSON output: `{ "ok", "dry_run"?, "migrated_vault"?, "migrated_key"?, "agent_id"?, "blocked"?, "hint"? }`.
 
 See [vault-key-management.md](vault-key-management.md) for key storage conventions (OpenClaw, ZeroClaw, `ALF_VAULT_KEY`, fly.io).
 

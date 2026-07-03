@@ -460,8 +460,10 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     // Layer 4 = the agent's explicit ALF vault ONLY. ALF never captures a
     // runtime's own keystore (e.g. OpenClaw `auth-profiles.json`) — the agent
     // chooses what to back up via `alf vault add`. Vault records are already
-    // AEAD-encrypted, so they enter the archive verbatim.
-    let vault_path = dirs_home().map(|h| h.join(".alf").join("vault").join("credentials.json"));
+    // AEAD-encrypted, so they enter the archive verbatim. Per-agent path
+    // (WP1): the CLI migrates any legacy install-scoped vault before export,
+    // so there is deliberately no legacy fallback here.
+    let vault_path = dirs_home().map(|h| alf_core::agent_vault_path(&h, agent_id));
     let credentials = load_agent_vault(vault_path.as_deref())?;
 
     // 6. Build manifest

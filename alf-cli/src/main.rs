@@ -14,6 +14,7 @@ pub mod output;
 mod selector;
 mod state;
 mod vault_key;
+mod vault_migrate;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -366,7 +367,7 @@ enum VaultCommand {
         long_about = "Generates a cryptographically-random 32-byte vault key and writes\n\
         it as base64 to the given file with mode 0600. Pass --stdout to print the\n\
         key on stdout instead (use for piping into env vars on ephemeral hosts).\n\n\
-        Example: alf vault keygen --out ~/.openclaw/state/.alf-vault-key"
+        Example: alf vault keygen --out ~/.openclaw/state/<alf-agent-id>/.alf-vault-key"
     )]
     Keygen {
         /// File to write the base64-encoded key to (mode 0600)
@@ -435,10 +436,11 @@ enum VaultCommand {
     /// Add an account credential to the agent's vault
     #[command(
         long_about = "Encrypts a credential under the resolved vault key and appends it\n\
-        to the ALF vault. The default target is ~/.alf/vault/credentials.json, which\n\
-        `alf sync` merges into the archive's encrypted Layer 4 and `alf restore` brings\n\
-        back on another host. The vault is ALF's own store — separate from any runtime\n\
-        keystore — and the agent chooses exactly what goes in it.\n\n\
+        to the ALF vault. The default target is the selected agent's vault at\n\
+        ~/.alf/vault/<alf-agent-id>/credentials.json, which `alf sync` merges into the\n\
+        archive's encrypted Layer 4 and `alf restore` brings back on another host. The\n\
+        vault is ALF's own store — separate from any runtime keystore — and the agent\n\
+        chooses exactly what goes in it.\n\n\
         The secret may come from --secret, --secret-file, stdin, or --secret-json (a\n\
         JSON object whose user/password/token fields are mapped automatically). Every\n\
         record is tagged `alf-vault`.\n\n\
@@ -509,16 +511,16 @@ enum VaultCommand {
 
     /// Decrypt one record and print its payload
     #[command(
-        long_about = "Reads credentials.json (or the entry inside a .alf archive),\n\
+        long_about = "Reads the agent's vault (or --in credentials.json / .alf archive),\n\
         decrypts a single selected record under the resolved key, and prints the\n\
         plaintext envelope. Refuses to print to non-TTY stdout without --yes-insecure.\n\n\
         Select with one of: --id <UUID>, --label <STR>, --service <STR>.\n\n\
-        Example: alf vault decrypt --in credentials.json --label kleo@agent-life.run"
+        Example: alf vault decrypt --label kleo@agent-life.run"
     )]
     Decrypt {
-        /// Path to credentials.json or .alf archive.
+        /// Path to credentials.json or .alf archive [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
 
         /// Record selector: UUID.
         #[arg(long)]
@@ -532,7 +534,7 @@ enum VaultCommand {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Runtime for default key path resolution.
+        /// Runtime for default key + vault path resolution.
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 
@@ -547,28 +549,33 @@ enum VaultCommand {
     /// List plaintext descriptors (no key required)
     #[command(
         long_about = "Lists the plaintext descriptor fields of every credential in\n\
-        the given file or archive. Never touches ciphertext or keys — useful for\n\
-        triage and for picking a record to surgically delete.\n\n\
-        Example: alf vault list --in credentials.json"
+        the agent's vault (or --in file/archive). Never touches ciphertext or keys —\n\
+        useful for triage and for picking a record to surgically delete.\n\n\
+        Example: alf vault list\n\
+        Example: alf vault list --in backup.alf"
     )]
     List {
-        /// Path to credentials.json or .alf archive.
+        /// Path to credentials.json or .alf archive [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
+
+        /// Runtime for default vault path resolution (alias scoping).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
     },
 
     /// Remove a single credential record (NO key required)
     #[command(
-        long_about = "Drops one record from credentials.json. Selecting works on\n\
-        plaintext descriptors so the agent never needs to decrypt anything — the\n\
-        surgical-delete path for ephemeral hosts that provisioned an account on\n\
-        the user's behalf and now needs to remove it.\n\n\
-        Example: alf vault delete --in credentials.json --label kleo@agent-life.run"
+        long_about = "Drops one record from the agent's vault (or --in credentials.json).\n\
+        Selecting works on plaintext descriptors so the agent never needs to decrypt\n\
+        anything — the surgical-delete path for ephemeral hosts that provisioned an\n\
+        account on the user's behalf and now needs to remove it.\n\n\
+        Example: alf vault delete --label kleo@agent-life.run"
     )]
     Delete {
-        /// Path to credentials.json to mutate.
+        /// Path to credentials.json to mutate [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
 
         /// Record selector: UUID.
         #[arg(long)]
@@ -582,9 +589,71 @@ enum VaultCommand {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Write to a different file (default: overwrite --in).
+        /// Write to a different file (default: overwrite the input).
         #[arg(short, long)]
         out: Option<PathBuf>,
+
+        /// Runtime for default vault path resolution (alias scoping).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+    },
+
+    /// Rotate the vault key: re-encrypt every record under a new key
+    #[command(
+        name = "rotate-key",
+        long_about = "Decrypts every record in the agent's vault under the OLD key\n\
+        (resolved with the usual flags/default-file order) and re-encrypts under a\n\
+        NEW key — a freshly generated one by default, or --new-key-file. Crash-safe:\n\
+        the new key is persisted before the vault is rewritten, and an interrupted\n\
+        run self-heals on the next invocation. Never prints key material; the JSON\n\
+        carries fingerprints only.\n\n\
+        Point-in-time restores of pre-rotation sequences always need the old key —\n\
+        keep a copy until you no longer need that history.\n\n\
+        Example: alf vault rotate-key -r openclaw --agent main"
+    )]
+    RotateKey {
+        /// Path to credentials.json [default: the agent's vault].
+        #[arg(short = 'i', long = "in")]
+        input: Option<PathBuf>,
+
+        /// Use an existing key file as the NEW key (default: generate one).
+        #[arg(long, value_name = "PATH")]
+        new_key_file: Option<PathBuf>,
+
+        /// Write the new key here (0600; refuses to overwrite without --force).
+        #[arg(long, value_name = "PATH")]
+        new_key_out: Option<PathBuf>,
+
+        /// Overwrite an existing --new-key-out file.
+        #[arg(long)]
+        force: bool,
+
+        /// Runtime for default key + vault path resolution.
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
+    },
+
+    /// Move a legacy install-scoped vault to the per-agent layout
+    #[command(
+        long_about = "Moves the pre-multi-agent vault (~/.alf/vault/credentials.json)\n\
+        and vault key (~/.<runtime>/state/.alf-vault-key) to their per-agent locations.\n\
+        Runs automatically before vault/sync/export/import/restore when the target is\n\
+        unambiguous; this command is the explicit escape hatch for ambiguous installs\n\
+        (several enabled agents, cross-runtime evidence). Ciphertext moves verbatim —\n\
+        no key is required. --dry-run reports the decision without writing.\n\n\
+        Example: alf vault migrate -r openclaw --agent main"
+    )]
+    Migrate {
+        /// Runtime whose legacy key path and agent mapping apply.
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        /// Report the migration decision without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -598,18 +667,6 @@ pub struct VaultKeyCli {
     /// Name of an env var holding a base64 vault key (default: ALF_VAULT_KEY).
     #[arg(long, value_name = "VAR")]
     pub vault_key_env: Option<String>,
-
-    /// Path to a file containing a passphrase (Argon2id mode).
-    #[arg(long, value_name = "PATH")]
-    pub vault_passphrase_file: Option<PathBuf>,
-
-    /// Name of an env var holding a passphrase (Argon2id mode).
-    #[arg(long, value_name = "VAR")]
-    pub vault_passphrase_env: Option<String>,
-
-    /// Base64-encoded salt for passphrase mode (default: per-runtime constant).
-    #[arg(long, value_name = "BASE64")]
-    pub vault_salt: Option<String>,
 }
 
 impl VaultKeyCli {
@@ -617,9 +674,6 @@ impl VaultKeyCli {
         VaultKeyArgs {
             key_file: self.vault_key_file.clone(),
             key_env: self.vault_key_env.clone(),
-            passphrase_file: self.vault_passphrase_file.clone(),
-            passphrase_env: self.vault_passphrase_env.clone(),
-            salt_b64: self.vault_salt.clone(),
         }
     }
 }
@@ -793,6 +847,7 @@ fn main() {
 
 fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> {
     match cmd {
+        // keygen touches no default paths — no scope, no migration trigger.
         VaultCommand::Keygen { out, stdout, force } => {
             commands::vault::keygen(out.as_deref(), force, stdout)
         }
@@ -808,9 +863,9 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             runtime,
             key,
         } => {
-            // WP0: default the record's agent id to the selected agent when
-            // --agent-id was not explicitly passed. Explicit --agent-id wins.
-            let selected = vault_selected_agent(&runtime, agent, agent_id.as_deref())?;
+            // encrypt only prints a record (no vault file) — lenient scope.
+            let (config, scope) = vault_scope(&runtime, agent, /* strict: */ false)?;
+            vault_migrate::require_migrated(&config, &runtime)?;
             commands::vault::encrypt(
                 input.as_deref(),
                 &service,
@@ -820,7 +875,7 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
                 &tags,
                 &capabilities,
                 agent_id.as_deref(),
-                selected,
+                scope,
                 &key.to_args(),
                 &runtime,
             )
@@ -842,7 +897,8 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             runtime,
             key,
         } => {
-            let selected = vault_selected_agent(&runtime, agent, agent_id.as_deref())?;
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
             commands::vault::add(
                 input.as_deref(),
                 &service,
@@ -856,7 +912,7 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
                 &tags,
                 &fields,
                 agent_id.as_deref(),
-                selected,
+                scope,
                 update,
                 &key.to_args(),
                 &runtime,
@@ -870,39 +926,83 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             runtime,
             yes_insecure,
             key,
-        } => commands::vault::decrypt(
-            &input,
-            &commands::vault::Selector { id, label, service },
-            &key.to_args(),
-            &runtime,
-            yes_insecure,
-        ),
-        VaultCommand::List { input } => commands::vault::list(&input),
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::decrypt(
+                input.as_deref(),
+                &commands::vault::Selector { id, label, service },
+                scope,
+                &key.to_args(),
+                &runtime,
+                yes_insecure,
+            )
+        }
+        VaultCommand::List { input, runtime } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::list(input.as_deref(), scope)
+        }
         VaultCommand::Delete {
             input,
             id,
             label,
             service,
             out,
-        } => commands::vault::delete(
-            &input,
-            &commands::vault::Selector { id, label, service },
-            out.as_deref(),
-        ),
+            runtime,
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::delete(
+                input.as_deref(),
+                &commands::vault::Selector { id, label, service },
+                out.as_deref(),
+                scope,
+            )
+        }
+        VaultCommand::RotateKey {
+            input,
+            new_key_file,
+            new_key_out,
+            force,
+            runtime,
+            key,
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::rotate_key(
+                input.as_deref(),
+                new_key_file.as_deref(),
+                new_key_out.as_deref(),
+                force,
+                scope,
+                &key.to_args(),
+                &runtime,
+            )
+        }
+        VaultCommand::Migrate { runtime, dry_run } => {
+            let config = Config::load()?;
+            commands::vault::migrate(&config, &runtime, agent, dry_run)
+        }
     }
 }
 
-/// WP0-minimal vault selection: the global `--agent` / `ALF_AGENT` resolves
-/// via the mapping (no lazy init — no workspace context) and, when `--agent-id`
-/// was not explicitly passed, supplies the credential record's `agent_id`.
-fn vault_selected_agent(
+/// Vault scope resolution (WP1): the agent whose per-agent vault/key default
+/// paths apply. Strict for commands consulting a default path (ambiguity is a
+/// coded error, D9); lenient when the caller passed an explicit `--in` (the
+/// default-file key step then simply won't resolve). The scope also supplies
+/// the credential record's `agent_id` default — an explicit `--agent-id` only
+/// overrides the record's metadata field, never the paths.
+fn vault_scope(
     runtime: &str,
     agent: Option<&str>,
-    explicit_agent_id: Option<&str>,
-) -> anyhow::Result<Option<uuid::Uuid>> {
-    if explicit_agent_id.is_some() {
-        return Ok(None); // explicit --agent-id wins; no selection needed
-    }
+    strict: bool,
+) -> anyhow::Result<(Config, Option<uuid::Uuid>)> {
     let config = Config::load()?;
-    selector::vault_default_agent_id(&config, runtime, agent)
+    let scope = if strict {
+        selector::vault_scope_agent_id(&config, runtime, agent)?
+    } else {
+        selector::vault_scope_agent_id_lenient(&config, runtime, agent)?
+    };
+    Ok((config, scope))
 }

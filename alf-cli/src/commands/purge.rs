@@ -21,6 +21,17 @@ struct PurgeResult {
     objects_removed: u32,
 }
 
+/// The agent's vault file if one exists — per-agent path first, then the
+/// legacy install-scoped path (mapping-less hosts). Display-only.
+fn existing_vault_path(agent_id: uuid::Uuid) -> Option<PathBuf> {
+    let per_agent = crate::vault_key::default_vault_path(Some(agent_id)).ok()?;
+    if per_agent.is_file() {
+        return Some(per_agent);
+    }
+    let legacy = crate::vault_key::default_vault_path(None).ok()?;
+    legacy.is_file().then_some(legacy)
+}
+
 pub fn run(runtime: &str, workspace_flag: Option<&Path>, agent_arg: Option<&str>) -> Result<()> {
     let human = output::human_mode();
 
@@ -104,6 +115,15 @@ pub fn run(runtime: &str, workspace_flag: Option<&Path>, agent_arg: Option<&str>
         println!();
         println!("  Local sync state under ~/.alf/state/ was reset for this agent.");
         println!("  The workspace on disk was not modified. Run `alf sync` to upload again.");
+        // D7: purge never touches the vault — deleting the last ciphertext
+        // copy right after deleting the cloud copy would be the worst moment.
+        if let Some(vault_path) = existing_vault_path(agent_id) {
+            println!(
+                "  The local vault at {} was kept — purge never deletes secrets. \
+                 Remove the file manually if you intend to destroy them.",
+                vault_path.display()
+            );
+        }
         println!();
     } else {
         output::json(&PurgeResult {

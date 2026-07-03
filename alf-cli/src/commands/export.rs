@@ -86,6 +86,11 @@ pub fn run(
     let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
     let selected =
         selector::select_current_agent(&mut config, adapter.as_ref(), runtime, &install, agent)?;
+
+    // WP1: move any legacy vault/key to the per-agent layout before export —
+    // the adapter reads only the per-agent vault path (no legacy fallback).
+    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
+
     let (workspace, adhoc) = selector::effective_workspace(&selected, workspace_flag);
     let workspace = workspace.as_path();
 

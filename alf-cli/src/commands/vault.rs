@@ -2,12 +2,19 @@
 //!
 //! Subcommands:
 //!
-//! - `keygen`  — generate a fresh 32-byte vault key.
-//! - `encrypt` — wrap a plaintext credential into a `CredentialRecord`.
-//! - `add`     — encrypt a credential and append it to the agent's vault.
-//! - `decrypt` — read one record out of a vault and print its plaintext.
-//! - `list`    — print plaintext descriptors only (no key required).
-//! - `delete`  — surgically remove a record by id/label/service (no key required).
+//! - `keygen`     — generate a fresh 32-byte vault key.
+//! - `encrypt`    — wrap a plaintext credential into a `CredentialRecord`.
+//! - `add`        — encrypt a credential and append it to the agent's vault.
+//! - `decrypt`    — read one record out of a vault and print its plaintext.
+//! - `list`       — print plaintext descriptors only (no key required).
+//! - `delete`     — surgically remove a record by id/label/service (no key required).
+//! - `rotate-key` — re-encrypt every record under a new key (crash-safe).
+//! - `migrate`    — move a legacy install-scoped vault to per-agent paths.
+//!
+//! Vault and key paths are per-agent (WP1): the default vault is
+//! `~/.alf/vault/{alf_agent_id}/credentials.json` under the resolved agent
+//! scope, falling back to the legacy install-scoped path only on
+//! mapping-less hosts.
 //!
 //! Stdout is JSON by default; `--human` switches to text. Secret values
 //! sent to stdout require either a TTY or `--yes-insecure`.
@@ -25,12 +32,14 @@ use uuid::Uuid;
 
 use alf_core::{
     decrypt_record, encrypt_payload, AlfReader, Algorithm, CredentialRecord, CredentialType,
-    CredentialsDocument, VaultPayload,
+    CredentialsDocument, VaultKey, VaultPayload,
 };
 
-use crate::fs_private::write_private;
+use crate::errors::{codes, CliError};
+use crate::fs_private::{write_private, write_private_atomic};
 use crate::output;
-use crate::vault_key::{self, VaultKeyArgs};
+use crate::vault_key::{self, KeySource, VaultKeyArgs};
+use crate::vault_migrate::{self, MigrationOutcome, MigrationPlan};
 
 // ===========================================================================
 // keygen
@@ -129,7 +138,7 @@ pub fn encrypt(
     tags: &[String],
     capabilities: &[String],
     agent_id: Option<&str>,
-    selected_agent: Option<Uuid>,
+    scope: Option<Uuid>,
     key_args: &VaultKeyArgs,
     runtime: &str,
 ) -> Result<()> {
@@ -145,7 +154,7 @@ pub fn encrypt(
         }
     };
 
-    let (key, source) = vault_key::resolve_required(key_args, runtime)?;
+    let (key, source) = vault_key::resolve_required(key_args, runtime, scope)?;
     output::progress(&format!(
         "Encrypting with key from {} (fingerprint {})",
         source.label(),
@@ -159,7 +168,7 @@ pub fn encrypt(
     // --agent / ALF_AGENT / sole enabled mapping row), else the nil UUID.
     let agent_uuid = match agent_id {
         Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
-        None => selected_agent.unwrap_or_else(Uuid::nil),
+        None => scope.unwrap_or_else(Uuid::nil),
     };
 
     let credential_type = parse_credential_type(credential_type);
@@ -228,9 +237,10 @@ const SECRET_JSON_SECRET_KEYS: &[&str] = &["secret", "password", "token", "bot_t
 ///
 /// Encrypts the secret under the resolved vault key and appends a
 /// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
-/// `CredentialsDocument`. The default target is the agent vault at
-/// `~/.<runtime>/agents/main/agent/credentials.json`, which the OpenClaw
-/// adapter merges into the archive's Layer 4 on the next `alf sync`.
+/// `CredentialsDocument`. The default target is the agent's vault at
+/// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
+/// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
+/// merge into the archive's Layer 4 on the next `alf sync`.
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     input: Option<&Path>,
@@ -245,15 +255,15 @@ pub fn add(
     tags: &[String],
     fields: &[String],
     agent_id: Option<&str>,
-    selected_agent: Option<Uuid>,
+    scope: Option<Uuid>,
     update: bool,
     key_args: &VaultKeyArgs,
     runtime: &str,
 ) -> Result<()> {
-    // 1. Resolve the target vault file (~/.alf/vault/credentials.json default).
+    // 1. Resolve the target vault file.
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
-        None => vault_key::default_vault_path()?,
+        None => vault_key::default_vault_path(scope)?,
     };
     if target
         .extension()
@@ -345,7 +355,7 @@ pub fn add(
     };
 
     // 3. Encrypt under the resolved key.
-    let (key, source) = vault_key::resolve_required(key_args, runtime)?;
+    let (key, source) = vault_key::resolve_required(key_args, runtime, scope)?;
     output::progress(&format!(
         "Encrypting with key from {} (fingerprint {})",
         source.label(),
@@ -358,7 +368,7 @@ pub fn add(
     // --agent / ALF_AGENT / sole enabled mapping row), else the nil UUID.
     let agent_uuid = match agent_id {
         Some(s) => Uuid::parse_str(s).context("agent-id is not a valid UUID")?,
-        None => selected_agent.unwrap_or_else(Uuid::nil),
+        None => scope.unwrap_or_else(Uuid::nil),
     };
     let record_label = label
         .map(str::to_string)
@@ -416,8 +426,9 @@ pub fn add(
         doc.credentials.push(record.clone());
     }
 
-    // 5. Write back with owner-only permissions (the file holds ciphertext,
-    //    but tightening to 0600 matches the vault key file).
+    // 5. Write back atomically with owner-only permissions (the file holds
+    //    ciphertext, but tightening to 0600 matches the vault key file; the
+    //    atomic temp+rename means a crash can never truncate the vault).
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)
@@ -426,7 +437,7 @@ pub fn add(
     }
     let serialized =
         serde_json::to_string_pretty(&doc).context("Failed to serialize credentials document")?;
-    write_private(&target, &serialized)
+    write_private_atomic(&target, &serialized)
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     if output::human_mode() {
@@ -483,8 +494,12 @@ struct DescriptorView {
     created_at: chrono::DateTime<Utc>,
 }
 
-pub fn list(input: &Path) -> Result<()> {
-    let doc = load_credentials_document(input)?;
+pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    let doc = load_credentials_document(&target)?;
 
     let views: Vec<DescriptorView> = doc
         .credentials
@@ -546,16 +561,21 @@ struct DecryptResult<'a> {
 }
 
 pub fn decrypt(
-    input: &Path,
+    input: Option<&Path>,
     selector: &Selector,
+    scope: Option<Uuid>,
     key_args: &VaultKeyArgs,
     runtime: &str,
     yes_insecure: bool,
 ) -> Result<()> {
-    let doc = load_credentials_document(input)?;
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    let doc = load_credentials_document(&target)?;
     let record = find_record(&doc, selector)?.clone();
 
-    let (key, source) = vault_key::resolve_required(key_args, runtime)?;
+    let (key, source) = vault_key::resolve_required(key_args, runtime, scope)?;
     output::progress(&format!(
         "Decrypting record {} using key from {} (fingerprint {})",
         record.id,
@@ -616,8 +636,17 @@ struct DeleteResult {
     written_to: Option<String>,
 }
 
-pub fn delete(input: &Path, selector: &Selector, out: Option<&Path>) -> Result<()> {
-    let mut doc = load_credentials_document(input)?;
+pub fn delete(
+    input: Option<&Path>,
+    selector: &Selector,
+    out: Option<&Path>,
+    scope: Option<Uuid>,
+) -> Result<()> {
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    let mut doc = load_credentials_document(&target)?;
     let target_id = find_record(&doc, selector)?.id;
     let removed_index = doc
         .credentials
@@ -626,7 +655,7 @@ pub fn delete(input: &Path, selector: &Selector, out: Option<&Path>) -> Result<(
         .expect("target_id came from doc");
     let removed = doc.credentials.remove(removed_index);
 
-    let output_path = out.unwrap_or(input);
+    let output_path = out.unwrap_or(&target);
     let serialized = serde_json::to_string_pretty(&doc).context("Failed to serialize document")?;
 
     // If the input is a .alf archive, deletion mutates only the
@@ -669,6 +698,525 @@ pub fn delete(input: &Path, selector: &Selector, out: Option<&Path>) -> Result<(
     }
 
     Ok(())
+}
+
+// ===========================================================================
+// rotate-key — re-encrypt every record under a new key (crash-safe)
+// ===========================================================================
+
+#[derive(Serialize)]
+struct RotateKeyResult {
+    ok: bool,
+    vault: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<Uuid>,
+    rotated: usize,
+    skipped_legacy: usize,
+    old_fingerprint: String,
+    new_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_key_written_to: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovered: Option<bool>,
+    next: &'static str,
+}
+
+/// Where the new key ends up — validated BEFORE any decryption.
+enum NewKeyDestination {
+    /// `--new-key-out PATH`.
+    WriteOut(PathBuf),
+    /// Generated key replacing the old default key file in place
+    /// (the 3-step crash-safe protocol).
+    InPlace(PathBuf),
+    /// `--new-key-file` — the caller owns the file, nothing to write.
+    NoWrite,
+}
+
+/// Rotate the vault key: decrypt every record under the old key, re-encrypt
+/// under the new one, stamp `last_rotated_at`. Any single decrypt failure
+/// aborts the whole rotation with the files untouched (fail closed).
+///
+/// Crash-safe in-place protocol: (1) new key to `<keypath>.new` (0600) —
+/// vault still opens with the old key; (2) atomic vault rewrite — the new
+/// key survives at `.new`; (3) rename `.new` over the keypath. A leftover
+/// `.new` that opens the vault is completed to step 3 on the next run
+/// (`recovered: true`). No key material is ever lost.
+#[allow(clippy::too_many_arguments)]
+pub fn rotate_key(
+    input: Option<&Path>,
+    new_key_file: Option<&Path>,
+    new_key_out: Option<&Path>,
+    force: bool,
+    scope: Option<Uuid>,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    if target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("alf"))
+        .unwrap_or(false)
+    {
+        bail!(
+            "Cannot rotate keys inside a .alf archive. Pass --in PATH to a \
+             credentials.json file, or restore the archive first."
+        );
+    }
+    let mut doc = load_credentials_document(&target)?;
+
+    // Self-heal a crashed previous rotation: a leftover `<keypath>.new` that
+    // opens the vault means steps 1–2 completed — finish step 3.
+    //
+    // The pending key was staged for the DEFAULT vault, so recovery only runs
+    // when this rotation targets it (no --in): validating the pending key
+    // against an unrelated --in document and deleting it on mismatch would
+    // destroy the only copy of a live vault key.
+    let mut recovered = false;
+    if let Some(keypath) = vault_key::default_key_path(runtime, scope)? {
+        let pending = stale_new_key_path(&keypath);
+        if pending.is_file() {
+            if input.is_some() {
+                output::progress(&format!(
+                    "  ! {} is left over from an interrupted rotation of the \
+                     default vault — leaving it untouched. Run rotate-key \
+                     without --in to recover it.",
+                    pending.display()
+                ));
+            } else {
+                match classify_pending_key(&pending, &doc)? {
+                    PendingKeyState::OpensAll => {
+                        fs::rename(&pending, &keypath).with_context(|| {
+                            format!(
+                                "Failed to complete interrupted rotation: rename {} to {}",
+                                pending.display(),
+                                keypath.display()
+                            )
+                        })?;
+                        output::progress(&format!(
+                            "  Recovered interrupted rotation: {} is now the vault key",
+                            keypath.display()
+                        ));
+                        recovered = true;
+                    }
+                    PendingKeyState::ProvablyStale => {
+                        // Steps 1–2 never both completed — the pending key
+                        // opens nothing the vault holds. Safe to discard.
+                        fs::remove_file(&pending).with_context(|| {
+                            format!("Failed to remove stale key file {}", pending.display())
+                        })?;
+                        output::progress(&format!(
+                            "  Removed stale {} from an aborted rotation",
+                            pending.display()
+                        ));
+                    }
+                    PendingKeyState::Indeterminate => {
+                        // Mixed or unverifiable state: the pending key may
+                        // guard records. Never delete a key that could be the
+                        // only copy — fail closed and let a human decide.
+                        return Err(CliError {
+                            code: codes::VAULT_ROTATE_FAILED,
+                            cause: format!(
+                                "An interrupted rotation left {} and the vault at {} \
+                                 cannot be verified against it (records under more \
+                                 than one key, or no ciphertext to test). Neither \
+                                 key file was touched.",
+                                pending.display(),
+                                target.display()
+                            ),
+                            remedy: format!(
+                                "Decrypt each record with the key that opens it \
+                                 (--vault-key-file {} or --vault-key-file {}) and \
+                                 re-add it, then delete the leftover .new file \
+                                 yourself and re-run rotate-key.",
+                                pending.display(),
+                                keypath.display()
+                            ),
+                        }
+                        .into());
+                    }
+                }
+            }
+        }
+    }
+
+    // Old key (file/env/per-agent default — unchanged order).
+    let (old_key, old_source) = vault_key::resolve_required(key_args, runtime, scope)?;
+
+    // New key: --new-key-file, else generated. Never read from stdin/argv,
+    // never printed — fingerprints only.
+    let (new_key, generated) = match new_key_file {
+        Some(p) => {
+            let raw = fs::read_to_string(p)
+                .with_context(|| format!("Failed to read new key file {}", p.display()))?;
+            let key = VaultKey::from_base64(&raw)
+                .map_err(|e| anyhow!("Invalid key in {}: {e}", p.display()))?;
+            (key, false)
+        }
+        None => (VaultKey::generate(), true),
+    };
+    if new_key.fingerprint() == old_key.fingerprint() {
+        bail!(
+            "The new key is identical to the old key (fingerprint {}). \
+             Nothing to rotate.",
+            new_key.fingerprint()
+        );
+    }
+
+    // Destination for the new key — decided BEFORE any decryption so a
+    // half-rotated vault can never exist without a persisted key.
+    let destination = match (new_key_out, generated, &old_source) {
+        (Some(out), _, source) => {
+            // Writing the new key over the OLD key's file before the vault is
+            // rewritten would destroy the only key that opens the current
+            // ciphertext if anything fails in between. The in-place protocol
+            // exists for exactly that case.
+            let old_key_file = match source {
+                KeySource::File(p) | KeySource::DefaultFile(p) => Some(p.as_path()),
+                _ => None,
+            };
+            if old_key_file.is_some_and(|p| paths_alias(p, out)) {
+                return Err(CliError {
+                    code: codes::VAULT_ROTATE_NO_DESTINATION,
+                    cause: format!(
+                        "--new-key-out points at the old key file ({}) — overwriting \
+                         it before the vault is rewritten could lose all key material.",
+                        out.display()
+                    ),
+                    remedy: "Omit --new-key-out to rotate the default vault in place \
+                             (crash-safe), or pass a different output path."
+                        .into(),
+                }
+                .into());
+            }
+            if out.is_file() && !force {
+                bail!(
+                    "Refusing to overwrite existing key file {}; pass --force to replace",
+                    out.display()
+                );
+            }
+            NewKeyDestination::WriteOut(out.to_path_buf())
+        }
+        (None, false, _) => NewKeyDestination::NoWrite,
+        (None, true, KeySource::DefaultFile(p)) if input.is_none() => {
+            NewKeyDestination::InPlace(p.clone())
+        }
+        (None, true, source) => {
+            return Err(CliError {
+                code: codes::VAULT_ROTATE_NO_DESTINATION,
+                cause: format!(
+                    "A new key was generated but there is nowhere safe to store it: \
+                     the old key came from {}.",
+                    source.label()
+                ),
+                remedy: "Pass --new-key-out PATH to write the generated key, or \
+                         --new-key-file PATH to rotate onto a key you already hold."
+                    .into(),
+            }
+            .into())
+        }
+    };
+
+    // Re-encrypt every record. Fail closed: one bad record aborts everything
+    // with the files untouched.
+    let now = Utc::now();
+    let mut rotated = 0usize;
+    let mut skipped_legacy = 0usize;
+    for record in &mut doc.credentials {
+        if record.encryption.algorithm == "none" || record.encrypted_payload == "<not-exported>" {
+            skipped_legacy += 1;
+            continue;
+        }
+        let plaintext = decrypt_record(record, &old_key).map_err(|e| {
+            anyhow::Error::from(CliError {
+                code: codes::VAULT_ROTATE_FAILED,
+                cause: format!(
+                    "Record {} (service={}) failed to decrypt under the old key: {e}. \
+                     The vault was NOT modified.",
+                    record.id, record.service
+                ),
+                remedy: "Every record must decrypt under one old key before rotation. \
+                         Decrypt-and-re-add the foreign record first (alf vault decrypt \
+                         / alf vault add), or rotate with the key that record uses."
+                    .into(),
+            })
+        })?;
+        let blob = encrypt_payload(&plaintext, &new_key, Algorithm::XChaCha20Poly1305)
+            .map_err(|e| anyhow!("Re-encryption failed for record {}: {e}", record.id))?;
+        record.encrypted_payload = blob.ciphertext_b64.clone();
+        record.encryption = blob.to_encryption_metadata();
+        record.last_rotated_at = Some(now);
+        rotated += 1;
+    }
+
+    let serialized =
+        serde_json::to_string_pretty(&doc).context("Failed to serialize credentials document")?;
+
+    // Ordered writes (the load-bearing part).
+    let mut new_key_written_to = None;
+    match &destination {
+        NewKeyDestination::InPlace(keypath) => {
+            let pending = stale_new_key_path(keypath);
+            write_private(&pending, &new_key.to_base64())
+                .with_context(|| format!("Failed to write {}", pending.display()))?; // (1)
+            write_private_atomic(&target, &serialized)
+                .with_context(|| format!("Failed to write {}", target.display()))?; // (2)
+            fs::rename(&pending, keypath).with_context(|| {
+                format!(
+                    "Vault re-encrypted; failed to rename {} to {}. Complete it \
+                     manually or re-run rotate-key to self-heal.",
+                    pending.display(),
+                    keypath.display()
+                )
+            })?; // (3)
+            new_key_written_to = Some(keypath.display().to_string());
+        }
+        NewKeyDestination::WriteOut(out) => {
+            if let Some(parent) = out.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("Failed to create {}", parent.display()))?;
+                }
+            }
+            write_private_atomic(out, &new_key.to_base64())
+                .with_context(|| format!("Failed to write {}", out.display()))?;
+            write_private_atomic(&target, &serialized)
+                .with_context(|| format!("Failed to write {}", target.display()))?;
+            new_key_written_to = Some(out.display().to_string());
+        }
+        NewKeyDestination::NoWrite => {
+            write_private_atomic(&target, &serialized)
+                .with_context(|| format!("Failed to write {}", target.display()))?;
+        }
+    }
+
+    let next = "Run 'alf sync' to upload the re-encrypted vault.";
+    if output::human_mode() {
+        println!("{} Rotated vault key", "✓".green().bold());
+        println!("  Vault:           {}", target.display());
+        println!("  Rotated:         {rotated} record(s)");
+        if skipped_legacy > 0 {
+            println!("  Skipped legacy:  {skipped_legacy} record(s) (no ciphertext)");
+        }
+        println!("  Old fingerprint: {}", old_key.fingerprint());
+        println!("  New fingerprint: {}", new_key.fingerprint());
+        if let Some(p) = &new_key_written_to {
+            println!("  New key file:    {p}");
+        }
+        println!();
+        println!("  {next}");
+        println!("  Point-in-time restores of pre-rotation sequences need the old key.");
+    } else {
+        output::json(&RotateKeyResult {
+            ok: true,
+            vault: target.display().to_string(),
+            agent_id: scope,
+            rotated,
+            skipped_legacy,
+            old_fingerprint: old_key.fingerprint(),
+            new_fingerprint: new_key.fingerprint(),
+            new_key_written_to,
+            recovered: recovered.then_some(true),
+            next,
+        });
+    }
+
+    Ok(())
+}
+
+/// Best-effort "same file" check: canonicalize both sides when possible; a
+/// not-yet-existing path is compared via its canonicalized parent + name.
+fn paths_alias(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| -> Option<PathBuf> {
+        if p.exists() {
+            fs::canonicalize(p).ok()
+        } else {
+            let parent = p.parent().filter(|q| !q.as_os_str().is_empty())?;
+            let name = p.file_name()?;
+            Some(fs::canonicalize(parent).ok()?.join(name))
+        }
+    };
+    match (canon(a), canon(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => a == b,
+    }
+}
+
+/// `<keypath>.new` — the staging name of the crash-safe protocol.
+fn stale_new_key_path(keypath: &Path) -> PathBuf {
+    let name = keypath
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| ".alf-vault-key".into());
+    keypath.with_file_name(format!("{name}.new"))
+}
+
+/// How a leftover `<keypath>.new` relates to the default vault's records.
+enum PendingKeyState {
+    /// Decrypts every rotatable record — steps 1–2 completed; finish step 3.
+    OpensAll,
+    /// Provably encrypted nothing the vault holds (opens zero of ≥1 rotatable
+    /// records, or is not a parseable key) — safe to discard.
+    ProvablyStale,
+    /// Mixed (opens some records) or unverifiable (no rotatable records) —
+    /// the pending key may guard data; never delete it automatically.
+    Indeterminate,
+}
+
+fn classify_pending_key(pending: &Path, doc: &CredentialsDocument) -> Result<PendingKeyState> {
+    let raw = fs::read_to_string(pending)
+        .with_context(|| format!("Failed to read {}", pending.display()))?;
+    let key = match VaultKey::from_base64(&raw) {
+        // Not a valid key ⇒ it cannot have sealed anything.
+        Err(_) => return Ok(PendingKeyState::ProvablyStale),
+        Ok(k) => k,
+    };
+    let mut opens = 0usize;
+    let mut rotatable = 0usize;
+    for record in &doc.credentials {
+        if record.encryption.algorithm == "none" || record.encrypted_payload == "<not-exported>" {
+            continue;
+        }
+        rotatable += 1;
+        if decrypt_record(record, &key).is_ok() {
+            opens += 1;
+        }
+    }
+    Ok(match (opens, rotatable) {
+        (_, 0) => PendingKeyState::Indeterminate, // nothing to verify against
+        (o, r) if o == r => PendingKeyState::OpensAll,
+        (0, _) => PendingKeyState::ProvablyStale,
+        _ => PendingKeyState::Indeterminate, // mixed — crash window plus later writes
+    })
+}
+
+// ===========================================================================
+// migrate — move a legacy install-scoped vault to per-agent paths
+// ===========================================================================
+
+#[derive(Serialize)]
+struct MigrateResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dry_run: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrated_vault: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    migrated_key: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    blocked: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+/// `alf vault migrate [-r RT] [--agent ALIAS-OR-ID] [--dry-run]`.
+///
+/// The explicit `--agent` (or `ALF_AGENT`) is the human decision that
+/// bypasses the ambiguity blocks (never the diverged-pair block). `--dry-run`
+/// reports the decision without writing. A blocked non-dry run is the coded
+/// `vault_migration_blocked` error.
+pub fn migrate(
+    config: &crate::config::Config,
+    runtime: &str,
+    agent: Option<&str>,
+    dry_run: bool,
+) -> Result<()> {
+    let explicit = crate::selector::explicit_agent_id(config, runtime, agent)?;
+
+    if dry_run {
+        let plan = vault_migrate::plan_migration(config, runtime, explicit)?;
+        let result = match plan {
+            MigrationPlan::NotNeeded => MigrateResult {
+                ok: true,
+                dry_run: Some(true),
+                migrated_vault: None,
+                migrated_key: None,
+                agent_id: None,
+                blocked: None,
+                hint: Some("No legacy vault or key present — nothing to migrate.".into()),
+            },
+            MigrationPlan::Blocked(err) => MigrateResult {
+                ok: true,
+                dry_run: Some(true),
+                migrated_vault: None,
+                migrated_key: None,
+                agent_id: None,
+                blocked: Some(err.cause),
+                hint: Some(err.remedy),
+            },
+            MigrationPlan::Move { agent, vault, key } => MigrateResult {
+                ok: true,
+                dry_run: Some(true),
+                migrated_vault: vault.map(|(_, to)| to.display().to_string()),
+                migrated_key: key.map(|(_, to)| to.display().to_string()),
+                agent_id: Some(agent),
+                blocked: None,
+                hint: None,
+            },
+        };
+        print_migrate(&result);
+        return Ok(());
+    }
+
+    match vault_migrate::ensure_migrated(config, runtime, explicit)? {
+        MigrationOutcome::NotNeeded => {
+            print_migrate(&MigrateResult {
+                ok: true,
+                dry_run: None,
+                migrated_vault: None,
+                migrated_key: None,
+                agent_id: None,
+                blocked: None,
+                hint: Some("No legacy vault or key present — nothing to migrate.".into()),
+            });
+            Ok(())
+        }
+        MigrationOutcome::Blocked(err) => Err(err.into()),
+        MigrationOutcome::Migrated { vault, key, agent } => {
+            print_migrate(&MigrateResult {
+                ok: true,
+                dry_run: None,
+                migrated_vault: vault.map(|p| p.display().to_string()),
+                migrated_key: key.map(|p| p.display().to_string()),
+                agent_id: Some(agent),
+                blocked: None,
+                hint: None,
+            });
+            Ok(())
+        }
+    }
+}
+
+fn print_migrate(result: &MigrateResult) {
+    if output::human_mode() {
+        if result.dry_run.is_some() {
+            println!("{} Migration preview (nothing written)", "▸".blue().bold());
+        } else {
+            println!("{} Vault migration", "✓".green().bold());
+        }
+        if let Some(v) = &result.migrated_vault {
+            println!("  Vault: {v}");
+        }
+        if let Some(k) = &result.migrated_key {
+            println!("  Key:   {k}");
+        }
+        if let Some(a) = &result.agent_id {
+            println!("  Agent: {a}");
+        }
+        if let Some(b) = &result.blocked {
+            println!("  Blocked: {b}");
+        }
+        if let Some(h) = &result.hint {
+            println!("  {h}");
+        }
+    } else {
+        output::json(result);
+    }
 }
 
 // ===========================================================================
@@ -873,7 +1421,7 @@ mod tests {
         let path = doc_with_records(vec![record]);
         // Run in JSON mode (the default) to avoid racing with other
         // tests that toggle ALF_HUMAN in the same process.
-        list(&path).unwrap();
+        list(Some(&path), None).unwrap();
     }
 
     #[test]
@@ -922,12 +1470,13 @@ mod tests {
         let path = doc_with_records(records);
 
         delete(
-            &path,
+            Some(&path),
             &Selector {
                 id: Some(record_id.to_string()),
                 label: None,
                 service: None,
             },
+            None,
             None,
         )
         .unwrap();
@@ -963,12 +1512,13 @@ mod tests {
         let path = doc_with_records(vec![record]);
 
         delete(
-            &path,
+            Some(&path),
             &Selector {
                 id: None,
                 label: Some("kleo@agent-life.run".into()),
                 service: None,
             },
+            None,
             None,
         )
         .unwrap();
@@ -1140,6 +1690,622 @@ mod tests {
             payload.extra.get("smtp_host").and_then(|v| v.as_str()),
             Some("smtp.x.com")
         );
+    }
+
+    // -- rotate-key (R-1..R-6) ------------------------------------------------
+
+    /// Seed a vault at `target` with `n` records encrypted under the key at
+    /// `key_path`, labeled `label-0..n`.
+    fn seed_vault(target: &Path, key_path: &Path, n: usize) {
+        let args = VaultKeyArgs {
+            key_file: Some(key_path.to_path_buf()),
+            ..Default::default()
+        };
+        for i in 0..n {
+            add(
+                Some(target),
+                "svc",
+                "api_key",
+                None,
+                Some(&format!("secret-{i}")),
+                None,
+                None,
+                Some(&format!("label-{i}")),
+                None,
+                &[],
+                &[],
+                None,
+                None,
+                false,
+                &args,
+                "openclaw",
+            )
+            .unwrap();
+        }
+    }
+
+    fn load_key(path: &Path) -> alf_core::VaultKey {
+        alf_core::VaultKey::from_base64(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    /// R-1: every record re-encrypts under the new key, `last_rotated_at` is
+    /// stamped, and the old key AEAD-fails afterwards.
+    #[test]
+    fn rotate_key_reencrypts_and_stamps_last_rotated_at() {
+        let dir = TempDir::new().unwrap();
+        let (old_key_path, old_key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &old_key_path, 2);
+
+        let new_out = dir.path().join("new.key");
+        let args = VaultKeyArgs {
+            key_file: Some(old_key_path.clone()),
+            ..Default::default()
+        };
+        rotate_key(
+            Some(&target),
+            None,
+            Some(&new_out),
+            false,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let new_key = load_key(&new_out);
+        let doc = read_doc(&target);
+        assert_eq!(doc.credentials.len(), 2);
+        for record in &doc.credentials {
+            assert!(record.last_rotated_at.is_some(), "must stamp rotation time");
+            assert!(
+                decrypt_record(record, &old_key).is_err(),
+                "old key must AEAD-fail after rotation"
+            );
+            let plaintext = decrypt_record(record, &new_key).expect("new key must open");
+            assert!(String::from_utf8_lossy(&plaintext).contains("secret-"));
+        }
+    }
+
+    /// R-2: one record under a foreign key aborts the whole rotation with the
+    /// file byte-identical and no `.tmp`/`.new`/out-file leftovers.
+    #[test]
+    fn rotate_key_foreign_record_aborts_whole_file() {
+        let dir = TempDir::new().unwrap();
+        let (key_a_path, _) = temp_key_file(&dir);
+        let foreign = alf_core::VaultKey::generate();
+        let foreign_path = dir.path().join("foreign-key");
+        write_private(&foreign_path, &foreign.to_base64()).unwrap();
+
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &key_a_path, 1);
+        // Second record under the foreign key.
+        let foreign_args = VaultKeyArgs {
+            key_file: Some(foreign_path),
+            ..Default::default()
+        };
+        add(
+            Some(&target),
+            "svc",
+            "api_key",
+            None,
+            Some("foreign-secret"),
+            None,
+            None,
+            Some("foreign-label"),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            &foreign_args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let before = std::fs::read(&target).unwrap();
+        let new_out = dir.path().join("new.key");
+        let args = VaultKeyArgs {
+            key_file: Some(key_a_path),
+            ..Default::default()
+        };
+        let err = rotate_key(
+            Some(&target),
+            None,
+            Some(&new_out),
+            false,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap_err();
+        let cli_err = err.downcast_ref::<CliError>().expect("coded error");
+        assert_eq!(cli_err.code, codes::VAULT_ROTATE_FAILED);
+        assert!(cli_err.cause.contains("svc"), "must name the service");
+
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            before,
+            "vault must be byte-identical after an aborted rotation"
+        );
+        assert!(!new_out.exists(), "no new key file on abort");
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp") || n.ends_with(".new"))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp leftovers: {leftovers:?}");
+    }
+
+    /// R-3: legacy metadata-only records (`algorithm: "none"`) pass through
+    /// untouched as `skipped_legacy`.
+    #[test]
+    fn rotate_key_passes_legacy_records_through() {
+        let dir = TempDir::new().unwrap();
+        let (old_key_path, _) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &old_key_path, 1);
+
+        // Inject a legacy metadata-only record.
+        let mut doc = read_doc(&target);
+        doc.credentials.push(CredentialRecord {
+            id: Uuid::new_v4(),
+            agent_id: Uuid::nil(),
+            service: "legacy".into(),
+            credential_type: CredentialType::ApiKey,
+            encrypted_payload: "<not-exported>".into(),
+            encryption: alf_core::EncryptionMetadata {
+                algorithm: "none".into(),
+                nonce: String::new(),
+                kdf: None,
+                kdf_params: None,
+                extra: Default::default(),
+            },
+            created_at: Utc::now(),
+            label: None,
+            description: None,
+            capabilities_granted: vec![],
+            updated_at: None,
+            last_rotated_at: None,
+            expires_at: None,
+            tags: vec![],
+            extra: Default::default(),
+        });
+        std::fs::write(&target, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+        let new_out = dir.path().join("new.key");
+        let args = VaultKeyArgs {
+            key_file: Some(old_key_path),
+            ..Default::default()
+        };
+        rotate_key(
+            Some(&target),
+            None,
+            Some(&new_out),
+            false,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let after = read_doc(&target);
+        let legacy = after
+            .credentials
+            .iter()
+            .find(|c| c.service == "legacy")
+            .unwrap();
+        assert_eq!(legacy.encrypted_payload, "<not-exported>");
+        assert_eq!(legacy.encryption.algorithm, "none");
+        assert!(legacy.last_rotated_at.is_none(), "skipped, not rotated");
+        let rotated = after
+            .credentials
+            .iter()
+            .find(|c| c.service == "svc")
+            .unwrap();
+        assert!(rotated.last_rotated_at.is_some());
+    }
+
+    /// R-4: refuses a same-key rotation, and a generated key with a
+    /// non-default-file old source requires an explicit destination.
+    #[test]
+    fn rotate_key_refuses_same_key_and_requires_destination() {
+        let dir = TempDir::new().unwrap();
+        let (old_key_path, _) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &old_key_path, 1);
+
+        let args = VaultKeyArgs {
+            key_file: Some(old_key_path.clone()),
+            ..Default::default()
+        };
+
+        // Same key as old and new.
+        let err = rotate_key(
+            Some(&target),
+            Some(&old_key_path),
+            None,
+            false,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("identical"));
+
+        // Generated key + explicit-file old key ⇒ nowhere safe to store it.
+        let err =
+            rotate_key(Some(&target), None, None, false, None, &args, "openclaw").unwrap_err();
+        let cli_err = err.downcast_ref::<CliError>().expect("coded error");
+        assert_eq!(cli_err.code, codes::VAULT_ROTATE_NO_DESTINATION);
+        assert!(cli_err.remedy.contains("--new-key-out"));
+        assert!(cli_err.remedy.contains("--new-key-file"));
+    }
+
+    /// R-5: default-file old key rotates in place via the ordered 3-step
+    /// protocol, and a stale `.new` from a crashed step-2/step-3 window
+    /// self-heals on the next run.
+    #[test]
+    fn rotate_key_in_place_replacement_and_stale_new_self_heal() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let _restore = crate::context::tests::RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::env::remove_var("ALF_VAULT_KEY");
+
+        let agent = Uuid::parse_str("cfef1150-0000-4000-8000-0000000000ab").unwrap();
+        let keypath = vault_key::default_key_path("openclaw", Some(agent))
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir_all(keypath.parent().unwrap()).unwrap();
+        let old_key = alf_core::VaultKey::generate();
+        write_private(&keypath, &old_key.to_base64()).unwrap();
+
+        // Seed the default per-agent vault through the default-file key.
+        let target = vault_key::default_vault_path(Some(agent)).unwrap();
+        add(
+            None,
+            "svc",
+            "api_key",
+            None,
+            Some("in-place-secret"),
+            None,
+            None,
+            Some("in-place"),
+            None,
+            &[],
+            &[],
+            None,
+            Some(agent),
+            false,
+            &VaultKeyArgs::default(),
+            "openclaw",
+        )
+        .unwrap();
+
+        // In-place rotation: no flags at all.
+        rotate_key(
+            None,
+            None,
+            None,
+            false,
+            Some(agent),
+            &VaultKeyArgs::default(),
+            "openclaw",
+        )
+        .unwrap();
+
+        let current_key = load_key(&keypath);
+        assert_ne!(current_key.fingerprint(), old_key.fingerprint());
+        let doc = read_doc(&target);
+        assert!(decrypt_record(&doc.credentials[0], &current_key).is_ok());
+        assert!(decrypt_record(&doc.credentials[0], &old_key).is_err());
+        let pending = keypath.with_file_name(".alf-vault-key.new");
+        assert!(!pending.exists(), "protocol must consume the .new file");
+
+        // Simulate a crash between step 2 and step 3: the vault is under a
+        // NEW key that only exists at `.new`; the keypath still holds the
+        // now-dead key.
+        let next_key = alf_core::VaultKey::generate();
+        let mut doc = read_doc(&target);
+        for record in &mut doc.credentials {
+            let plaintext = decrypt_record(record, &current_key).unwrap();
+            let blob =
+                encrypt_payload(&plaintext, &next_key, Algorithm::XChaCha20Poly1305).unwrap();
+            record.encrypted_payload = blob.ciphertext_b64.clone();
+            record.encryption = blob.to_encryption_metadata();
+        }
+        std::fs::write(&target, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        write_private(&pending, &next_key.to_base64()).unwrap();
+
+        // The next rotation self-heals (completes step 3) and then rotates.
+        rotate_key(
+            None,
+            None,
+            None,
+            false,
+            Some(agent),
+            &VaultKeyArgs::default(),
+            "openclaw",
+        )
+        .unwrap();
+        assert!(!pending.exists(), "recovery must consume the .new file");
+        let healed_key = load_key(&keypath);
+        let doc = read_doc(&target);
+        assert!(
+            decrypt_record(&doc.credentials[0], &healed_key).is_ok(),
+            "the key at the default path must open the vault after recovery"
+        );
+    }
+
+    /// Review fix: recovery only runs when the rotation targets the DEFAULT
+    /// vault — a pending .new must never be validated against (and deleted
+    /// because of) an unrelated --in document.
+    #[test]
+    fn rotate_recovery_skipped_for_in_target() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let _restore = crate::context::tests::RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::env::remove_var("ALF_VAULT_KEY");
+
+        let agent = Uuid::parse_str("cfef1150-0000-4000-8000-0000000000ac").unwrap();
+        let keypath = vault_key::default_key_path("openclaw", Some(agent))
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir_all(keypath.parent().unwrap()).unwrap();
+        write_private(&keypath, &alf_core::VaultKey::generate().to_base64()).unwrap();
+        // The only copy of a live key from a crashed default-vault rotation.
+        let pending = keypath.with_file_name(".alf-vault-key.new");
+        let live = alf_core::VaultKey::generate();
+        write_private(&pending, &live.to_base64()).unwrap();
+
+        // Rotate an unrelated --in vault; the pending key must survive.
+        let dir = TempDir::new().unwrap();
+        let (in_key_path, _) = temp_key_file(&dir);
+        let target = dir.path().join("other.json");
+        seed_vault(&target, &in_key_path, 1);
+        let out = dir.path().join("out.key");
+        rotate_key(
+            Some(&target),
+            None,
+            Some(&out),
+            false,
+            Some(agent),
+            &VaultKeyArgs {
+                key_file: Some(in_key_path),
+                ..Default::default()
+            },
+            "openclaw",
+        )
+        .unwrap();
+
+        assert!(
+            pending.is_file(),
+            "--in rotation must not touch the default vault's pending key"
+        );
+        assert_eq!(load_key(&pending).fingerprint(), live.fingerprint());
+    }
+
+    /// Review fix: a pending key that opens SOME records (mixed vault) or
+    /// that cannot be verified (no rotatable records) is never deleted —
+    /// rotation fails closed instead of destroying possibly-live key material.
+    #[test]
+    fn rotate_recovery_never_deletes_mixed_or_unverifiable_pending() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let _restore = crate::context::tests::RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::env::remove_var("ALF_VAULT_KEY");
+
+        let agent = Uuid::parse_str("cfef1150-0000-4000-8000-0000000000ad").unwrap();
+        let keypath = vault_key::default_key_path("openclaw", Some(agent))
+            .unwrap()
+            .unwrap();
+        std::fs::create_dir_all(keypath.parent().unwrap()).unwrap();
+        let k1 = alf_core::VaultKey::generate();
+        write_private(&keypath, &k1.to_base64()).unwrap();
+
+        // One record under the keypath key…
+        let target = vault_key::default_vault_path(Some(agent)).unwrap();
+        add(
+            None,
+            "svc",
+            "api_key",
+            None,
+            Some("k1-secret"),
+            None,
+            None,
+            Some("k1-record"),
+            None,
+            &[],
+            &[],
+            None,
+            Some(agent),
+            false,
+            &VaultKeyArgs {
+                key_file: Some(keypath.clone()),
+                ..Default::default()
+            },
+            "openclaw",
+        )
+        .unwrap();
+        // …plus one under the pending key ⇒ mixed vault.
+        let pending_key = alf_core::VaultKey::generate();
+        let mut doc = read_doc(&target);
+        let blob = encrypt_payload(
+            b"pending-sealed",
+            &pending_key,
+            Algorithm::XChaCha20Poly1305,
+        )
+        .unwrap();
+        let mut mixed = doc.credentials[0].clone();
+        mixed.id = Uuid::new_v4();
+        mixed.label = Some("pending-record".into());
+        mixed.encrypted_payload = blob.ciphertext_b64.clone();
+        mixed.encryption = blob.to_encryption_metadata();
+        doc.credentials.push(mixed);
+        std::fs::write(&target, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+        let pending = keypath.with_file_name(".alf-vault-key.new");
+        write_private(&pending, &pending_key.to_base64()).unwrap();
+
+        let err = rotate_key(
+            None,
+            None,
+            None,
+            false,
+            Some(agent),
+            &VaultKeyArgs::default(),
+            "openclaw",
+        )
+        .unwrap_err();
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::VAULT_ROTATE_FAILED);
+        assert!(
+            pending.is_file(),
+            "a possibly-live pending key must never be deleted (mixed vault)"
+        );
+
+        // Unverifiable: an empty vault gives nothing to test against.
+        std::fs::write(
+            &target,
+            serde_json::to_string_pretty(&CredentialsDocument {
+                credentials: vec![],
+                extra: Default::default(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let err = rotate_key(
+            None,
+            None,
+            None,
+            false,
+            Some(agent),
+            &VaultKeyArgs::default(),
+            "openclaw",
+        )
+        .unwrap_err();
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::VAULT_ROTATE_FAILED);
+        assert!(
+            pending.is_file(),
+            "an unverifiable pending key must never be deleted (empty vault)"
+        );
+    }
+
+    /// Review fix: --new-key-out aimed at the old key's own file is refused —
+    /// overwriting it before the vault rewrite could lose all key material.
+    #[test]
+    fn rotate_refuses_new_key_out_at_old_key_path() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let _restore = crate::context::tests::RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::env::remove_var("ALF_VAULT_KEY");
+
+        let dir = TempDir::new().unwrap();
+        let (old_key_path, old_key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &old_key_path, 1);
+        let args = VaultKeyArgs {
+            key_file: Some(old_key_path.clone()),
+            ..Default::default()
+        };
+        let err = rotate_key(
+            Some(&target),
+            None,
+            Some(&old_key_path),
+            true,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap_err();
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::VAULT_ROTATE_NO_DESTINATION);
+        assert_eq!(
+            load_key(&old_key_path).fingerprint(),
+            old_key.fingerprint(),
+            "the old key file must be untouched"
+        );
+        let doc = read_doc(&target);
+        assert!(
+            decrypt_record(&doc.credentials[0], &old_key).is_ok(),
+            "the vault must be untouched"
+        );
+    }
+
+    /// Write-path pin: records are sealed under raw keys only — no KDF is
+    /// ever stamped onto a freshly added record.
+    #[test]
+    fn records_carry_no_kdf_on_write() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        let args = VaultKeyArgs {
+            key_file: Some(key_path),
+            ..Default::default()
+        };
+        add(
+            Some(&target),
+            "svc",
+            "api_key",
+            None,
+            Some("s"),
+            None,
+            None,
+            Some("no-kdf"),
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            false,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+
+        let doc = read_doc(&target);
+        assert!(doc.credentials[0].encryption.kdf.is_none());
+        assert!(doc.credentials[0].encryption.kdf_params.is_none());
+    }
+
+    /// R-6: diff_credentials classifies every rotated record as UPDATED —
+    /// the contract that makes the next sync carry the re-encrypted Layer 4
+    /// without any sync.rs change.
+    #[test]
+    fn rotate_key_diff_classifies_every_record_updated() {
+        let dir = TempDir::new().unwrap();
+        let (old_key_path, _) = temp_key_file(&dir);
+        let target = dir.path().join("credentials.json");
+        seed_vault(&target, &old_key_path, 3);
+
+        let pre = read_doc(&target);
+        let new_out = dir.path().join("new.key");
+        let args = VaultKeyArgs {
+            key_file: Some(old_key_path),
+            ..Default::default()
+        };
+        rotate_key(
+            Some(&target),
+            None,
+            Some(&new_out),
+            false,
+            None,
+            &args,
+            "openclaw",
+        )
+        .unwrap();
+        let post = read_doc(&target);
+
+        let diff = alf_core::diff_credentials(Some(&pre), Some(&post));
+        assert!(diff.created.is_empty());
+        assert!(diff.deleted.is_empty());
+        assert_eq!(diff.updated.len(), 3, "every id must classify as updated");
     }
 
     #[test]

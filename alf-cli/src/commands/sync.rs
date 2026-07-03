@@ -287,6 +287,11 @@ pub fn run(
         selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?;
     selector::require_enabled_for_sync(&selected)?;
 
+    // WP1: move any legacy vault/key to the per-agent layout before export —
+    // adapters read only per-agent vault paths (no legacy fallback), so an
+    // unmigrated vault would silently drop Layer 4 from the upload.
+    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
+
     let client = ApiClient::from_config(&config)?;
     let outcome = sync_one(
         &client,
@@ -336,6 +341,10 @@ fn run_all(
     human: bool,
 ) -> Result<()> {
     let selected = selector::select_all_enabled(config, adapt, runtime, install)?;
+
+    // WP1: one migration pass for the runtime before any agent exports.
+    crate::vault_migrate::require_migrated(config, runtime)?;
+
     let client = ApiClient::from_config(config)?;
 
     let mut results = Vec::with_capacity(selected.len());

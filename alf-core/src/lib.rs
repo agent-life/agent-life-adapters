@@ -43,8 +43,8 @@ pub use archive::{
 };
 pub use credentials::*;
 pub use crypto::{
-    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob, VaultKey,
-    VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
+    decrypt_record, encrypt_payload, Algorithm, CryptoError, EncryptedBlob, VaultKey, VaultPayload,
+    VAULT_PAYLOAD_VERSION,
 };
 pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,
@@ -58,7 +58,7 @@ pub use include::{
 pub use manifest::*;
 pub use memory::*;
 pub use partition::{PartitionAssigner, PartitionReader, PartitionWriter};
-pub use paths::home_dir;
+pub use paths::{agent_vault_path, home_dir, legacy_vault_path};
 pub use principals::*;
 pub use rebuild::rebuild_snapshot;
 pub use validation::*;

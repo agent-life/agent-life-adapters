@@ -85,12 +85,13 @@ pub fn import(
             // `alf-vault` tag — restore them to the agent vault file as-is
             // (still encrypted, no key needed). The rest came from the
             // runtime's auth profiles and need the key to decrypt.
+            let doc_extra = doc.extra.clone();
             let (vault_records, auth_records): (Vec<_>, Vec<_>) = doc
                 .credentials
                 .into_iter()
                 .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
 
-            let vaulted = restore_agent_vault(vault_records, workspace)?;
+            let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
             if vaulted > 0 {
                 warnings.push(format!(
                     "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -326,14 +327,19 @@ fn restore_credentials(
 }
 
 /// Restore `alf-vault`-tagged records — accounts the agent added with
-/// `alf vault add` — into the agent's ALF vault
-/// (`~/.alf/vault/credentials.json`).
+/// `alf vault add` — into the archive agent's own ALF vault
+/// (`~/.alf/vault/{agent_id}/credentials.json`).
 ///
 /// Records stay AEAD-encrypted exactly as the archive carried them: no vault
 /// key is required, and the agent decrypts on demand with `alf vault decrypt`.
-/// This is the write-twin of `export::load_agent_vault`.
+/// Full overwrite (D6): the archive is the truth for THIS agent — per-agent
+/// scoping is what makes that safe. The archive doc's `extra` is preserved
+/// verbatim (unknown doc-level fields survive every restore). This is the
+/// write-twin of `export::load_agent_vault`.
 fn restore_agent_vault(
     records: Vec<alf_core::CredentialRecord>,
+    doc_extra: std::collections::HashMap<String, serde_json::Value>,
+    agent_id: uuid::Uuid,
     workspace: &Path,
 ) -> Result<usize> {
     if records.is_empty() {
@@ -342,14 +348,14 @@ fn restore_agent_vault(
     let count = records.len();
     let doc = alf_core::CredentialsDocument {
         credentials: records,
-        extra: std::collections::HashMap::new(),
+        extra: doc_extra,
     };
 
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
     let target = alf_core::home_dir()
-        .map(|h| h.join(".alf").join("vault").join("credentials.json"))
+        .map(|h| alf_core::agent_vault_path(&h, agent_id))
         .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
 
     if let Some(parent) = target.parent() {
@@ -583,6 +589,94 @@ mod tests {
             std::env::set_var("HOME", home.path());
             home
         });
+    }
+
+    /// Minimal vault document JSON: one `alf-vault`-tagged record, optionally
+    /// carrying an unknown doc-level extra field.
+    fn vault_doc(agent_id: &str, label: &str, with_extra: bool) -> String {
+        let extra = if with_extra {
+            r#","future_doc_field":"kept""#.to_string()
+        } else {
+            String::new()
+        };
+        format!(
+            r#"{{"credentials":[{{
+                "id":"{agent_id}","agent_id":"{agent_id}",
+                "service":"email","credential_type":"account",
+                "encrypted_payload":"Q0lQSEVS",
+                "encryption":{{"algorithm":"xchacha20-poly1305","nonce":"Tk9OQ0U="}},
+                "created_at":"2026-01-01T00:00:00Z",
+                "label":"{label}","tags":["alf-vault"]
+            }}]{extra}}}"#
+        )
+    }
+
+    /// A-1 (WP1): export reads ONLY the exporting agent's per-agent vault —
+    /// a decoy under another agent's directory must not leak into Layer 4.
+    #[test]
+    fn export_reads_per_agent_vault() {
+        isolate_home();
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nhi"),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
+        let my_id = "cfef1150-aaaa-4aaa-8aaa-0000000000a1";
+        let other_id = "cfef1150-aaaa-4aaa-8aaa-0000000000a2";
+        fs::write(ws.path().join(".alf-agent-id"), my_id).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let mine = alf_core::agent_vault_path(&home, my_id.parse().unwrap());
+        fs::create_dir_all(mine.parent().unwrap()).unwrap();
+        fs::write(&mine, vault_doc(my_id, "mine", false)).unwrap();
+        let decoy = alf_core::agent_vault_path(&home, other_id.parse().unwrap());
+        fs::create_dir_all(decoy.parent().unwrap()).unwrap();
+        fs::write(&decoy, vault_doc(other_id, "decoy", false)).unwrap();
+
+        let alf_file = ws.path().join("export.alf");
+        export::export(ws.path(), &alf_file).unwrap();
+
+        let mut reader = alf_core::AlfReader::new(fs::File::open(&alf_file).unwrap()).unwrap();
+        let doc = reader.read_credentials().unwrap().expect("Layer 4 present");
+        assert_eq!(doc.credentials.len(), 1);
+        assert_eq!(doc.credentials[0].label.as_deref(), Some("mine"));
+    }
+
+    /// A-2 (WP1): import restores alf-vault records to the archive agent's
+    /// own per-agent vault path, fully overwriting a stale local vault (D6)
+    /// while preserving the archive doc's unknown extra fields.
+    #[test]
+    fn import_restores_vault_to_per_agent_path_full_overwrite_preserving_extra() {
+        isolate_home();
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nhi"),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
+        let my_id = "cfef1150-aaaa-4aaa-8aaa-0000000000a3";
+        fs::write(ws.path().join(".alf-agent-id"), my_id).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let vault = alf_core::agent_vault_path(&home, my_id.parse().unwrap());
+        fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        fs::write(&vault, vault_doc(my_id, "from-archive", true)).unwrap();
+
+        let alf_file = ws.path().join("export.alf");
+        export::export(ws.path(), &alf_file).unwrap();
+
+        // Stale local state that must NOT survive the restore.
+        fs::write(&vault, vault_doc(my_id, "stale-local", false)).unwrap();
+
+        let target = TempDir::new().unwrap();
+        import(&alf_file, target.path(), None).unwrap();
+
+        let doc: alf_core::CredentialsDocument =
+            serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
+        assert_eq!(doc.credentials.len(), 1, "full overwrite, no merge");
+        assert_eq!(doc.credentials[0].label.as_deref(), Some("from-archive"));
+        assert_eq!(
+            doc.extra.get("future_doc_field"),
+            Some(&serde_json::json!("kept")),
+            "unknown doc-level extra must survive restore"
+        );
     }
 
     #[test]

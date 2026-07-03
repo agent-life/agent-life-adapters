@@ -44,9 +44,8 @@ pub struct SelectedAgent {
     pub alf_agent_id: Uuid,
     pub alias: String,
     pub workspace: PathBuf,
-    /// Not read by WP0 command wiring yet — WP1 threads it into per-agent
-    /// vault/key paths.
-    #[allow(dead_code)]
+    /// The runtime this selection belongs to — WP1 threads it into the
+    /// legacy-vault migration trigger and per-agent vault/key paths.
     pub runtime: String,
     /// Fresh-discovery match when available, else synthesized
     /// (`InWorkspaceFiles`) from the mapping row.
@@ -144,32 +143,71 @@ pub fn resolve_for_cloud_op(
     Ok(sole_enabled_row(config, runtime)?.alf_agent_id)
 }
 
-/// Lenient selection for `alf vault add`/`encrypt` (no lazy init — no
-/// workspace context): an explicit `--agent`/`ALF_AGENT` selector must
-/// resolve (alias via mapping, unknown UUID passes through); with no selector
-/// the sole enabled row applies, else `None` (the caller keeps its nil-UUID
-/// default).
-pub fn vault_default_agent_id(
+/// Strict vault scope resolution (WP1, no lazy init — no workspace context).
+///
+/// Vault and key default paths depend on the agent scope, so commands that
+/// consult a default path resolve it strictly (design §3: "alf stops and
+/// asks"): an explicit `--agent`/`ALF_AGENT` selector must resolve (alias via
+/// mapping, unknown UUID passes through); no selector + empty mapping ⇒
+/// `Ok(None)` (the only route to legacy install-scoped paths); no selector +
+/// exactly one enabled row ⇒ that row; rows-but-0-or->1-enabled ⇒ the same
+/// coded errors as [`sole_enabled_row`].
+pub fn vault_scope_agent_id(
+    config: &Config,
+    runtime: &str,
+    agent_flag: Option<&str>,
+) -> Result<Option<Uuid>> {
+    if let Some(id) = explicit_agent_id(config, runtime, agent_flag)? {
+        return Ok(Some(id));
+    }
+    if config.agents_for_runtime(runtime).is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(sole_enabled_row(config, runtime)?.alf_agent_id))
+}
+
+/// Explicit-only selection: the `--agent` flag or `ALF_AGENT`, resolved via
+/// the mapping (alias or id; an unmapped raw UUID passes through). `Ok(None)`
+/// when no selector was given — `alf vault migrate` uses this so an absent
+/// selector leaves the migration decision table in charge.
+pub fn explicit_agent_id(
     config: &Config,
     runtime: &str,
     agent_flag: Option<&str>,
 ) -> Result<Option<Uuid>> {
     let selector = agent_flag.map(str::to_string).or_else(env_agent);
-    if let Some(sel) = selector {
-        if let Some(row) = config.find_agent(runtime, &sel) {
-            return Ok(Some(row.alf_agent_id));
+    match selector {
+        Some(sel) => {
+            if let Some(row) = config.find_agent(runtime, &sel) {
+                return Ok(Some(row.alf_agent_id));
+            }
+            if let Ok(id) = Uuid::parse_str(&sel) {
+                return Ok(Some(id));
+            }
+            Err(agent_not_found(runtime, &sel, config).into())
         }
-        if let Ok(id) = Uuid::parse_str(&sel) {
-            return Ok(Some(id));
-        }
-        return Err(agent_not_found(runtime, &sel, config).into());
+        None => Ok(None),
     }
-    let enabled: Vec<&AgentEntry> = config
-        .agents_for_runtime(runtime)
-        .into_iter()
-        .filter(|r| r.enabled)
-        .collect();
-    Ok((enabled.len() == 1).then(|| enabled[0].alf_agent_id))
+}
+
+/// Lenient wrapper for commands with an explicit `--in` target: an ambiguous
+/// or all-disabled mapping resolves to `None` instead of erroring (the key
+/// default-file step then simply won't resolve; explicit selectors still
+/// error on an unknown alias).
+pub fn vault_scope_agent_id_lenient(
+    config: &Config,
+    runtime: &str,
+    agent_flag: Option<&str>,
+) -> Result<Option<Uuid>> {
+    match vault_scope_agent_id(config, runtime, agent_flag) {
+        Ok(v) => Ok(v),
+        Err(err) => match err.downcast_ref::<CliError>().map(|e| e.code) {
+            // Only the no-selector cases produce these codes; explicit
+            // selector failures (agent_not_found) keep erroring.
+            Some(codes::NO_AGENTS) | Some(codes::AGENT_SELECTION_AMBIGUOUS) => Ok(None),
+            _ => Err(err),
+        },
+    }
 }
 
 /// The sync enabled-gate: refuse a disabled selection.
@@ -717,28 +755,97 @@ mod tests {
         assert!(adhoc);
     }
 
+    /// Strict scope: an empty mapping is the only route to `None` (legacy
+    /// install-scoped paths).
     #[test]
-    fn vault_default_agent_id_is_lenient_without_selector() {
+    fn vault_scope_none_when_mapping_empty() {
         let _guard = HOME_LOCK.lock().unwrap();
         let _restore = RestoreEnv::snapshot();
         std::env::remove_var("ALF_AGENT");
 
-        // No mapping ⇒ None (caller keeps the nil-UUID default), never an error.
         let config = Config::default();
         assert_eq!(
-            vault_default_agent_id(&config, "openclaw", None).unwrap(),
+            vault_scope_agent_id(&config, "openclaw", None).unwrap(),
             None
         );
 
-        // Sole enabled row ⇒ its id.
-        let config = config_with(vec![entry("main", uuid(1), "/ws", true)]);
+        // Explicit unknown alias must still error even on an empty mapping…
+        let err = vault_scope_agent_id(&config, "openclaw", Some("ghost")).unwrap_err();
+        assert_eq!(code_of(&err), codes::AGENT_NOT_FOUND);
+        // …and an unmapped raw UUID passes through.
         assert_eq!(
-            vault_default_agent_id(&config, "openclaw", None).unwrap(),
+            vault_scope_agent_id(&config, "openclaw", Some(&uuid(9).to_string())).unwrap(),
+            Some(uuid(9))
+        );
+    }
+
+    #[test]
+    fn vault_scope_sole_enabled() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        std::env::remove_var("ALF_AGENT");
+
+        let config = config_with(vec![
+            entry("main", uuid(1), "/ws", true),
+            entry("helper", uuid(2), "/ws-h", false),
+        ]);
+        assert_eq!(
+            vault_scope_agent_id(&config, "openclaw", None).unwrap(),
             Some(uuid(1))
         );
+        // Explicit alias resolves — including a disabled one.
+        assert_eq!(
+            vault_scope_agent_id(&config, "openclaw", Some("helper")).unwrap(),
+            Some(uuid(2))
+        );
+    }
 
-        // Explicit unknown alias must still error.
-        let err = vault_default_agent_id(&config, "openclaw", Some("ghost")).unwrap_err();
+    /// D9: strict scope errors on ambiguity — commands whose default paths
+    /// depend on the selection must stop and ask.
+    #[test]
+    fn vault_scope_ambiguous_is_coded_error() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        std::env::remove_var("ALF_AGENT");
+
+        let config = config_with(vec![
+            entry("main", uuid(1), "/ws", true),
+            entry("helper", uuid(2), "/ws-h", true),
+        ]);
+        let err = vault_scope_agent_id(&config, "openclaw", None).unwrap_err();
+        assert_eq!(code_of(&err), codes::AGENT_SELECTION_AMBIGUOUS);
+
+        // Rows exist but none enabled ⇒ the no-agents coded error.
+        let config = config_with(vec![entry("main", uuid(1), "/ws", false)]);
+        let err = vault_scope_agent_id(&config, "openclaw", None).unwrap_err();
+        assert_eq!(code_of(&err), codes::NO_AGENTS);
+    }
+
+    /// The lenient wrapper (explicit `--in` targets) maps the no-selector
+    /// ambiguity/no-agents cases to `None` but keeps explicit-selector errors.
+    #[test]
+    fn vault_scope_lenient_maps_ambiguity_to_none() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        std::env::remove_var("ALF_AGENT");
+
+        let config = config_with(vec![
+            entry("main", uuid(1), "/ws", true),
+            entry("helper", uuid(2), "/ws-h", true),
+        ]);
+        assert_eq!(
+            vault_scope_agent_id_lenient(&config, "openclaw", None).unwrap(),
+            None
+        );
+
+        let config = config_with(vec![entry("main", uuid(1), "/ws", false)]);
+        assert_eq!(
+            vault_scope_agent_id_lenient(&config, "openclaw", None).unwrap(),
+            None
+        );
+
+        // Explicit unknown alias still errors.
+        let err = vault_scope_agent_id_lenient(&config, "openclaw", Some("ghost")).unwrap_err();
         assert_eq!(code_of(&err), codes::AGENT_NOT_FOUND);
     }
 }

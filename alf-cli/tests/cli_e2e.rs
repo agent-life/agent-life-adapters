@@ -1415,6 +1415,874 @@ fn vault_add_defaults_record_agent_id_to_selection() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Per-agent vault (WP1): per-agent default paths, isolation, migration,
+// rotate-key. Every test runs with its own HOME.
+// ---------------------------------------------------------------------------
+
+/// The agent's default vault file under `home`.
+fn agent_vault(home: &std::path::Path, id: &str) -> std::path::PathBuf {
+    home.join(".alf")
+        .join("vault")
+        .join(id)
+        .join("credentials.json")
+}
+
+/// The agent's default openclaw vault-key file under `home`.
+fn agent_key(home: &std::path::Path, id: &str) -> std::path::PathBuf {
+    home.join(".openclaw")
+        .join("state")
+        .join(id)
+        .join(".alf-vault-key")
+}
+
+/// `alf vault keygen --out <path>` under `home`.
+fn keygen_at(home: &std::path::Path, path: &std::path::Path) {
+    alf_cmd()
+        .env("HOME", home)
+        .arg("vault")
+        .arg("keygen")
+        .arg("--out")
+        .arg(path)
+        .assert()
+        .success();
+}
+
+/// E-1: with a sole enabled agent and a key at the per-agent default path,
+/// a bare `vault add` (no key flags, no --in) lands in the per-agent vault.
+#[test]
+fn vault_add_defaults_to_per_agent_vault_path() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-1111-4111-8111-000000000001";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("me@example.com")
+        .arg("--secret")
+        .arg("hunter2")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["ok"], true);
+
+    let vault_path = agent_vault(&home, id);
+    assert_eq!(
+        v["written_to"].as_str().unwrap(),
+        vault_path.to_str().unwrap(),
+        "must write to the per-agent vault"
+    );
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&vault_path).unwrap()).unwrap();
+    assert_eq!(doc["credentials"][0]["agent_id"], id);
+}
+
+/// E-2: the secret can arrive on stdin (no --secret flag on the argv secret
+/// surface) and round-trips through a bare decrypt.
+#[test]
+fn vault_add_secret_via_stdin_round_trips() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-1111-4111-8111-000000000002";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("stdin-label")
+        .write_stdin("s3cret-from-stdin\n")
+        .assert()
+        .success();
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("stdin-label")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["payload"]["secret"], "s3cret-from-stdin");
+}
+
+/// E-3 (DoD): two agents get distinct default keys and vaults, auto-picked
+/// with no key flags; a cross-agent key fails closed at the AEAD layer.
+#[test]
+fn two_agents_distinct_default_keys_and_vaults() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws_a = tmp.path().join("ws-a");
+    let ws_b = tmp.path().join("ws-b");
+    let a = "cfef1150-2222-4222-8222-00000000000a";
+    let b = "cfef1150-2222-4222-8222-00000000000b";
+    write_config(
+        &home,
+        false,
+        None,
+        &[("main", a, &ws_a, true), ("helper", b, &ws_b, true)],
+    );
+    keygen_at(&home, &agent_key(&home, a));
+    keygen_at(&home, &agent_key(&home, b));
+
+    let add = |agent: &str, secret: &str| {
+        alf_cmd()
+            .env("HOME", &home)
+            .arg("--agent")
+            .arg(agent)
+            .arg("vault")
+            .arg("add")
+            .arg("-r")
+            .arg("openclaw")
+            .arg("--service")
+            .arg("email")
+            .arg("--label")
+            .arg("shared-label")
+            .arg("--secret")
+            .arg(secret)
+            .assert()
+            .success();
+    };
+    add("main", "secret-a");
+    add("helper", "secret-b");
+
+    assert!(agent_vault(&home, a).is_file());
+    assert!(agent_vault(&home, b).is_file());
+
+    // Own agent, auto key: opens.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("shared-label")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["payload"]["secret"], "secret-a");
+
+    // Cross-agent key: fails closed at the AEAD layer.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("shared-label")
+        .arg("--yes-insecure")
+        .arg("--vault-key-file")
+        .arg(agent_key(&home, b))
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert!(
+        v["error"].as_str().unwrap().contains("Decryption failed"),
+        "cross-agent key must AEAD-fail: {v}"
+    );
+}
+
+/// E-4 (D9): a default-path vault command with two enabled agents and no
+/// selector stops and asks with the coded ambiguity error.
+#[test]
+fn vault_add_ambiguous_selection_errors() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws_a = tmp.path().join("ws-a");
+    let ws_b = tmp.path().join("ws-b");
+    let a = "cfef1150-3333-4333-8333-00000000000a";
+    let b = "cfef1150-3333-4333-8333-00000000000b";
+    write_config(
+        &home,
+        false,
+        None,
+        &[("main", a, &ws_a, true), ("helper", b, &ws_b, true)],
+    );
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("email")
+        .arg("--secret")
+        .arg("s")
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert_eq!(v["code"], "agent_selection_ambiguous");
+}
+
+/// E-5 (DoD): per-agent round-trip — add → export carries only the agent's
+/// Layer 4 → wipe → import re-creates the per-agent vault → decrypt with the
+/// agent's default key.
+#[test]
+fn per_agent_round_trip_export_import() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws_a = tmp.path().join("ws-a");
+    let ws_b = tmp.path().join("ws-b");
+    let a = "cfef1150-4444-4444-8444-00000000000a";
+    let b = "cfef1150-4444-4444-8444-00000000000b";
+    seed_workspace(&ws_a, Some(a));
+    seed_workspace(&ws_b, Some(b));
+    write_config(
+        &home,
+        false,
+        None,
+        &[("main", a, &ws_a, true), ("helper", b, &ws_b, true)],
+    );
+    keygen_at(&home, &agent_key(&home, a));
+    keygen_at(&home, &agent_key(&home, b));
+
+    let add = |agent: &str, label: &str, secret: &str| {
+        alf_cmd()
+            .env("HOME", &home)
+            .arg("--agent")
+            .arg(agent)
+            .arg("vault")
+            .arg("add")
+            .arg("-r")
+            .arg("openclaw")
+            .arg("--service")
+            .arg("email")
+            .arg("--label")
+            .arg(label)
+            .arg("--secret")
+            .arg(secret)
+            .assert()
+            .success();
+    };
+    add("main", "label-a", "secret-A");
+    add("helper", "label-b", "secret-B");
+
+    let archive_a = tmp.path().join("a.alf");
+    let archive_b = tmp.path().join("b.alf");
+    for (agent, out) in [("main", &archive_a), ("helper", &archive_b)] {
+        alf_cmd()
+            .env("HOME", &home)
+            .arg("--agent")
+            .arg(agent)
+            .arg("export")
+            .arg("-r")
+            .arg("openclaw")
+            .arg("-o")
+            .arg(out)
+            .assert()
+            .success();
+    }
+
+    // Layer-4 isolation: each archive holds only its own agent's records.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("list")
+        .arg("--in")
+        .arg(&archive_a)
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["count"], 1);
+    assert_eq!(v["credentials"][0]["label"], "label-a");
+
+    // Wipe every local vault, then restore agent A's from its archive.
+    fs::remove_dir_all(home.join(".alf").join("vault")).unwrap();
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("import")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--agent")
+        .arg("main")
+        .arg(&archive_a)
+        .assert()
+        .success();
+
+    assert!(agent_vault(&home, a).is_file(), "a's vault re-created");
+    assert!(!agent_vault(&home, b).exists(), "b's vault stays wiped");
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("label-a")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["payload"]["secret"], "secret-A");
+}
+
+/// E-6 (DoD): a wrong-agent restore fails closed; the UUID escape hatch
+/// lands the records in the ARCHIVE agent's own vault dir, never the
+/// victim's; a cross-agent key still AEAD-fails on the restored records.
+#[test]
+fn wrong_agent_restore_fails_closed() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws_a = tmp.path().join("ws-a");
+    let a = "cfef1150-5555-4555-8555-00000000000a";
+    let c = "cfef1150-5555-4555-8555-00000000000c"; // unmapped foreign agent
+    seed_workspace(&ws_a, Some(a));
+    write_config(&home, false, None, &[("main", a, &ws_a, true)]);
+    keygen_at(&home, &agent_key(&home, a));
+    keygen_at(&home, &agent_key(&home, c));
+
+    // Seed c's vault (raw-UUID scope passthrough) and export c's archive from
+    // an ad-hoc foreign workspace.
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg(c)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("c-label")
+        .arg("--secret")
+        .arg("c-secret")
+        .assert()
+        .success();
+    let ws_c = tmp.path().join("ws-c");
+    seed_workspace(&ws_c, Some(c));
+    let archive_c = tmp.path().join("c.alf");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("export")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&ws_c)
+        .arg("-o")
+        .arg(&archive_c)
+        .assert()
+        .success();
+
+    // Wipe local vaults so the restore's writes are unambiguous.
+    fs::remove_dir_all(home.join(".alf").join("vault")).unwrap();
+
+    // 1. Importing c's archive as the mapped agent fails closed.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("import")
+        .arg("-r")
+        .arg("openclaw")
+        .arg(&archive_c)
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert!(
+        v["error"].as_str().unwrap().contains("Refusing to import"),
+        "must fail closed: {v}"
+    );
+
+    // 2. The UUID escape hatch imports it as ITS OWN agent: records land in
+    //    c's vault dir, never a's.
+    let restored_ws = tmp.path().join("restored-c");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("import")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("-w")
+        .arg(&restored_ws)
+        .arg("--agent")
+        .arg(c)
+        .arg(&archive_c)
+        .assert()
+        .success();
+    assert!(agent_vault(&home, c).is_file(), "c's own vault dir");
+    assert!(!agent_vault(&home, a).exists(), "never the victim's dir");
+
+    // 3. AEAD backstop: a's key cannot open c's restored records.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("decrypt")
+        .arg("--in")
+        .arg(agent_vault(&home, c))
+        .arg("--label")
+        .arg("c-label")
+        .arg("--yes-insecure")
+        .arg("--vault-key-file")
+        .arg(agent_key(&home, a))
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert!(v["error"].as_str().unwrap().contains("Decryption failed"));
+}
+
+/// E-7: rotate-key end-to-end — default-file old key, in-place replacement,
+/// no-flag decrypt under the new key, fingerprints + next in the JSON; a
+/// fabricated crash window self-heals with `recovered: true`.
+#[test]
+fn vault_rotate_key_e2e() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-6666-4666-8666-000000000001";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    let key_path = agent_key(&home, id);
+    keygen_at(&home, &key_path);
+    let old_key_content = fs::read_to_string(&key_path).unwrap();
+
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("rot-label")
+        .arg("--secret")
+        .arg("rot-secret")
+        .assert()
+        .success();
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("rotate-key")
+        .arg("-r")
+        .arg("openclaw")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["rotated"], 1);
+    assert_ne!(v["old_fingerprint"], v["new_fingerprint"]);
+    assert!(v["next"].as_str().unwrap().contains("alf sync"));
+    assert_eq!(
+        v["new_key_written_to"].as_str().unwrap(),
+        key_path.to_str().unwrap()
+    );
+    assert_ne!(
+        fs::read_to_string(&key_path).unwrap(),
+        old_key_content,
+        "the default key file must hold the new key"
+    );
+
+    // No-flag decrypt under the new key.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("rot-label")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["payload"]["secret"], "rot-secret");
+
+    // Fabricate the crash-after-step-2 window: re-encrypt the vault under a
+    // key that exists only at `<keypath>.new` (exactly what --new-key-out to
+    // that path produces), leaving the dead key at the default path.
+    let pending = key_path.with_file_name(".alf-vault-key.new");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("rotate-key")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--new-key-out")
+        .arg(&pending)
+        .assert()
+        .success();
+    assert!(pending.is_file());
+
+    // The next rotation self-heals (recovered: true) and completes.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("rotate-key")
+        .arg("-r")
+        .arg("openclaw")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["recovered"], true);
+    assert!(!pending.exists(), "recovery must consume the .new file");
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("rot-label")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["payload"]["secret"], "rot-secret");
+}
+
+/// M-1 (DoD): a legacy single-agent install migrates transparently on the
+/// first bare vault command — the vault and key files relocate verbatim, and
+/// flag-less default key resolution keeps opening pre-migration records.
+#[test]
+fn legacy_single_agent_migrates_transparently_no_flags() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+
+    // Pre-migration state: a legacy vault holding one record sealed under
+    // what becomes the legacy install-scoped key (seeded via --in and a
+    // scratch key file, so the seeding itself never trips the migration
+    // gate), plus that key at the legacy path.
+    let kf = tmp.path().join("seed.key");
+    keygen_at(&home, &kf);
+    let legacy_vault = home.join(".alf").join("vault").join("credentials.json");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--in")
+        .arg(&legacy_vault)
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("legacy-label")
+        .arg("--secret")
+        .arg("legacy-secret")
+        .arg("--vault-key-file")
+        .arg(&kf)
+        .assert()
+        .success();
+    let legacy_key = home.join(".openclaw").join("state").join(".alf-vault-key");
+    fs::create_dir_all(legacy_key.parent().unwrap()).unwrap();
+    fs::copy(&kf, &legacy_key).unwrap();
+    let legacy_key_content = fs::read_to_string(&legacy_key).unwrap();
+
+    // The upgrade: a mapping row appears (as alf check would create it).
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-7777-4777-8777-000000000001";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+
+    // Bare add (no key flags): migrates, then encrypts under the migrated
+    // per-agent default key.
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("github")
+        .arg("--label")
+        .arg("new-label")
+        .arg("--secret")
+        .arg("new-secret")
+        .assert()
+        .success();
+
+    // Files relocated; key bytes unchanged.
+    assert!(!legacy_vault.exists(), "legacy vault must be gone");
+    assert!(!legacy_key.exists(), "legacy key must be gone");
+    assert!(agent_vault(&home, id).is_file());
+    assert_eq!(
+        fs::read_to_string(agent_key(&home, id)).unwrap(),
+        legacy_key_content,
+        "key content must move verbatim"
+    );
+
+    // Continuity: flag-less decrypt (default key resolution) opens BOTH the
+    // pre-migration and post-migration records.
+    for (label, secret) in [
+        ("legacy-label", "legacy-secret"),
+        ("new-label", "new-secret"),
+    ] {
+        let assert = alf_cmd()
+            .env("HOME", &home)
+            .arg("vault")
+            .arg("decrypt")
+            .arg("-r")
+            .arg("openclaw")
+            .arg("--label")
+            .arg(label)
+            .arg("--yes-insecure")
+            .assert()
+            .success();
+        assert_eq!(json_stdout(&assert)["payload"]["secret"], secret);
+    }
+
+    // Idempotence: a second bare command does not re-migrate or fail.
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("list")
+        .arg("-r")
+        .arg("openclaw")
+        .assert()
+        .success();
+}
+
+/// M-2: two enabled agents block the automatic migration with the exact
+/// `alf vault migrate` remedy; following it resolves the block.
+#[test]
+fn legacy_two_enabled_blocks_with_migrate_remedy() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws_a = tmp.path().join("ws-a");
+    let ws_b = tmp.path().join("ws-b");
+    let a = "cfef1150-8888-4888-8888-00000000000a";
+    let b = "cfef1150-8888-4888-8888-00000000000b";
+    write_config(
+        &home,
+        false,
+        None,
+        &[("main", a, &ws_a, true), ("helper", b, &ws_b, true)],
+    );
+
+    // Legacy vault + key (seeded via --in, which stays lenient).
+    let kf = tmp.path().join("seed.key");
+    keygen_at(&home, &kf);
+    let legacy_vault = home.join(".alf").join("vault").join("credentials.json");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--in")
+        .arg(&legacy_vault)
+        .arg("--service")
+        .arg("email")
+        .arg("--label")
+        .arg("legacy-label")
+        .arg("--secret")
+        .arg("legacy-secret")
+        .arg("--vault-key-file")
+        .arg(&kf)
+        .assert()
+        .success();
+    let legacy_key = home.join(".openclaw").join("state").join(".alf-vault-key");
+    fs::create_dir_all(legacy_key.parent().unwrap()).unwrap();
+    fs::copy(&kf, &legacy_key).unwrap();
+
+    // Even an explicit --agent on the triggering command must NOT pick the
+    // migration target (D5) — the op blocks with the migrate remedy.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("x")
+        .arg("--secret")
+        .arg("y")
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert_eq!(v["code"], "vault_migration_blocked");
+    assert!(v["hint"].as_str().unwrap().contains("alf vault migrate"));
+    assert!(legacy_vault.is_file(), "nothing moved while blocked");
+
+    // The human decision resolves it.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("migrate")
+        .arg("-r")
+        .arg("openclaw")
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["agent_id"], a);
+    assert!(!legacy_vault.exists());
+    assert!(agent_vault(&home, a).is_file());
+    assert!(agent_key(&home, a).is_file());
+
+    // And the blocked command now works with the migrated default key.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("--agent")
+        .arg("main")
+        .arg("vault")
+        .arg("decrypt")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("legacy-label")
+        .arg("--yes-insecure")
+        .assert()
+        .success();
+    assert_eq!(json_stdout(&assert)["payload"]["secret"], "legacy-secret");
+}
+
+/// M-3: another runtime's legacy key blocks the automatic migration even
+/// with a sole enabled agent (the legacy vault is runtime-neutral).
+#[test]
+fn cross_runtime_evidence_blocks() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let a = "cfef1150-9999-4999-8999-00000000000a";
+    write_config(&home, false, None, &[("main", a, &ws, true)]);
+
+    let kf = tmp.path().join("seed.key");
+    keygen_at(&home, &kf);
+    let legacy_vault = home.join(".alf").join("vault").join("credentials.json");
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--in")
+        .arg(&legacy_vault)
+        .arg("--service")
+        .arg("email")
+        .arg("--secret")
+        .arg("s")
+        .arg("--vault-key-file")
+        .arg(&kf)
+        .assert()
+        .success();
+    // Cross-runtime evidence: a zeroclaw legacy key.
+    keygen_at(
+        &home,
+        &home.join(".zeroclaw").join("state").join(".alf-vault-key"),
+    );
+
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("add")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--service")
+        .arg("x")
+        .arg("--secret")
+        .arg("y")
+        .arg("--vault-key-file")
+        .arg(&kf)
+        .assert()
+        .failure();
+    let v = json_stdout(&assert);
+    assert_eq!(v["code"], "vault_migration_blocked");
+    assert!(
+        v["error"].as_str().unwrap().contains("zeroclaw"),
+        "must name the other runtime's evidence: {v}"
+    );
+    assert!(v["hint"].as_str().unwrap().contains("alf vault migrate"));
+}
+
+/// M-5: unknown doc-level extra fields survive a `vault delete` rewrite
+/// (forward-compat hygiene: the rewrite round-trips fields it doesn't know).
+#[test]
+fn doc_extra_survives_vault_delete_rewrite() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-aaaa-4aaa-8aaa-0000000000f5";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+
+    let add = |label: &str| {
+        alf_cmd()
+            .env("HOME", &home)
+            .arg("vault")
+            .arg("add")
+            .arg("-r")
+            .arg("openclaw")
+            .arg("--service")
+            .arg("email")
+            .arg("--label")
+            .arg(label)
+            .arg("--secret")
+            .arg("s")
+            .assert()
+            .success();
+    };
+    add("first");
+    add("second");
+
+    // Inject an unknown doc-level field (as a future alf version might).
+    let vault_path = agent_vault(&home, id);
+    let mut doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&vault_path).unwrap()).unwrap();
+    doc["future_doc_field"] = serde_json::json!("kept");
+    fs::write(&vault_path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+
+    alf_cmd()
+        .env("HOME", &home)
+        .arg("vault")
+        .arg("delete")
+        .arg("-r")
+        .arg("openclaw")
+        .arg("--label")
+        .arg("first")
+        .assert()
+        .success();
+
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&vault_path).unwrap()).unwrap();
+    assert_eq!(doc["credentials"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        doc["future_doc_field"], "kept",
+        "unknown doc-level extra must survive the delete rewrite"
+    );
+}
+
 /// IN-4 (local half): `restore --dry-run` bails cleanly when no API key is
 /// configured and never creates the target workspace.
 #[test]

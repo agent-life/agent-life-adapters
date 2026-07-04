@@ -208,6 +208,59 @@ class ZeroClawKit(FrameworkKit):
                 conn.close()
         return {"count": 0, "source": "no brain.db"}
 
+    # -- Z8 / Z12 (WP3 multi-agent + restore) --------------------------------------
+
+    def create_agent(self, ctr, slot: str) -> None:
+        """Configure a second agent. `zeroclaw agents create <alias>` writes a
+        config-only `[agents.<alias>]` block (no brain.db row — that appears when
+        the slot is first seeded). We run the framework CLI, then ensure the
+        declared block exists host-side so discovery sees the agent regardless of
+        the CLI's exact output on this pin."""
+        ctr.exec(["zeroclaw", "agents", "create", slot], timeout=60)
+        text = self._config.read_text(encoding="utf-8") if self._config.is_file() else ""
+        if f"[agents.{slot}]" not in text:
+            block = (
+                f"\n[agents.{slot}]\n"
+                'model_provider = "custom.agentlife"\n'
+                'risk_profile = "assistant"\n'
+                'runtime_profile = "assistant"\n'
+                'channels = ["cli"]\n'
+            )
+            self._config.write_text(text + block, encoding="utf-8")
+
+    def mutate_slice(self, ctr, slot: str, round: int) -> None:
+        """Diverge the slot's brain.db slice from its archive so restore has
+        something to correct: rewrite one row's content and delete another —
+        BOTH scoped to the slot's own agent_id, leaving every other agent's rows
+        untouched. FTS is maintained by the update/delete triggers."""
+        if not self._db.is_file():
+            raise RuntimeError(f"mutate_slice: {self._db} does not exist")
+        conn = sqlite3.connect(self._db)
+        try:
+            where, params = self._slot_scope(conn, slot)
+            keys = [
+                r[0]
+                for r in conn.execute(
+                    f"SELECT key FROM memories WHERE {where} ORDER BY key", params
+                ).fetchall()
+            ]
+            if not keys:
+                raise RuntimeError(f"mutate_slice: no rows for slot '{slot}'")
+            # Corrupt the first row's content (restore must overwrite it).
+            conn.execute(
+                f"UPDATE memories SET content = ? WHERE {where} AND key = ?",
+                ("[[MUTATED — should be overwritten by restore]]", *params, keys[0]),
+            )
+            # Delete the last row (restore must bring it back in total mode).
+            if len(keys) > 1:
+                conn.execute(
+                    f"DELETE FROM memories WHERE {where} AND key = ?",
+                    (*params, keys[-1]),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+
     # -- alf addressing ------------------------------------------------------------
 
     def alf_target_args(self, slot: str) -> list:

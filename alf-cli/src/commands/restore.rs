@@ -26,7 +26,7 @@ use crate::vault_migrate;
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
-use alf_core::{FileEntry, ImportOptions};
+use alf_core::{FileEntry, ImportOptions, RestoreMode};
 
 use anyhow::Context;
 use anyhow::Result;
@@ -232,6 +232,7 @@ pub fn run(
     agent_arg: Option<&str>,
     at_sequence: Option<u64>,
     dry_run: bool,
+    mode: RestoreMode,
     key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
@@ -338,6 +339,7 @@ pub fn run(
     }
     let import_options = ImportOptions {
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
+        mode,
     };
     let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
 

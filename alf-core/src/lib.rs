@@ -34,8 +34,8 @@ pub mod validation;
 
 pub use adapter::{
     ensure_workspace_agent_id, verify_archive_agent, Adapter, AgentBinding, ArchiveEnumeration,
-    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, WorkspaceEnumeration,
-    AGENT_ID_FILE,
+    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode,
+    WorkspaceEnumeration, AGENT_ID_FILE,
 };
 pub use archive::{
     safe_extract_path, AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter,

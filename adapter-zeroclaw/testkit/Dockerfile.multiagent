@@ -10,7 +10,9 @@
 # Inspect: ./inspect.sh   (build + run + capture into captured/)
 FROM debian:bookworm-slim
 
-ARG ZEROCLAW_REF=master
+# Pinned to the verified target (capture plan D11). The captured/ artifacts and
+# the alf adapter are validated against ZeroClaw v0.8.2.
+ARG ZEROCLAW_REF=v0.8.2
 ENV DEBIAN_FRONTEND=noninteractive
 
 RUN apt-get update \

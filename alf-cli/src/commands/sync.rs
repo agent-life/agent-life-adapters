@@ -449,9 +449,11 @@ fn sync_one(
     // and the mapping must agree on who this agent is.
     check_identity_drift(selected)?;
 
-    let (workspace, _adhoc) = selector::effective_workspace(selected, workspace_flag);
+    let (workspace, adhoc) = selector::effective_workspace(selected, workspace_flag);
 
-    if !workspace.exists() {
+    // A mapped per-agent workspace is adapter-owned and may not exist yet
+    // (`export_agent` creates it); only validate an explicit -w target.
+    if adhoc && !workspace.exists() {
         bail!(
             "Workspace directory does not exist: {}",
             workspace.display()

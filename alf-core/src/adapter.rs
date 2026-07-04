@@ -56,6 +56,24 @@ pub struct ImportReport {
 // Import options
 // ---------------------------------------------------------------------------
 
+/// How an adapter that restores into a live per-agent store should reconcile
+/// the archive's records with rows already present for that agent.
+///
+/// Only adapters with a mutable per-agent store (WP3 ZeroClaw `brain.db`) act
+/// on this; file/markdown adapters ignore it. `Total` is the default so a bare
+/// restore reproduces the backup exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreMode {
+    /// Transactional delete-slice-then-insert: the agent's end state equals the
+    /// archive. Rows written locally after the backup are dropped.
+    #[default]
+    Total,
+    /// Per-agent upsert (`ON CONFLICT(agent_id, key) DO UPDATE`): archive rows
+    /// win on conflict, but local-only rows written after the backup survive.
+    Merge,
+}
+
 /// Optional inputs for an import run.
 ///
 /// `vault_key`, when supplied, tells the adapter to decrypt
@@ -63,9 +81,13 @@ pub struct ImportReport {
 /// plaintext into the target runtime's native credential storage. When
 /// absent, adapters preserve the legacy behavior of reporting credentials
 /// without writing them.
+///
+/// `mode` governs how a live per-agent store is reconciled with the archive
+/// (WP3 ZeroClaw restore); adapters without a mutable store ignore it.
 #[derive(Default)]
 pub struct ImportOptions<'a> {
     pub vault_key: Option<&'a VaultKey>,
+    pub mode: RestoreMode,
 }
 
 // ---------------------------------------------------------------------------

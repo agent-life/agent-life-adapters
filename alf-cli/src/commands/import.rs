@@ -6,7 +6,7 @@ use crate::output;
 use crate::selector;
 use crate::vault_key::{self, VaultKeyArgs};
 use crate::vault_migrate;
-use alf_core::ImportOptions;
+use alf_core::{ImportOptions, RestoreMode};
 use anyhow::{bail, Result};
 use colored::Colorize;
 use serde::Serialize;
@@ -31,6 +31,7 @@ pub fn run(
     alf_file: &Path,
     workspace_flag: Option<&Path>,
     agent: Option<&str>,
+    mode: RestoreMode,
     key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
@@ -129,6 +130,7 @@ pub fn run(
     }
     let options = ImportOptions {
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
+        mode,
     };
     // Importing into the selected agent's own workspace fails closed on a
     // wrong-agent archive; an ad-hoc -w target keeps the legacy path.

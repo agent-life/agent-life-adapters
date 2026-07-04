@@ -1,13 +1,14 @@
 """Stage registry Z1–Z13 (work definition §6; Z-ids canonical per D11).
 
-All thirteen slots are registered; Z5–Z12 raise SkipStage naming the owning
-WP so `--full` renders them as planned slots, never invisible. Z1–Z4 + Z13
-are the WP2 pilot scope. ONE execution path: assertions are identical in
-automated and interactive modes (D8) — the narrator only adds rendering.
+All thirteen slots are implemented for the ZeroClaw pilot (WP3): Z1–Z4 + Z13
+were the WP2 scope; Z5–Z12 (round-2 memory, vault, delta sync, the second
+agent, cross-agent isolation, per-agent vault, and restore) land with the WP3
+adapter fix. Backend-dependent stages raise SkipStage on `--backend none`.
+ONE execution path: assertions are identical in automated and interactive modes
+(D8) — the narrator only adds rendering.
 
-The ZeroClaw pilot carries exactly one pre-registered XFAIL:
-`wp3-brain-db-extraction` (v1.0.0's adapter does not capture real brain.db
-rows — fixing it IS WP3's goal; this stage hands WP3 its red→green test).
+WP3 flipped the pilot XFAIL (`wp3-brain-db-extraction`) to a plain PASS at Z4:
+the adapter now reads the real brain.db, so all four markers reach the archive.
 """
 
 from __future__ import annotations
@@ -15,11 +16,9 @@ from __future__ import annotations
 import time
 import tomllib
 
-from . import archives, scenario, snapshots, verify
+from . import archives, scenario, snapshots, sqlite_util, verify
 from .contract import SkipStage
 from .report import Check, StageResult
-
-XFAIL_BRAIN_DB = "wp3-brain-db-extraction"
 
 
 # ---------------------------------------------------------------------------
@@ -232,8 +231,12 @@ def z03_alf_check(run, result: StageResult):
                          f"[[agents]] rows={len(mapping)}"))
     agent_id = str(mapping[0].get("alf_agent_id", "")) if mapping else ""
     ws = mapping[0].get("workspace", "") if mapping else ""
-    result.add(_passfail(ws == kit.home_mount,
-                         "mapped workspace == install root (WP0 fallback)", ws))
+    # WP3 discovery maps each agent to a per-agent workspace under the install
+    # root (`<install>/agents/<alias>/workspace`) so each carries its own
+    # `.alf-agent-id` pin; the shared brain.db is the memory source.
+    result.add(_passfail(ws.startswith(kit.home_mount) and "/agents/" in ws,
+                         "mapped workspace is the per-agent workspace under the install root",
+                         ws))
     run.state["alf_agent_id"] = agent_id
 
     # Manifest-before-registration invariant (STRICTLY before Z4).
@@ -254,11 +257,14 @@ def z03_alf_check(run, result: StageResult):
         result.add(Check(name="⊙ laziness probe", status="SKIP",
                          detail="backend=none (CI tier)"))
 
-    # Framework home untouched — except alf's own `.alf-agent-id` pin, which
-    # v1.0.0 writes into the workspace at check time (observed behavior;
-    # deviation from the plan's literal 'zero changes' noted in the README).
+    # Framework home untouched — except alf's own `.alf-agent-id` pin(s), which
+    # `alf check` write-throughs into each discovered agent's workspace. Under
+    # WP3 the per-agent workspace is `agents/<alias>/workspace/`, so the pin
+    # lands there rather than at the install root (see the mapped-workspace
+    # assertion above); tolerate the pin wherever it lands.
     d = snapshots.diff(before, after)
-    only_pin = d["added"] in ([], [".alf-agent-id"]) and not d["removed"] and not d["changed"]
+    only_pin = (all(a.split("/")[-1] == ".alf-agent-id" for a in d["added"])
+                and not d["removed"] and not d["changed"])
     result.add(_passfail(only_pin,
                          "framework home unchanged by check (allowing alf's .alf-agent-id pin)",
                          str(d)))
@@ -345,34 +351,309 @@ def z04_first_sync(run, result: StageResult):
         result.add(_passfail(raw_cfg in names,
                              "parity (green): archive holds the raw framework config",
                              f"{len(names)} entries"))
-        # The pilot XFAIL: brain.db markers in the memory layer (D4).
+        # WP3: the zeroclaw adapter now reads the real brain.db, so all four
+        # markers land in the memory layer. This was the pilot XFAIL
+        # (`wp3-brain-db-extraction`) — flipped to a plain PASS now that the
+        # extraction ships. A partial fix (n<4) FAILs, never XFAILs.
         marks = scenario.markers(slot, 1)
         hits = archives.scan_markers(host_alf, marks, prefix="memory/")
         found = [m for m, where in hits.items() if where]
-        if len(found) == len(marks):
-            result.add(Check(
-                name="parity: memory layer carries the 4 brain.db markers",
-                status="XPASS", xfail_id=XFAIL_BRAIN_DB,
-                detail="known gap now passes — WP3 must flip the registration deliberately"))
-        else:
-            result.add(Check(
-                name="parity: memory layer carries the 4 brain.db markers",
-                status="XFAIL", xfail_id=XFAIL_BRAIN_DB,
-                detail=f"{len(found)}/4 markers in memory/*; v1.0.0 zeroclaw adapter "
-                       f"does not read the real brain.db — WP3's exit criterion"))
+        result.add(_passfail(
+            len(found) == len(marks),
+            "parity: memory layer carries the 4 brain.db markers",
+            f"{len(found)}/{len(marks)} markers in memory/*"))
         nar.show_data("export entries", names[:12])
     else:
         result.add(_passfail(False, "alf export copy-out readable on the host"))
 
 
 # ---------------------------------------------------------------------------
-# Z5–Z12 — planned slots (owned by WP3–5; never invisible)
+# Z5 — second round of marked memories (append-shaped)
 # ---------------------------------------------------------------------------
 
-def _planned(reason: str, wp: str):
-    def stage(run, result: StageResult):
-        raise SkipStage(reason, wp=wp)
-    return stage
+def z05_second_round(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    slot = kit.agent_slots[0]
+    nar.explain("""
+        Round 2 appends four NEW marked memories. It is append-shaped by design:
+        the round-1 rows stay, so a later delta (Z7) is exactly the round-2 rows.
+    """)
+    if run.llm == "proxy":
+        for turn in scenario.turns(slot, round=2):
+            log = kit.llm_turn(run.container, slot, turn)
+            from .redact import redact
+            result.add(_passfail(log.ok, f"round-2 turn {turn.turn_type} ({turn.marker})",
+                                 redact(log.response_tail)[:80]))
+    else:
+        kit.seed_markers(run.container, slot, round=2)
+        result.add(Check(name="round-2 marker rows seeded (append-shaped)", status="PASS"))
+
+    dump = kit.dump_memory(run.container, slot)
+    v2 = verify.check_coverage({slot: dump}, round=2)
+    result.add(_passfail(v2.covered == v2.total,
+                         f"round-2 coverage via the framework's own store = {v2.coverage}"))
+    v1 = verify.check_coverage({slot: dump}, round=1)
+    result.add(_passfail(v1.covered == v1.total,
+                         "round-1 markers still present (append-shaped, not replaced)"))
+
+
+# ---------------------------------------------------------------------------
+# Z6 — alf vault add / decrypt / list (key-file only)
+# ---------------------------------------------------------------------------
+
+def z06_vault(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    slot = kit.agent_slots[0]
+    agent_id = run.state.get("alf_agent_id", "")
+    nar.explain("""
+        `alf vault add / decrypt / list` on the current agent. The per-agent key
+        is a LOCAL key file (WP1: ~/.<rt>/state/<alf_agent_id>/.alf-vault-key) —
+        no service, no runtime key emission (that ships with the runtimes
+        release). Stored values are obviously FAKE.
+    """)
+    key_path = f"{kit.home_mount}/state/{agent_id}/.alf-vault-key"
+    run.container.sh(f"mkdir -p {kit.home_mount}/state/{agent_id}")
+    run.container.exec_json(["alf", "vault", "keygen", "--out", key_path])
+    result.add(_passfail(run.container.sh(f"test -f {key_path}").returncode == 0,
+                         "vault keygen wrote the per-agent key file (0600)", key_path))
+
+    secret = scenario.marker_for(slot, "secret", 1)  # a committed FAKE value
+    add, addj = run.container.exec_json(
+        ["alf", "vault", "add", "-r", kit.name, "--service", "email", "--type", "account",
+         "--label", "vault-z6", "--secret", f"{secret}-DO-NOT-USE"])
+    result.add(_passfail(bool(addj) and addj.get("ok") is True,
+                         "alf vault add ok (encrypted under the agent's key)",
+                         (add.stderr or "")[:120] if add.returncode else ""))
+    _, lstj = run.container.exec_json(["alf", "vault", "list", "-r", kit.name])
+    labels = [c.get("label") for c in (lstj or {}).get("credentials", [])]
+    result.add(_passfail("vault-z6" in labels, "alf vault list shows the added credential",
+                         f"labels={labels}"))
+    # --yes-insecure: the harness runs alf over a non-TTY docker-exec pipe, and
+    # decrypt refuses to print plaintext to a non-terminal without it.
+    dec, _ = run.container.exec_json(
+        ["alf", "vault", "decrypt", "-r", kit.name, "--label", "vault-z6", "--yes-insecure"])
+    body = (dec.stdout or "") + (dec.stderr or "")
+    result.add(_passfail(secret in body, "alf vault decrypt returns the stored secret (get)",
+                         "matched" if secret in body else "not found"))
+
+
+# ---------------------------------------------------------------------------
+# Z7 — delta sync ⊙ (round-2 only; vault ciphertext in Layer 4)
+# ---------------------------------------------------------------------------
+
+def z07_delta_sync(run, result: StageResult):
+    if run.backend != "real":
+        raise SkipStage("Z7 needs --backend real (⊙ delta lane)")
+    kit, nar = run.kit, run.narrator
+    agent_id = run.state.get("alf_agent_id", "")
+    nar.explain("""
+        Only round-2 (and the Z6 vault add) changed since Z4, so this sync is a
+        DELTA — not a full snapshot. The ⊙ lane confirms an advanced sequence
+        and a delta in the restore plan; the export copy-out shows the vault
+        ciphertext now rides in the agent's Layer 4.
+    """)
+    nar.flow("alf sync ──▶ PUT delta (round-2 only) ──▶ S3 + Neon ⊙")
+    proc, res = run.container.exec_json(["alf", "sync", "-r", kit.name], timeout=300)
+    result.add(_passfail(bool(res) and res.get("ok") is True and res.get("delta") is True,
+                         "alf sync ok + delta path (not a full snapshot)",
+                         f"sequence={res.get('sequence') if res else '?'}"))
+    seq = res.get("sequence", 0) if res else 0
+    result.add(_passfail(seq > run.state.get("sequence", 0),
+                         "⊙ sequence advanced past the snapshot", f"seq={seq}"))
+    run.state["sequence"] = seq
+    r = run.api.get(f"/agents/{agent_id}/restore")
+    rbody = r.json() if r.status_code == 200 else {}
+    result.add(_passfail(len(rbody.get("deltas") or []) >= 1,
+                         "⊙ API: restore plan now includes a delta",
+                         f"deltas={len(rbody.get('deltas') or [])}"))
+    # Vault ciphertext travels in Layer 4 (export copy-out).
+    export_path = "/home/agent/.alf/z7-export.alf"
+    run.container.exec(["alf", "export", "-r", kit.name, "-o", export_path], timeout=300)
+    host_alf = run.paths.alf_home / "z7-export.alf"
+    if host_alf.is_file():
+        names = archives.entries(host_alf)
+        # ALF's Layer 4 is the archive-root `credentials.json` entry.
+        result.add(_passfail("credentials.json" in names,
+                             "vault ciphertext present in the agent's Layer 4",
+                             f"{len(names)} entries"))
+
+
+# ---------------------------------------------------------------------------
+# Z8 — second agent via the framework CLI
+# ---------------------------------------------------------------------------
+
+def z08_second_agent(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    slot_b = "agent_b"
+    nar.explain("""
+        Configure a SECOND agent via the framework's own CLI. Stores stay lazy:
+        the config gains the `[agents.<b>]` block now; brain.db gets b's row when
+        b is first populated (Z10).
+    """)
+    kit.create_agent(run.container, slot_b)
+    text = kit._config.read_text(encoding="utf-8") if kit._config.is_file() else ""
+    result.add(_passfail(f"[agents.{slot_b}]" in text,
+                         "framework config declares the second agent", slot_b))
+    run.state["slot_b"] = slot_b
+
+
+# ---------------------------------------------------------------------------
+# Z9 — alf check reports b (info-only) + explicit enable ⊙
+# ---------------------------------------------------------------------------
+
+def z09_enable_second(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    slot_b = run.state.get("slot_b", "agent_b")
+    nar.explain("""
+        `alf check` REPORTS the new agent but does NOT enable it — discovery is
+        information-only; enabling is always explicit. `alf agents enable <b>`
+        opts it in; it registers lazily on its first sync (Z10).
+    """)
+    _, check = run.container.exec_json(["alf", "check", "-r", kit.name])
+    rows = ((check or {}).get("agents") or {}).get("agents") or []
+    has_b = any(r.get("runtime_agent") == slot_b for r in rows)
+    b_enabled = any(r.get("runtime_agent") == slot_b and r.get("enabled") for r in rows)
+    result.add(_passfail(has_b, "alf check discovers the second agent (info-only)", slot_b))
+    result.add(_passfail(not b_enabled, "check does NOT auto-enable the second agent"))
+    _, enj = run.container.exec_json(["alf", "agents", "-r", kit.name, "enable", slot_b])
+    result.add(_passfail(bool(enj) and enj.get("enabled") is True,
+                         f"alf agents enable {slot_b} → enabled", str(enj)[:80]))
+
+
+# ---------------------------------------------------------------------------
+# Z10 — agent-b turns + sync — isolation both ways ⊙
+# ---------------------------------------------------------------------------
+
+def z10_agent_b_isolation(run, result: StageResult):
+    if run.backend != "real":
+        raise SkipStage("Z10 needs --backend real (⊙ per-agent registration/isolation)")
+    kit, nar = run.kit, run.narrator
+    slot_a = kit.agent_slots[0]
+    slot_b = run.state.get("slot_b", "agent_b")
+    nar.explain("""
+        Populate agent b's OWN marked memories in the shared brain.db, sync, and
+        assert isolation BOTH ways: b's archive carries only b's markers, and a's
+        slice is untouched. The `agent_id` filter is what keeps the shared store
+        clean.
+    """)
+    if run.llm == "proxy":
+        for turn in scenario.turns(slot_b, round=1):
+            kit.llm_turn(run.container, slot_b, turn)
+    else:
+        kit.seed_markers(run.container, slot_b, round=1)
+
+    proc, _ = run.container.exec_json(["alf", "sync", "-r", kit.name, "--all"], timeout=600)
+    result.add(_passfail(proc.returncode == 0, "alf sync --all (a + b, b registers lazily)",
+                         (proc.stderr or "")[:120] if proc.returncode else ""))
+
+    dumps = {slot_a: kit.dump_memory(run.container, slot_a),
+             slot_b: kit.dump_memory(run.container, slot_b)}
+    v = verify.check_coverage(dumps, round=1)
+    run.report.isolation = v.isolation
+    result.add(_passfail(v.isolation == "clean",
+                         "isolation clean both ways (no cross-agent marker leakage)",
+                         f"coverage {v.coverage}"))
+
+    export_path = "/home/agent/.alf/z10-b.alf"
+    run.container.exec(["alf", "export", "-r", kit.name, "--agent", slot_b, "-o", export_path],
+                       timeout=300)
+    host_b = run.paths.alf_home / "z10-b.alf"
+    if host_b.is_file():
+        b_found = sum(1 for _, w in archives.scan_markers(
+            host_b, scenario.markers(slot_b, 1), prefix="memory/").items() if w)
+        a_leak = sum(1 for _, w in archives.scan_markers(
+            host_b, scenario.markers(slot_a, 1), prefix="memory/").items() if w)
+        result.add(_passfail(b_found == 4 and a_leak == 0,
+                             "agent b's archive carries only b's markers",
+                             f"b={b_found}/4 a_leak={a_leak}"))
+
+
+# ---------------------------------------------------------------------------
+# Z11 — vault b + cross-agent read fails closed (key files only)
+# ---------------------------------------------------------------------------
+
+def z11_vault_b_isolation(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    slot_b = run.state.get("slot_b", "agent_b")
+    a_id = run.state.get("alf_agent_id", "")
+    rows = _mapping_rows(run)
+    b_id = next((str(r.get("alf_agent_id")) for r in rows if r.get("runtime_agent") == slot_b), "")
+    nar.explain("""
+        Agent b gets its OWN vault + key. b's key opens b's vault; a's key CANNOT
+        (AEAD fail-closed) — per-agent secret isolation, key files only.
+    """)
+    if not b_id:
+        result.add(_passfail(False, "agent b is mapped (needed for per-agent vault)"))
+        return
+    b_key = f"{kit.home_mount}/state/{b_id}/.alf-vault-key"
+    run.container.sh(f"mkdir -p {kit.home_mount}/state/{b_id}")
+    run.container.exec_json(["alf", "vault", "keygen", "--out", b_key])
+    secret = scenario.marker_for(slot_b, "secret", 1)
+    run.container.exec_json(
+        ["alf", "vault", "add", "-r", kit.name, "--agent", slot_b, "--service", "email",
+         "--type", "account", "--label", "vault-b", "--secret", f"{secret}-DO-NOT-USE"])
+
+    # --yes-insecure: decrypt won't print plaintext to the harness's non-TTY
+    # pipe otherwise (and the AEAD path below must actually run, not be short-
+    # circuited by the TTY guard).
+    dec_b, _ = run.container.exec_json(
+        ["alf", "vault", "decrypt", "-r", kit.name, "--agent", slot_b, "--label", "vault-b",
+         "--yes-insecure"])
+    result.add(_passfail(secret in ((dec_b.stdout or "") + (dec_b.stderr or "")),
+                         "agent b's own key opens b's vault"))
+
+    a_key = f"{kit.home_mount}/state/{a_id}/.alf-vault-key"
+    dec_x = run.container.exec(
+        ["alf", "vault", "decrypt", "-r", kit.name, "--agent", slot_b, "--label", "vault-b",
+         "--vault-key-file", a_key, "--yes-insecure"])
+    body = (dec_x.stdout or "") + (dec_x.stderr or "")
+    result.add(_passfail(dec_x.returncode != 0 or secret not in body,
+                         "a's key fails CLOSED on b's vault (AEAD)",
+                         f"exit={dec_x.returncode}"))
+
+
+# ---------------------------------------------------------------------------
+# Z12 — mutate slice → alf restore (total) — other agents byte-identical
+# ---------------------------------------------------------------------------
+
+def z12_restore(run, result: StageResult):
+    if run.backend != "real":
+        raise SkipStage("Z12 needs --backend real (restore pulls the cloud archive)")
+    import shutil
+    kit, nar = run.kit, run.narrator
+    slot_b = run.state.get("slot_b", "agent_b")
+    nar.explain("""
+        The shared-store restore invariant: snapshot brain.db, mutate agent b's
+        slice, `alf restore --agent b` (default = total), and b's memory returns
+        to EXACTLY the archive WHILE every other agent's rows stay
+        byte-identical. brain.db is one shared store — this is the WP3 restore
+        headline.
+    """)
+    if not kit._db.is_file():
+        result.add(_passfail(False, "brain.db present before Z12"))
+        return
+    baseline = run.paths.run_dir / "z12-brain-before.db"
+    shutil.copy2(kit._db, baseline)
+    b_before = sqlite_util.agent_row_count(kit._db, slot_b)
+
+    kit.mutate_slice(run.container, slot_b, round=2)
+    mutated = sqlite_util.agent_row_count(kit._db, slot_b)
+    result.add(_passfail(mutated != b_before,
+                         "mutate_slice diverged agent b's slice from its archive",
+                         f"rows {b_before} → {mutated}"))
+
+    proc, res = run.container.exec_json(
+        ["alf", "restore", "-r", kit.name, "--agent", slot_b], timeout=300)
+    result.add(_passfail(proc.returncode == 0 and bool(res) and res.get("ok") is True,
+                         f"alf restore --agent {slot_b} (default = total)",
+                         (proc.stderr or "")[:120] if proc.returncode else ""))
+
+    restored = sqlite_util.agent_row_count(kit._db, slot_b)
+    result.add(_passfail(restored == b_before,
+                         "total restore: agent b's slice equals the archive",
+                         f"rows now {restored} (was {b_before})"))
+    ok, detail = sqlite_util.db_identical_except_agent(baseline, kit._db, slot_b)
+    result.add(_passfail(ok, "restore leaves every OTHER agent byte-identical", detail))
 
 
 # ---------------------------------------------------------------------------
@@ -388,7 +669,12 @@ def z13_idle_resync(run, result: StageResult):
             empty delta feed — id/key stability end to end.
         """)
         nar.flow("alf sync (idle) ──▶ no_changes ⊙ latest_sequence unchanged, deltas empty")
-        proc, res = run.container.exec_json(["alf", "sync", "-r", kit.name], timeout=300)
+        # Scope to the primary agent: after the multi-agent stages a bare sync is
+        # ambiguous (default + agent_b both enabled). default's slice is idle
+        # since Z7, so this still resolves to no_changes.
+        slot = kit.agent_slots[0]
+        proc, res = run.container.exec_json(
+            ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
         result.add(_passfail(bool(res) and res.get("no_changes") is True,
                              "idle re-sync: no_changes == true"))
         agent_id = run.state.get("alf_agent_id", "")
@@ -411,11 +697,15 @@ def z13_idle_resync(run, result: StageResult):
             event time, by design not deterministic).
         """)
         nar.flow("alf export ×2 ──▶ entry-identical archives (ids/keys stable)")
+        # Scope to the primary agent — Z8 may have declared a second agent, which
+        # would make a bare export ambiguous.
+        slot = kit.agent_slots[0]
         paths = []
         for i in (1, 2):
             ctr_path = f"/home/agent/.alf/z13-export-{i}.alf"
-            run.container.exec(["alf", "export", "-r", kit.name, "-o", ctr_path],
-                               timeout=300)
+            run.container.exec(
+                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+                timeout=300)
             host = run.paths.alf_home / f"z13-export-{i}.alf"
             if not host.is_file():
                 result.add(_passfail(False, f"export {i} readable on host"))
@@ -449,22 +739,14 @@ REGISTRY = [
     ("z02", "Marked memories via the framework's real store", False, z02_seed_markers),
     ("z03", "alf-under-test + check — mapping, laziness ⊙", True, z03_alf_check),
     ("z04", "First sync — registration + snapshot + parity ⊙", True, z04_first_sync),
-    ("z05", "Second round of marked memories", False,
-     _planned("round-2 memories land with the zeroclaw adapter fix", "WP3")),
-    ("z06", "alf vault add / get / list (key-file only)", True,
-     _planned("vault stages land with the phase-1 completion", "WP3")),
-    ("z07", "Delta sync — round-2 markers only ⊙", True,
-     _planned("delta-exactness lands with the zeroclaw adapter fix", "WP3")),
-    ("z08", "Second agent via the framework CLI", False,
-     _planned("multi-agent stages land with the OpenClaw kit", "WP4")),
-    ("z09", "alf check + agents enable <b> ⊙", True,
-     _planned("multi-agent enable lands with the OpenClaw kit", "WP4")),
-    ("z10", "Agent-b turns + sync — isolation ⊙", True,
-     _planned("cross-agent isolation lands with the OpenClaw kit", "WP4")),
-    ("z11", "Vault b + cross-agent read fails closed", True,
-     _planned("per-agent vault stages land with multi-agent", "WP4")),
-    ("z12", "Mutate slice → alf restore (total/merge)", True,
-     _planned("restore semantics land with the zeroclaw adapter fix", "WP3")),
+    ("z05", "Second round of marked memories (append-shaped)", False, z05_second_round),
+    ("z06", "alf vault add / decrypt / list (key-file only)", True, z06_vault),
+    ("z07", "Delta sync — round-2 only + Layer-4 ciphertext ⊙", True, z07_delta_sync),
+    ("z08", "Second agent via the framework CLI", False, z08_second_agent),
+    ("z09", "alf check + agents enable <b> ⊙", True, z09_enable_second),
+    ("z10", "Agent-b turns + sync — isolation both ways ⊙", True, z10_agent_b_isolation),
+    ("z11", "Vault b + cross-agent read fails closed", True, z11_vault_b_isolation),
+    ("z12", "Mutate slice → alf restore (total) — others byte-identical", True, z12_restore),
     ("z13", "Idle re-sync — no changes / Z13' determinism ⊙", True, z13_idle_resync),
 ]
 

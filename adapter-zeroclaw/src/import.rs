@@ -1,22 +1,25 @@
 //! Import an `.alf` archive into a ZeroClaw workspace.
 //!
-//! Two paths:
-//! 1. **Raw source restore** (preferred): if `raw/zeroclaw/` entries exist,
-//!    extract them directly. This is the lossless path for ZeroClaw-to-ZeroClaw
-//!    restores.
-//! 2. **Cross-runtime migration**: reconstruct workspace files from ALF
-//!    structured data (identity, principals, memory records). Writes Markdown
-//!    files for the memory layer — does NOT populate SQLite (the user must run
-//!    `zeroclaw` to ingest the Markdown files).
+//! Restore has two complementary halves:
+//! 1. **Files** — raw-source restore (preferred, lossless for ZeroClaw→ZeroClaw)
+//!    or cross-runtime reconstruction from ALF structured data (identity,
+//!    principals, memory-as-Markdown).
+//! 2. **Memory** — for the SQLite backend, the agent's slice is restored into
+//!    the shared `data/memory/brain.db` (per `agent_id`, total or merge),
+//!    bootstrapping the store from the captured DDL when it is lazily absent and
+//!    leaving every other agent's rows untouched. This runs independently of the
+//!    file half because `brain.db` is not a raw source.
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use chrono::Utc;
 
-use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, VaultKey};
+use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, RestoreMode, VaultKey};
 
+use crate::brain_db::{self, ArchivedAgent, BrainDbSchema, NativeRow};
 use crate::ImportReport;
 
 // ---------------------------------------------------------------------------
@@ -34,6 +37,7 @@ pub fn import(
     alf_file: &Path,
     workspace: &Path,
     vault_key: Option<&VaultKey>,
+    mode: RestoreMode,
 ) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -125,6 +129,58 @@ pub fn import(
         }
     }
 
+    // Restore the agent's brain.db slice (SQLite backend). Independent of the
+    // file restore above — brain.db is not a raw source. Only for archives that
+    // carry ZeroClaw provenance (manifest.agent.extra.zeroclaw_alias); cross-
+    // runtime archives fall through to the Markdown reconstruction path.
+    if let Some(archived) = archived_agent(&manifest) {
+        let install_root = crate::export::zeroclaw_home(workspace);
+        let db_path = crate::export::brain_db_path(&install_root);
+        let rows: Vec<NativeRow> = all_memory
+            .iter()
+            .filter_map(NativeRow::from_record)
+            .collect();
+        let schema = read_schema_sidecar(&mut alf)?;
+        let can_bootstrap = schema.as_ref().is_some_and(|s| !s.ddl.is_empty());
+
+        if !db_path.is_file() && !can_bootstrap {
+            warnings.push(format!(
+                "no brain.db at {} and the archive carries no schema — {} memory row(s) not \
+                 restored to SQLite; run `zeroclaw memory reindex` to create the store, then \
+                 re-run restore",
+                db_path.display(),
+                rows.len()
+            ));
+        } else if !rows.is_empty() || db_path.is_file() {
+            let schema = schema.unwrap_or_default();
+            let now = Utc::now().to_rfc3339();
+            let outcome =
+                brain_db::restore_agent_slice(&db_path, &schema, &archived, &rows, mode, &now)
+                    .context("restoring the agent's memory slice into brain.db")?;
+            let mode_label = match mode {
+                RestoreMode::Total => "total",
+                RestoreMode::Merge => "merge",
+            };
+            warnings.push(format!(
+                "Restored {} memory row(s) to agent '{}' in brain.db ({mode_label} mode).",
+                outcome.rows_written, archived.alias
+            ));
+            if outcome.bootstrapped {
+                warnings.push(format!(
+                    "Created brain.db at {} from the captured schema.",
+                    db_path.display()
+                ));
+            }
+            if let Some(from) = outcome.remapped_from {
+                warnings.push(format!(
+                    "Alias '{}' already existed under id {} — restored under that id \
+                     (archive id {from} kept as provenance).",
+                    archived.alias, outcome.resolved_agent_id
+                ));
+            }
+        }
+    }
+
     Ok(ImportReport {
         agent_name,
         memory_records: all_memory.len() as u64,
@@ -136,6 +192,42 @@ pub fn import(
         credentials_count,
         warnings,
     })
+}
+
+/// Extract the ZeroClaw agent provenance an export stamped into
+/// `manifest.agent.extra`. `None` for archives without it (cross-runtime, or a
+/// pre-WP3 ZeroClaw archive) — those skip the brain.db slice restore.
+fn archived_agent(manifest: &alf_core::Manifest) -> Option<ArchivedAgent> {
+    let extra = &manifest.agent.extra;
+    let alias = extra
+        .get("zeroclaw_alias")
+        .and_then(|v| v.as_str())?
+        .to_string();
+    let id = extra
+        .get("zeroclaw_agent_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+    Some(ArchivedAgent {
+        id,
+        alias,
+        created_at: None,
+    })
+}
+
+/// Read the `brain.db` schema sidecar (`raw/zeroclaw/.alf-brain-db-schema.json`)
+/// when present. Consumed by the slice restore; never written to the workspace.
+fn read_schema_sidecar<R: std::io::Read + std::io::Seek>(
+    alf: &mut AlfReader<R>,
+) -> Result<Option<BrainDbSchema>> {
+    let path = format!("raw/zeroclaw/{}", brain_db::SCHEMA_SIDECAR);
+    if !alf.file_names().iter().any(|f| f == &path) {
+        return Ok(None);
+    }
+    let bytes = alf.read_raw_entry(&path)?;
+    let schema: BrainDbSchema =
+        serde_json::from_slice(&bytes).context("parsing brain.db schema sidecar")?;
+    Ok(Some(schema))
 }
 
 // ---------------------------------------------------------------------------
@@ -162,9 +254,10 @@ pub fn enumerate_archive(alf_file: &Path) -> Result<ArchiveEnumeration> {
 
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
     if has_raw {
+        let sidecar = format!("{raw_prefix}{}", brain_db::SCHEMA_SIDECAR);
         let mut raw: Vec<String> = file_names
             .iter()
-            .filter(|f| f.starts_with(raw_prefix) && f.len() > raw_prefix.len())
+            .filter(|f| f.starts_with(raw_prefix) && f.len() > raw_prefix.len() && **f != sidecar)
             .cloned()
             .collect();
         raw.sort();
@@ -321,8 +414,11 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
     prefix: &str,
     file_names: &[String],
 ) -> Result<()> {
-    // Determine the ZeroClaw home (parent of workspace)
-    let zc_home = workspace.parent().unwrap_or(workspace);
+    // Everything an export captured (config.toml, SOUL.md, memory/*, …) was
+    // taken relative to the install root; restore it back there. The install
+    // root is resolved from `workspace`, which may be a per-agent binding
+    // (`<root>/agents/<alias>/workspace`) or the root itself.
+    let install_root = crate::export::zeroclaw_home(workspace);
 
     let mut total_bytes: u64 = 0;
     for name in file_names {
@@ -330,25 +426,27 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             continue;
         }
         let relative = &name[prefix.len()..];
-        if relative.is_empty() {
+        if relative.is_empty() || relative == brain_db::SCHEMA_SIDECAR {
+            // The schema sidecar is internal — consumed by the brain.db restore,
+            // never written into the install (mirrors Hermes).
             continue;
         }
 
-        // Decide the extraction root:
-        // - config.toml → zc_home (parent of workspace, by design)
-        // - identity.json, memory/*, everything else → workspace
-        let base = if relative == "config.toml" {
-            zc_home
-        } else {
-            workspace
-        };
-
-        // Reject path-traversal / absolute entry names relative to that root —
-        // a hostile or compromised-server archive must not escape it (Zip Slip;
-        // see threat model A4.1/A1.1). The `config.toml` placement above is the
-        // only sanctioned escape and uses a traversal-free relative path.
-        let target = alf_core::safe_extract_path(base, relative)
+        // Reject path-traversal / absolute entry names relative to the install
+        // root — a hostile or compromised-server archive must not escape it
+        // (Zip Slip; see threat model A4.1/A1.1).
+        let target = alf_core::safe_extract_path(&install_root, relative)
             .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
+
+        // The raw files (config.toml, SOUL.md, memory/*) live at the SHARED
+        // install root, not per agent. When restoring one agent into a populated
+        // install, do NOT clobber files that already exist — they belong to the
+        // live install / other agents, and the archived config.toml is redacted
+        // (overwriting it would drop the running secrets). A fresh restore (new
+        // machine) has none of these, so it still gets the full workspace.
+        if target.exists() {
+            continue;
+        }
 
         // Bound decompression to defend against zip bombs.
         let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
@@ -637,7 +735,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target_ws = target_dir.path().join("workspace");
         fs::create_dir_all(&target_ws).unwrap();
-        import(&alf_file, &target_ws, None).unwrap();
+        import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -650,47 +748,46 @@ mod tests {
         );
     }
 
+    const A_ID: &str = "aaaaaaaa-0000-0000-0000-0000000000a1";
+
+    /// Flat ZeroClaw install root (the real/harness layout): config.toml +
+    /// files live directly under the root.
     fn create_zeroclaw_home(
         config_toml: &str,
-        workspace_files: &[(&str, &str)],
+        files: &[(&str, &str)],
     ) -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
-        let zc_home = dir.path().to_path_buf();
-        let ws = zc_home.join("workspace");
-        fs::create_dir_all(&ws).unwrap();
-        fs::write(zc_home.join("config.toml"), config_toml).unwrap();
-        for (name, content) in workspace_files {
-            let path = ws.join(name);
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("config.toml"), config_toml).unwrap();
+        for (name, content) in files {
+            let path = root.join(name);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&path, content).unwrap();
         }
-        (dir, ws)
+        (dir, root)
     }
 
-    fn create_test_db(zc_home: &Path) {
-        let db_path = zc_home.join("memory.db");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE memories (
-                id TEXT PRIMARY KEY,
-                key TEXT NOT NULL,
-                content TEXT NOT NULL,
-                category TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                embedding BLOB
-            );",
-        )
-        .unwrap();
+    /// Seed a real-schema `brain.db` at `<root>/data/memory/brain.db` with one
+    /// agent (`agent_a`) and one row.
+    fn create_test_db(root: &Path) {
+        let db = crate::brain_db::real_schema_db(
+            &root.join("data").join("memory"),
+            &[(A_ID, "agent_a")],
+        );
+        let conn = Connection::open(&db).unwrap();
         conn.execute(
-            "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
+            "INSERT INTO memories (id, key, content, category, embedding, created_at, \
+             updated_at, session_id, namespace, importance, superseded_by, agent_id) \
+             VALUES (?1,?2,?3,?4,NULL,?5,?5,NULL,'default',0.5,NULL,?6)",
             rusqlite::params![
                 "00000000-0000-0000-0000-000000000001",
                 "pref_lang",
-                "## Language Preference\n\nUser prefers Rust.",
+                "User prefers Rust.",
                 "core",
                 "2026-01-15T10:00:00Z",
+                A_ID
             ],
         )
         .unwrap();
@@ -700,46 +797,57 @@ mod tests {
     fn round_trip_sqlite_workspace() {
         isolate_home();
         let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
-        let (dir, ws) = create_zeroclaw_home(
+        let (dir, root) = create_zeroclaw_home(
             config,
             &[
                 ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
                 ("USER.md", "# Alice\n\n## Timezone\n\nAmerica/New_York\n"),
             ],
         );
-        create_test_db(dir.path());
+        create_test_db(&root);
 
         // Export
         let alf_file = dir.path().join("export.alf");
-        let export_report = export::export(&ws, &alf_file).unwrap();
+        let export_report = export::export(&root, &alf_file).unwrap();
         assert!(export_report.memory_records > 0);
 
-        // Import into fresh workspace
+        // Import into a fresh install root (no config.toml yet → files land
+        // directly under the given workspace).
         let target_dir = TempDir::new().unwrap();
-        let target_ws = target_dir.path().join("workspace");
+        let target_ws = target_dir.path().join("install");
         fs::create_dir_all(&target_ws).unwrap();
 
-        let import_report = import(&alf_file, &target_ws, None).unwrap();
+        let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
         assert_eq!(import_report.agent_name, "ZCBot");
         assert!(import_report.identity_imported);
         assert_eq!(import_report.principals_count, 1);
 
-        // Raw sources should be restored
+        // Raw sources restored under the install root.
         let soul = fs::read_to_string(target_ws.join("SOUL.md")).unwrap();
         assert!(soul.contains("ZCBot"));
-
-        // config.toml goes to parent (zc_home level)
-        // Note: in our test the target_ws has no parent with special meaning,
-        // so config.toml ends up at target_ws's parent
-        let config_path = target_dir.path().join("config.toml");
-        assert!(config_path.is_file());
+        assert!(target_ws.join("config.toml").is_file());
+        // Memory restored into a bootstrapped brain.db.
+        let db = target_ws.join("data").join("memory").join("brain.db");
+        assert!(
+            db.is_file(),
+            "brain.db bootstrapped from the captured schema"
+        );
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id=?1 AND key='pref_lang'",
+                [A_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the agent slice was restored into brain.db");
     }
 
     #[test]
     fn import_creates_workspace_dirs() {
         isolate_home();
         let config = "[memory]\nbackend = \"markdown\"";
-        let (dir, ws) = create_zeroclaw_home(
+        let (dir, root) = create_zeroclaw_home(
             config,
             &[
                 ("SOUL.md", "# DirTest\n\nTest.\n"),
@@ -748,11 +856,11 @@ mod tests {
         );
 
         let alf_file = dir.path().join("export.alf");
-        export::export(&ws, &alf_file).unwrap();
+        export::export(&root, &alf_file).unwrap();
 
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep, None).unwrap();
+        let report = import(&alf_file, &deep, None, RestoreMode::Total).unwrap();
         assert_eq!(report.agent_name, "DirTest");
         assert!(deep.is_dir());
     }
@@ -793,7 +901,7 @@ mod tests {
         // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
         let escaped = root.path().join("PWNED.txt");
 
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
         assert!(
             result.is_err(),
             "import must reject a path-traversal archive"
@@ -818,7 +926,7 @@ mod tests {
         // Workspace nested so its parent (the ZeroClaw `config.toml` target)
         // also stays inside the sandbox.
         let workspace = root.path().join("home/ws");
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
         assert!(
             result.is_err(),
             "import must reject an absolute-path archive entry"

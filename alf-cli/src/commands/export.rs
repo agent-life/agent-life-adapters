@@ -62,8 +62,11 @@ pub fn run(
     // and the selection's workspace; only an empty mapping keeps the legacy
     // selector-free path.
     if dry_run {
-        let workspace = if config.agents_for_runtime(runtime).is_empty() {
-            config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?
+        let (workspace, adhoc) = if config.agents_for_runtime(runtime).is_empty() {
+            (
+                config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?,
+                true,
+            )
         } else {
             let install =
                 crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
@@ -74,9 +77,14 @@ pub fn run(
                 &install,
                 agent,
             )?;
-            selector::effective_workspace(&selected, workspace_flag).0
+            selector::effective_workspace(&selected, workspace_flag)
         };
-        check_workspace_dir(&workspace)?;
+        // Only validate an explicit -w target. A mapped per-agent workspace is
+        // adapter-owned and may not exist on disk (shared-store runtimes derive
+        // the install root from it); the adapter's dry-run tolerates that.
+        if adhoc {
+            check_workspace_dir(&workspace)?;
+        }
         return run_dry_run(adapter.as_ref(), &workspace, human);
     }
 
@@ -94,7 +102,11 @@ pub fn run(
     let (workspace, adhoc) = selector::effective_workspace(&selected, workspace_flag);
     let workspace = workspace.as_path();
 
-    check_workspace_dir(workspace)?;
+    // A mapped per-agent workspace is adapter-owned and may not exist yet —
+    // `export_agent` creates it. Only validate an explicit -w target.
+    if adhoc {
+        check_workspace_dir(workspace)?;
+    }
 
     let default_output;
     let output_path = match output_arg {

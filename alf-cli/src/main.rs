@@ -138,6 +138,11 @@ enum Command {
         /// Path to the .alf file to import
         alf_file: PathBuf,
 
+        /// Memory restore mode for a live per-agent store (ZeroClaw brain.db):
+        /// total (exact, default) or merge (keep local-only rows).
+        #[arg(long, value_enum, default_value_t = RestoreModeArg::Total)]
+        mode: RestoreModeArg,
+
         #[command(flatten)]
         key: VaultKeyCli,
     },
@@ -237,6 +242,11 @@ enum Command {
         /// Preview the files that would be written; touches neither the workspace nor ~/.alf/state/
         #[arg(long)]
         dry_run: bool,
+
+        /// Memory restore mode for a live per-agent store (ZeroClaw brain.db):
+        /// total (exact, default) or merge (keep local-only rows).
+        #[arg(long, value_enum, default_value_t = RestoreModeArg::Total)]
+        mode: RestoreModeArg,
 
         #[command(flatten)]
         key: VaultKeyCli,
@@ -678,6 +688,26 @@ impl VaultKeyCli {
     }
 }
 
+/// Memory restore mode for runtimes with a mutable per-agent store (ZeroClaw
+/// `brain.db`). Ignored by file/markdown runtimes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+pub enum RestoreModeArg {
+    /// Replace the agent's slice so it exactly equals the archive (default).
+    #[default]
+    Total,
+    /// Upsert the archive over the current slice, keeping local-only rows.
+    Merge,
+}
+
+impl From<RestoreModeArg> for alf_core::RestoreMode {
+    fn from(m: RestoreModeArg) -> Self {
+        match m {
+            RestoreModeArg::Total => alf_core::RestoreMode::Total,
+            RestoreModeArg::Merge => alf_core::RestoreMode::Merge,
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
 
@@ -732,6 +762,7 @@ fn main() {
             runtime,
             workspace,
             alf_file,
+            mode,
             key,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
@@ -741,6 +772,7 @@ fn main() {
                 &alf_file,
                 workspace.as_deref(),
                 agent,
+                mode.into(),
                 &key.to_args(),
             )
         })(),
@@ -774,6 +806,7 @@ fn main() {
             workspace,
             at_sequence,
             dry_run,
+            mode,
             key,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
@@ -784,6 +817,7 @@ fn main() {
                 agent,
                 at_sequence,
                 dry_run,
+                mode.into(),
                 &key.to_args(),
             )
         })(),

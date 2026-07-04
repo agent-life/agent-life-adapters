@@ -83,11 +83,12 @@ fn round_trip_preserves_redacted_config() {
         .expect("export failed");
     adapter.import(&alf_path, &restored).expect("import failed");
 
-    // Raw restore writes config.toml to the ZeroClaw home (workspace parent).
-    let restored_config = restored_home.path().join("config.toml");
+    // Flat layout: raw restore writes config.toml to the install root (which,
+    // for a fresh target with no existing config.toml, is the given workspace).
+    let restored_config = restored.join("config.toml");
     assert!(
         restored_config.is_file(),
-        "config.toml should be restored to the zeroclaw home"
+        "config.toml should be restored to the install root"
     );
     let body = fs::read_to_string(&restored_config).unwrap();
     assert!(

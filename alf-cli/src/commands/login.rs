@@ -117,6 +117,13 @@ mod tests {
 
     #[test]
     fn save_key_to_config() {
+        // Config::load_from now consults ALF_API_URL/ALF_API_KEY — serialize
+        // with the env-mutating tests and pin a clean environment.
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let _restore = crate::context::tests::RestoreEnv::snapshot();
+        std::env::remove_var("ALF_API_URL");
+        std::env::remove_var("ALF_API_KEY");
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 

@@ -14,12 +14,21 @@
 #   installer    scripts/test_install.sh --linux --quick            (needs: docker, python3)
 #                  └ install.sh contract vs a mock GitHub Releases server (ubuntu only;
 #                    use --installer-full for the debian/alpine/alpine-nochecksum matrix)
+#   lifecycle    tests/lifecycle/driver.py, no-LLM/no-backend       (needs: docker, python3)
+#                  └ the CI tier: real zeroclaw install, seeded markers, alf check,
+#                    Z13' determinism (Z1-Z3,Z13). Zero secrets, stdlib-only Python.
+#   lifecycle-llm  tests/lifecycle/driver.py --llm proxy --backend real  (needs: docker,
+#                  python3 + requests, $ALF_SERVICE_REPO checkout with its .env)
+#                  └ mints a runtime key, drives real LLM turns, asserts the ⊙
+#                    API/S3/Neon lanes, ALWAYS runs the teardown ladder. Z1-Z4+Z13
+#                    with exactly one XFAIL (wp3-brain-db-extraction).
 #   walkthroughs cloud e2e walkthroughs, every runtime branch, --no-pause  (needs: python3 + live .env)
-#                  └ main + workspace × {openclaw,zeroclaw,hermes}, plus the memory and
-#                    vault walkthroughs. Each combo is its own pass/fail row. SKIPPED
+#                  └ main + workspace × {openclaw,zeroclaw,hermes}, plus the vault
+#                    walkthrough. Each combo is its own pass/fail row. SKIPPED
 #                    unless cloud creds are present (.env or API_BASE_URL/API_KEY/
 #                    NEON_DATABASE_URL/S3_BUCKET_NAME). The hermes combos clone the real
 #                    NousResearch/hermes-agent (cached at $HERMES_AGENT_DIR or /tmp).
+#                    (The memory walkthrough was superseded by the lifecycle harness.)
 #
 # Usage:
 #   ./test.sh                  Default set; tiers whose tools are missing are SKIPPED.
@@ -43,7 +52,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-ALL_TIERS=(fmt clippy unit integration installer walkthroughs)
+ALL_TIERS=(fmt clippy unit integration installer lifecycle lifecycle-llm walkthroughs)
 
 # --- colours (only when stdout is a tty) ----------------------------------
 if [ -t 1 ]; then
@@ -67,7 +76,7 @@ while [ $# -gt 0 ]; do
         --installer-full)  INSTALLER_FULL=1 ;;
         --list)            printf '%s\n' "${ALL_TIERS[@]}"; exit 0 ;;
         -h|--help)         usage; exit 0 ;;
-        fmt|clippy|unit|integration|installer|walkthroughs) SELECTED+=("$1") ;;
+        fmt|clippy|unit|integration|installer|lifecycle|lifecycle-llm|walkthroughs) SELECTED+=("$1") ;;
         *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -96,9 +105,17 @@ WALKTHROUGH_MATRIX=(
     "wt:workspace:openclaw|integration_walkthrough_for_workspace.py|--runtime openclaw"
     "wt:workspace:zeroclaw|integration_walkthrough_for_workspace.py|--runtime zeroclaw"
     "wt:workspace:hermes|integration_walkthrough_for_workspace.py|--runtime hermes"
-    "wt:memory|integration_walkthrough_for_memory.py|"
     "wt:vault|integration_walkthrough_for_vault.py|"
 )
+
+# lifecycle-llm needs the service checkout (provisioner) + its .env, and a
+# python3 that can import requests (see tests/lifecycle/requirements.txt).
+lifecycle_llm_ready() {
+    local service="${ALF_SERVICE_REPO:-$ROOT/../agent-life-service}"
+    [ -f "$service/scripts/provision-test-runtime.sh" ] \
+        && [ -f "$service/.env" ] \
+        && python3 -c 'import requests' >/dev/null 2>&1
+}
 
 # The walkthroughs need live cloud creds — a .env in the repo root or the four
 # vars exported. Without them the tier is SKIPPED (FAILED under --all).
@@ -164,6 +181,26 @@ for tier in "${TIERS[@]}"; do
                 run_tier installer ./scripts/test_install.sh --linux
             else
                 run_tier installer ./scripts/test_install.sh --linux --quick
+            fi ;;
+        lifecycle)
+            if ! have python3; then
+                skip_tier lifecycle "python3 not found"
+            elif ! docker_ready; then
+                skip_tier lifecycle "docker not available (daemon running?)"
+            else
+                run_tier lifecycle python3 tests/lifecycle/driver.py \
+                    --framework zeroclaw --llm none --backend none --ci --stages Z1-Z3,Z13
+            fi ;;
+        lifecycle-llm)
+            if ! have python3; then
+                skip_tier lifecycle-llm "python3 not found"
+            elif ! docker_ready; then
+                skip_tier lifecycle-llm "docker not available (daemon running?)"
+            elif ! lifecycle_llm_ready; then
+                skip_tier lifecycle-llm "needs \$ALF_SERVICE_REPO/.env + python3 with requests"
+            else
+                run_tier lifecycle-llm python3 tests/lifecycle/driver.py \
+                    --framework zeroclaw --llm proxy --backend real --no-pause
             fi ;;
         walkthroughs)
             if ! have python3; then

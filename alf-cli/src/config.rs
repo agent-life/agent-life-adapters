@@ -156,6 +156,18 @@ impl Config {
             }
         }
 
+        // Symmetric fallback for the service URL: a file that doesn't set
+        // `[service] api_url` (it deserializes to the default) can be pointed
+        // elsewhere via ALF_API_URL — used by containers/runtimes so no config
+        // pre-write is required. A URL explicitly set in the file wins.
+        if config.service.api_url == default_api_url() {
+            if let Ok(url) = std::env::var("ALF_API_URL") {
+                if !url.is_empty() {
+                    config.service.api_url = url;
+                }
+            }
+        }
+
         Ok(config)
     }
 
@@ -279,6 +291,7 @@ mod tests {
     fn load_missing_file_returns_defaults() {
         let _lock = HOME_LOCK.lock().unwrap();
         std::env::remove_var("ALF_API_KEY");
+        std::env::remove_var("ALF_API_URL");
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
@@ -289,6 +302,9 @@ mod tests {
 
     #[test]
     fn load_partial_config_fills_defaults() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        std::env::remove_var("ALF_API_URL");
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
@@ -342,6 +358,27 @@ mod tests {
         std::env::remove_var("ALF_API_KEY");
 
         assert_eq!(config.service.api_key, "alf_sk_from_env");
+    }
+
+    #[test]
+    fn api_url_env_fallback_and_file_precedence() {
+        let _lock = HOME_LOCK.lock().unwrap();
+
+        let dir = TempDir::new().unwrap();
+
+        // File without api_url → ALF_API_URL fills it in.
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[service]\napi_key = \"my-key\"\n").unwrap();
+        std::env::set_var("ALF_API_URL", "http://localhost:9099");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.service.api_url, "http://localhost:9099");
+
+        // File with an explicit non-default api_url wins over the env var.
+        let path = dir.path().join("config-explicit.toml");
+        fs::write(&path, "[service]\napi_url = \"https://custom.example\"\n").unwrap();
+        let config = Config::load_from(&path).unwrap();
+        std::env::remove_var("ALF_API_URL");
+        assert_eq!(config.service.api_url, "https://custom.example");
     }
 
     #[test]

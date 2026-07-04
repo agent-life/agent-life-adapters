@@ -152,6 +152,13 @@ In `agent-life-adapters`:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo fmt --check
 
+Canonical pre-release lifecycle runs (real install + real backend; see
+[tests/lifecycle/README.md](tests/lifecycle/README.md) — after WP4 extends the
+pilot to Z1–Z13 the interactive run is the M1 vehicle):
+
+    python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --interactive
+    python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --no-pause
+
 If the JSON contract changed:
 
     cargo run -p alf-cli -- <relevant command> | jq '.<expected new field>'

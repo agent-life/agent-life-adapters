@@ -1,0 +1,3 @@
+state.db absent in default (lazy; created on first session run)
+state.db absent in profiles/agent_a (lazy; created on first session run)
+state.db absent in profiles/agent_b (lazy; created on first session run)

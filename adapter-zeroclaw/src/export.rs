@@ -3,7 +3,7 @@
 //! Orchestrates: detect backend from `config.toml` → extract memory (SQLite
 //! or Markdown) → build identity/principals/credentials → write archive.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -20,6 +20,9 @@ use alf_core::{
     WorkspaceEnumeration,
 };
 
+use alf_core::{AgentBinding, MemorySource};
+
+use crate::brain_db;
 use crate::config_parser::{self, MemoryBackend, ZeroClawConfig};
 use crate::identity_parser;
 use crate::markdown_parser;
@@ -41,8 +44,9 @@ const AGENT_ID_NS: Uuid = Uuid::from_bytes([
 ///
 /// Reads `{workspace}/.alf-agent-id` if present, otherwise derives a
 /// deterministic UUID v5 from the canonical workspace path. A freshly-derived
-/// id is **not** persisted — the read-only path used by `export --dry-run`.
-fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
+/// id is **not** persisted — the read-only path used by `export --dry-run` and
+/// the adapter's `Adapter::resolve_agent_id` (WP0 selector/discovery).
+pub(crate) fn resolve_agent_id_readonly(workspace: &Path) -> Result<Uuid> {
     let id_file = workspace.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
@@ -72,22 +76,50 @@ fn resolve_agent_id(workspace: &Path) -> Result<Uuid> {
 // ZeroClaw directory detection
 // ---------------------------------------------------------------------------
 
-/// Locate the ZeroClaw home directory.
+/// The real shared store location relative to the install root.
+pub(crate) fn brain_db_path(install: &Path) -> PathBuf {
+    install.join("data").join("memory").join("brain.db")
+}
+
+/// Locate the ZeroClaw install root from any workspace path.
 ///
-/// The `workspace` argument is typically `~/.zeroclaw/workspace/`, so the
-/// ZeroClaw home is its parent. Falls back to `~/.zeroclaw` if not a child.
-fn zeroclaw_home(workspace: &Path) -> std::path::PathBuf {
-    if let Some(parent) = workspace.parent() {
-        if parent.join("config.toml").is_file() || parent.join("memory.db").is_file() {
-            return parent.to_path_buf();
+/// The install root is the directory that holds `config.toml` (and/or the
+/// shared `data/memory/brain.db`). It is found by walking up from `workspace`
+/// — this resolves the flat layout (`workspace == install root`, the real and
+/// harness install), the multi-agent per-agent binding
+/// (`<root>/agents/<alias>/workspace`), and the legacy `<root>/workspace/`
+/// subdir uniformly. Falls back to `workspace` itself.
+pub(crate) fn zeroclaw_home(workspace: &Path) -> std::path::PathBuf {
+    for anc in workspace.ancestors().take(6) {
+        if anc.join("config.toml").is_file() || brain_db_path(anc).is_file() {
+            return anc.to_path_buf();
         }
     }
-    // Fallback: check if workspace itself contains config
-    if workspace.join("config.toml").is_file() {
-        return workspace.to_path_buf();
+    workspace.to_path_buf()
+}
+
+/// Locate the shared `brain.db` under an install root (capture plan D9): the
+/// canonical `data/memory/brain.db`, then the older `memory/brain.db`, then the
+/// fictional flat `memory.db`, then a shallow search for any `brain.db`.
+fn resolve_brain_db(install: &Path) -> Option<PathBuf> {
+    let candidates = [
+        brain_db_path(install),
+        install.join("memory").join("brain.db"),
+        install.join("memory.db"),
+    ];
+    for c in candidates {
+        if c.is_file() {
+            return Some(c);
+        }
     }
-    // Best guess
-    workspace.parent().unwrap_or(workspace).to_path_buf()
+    // Shallow bounded search (depth ≤ 3) for a stray brain.db.
+    WalkDir::new(install)
+        .max_depth(3)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .find(|e| e.file_type().is_file() && e.file_name() == "brain.db")
+        .map(|e| e.path().to_path_buf())
 }
 
 /// Try to detect ZeroClaw version from workspace files or environment.
@@ -101,7 +133,64 @@ fn detect_zeroclaw_version(zc_home: &Path) -> Option<String> {
             }
         }
     }
+    // 0.8.2's config.toml carries `schema_version` but no top-level `version`,
+    // so fall back to the installed binary: `zeroclaw --version` prints e.g.
+    // "zeroclaw 0.8.2". Host unit tests (no binary on PATH) yield None; live
+    // runs execute `alf` inside the container where `zeroclaw` resolves.
+    detect_zeroclaw_version_from_binary()
+}
+
+/// `zeroclaw --version` → first `X.Y.Z`, or `None` when the binary is absent.
+fn detect_zeroclaw_version_from_binary() -> Option<String> {
+    let output = std::process::Command::new("zeroclaw")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        stdout.into_owned()
+    };
+    extract_semver(&text)
+}
+
+/// First `<digits>.<digits>.<digits>` run in `text`, if any. Hand-rolled to
+/// avoid a regex dependency.
+fn extract_semver(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            let parts: Vec<&str> = run.split('.').collect();
+            if parts.len() >= 3
+                && parts[..3]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+            }
+        } else {
+            i += 1;
+        }
+    }
     None
+}
+
+/// Best-effort top-level `schema_version` from ZeroClaw `config.toml` (=3 on
+/// 0.8.2), or `None` when absent. Recorded alongside `source_runtime_version`.
+fn detect_config_schema_version(zc_home: &Path) -> Option<i64> {
+    let content = fs::read_to_string(zc_home.join("config.toml")).ok()?;
+    content
+        .parse::<toml::Value>()
+        .ok()?
+        .get("schema_version")?
+        .as_integer()
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +274,8 @@ fn is_alfignored(matcher: &Gitignore, rel: &str) -> bool {
 ///   `identity.json` (which may live outside the workspace entirely). A
 ///   workspace-relative `.alfignore` pattern cannot meaningfully address these,
 ///   so they are always included, never matched, and never counted.
-fn enumerate_raw(workspace: &Path, config: &ZeroClawConfig) -> RawEnumeration {
+fn enumerate_raw(install: &Path, config: &ZeroClawConfig) -> RawEnumeration {
+    let workspace = install;
     let (matcher, mut warnings) = load_alfignore(workspace);
     let mut entries: Vec<(FileEntry, RawContent)> = Vec::new();
     let mut excluded: u32 = 0;
@@ -200,6 +290,19 @@ fn enumerate_raw(workspace: &Path, config: &ZeroClawConfig) -> RawEnumeration {
         },
         RawContent::Inline(redacted),
     ));
+
+    // brain.db schema sidecar — synthesized & unfilterable, like config.toml.
+    // Consumed by restore to bootstrap a lazily-absent store; skipped by name on
+    // restore so it never lands in the workspace (mirrors Hermes).
+    if let Some(bytes) = capture_schema_sidecar(install) {
+        entries.push((
+            FileEntry {
+                path: brain_db::SCHEMA_SIDECAR.to_string(),
+                size: bytes.len() as u64,
+            },
+            RawContent::Inline(bytes),
+        ));
+    }
 
     // Root-level workspace files — `.alfignore` applies.
     for name in ROOT_FILES {
@@ -350,7 +453,7 @@ fn enumerate_raw(workspace: &Path, config: &ZeroClawConfig) -> RawEnumeration {
 pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
     let zc_home = zeroclaw_home(workspace);
     let config = load_config(&zc_home)?;
-    let (entries, excluded, warnings, missing_includes) = enumerate_raw(workspace, &config);
+    let (entries, excluded, warnings, missing_includes) = enumerate_raw(&zc_home, &config);
     Ok(EnumerationResult {
         files: entries.into_iter().map(|(fe, _)| fe).collect(),
         excluded_by_alfignore: excluded,
@@ -365,29 +468,37 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
 /// Strictly read-only — writes no archive and, unlike a real export, never
 /// persists `.alf-agent-id`.
 pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
-    if !workspace.is_dir() {
+    // A per-agent binding workspace (`<root>/agents/<alias>/workspace`) may not
+    // exist on disk — for ZeroClaw's shared store the data lives at the install
+    // root, which is what must exist. Validate that, not the per-agent leaf.
+    let zc_home = zeroclaw_home(workspace);
+    if !zc_home.is_dir() {
         bail!(
-            "Workspace directory does not exist: {}",
-            workspace.display()
+            "ZeroClaw install root does not exist: {}",
+            zc_home.display()
         );
     }
 
-    let zc_home = zeroclaw_home(workspace);
     let config = load_config(&zc_home)?;
-    let (entries, excluded, mut warnings, missing_includes) = enumerate_raw(workspace, &config);
+    let (entries, excluded, mut warnings, missing_includes) = enumerate_raw(&zc_home, &config);
     let files: Vec<FileEntry> = entries.into_iter().map(|(fe, _)| fe).collect();
     let total_size = files.iter().map(|f| f.size).sum();
 
-    let agent_id = resolve_agent_id_readonly(workspace)?;
-    let agent_name = identity_parser::detect_agent_name(workspace, &config);
+    let agent_id = resolve_agent_id_readonly(&zc_home)?;
+    let detected_name = identity_parser::detect_agent_name(&zc_home, &config);
     let runtime_version = detect_zeroclaw_version(&zc_home);
-    let records = extract_memory_records(
-        workspace,
+    let target = slice_target_for(workspace, &zc_home);
+    let slice = read_memory_slice(
         &zc_home,
         &config,
         agent_id,
+        &target,
         runtime_version.as_deref(),
     )?;
+    // Match the real export path: the per-agent alias is the unique name a sync
+    // would register (see the WP6 note in `export`), so a dry-run preview shows it.
+    let agent_name = slice.provenance.alias.clone().unwrap_or(detected_name);
+    warnings.extend(slice.warnings);
 
     // Surface (but do not prune — this is read-only) tracked files that have
     // gone missing, so a dry-run preview shows what `alf sync` would drop.
@@ -399,7 +510,7 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
 
     Ok(WorkspaceEnumeration {
         agent_name,
-        memory_records: records.len() as u64,
+        memory_records: slice.records.len() as u64,
         files,
         excluded_by_alfignore: excluded,
         total_size,
@@ -489,37 +600,154 @@ fn load_config(zc_home: &Path) -> Result<ZeroClawConfig> {
     )
 }
 
-/// Extract memory records for the configured backend (SQLite or Markdown).
-fn extract_memory_records(
-    workspace: &Path,
-    zc_home: &Path,
+/// Which agent's slice of the shared `brain.db` to export.
+enum SliceTarget {
+    /// The bound agent (from the mapping/binding): alias + optional runtime id.
+    Bound { alias: String, id: Option<String> },
+    /// Adhoc `-w` export: resolve the sole `agents` row; error on ambiguity.
+    Sole,
+}
+
+/// ZeroClaw agent provenance stamped into `manifest.agent.extra` so restore can
+/// resolve the target agent (by alias) and preserve the archived id.
+#[derive(Default)]
+struct SliceProvenance {
+    zeroclaw_agent_id: Option<String>,
+    alias: Option<String>,
+}
+
+/// An exported memory slice: the ALF records plus the source-agent provenance.
+struct MemorySlice {
+    records: Vec<alf_core::MemoryRecord>,
+    provenance: SliceProvenance,
+    warnings: Vec<String>,
+}
+
+/// Read one agent's memory slice for the configured backend. For the SQLite
+/// backend this is a per-`agent_id` slice of the shared `brain.db` (WAL
+/// copy-read); markdown backends fall back to the markdown collector.
+fn read_memory_slice(
+    install: &Path,
     config: &ZeroClawConfig,
-    agent_id: Uuid,
+    alf_agent_id: Uuid,
+    target: &SliceTarget,
     runtime_version: Option<&str>,
-) -> Result<Vec<alf_core::MemoryRecord>> {
-    let records = match config.memory_backend {
-        MemoryBackend::Sqlite => {
-            let db_path = zc_home.join("memory.db");
-            if db_path.is_file() {
-                sqlite_extractor::extract_from_sqlite(&db_path, config, agent_id, runtime_version)?
-            } else {
-                // SQLite configured but file missing — try markdown fallback.
-                markdown_parser::collect_markdown_memory(workspace, agent_id, runtime_version)?
+) -> Result<MemorySlice> {
+    let brain_db = match config.memory_backend {
+        MemoryBackend::Sqlite => resolve_brain_db(install),
+        _ => None,
+    };
+
+    let Some(brain_db) = brain_db else {
+        // No brain.db (markdown backend, or SQLite configured but store not
+        // materialized yet). Fall back to the markdown collector for markdown/
+        // sqlite; None/unsupported produce nothing.
+        let records = match config.memory_backend {
+            MemoryBackend::Sqlite | MemoryBackend::Markdown => {
+                markdown_parser::collect_markdown_memory(install, alf_agent_id, runtime_version)?
+            }
+            MemoryBackend::None | MemoryBackend::Unsupported => Vec::new(),
+        };
+        return Ok(MemorySlice {
+            records,
+            provenance: SliceProvenance::default(),
+            warnings: Vec::new(),
+        });
+    };
+
+    let copy = brain_db::open_readonly_copy(&brain_db)?;
+    let agents = brain_db::read_agents(&copy.conn)?;
+
+    // Resolve (alias, zeroclaw agent id).
+    let (alias, zc_id): (Option<String>, Option<String>) = match target {
+        SliceTarget::Bound { alias, id } => {
+            let id = id.clone().or_else(|| {
+                agents
+                    .iter()
+                    .find(|(_, a)| a == alias)
+                    .map(|(i, _)| i.clone())
+            });
+            (Some(alias.clone()), id)
+        }
+        SliceTarget::Sole => match agents.as_slice() {
+            [] => (None, None),
+            [(id, alias)] => (Some(alias.clone()), Some(id.clone())),
+            many => {
+                let names: Vec<String> = many.iter().map(|(_, a)| a.clone()).collect();
+                anyhow::bail!(
+                    "brain.db holds {} agents ({}); pass --agent <alias> to export one",
+                    many.len(),
+                    names.join(", ")
+                );
+            }
+        },
+    };
+
+    let mut warnings = Vec::new();
+    let records = match &zc_id {
+        Some(id) => sqlite_extractor::records_from_conn(
+            &copy.conn,
+            config,
+            alf_agent_id,
+            id,
+            runtime_version,
+        )?,
+        None => {
+            if let Some(a) = &alias {
+                warnings.push(format!(
+                    "agent '{a}' has no rows in brain.db yet — exporting an empty memory slice"
+                ));
+            }
+            Vec::new()
+        }
+    };
+
+    Ok(MemorySlice {
+        records,
+        provenance: SliceProvenance {
+            zeroclaw_agent_id: zc_id,
+            alias,
+        },
+        warnings,
+    })
+}
+
+/// Infer the slice target from a workspace path. A per-agent binding workspace
+/// is `<root>/agents/<alias>/workspace`, so dry-run (which has no binding) can
+/// still scope to that agent; anything else resolves the sole agent.
+fn slice_target_for(workspace: &Path, install: &Path) -> SliceTarget {
+    if workspace.file_name().and_then(|n| n.to_str()) == Some("workspace") {
+        if let Some(alias_dir) = workspace.parent() {
+            let under_agents = alias_dir.parent() == Some(install.join("agents").as_path());
+            if let (true, Some(alias)) =
+                (under_agents, alias_dir.file_name().and_then(|n| n.to_str()))
+            {
+                return SliceTarget::Bound {
+                    alias: alias.to_string(),
+                    id: None,
+                };
             }
         }
-        MemoryBackend::Markdown => {
-            markdown_parser::collect_markdown_memory(workspace, agent_id, runtime_version)?
-        }
-        MemoryBackend::None | MemoryBackend::Unsupported => Vec::new(),
-    };
-    Ok(records)
+    }
+    SliceTarget::Sole
+}
+
+/// Serialize the `brain.db` schema sidecar (`.alf-brain-db-schema.json`) when a
+/// store exists. Restore replays this DDL to bootstrap a lazily-absent store.
+fn capture_schema_sidecar(install: &Path) -> Option<Vec<u8>> {
+    let db = resolve_brain_db(install)?;
+    let copy = brain_db::open_readonly_copy(&db).ok()?;
+    let schema = brain_db::capture_schema(&copy.conn).ok()?;
+    serde_json::to_vec_pretty(&schema).ok()
 }
 
 // ---------------------------------------------------------------------------
 // Export entry point
 // ---------------------------------------------------------------------------
 
-/// Export a ZeroClaw workspace to an `.alf` archive.
+/// Export a ZeroClaw workspace to an `.alf` archive (adhoc `-w` / the sole
+/// agent). Resolves the install root, then delegates to [`export_impl`] with the
+/// sole-agent slice target.
 ///
 /// Layer 4 (credentials) is the agent's explicit ALF vault — see
 /// [`load_agent_vault`]. Its records are already AEAD-encrypted; export never
@@ -531,25 +759,157 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
             workspace.display()
         );
     }
+    let install = zeroclaw_home(workspace);
+    let alf_agent_id = resolve_agent_id(&install)?;
+    export_impl(&install, output, alf_agent_id, SliceTarget::Sole)
+}
 
-    let zc_home = zeroclaw_home(workspace);
+/// Export one agent's slice of a shared install (WP0 `export_agent` seam).
+///
+/// The mapping's `alf_agent_id` is authoritative and becomes the archive
+/// identity; the ZeroClaw slice is filtered by `binding.runtime_agent_id`.
+/// Writes the id through to the per-agent workspace pin (fail-closed on drift,
+/// like the default seam), then delegates to [`export_impl`].
+pub fn export_agent(
+    binding: &AgentBinding,
+    alf_agent_id: Uuid,
+    output: &Path,
+) -> Result<ExportReport> {
+    let _ = fs::create_dir_all(&binding.workspace);
+    alf_core::ensure_workspace_agent_id(&binding.workspace, alf_agent_id)?;
+    let install = zeroclaw_home(&binding.workspace);
+    let target = SliceTarget::Bound {
+        alias: binding.runtime_agent.clone(),
+        id: binding.runtime_agent_id.clone(),
+    };
+    export_impl(&install, output, alf_agent_id, target)
+}
+
+/// Discover the agents in a ZeroClaw install (WP3 override of the WP0 single-
+/// agent fallback).
+///
+/// Enumerates the union of the shared `brain.db` `agents` table and the declared
+/// `[agents.<alias>]` config blocks. Each agent maps to a per-agent workspace
+/// (for its `.alf-agent-id` pin) over the shared `SharedDb` memory source
+/// (`agent_id` filter). `default_enabled` follows the Z3 rule: declared agents
+/// on; the system `default` off when declared agents exist, but a bare install's
+/// sole agent (even `default`) is enabled. Read-only — never writes the install.
+pub fn discover_agents(install: &Path) -> Result<Vec<AgentBinding>> {
+    let zc_home = zeroclaw_home(install);
+    let config = load_config(&zc_home)?;
+    let declared = config_parser::discovered_config_agents(&config.raw_toml);
+    let declared_set: HashSet<&str> = declared.iter().map(|s| s.as_str()).collect();
+
+    let resolved_db = resolve_brain_db(&zc_home);
+    let db_agents = match &resolved_db {
+        Some(db) => brain_db::read_agents_from_path(db).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    // The canonical shared-store path even when the store is lazily absent.
+    let db_path = resolved_db.unwrap_or_else(|| brain_db_path(&zc_home));
+
+    // Union of aliases: brain.db agents (oldest first) then declared-only ones.
+    let mut id_by_alias: HashMap<String, String> = HashMap::new();
+    let mut aliases: Vec<String> = Vec::new();
+    for (id, alias) in &db_agents {
+        id_by_alias
+            .entry(alias.clone())
+            .or_insert_with(|| id.clone());
+        aliases.push(alias.clone());
+    }
+    for alias in &declared {
+        aliases.push(alias.clone());
+    }
+    let mut seen = HashSet::new();
+    aliases.retain(|a| seen.insert(a.clone()));
+
+    let has_declared = !declared.is_empty();
+    let sole = aliases.len() == 1;
+
+    let mut bindings: Vec<AgentBinding> = aliases
+        .into_iter()
+        .map(|alias| {
+            let is_declared = declared_set.contains(alias.as_str());
+            // Z3 rule (design §10): declared agents on; the system `default` is
+            // off when declared agents exist, but a bare install's sole agent —
+            // even `default` — is the user's agent and is enabled. A DB-only
+            // non-default agent is enabled only when it is the sole agent.
+            let default_enabled = if is_declared {
+                true
+            } else if alias == "default" {
+                !has_declared || sole
+            } else {
+                sole
+            };
+            AgentBinding {
+                runtime_agent_id: id_by_alias.get(&alias).cloned(),
+                workspace: zc_home.join("agents").join(&alias).join("workspace"),
+                memory_source: MemorySource::SharedDb {
+                    path: db_path.clone(),
+                    filter_key: "agent_id".to_string(),
+                },
+                default_enabled,
+                runtime_agent: alias,
+            }
+        })
+        .collect();
+
+    // Never return empty: a fresh install (no config agents, no DB) still maps
+    // one `default` agent — the WP0 zero-friction promise.
+    if bindings.is_empty() {
+        bindings.push(AgentBinding {
+            runtime_agent: "default".to_string(),
+            runtime_agent_id: None,
+            workspace: zc_home.join("agents").join("default").join("workspace"),
+            memory_source: MemorySource::SharedDb {
+                path: db_path,
+                filter_key: "agent_id".to_string(),
+            },
+            default_enabled: true,
+        });
+    }
+    Ok(bindings)
+}
+
+/// Shared export core. `install` is the resolved install root (config.toml,
+/// `data/memory/brain.db`, identity files, `memory/` all live directly under
+/// it); `alf_agent_id` stamps the archive identity; `target` selects the memory
+/// slice.
+fn export_impl(
+    install: &Path,
+    output: &Path,
+    alf_agent_id: Uuid,
+    target: SliceTarget,
+) -> Result<ExportReport> {
+    if !install.is_dir() {
+        bail!("Workspace directory does not exist: {}", install.display());
+    }
+    let agent_id = alf_agent_id;
 
     // 1. Parse config
-    let config = load_config(&zc_home)?;
+    let config = load_config(install)?;
 
-    // 2. Agent ID + name
-    let agent_id = resolve_agent_id(workspace)?;
-    let agent_name = identity_parser::detect_agent_name(workspace, &config);
-    let runtime_version = detect_zeroclaw_version(&zc_home);
+    // 2. Name + version
+    let detected_name = identity_parser::detect_agent_name(install, &config);
+    let runtime_version = detect_zeroclaw_version(install);
 
-    // 3. Extract memory records (based on backend)
-    let records = extract_memory_records(
-        workspace,
-        &zc_home,
+    // 3. Extract the agent's memory slice (per-agent for the shared brain.db)
+    let slice = read_memory_slice(
+        install,
         &config,
         agent_id,
+        &target,
         runtime_version.as_deref(),
     )?;
+    let export_warnings = slice.warnings;
+    let provenance = slice.provenance;
+    // ALF agent names must be unique per tenant (service `agents_tenant_name_unique`).
+    // Every agent in the shared brain.db exports from the same install root, so the
+    // detected name (SOUL.md H1 / install dir) is IDENTICAL across agents and a second
+    // agent's registration 409s. Use the per-agent alias as the name — it is the
+    // agent's own identity in the brain.db and is unique per install (WP6).
+    let agent_name = provenance.alias.clone().unwrap_or(detected_name);
+    let records = slice.records;
     let total_records = records.len() as u64;
 
     // Check for embeddings in the record set
@@ -591,14 +951,16 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
     }
 
     // 5. Build other layers
-    let identity = identity_parser::parse_identity(workspace, &config, agent_id)?;
-    let principals = principals_parser::parse_principals(workspace, agent_id)?;
+    let identity = identity_parser::parse_identity(install, &config, agent_id)?;
+    let principals = principals_parser::parse_principals(install, agent_id)?;
 
     // Layer 4 = the agent's explicit ALF vault ONLY. ALF never captures a
     // runtime's own keystore (e.g. ZeroClaw `config.toml [secrets]`) — the
     // agent chooses what to back up via `alf vault add`. Vault records are
-    // already AEAD-encrypted, so they enter the archive verbatim.
-    let vault_path = dirs_home().map(|h| h.join(".alf").join("vault").join("credentials.json"));
+    // already AEAD-encrypted, so they enter the archive verbatim. Per-agent
+    // path (WP1): the CLI migrates any legacy install-scoped vault before
+    // export, so there is deliberately no legacy fallback here.
+    let vault_path = dirs_home().map(|h| alf_core::agent_vault_path(&h, agent_id));
     let credentials = load_agent_vault(vault_path.as_deref())?;
 
     let has_identity = identity.is_some();
@@ -612,6 +974,20 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         .map(|c| c.credentials.len() as u32)
         .unwrap_or(0);
 
+    // ZeroClaw slice provenance → manifest.agent.extra. Restore reads
+    // `zeroclaw_alias` to resolve the target agent and prefers the archived
+    // `zeroclaw_agent_id` when creating a fresh row.
+    let mut agent_extra = std::collections::HashMap::new();
+    if let Some(id) = &provenance.zeroclaw_agent_id {
+        agent_extra.insert("zeroclaw_agent_id".to_string(), serde_json::json!(id));
+    }
+    if let Some(alias) = &provenance.alias {
+        agent_extra.insert("zeroclaw_alias".to_string(), serde_json::json!(alias));
+    }
+    if let Some(sv) = detect_config_schema_version(install) {
+        agent_extra.insert("schema_version".to_string(), serde_json::json!(sv));
+    }
+
     // 6. Build manifest
     let manifest = Manifest {
         alf_version: "1.0.0".to_string(),
@@ -621,7 +997,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
             name: agent_name.clone(),
             source_runtime: "zeroclaw".to_string(),
             source_runtime_version: runtime_version,
-            extra: std::collections::HashMap::new(),
+            extra: agent_extra,
         },
         layers: LayerInventory {
             identity: if has_identity {
@@ -694,7 +1070,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
 
     // Raw sources — `enumerate_raw` is the single source of truth for the set.
     let (raw_entries, excluded_by_alfignore, _warnings, missing_includes) =
-        enumerate_raw(workspace, &config);
+        enumerate_raw(install, &config);
     let mut raw_source_names = Vec::with_capacity(raw_entries.len());
     for (entry, content) in raw_entries {
         let data = match content {
@@ -724,7 +1100,7 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_size_bytes: output_size,
         excluded_by_alfignore,
         missing_includes,
-        warnings: Vec::new(),
+        warnings: export_warnings,
     })
 }
 
@@ -735,69 +1111,93 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusqlite::Connection;
+    use crate::brain_db;
     use std::fs;
     use tempfile::TempDir;
 
-    /// Create a ZeroClaw-style directory structure:
-    /// `{dir}/config.toml`, `{dir}/workspace/SOUL.md`, etc.
+    /// Create a flat ZeroClaw install root (the real/harness layout): everything
+    /// — `config.toml`, `SOUL.md`, `memory/*.md` — lives directly under the root.
     fn create_zeroclaw_home(
         config_toml: &str,
-        workspace_files: &[(&str, &str)],
+        files: &[(&str, &str)],
     ) -> (TempDir, std::path::PathBuf) {
         let dir = TempDir::new().unwrap();
-        let zc_home = dir.path().to_path_buf();
-        let ws = zc_home.join("workspace");
-        fs::create_dir_all(&ws).unwrap();
-
-        fs::write(zc_home.join("config.toml"), config_toml).unwrap();
-
-        for (name, content) in workspace_files {
-            let path = ws.join(name);
+        let root = dir.path().to_path_buf();
+        fs::write(root.join("config.toml"), config_toml).unwrap();
+        for (name, content) in files {
+            let path = root.join(name);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).unwrap();
             }
             fs::write(&path, content).unwrap();
         }
-        (dir, ws)
+        (dir, root)
     }
 
-    fn create_test_db(zc_home: &Path) {
-        let db_path = zc_home.join("memory.db");
-        let conn = Connection::open(&db_path).unwrap();
-        conn.execute_batch(
-            "CREATE TABLE memories (
-                id TEXT PRIMARY KEY,
-                key TEXT NOT NULL,
-                content TEXT NOT NULL,
-                category TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                embedding BLOB
-            );",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            rusqlite::params![
+    const A: &str = "aaaaaaaa-0000-0000-0000-0000000000a1";
+
+    /// Seed a real-schema `brain.db` at `<root>/data/memory/brain.db` with one
+    /// agent (`agent_a`) and two rows.
+    fn create_test_db(root: &Path) {
+        use rusqlite::Connection;
+        let db = brain_db::real_schema_db(&root.join("data").join("memory"), &[(A, "agent_a")]);
+        let conn = Connection::open(&db).unwrap();
+        for (id, key, content, cat, ts) in [
+            (
                 "a1b2c3d4-0000-0000-0000-000000000001",
                 "user_pref",
                 "User prefers Rust over Go",
                 "core",
                 "2026-01-15T10:00:00Z",
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO memories VALUES (?1, ?2, ?3, ?4, ?5, NULL)",
-            rusqlite::params![
+            ),
+            (
                 "a1b2c3d4-0000-0000-0000-000000000002",
                 "daily_log",
                 "Reviewed migration plan",
-                "daily",
+                "episodic",
                 "2026-02-20T14:00:00Z",
-            ],
-        )
-        .unwrap();
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, \
+                 updated_at, session_id, namespace, importance, superseded_by, agent_id) \
+                 VALUES (?1,?2,?3,?4,NULL,?5,?5,NULL,'default',0.5,NULL,?6)",
+                rusqlite::params![id, key, content, cat, ts, A],
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn extract_semver_variants() {
+        assert_eq!(extract_semver("zeroclaw 0.8.2").as_deref(), Some("0.8.2"));
+        assert_eq!(
+            extract_semver("zeroclaw v0.8.2 (build 9)").as_deref(),
+            Some("0.8.2")
+        );
+        assert_eq!(extract_semver("1.2.3.4").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver("no digits here"), None);
+        assert_eq!(extract_semver("v0.8"), None);
+    }
+
+    #[test]
+    fn config_schema_version_present_and_absent() {
+        let (_d, root) =
+            create_zeroclaw_home("schema_version = 3\n[memory]\nbackend = \"sqlite\"\n", &[]);
+        assert_eq!(detect_config_schema_version(&root), Some(3));
+        let (_d2, root2) = create_zeroclaw_home("[memory]\nbackend = \"sqlite\"\n", &[]);
+        assert_eq!(detect_config_schema_version(&root2), None);
+    }
+
+    #[test]
+    fn detect_version_prefers_config_then_binary() {
+        // An explicit config `version` wins (offline, deterministic).
+        let (_d, root) = create_zeroclaw_home("version = \"9.9.9\"\nschema_version = 3\n", &[]);
+        assert_eq!(detect_zeroclaw_version(&root).as_deref(), Some("9.9.9"));
+        // No config version → binary fallback (absent in tests → None, or a real
+        // semver if installed); must not panic.
+        let (_d2, root2) = create_zeroclaw_home("schema_version = 3\n", &[]);
+        let _ = detect_zeroclaw_version(&root2);
     }
 
     #[test]
@@ -810,21 +1210,27 @@ embedding_provider = "none"
 [identity]
 format = "openclaw"
 "#;
-        let (dir, ws) = create_zeroclaw_home(
+        let (dir, root) = create_zeroclaw_home(
             config,
             &[("SOUL.md", "# ZCAgent\n\nA test ZeroClaw agent.\n")],
         );
-        create_test_db(dir.path());
+        create_test_db(&root);
 
         let output = dir.path().join("test.alf");
-        let report = export(&ws, &output).unwrap();
+        let report = export(&root, &output).unwrap();
 
-        assert_eq!(report.agent_name, "ZCAgent");
+        // The agent NAME is the per-agent alias (unique per tenant), not the
+        // shared-install SOUL.md H1 "ZCAgent" — WP6 fix for the sync --all 409.
+        assert_eq!(report.agent_name, "agent_a");
         assert_eq!(report.memory_records, 2);
         assert!(report.identity_version.is_some());
         assert!(output.is_file());
         assert!(report.output_size_bytes > 0);
         assert!(report.raw_sources.contains(&"config.toml".to_string()));
+        // The DDL sidecar rides along for lazy-store restore.
+        assert!(report
+            .raw_sources
+            .contains(&brain_db::SCHEMA_SIDECAR.to_string()));
     }
 
     #[test]
@@ -833,7 +1239,7 @@ format = "openclaw"
 [memory]
 backend = "markdown"
 "#;
-        let (dir, ws) = create_zeroclaw_home(
+        let (dir, root) = create_zeroclaw_home(
             config,
             &[
                 ("SOUL.md", "# MdAgent\n\nMarkdown backend.\n"),
@@ -845,24 +1251,77 @@ backend = "markdown"
         );
 
         let output = dir.path().join("test.alf");
-        let report = export(&ws, &output).unwrap();
+        let report = export(&root, &output).unwrap();
 
         assert_eq!(report.agent_name, "MdAgent");
         assert_eq!(report.memory_records, 2);
     }
 
     #[test]
+    fn two_agents_export_distinct_names() {
+        // Regression guard for the sync --all 409: two agents in one shared
+        // brain.db must export DISTINCT names (their aliases), or the second's
+        // registration violates the tenant's unique-name constraint.
+        use rusqlite::Connection;
+        const B: &str = "bbbbbbbb-0000-0000-0000-0000000000b2";
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"\n\
+                      [agents.agent_a]\n[agents.agent_b]\n";
+        // A shared SOUL.md → detect_agent_name is identical for both; only the
+        // alias distinguishes them.
+        let (dir, root) = create_zeroclaw_home(config, &[("SOUL.md", "# SharedSoul\n")]);
+        let db = brain_db::real_schema_db(
+            &root.join("data").join("memory"),
+            &[(A, "agent_a"), (B, "agent_b")],
+        );
+        let conn = Connection::open(&db).unwrap();
+        for (id, key, aid) in [
+            ("11111111-0000-0000-0000-000000000001", "k_a", A),
+            ("22222222-0000-0000-0000-000000000002", "k_b", B),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, \
+                 updated_at, session_id, namespace, importance, superseded_by, agent_id) \
+                 VALUES (?1,?2,'c','core',NULL,'2026-01-15T10:00:00Z','2026-01-15T10:00:00Z',\
+                 NULL,'default',0.5,NULL,?3)",
+                rusqlite::params![id, key, aid],
+            )
+            .unwrap();
+        }
+
+        let export_alias = |alias: &str, zid: &str| {
+            let binding = AgentBinding {
+                runtime_agent: alias.to_string(),
+                runtime_agent_id: Some(zid.to_string()),
+                workspace: root.join("agents").join(alias).join("workspace"),
+                memory_source: MemorySource::SharedDb {
+                    path: db.clone(),
+                    filter_key: "agent_id".to_string(),
+                },
+                default_enabled: true,
+            };
+            let out = dir.path().join(format!("{alias}.alf"));
+            export_agent(&binding, Uuid::parse_str(zid).unwrap(), &out).unwrap()
+        };
+
+        let ra = export_alias("agent_a", A);
+        let rb = export_alias("agent_b", B);
+        assert_eq!(ra.agent_name, "agent_a");
+        assert_eq!(rb.agent_name, "agent_b");
+        assert_ne!(ra.agent_name, rb.agent_name);
+    }
+
+    #[test]
     fn agent_id_stability() {
         let config = "[memory]\nbackend = \"sqlite\"";
-        let (dir, ws) = create_zeroclaw_home(config, &[("SOUL.md", "# Stable\n\nTest.\n")]);
-        create_test_db(dir.path());
+        let (dir, root) = create_zeroclaw_home(config, &[("SOUL.md", "# Stable\n\nTest.\n")]);
+        create_test_db(&root);
 
         let out1 = dir.path().join("out1.alf");
         let out2 = dir.path().join("out2.alf");
-        export(&ws, &out1).unwrap();
-        export(&ws, &out2).unwrap();
+        export(&root, &out1).unwrap();
+        export(&root, &out2).unwrap();
 
-        assert!(ws.join(".alf-agent-id").is_file());
+        assert!(root.join(".alf-agent-id").is_file());
     }
 
     #[test]

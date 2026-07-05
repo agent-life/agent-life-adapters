@@ -1,7 +1,9 @@
 //! `alf export` — export an agent workspace to an .alf archive.
 
 use crate::adapter;
+use crate::config::Config;
 use crate::output;
+use crate::selector;
 use alf_core::FileEntry;
 use anyhow::{bail, Result};
 use colored::Colorize;
@@ -36,7 +38,8 @@ struct ExportDryRunResult {
 
 pub fn run(
     runtime: &str,
-    workspace: &Path,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
     output_arg: Option<&Path>,
     dry_run: bool,
 ) -> Result<()> {
@@ -50,18 +53,59 @@ pub fn run(
         )
     })?;
 
-    if !workspace.exists() {
-        bail!(
-            "Workspace directory does not exist: {}",
-            workspace.display()
-        );
-    }
-    if !workspace.is_dir() {
-        bail!("Workspace path is not a directory: {}", workspace.display());
+    let mut config = Config::load()?;
+
+    // --dry-run writes nothing (CLI-1/IN-2) — including the mapping and the
+    // workspace's .alf-agent-id — but must preview the same workspace the real
+    // export would use. With a mapping present the selector is read-only
+    // (lazy init only fires on an empty mapping), so honor --agent/ALF_AGENT
+    // and the selection's workspace; only an empty mapping keeps the legacy
+    // selector-free path.
+    if dry_run {
+        let (workspace, adhoc) = if config.agents_for_runtime(runtime).is_empty() {
+            (
+                config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?,
+                true,
+            )
+        } else {
+            let install =
+                crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+            let selected = selector::select_current_agent(
+                &mut config,
+                adapter.as_ref(),
+                runtime,
+                &install,
+                agent,
+            )?;
+            selector::effective_workspace(&selected, workspace_flag)
+        };
+        // Only validate an explicit -w target. A mapped per-agent workspace is
+        // adapter-owned and may not exist on disk (shared-store runtimes derive
+        // the install root from it); the adapter's dry-run tolerates that.
+        if adhoc {
+            check_workspace_dir(&workspace)?;
+        }
+        return run_dry_run(adapter.as_ref(), &workspace, human);
     }
 
-    if dry_run {
-        return run_dry_run(adapter.as_ref(), workspace, human);
+    // Selection (lazy init applies): the mapping's id becomes the archive
+    // identity. An explicit -w pointing elsewhere is an ad-hoc export and
+    // keeps the legacy id-less path.
+    let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+    let selected =
+        selector::select_current_agent(&mut config, adapter.as_ref(), runtime, &install, agent)?;
+
+    // WP1: move any legacy vault/key to the per-agent layout before export —
+    // the adapter reads only the per-agent vault path (no legacy fallback).
+    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
+
+    let (workspace, adhoc) = selector::effective_workspace(&selected, workspace_flag);
+    let workspace = workspace.as_path();
+
+    // A mapped per-agent workspace is adapter-owned and may not exist yet —
+    // `export_agent` creates it. Only validate an explicit -w target.
+    if adhoc {
+        check_workspace_dir(workspace)?;
     }
 
     let default_output;
@@ -90,7 +134,13 @@ pub fn run(
         output::progress(&format!("Exporting {} workspace...", adapter.name()));
     }
 
-    let report = adapter.export(workspace, output_path)?;
+    let report = if adhoc {
+        adapter.export(workspace, output_path)?
+    } else {
+        let mut binding = selected.binding.clone();
+        binding.workspace = workspace.to_path_buf();
+        adapter.export_agent(&binding, selected.alf_agent_id, output_path)?
+    };
 
     if human {
         println!("{} Export complete", "✓".green().bold());
@@ -142,6 +192,19 @@ pub fn run(
         });
     }
 
+    Ok(())
+}
+
+fn check_workspace_dir(workspace: &Path) -> Result<()> {
+    if !workspace.exists() {
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
+    }
+    if !workspace.is_dir() {
+        bail!("Workspace path is not a directory: {}", workspace.display());
+    }
     Ok(())
 }
 

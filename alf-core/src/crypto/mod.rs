@@ -27,18 +27,15 @@
 //!
 //! ## Keys
 //!
-//! - Raw 32-byte key (default): produced by `VaultKey::generate` or
-//!   loaded with `VaultKey::from_base64`.
-//! - Argon2id-derived key (opt-in): `VaultKey::from_passphrase`. The
-//!   derived key is identical in handling to a raw key; only the
-//!   metadata stamped onto the record differs.
+//! Raw 32-byte keys only: produced by `VaultKey::generate` or loaded
+//! with `VaultKey::from_base64`.
 
 mod aead;
 mod key;
 mod payload;
 
 pub use aead::{decrypt_record, encrypt_payload, Algorithm, EncryptedBlob};
-pub use key::{Argon2Params, VaultKey, RECOMMENDED_ARGON2};
+pub use key::VaultKey;
 pub use payload::{VaultPayload, VAULT_PAYLOAD_VERSION};
 
 use thiserror::Error;
@@ -70,9 +67,6 @@ pub enum CryptoError {
 
     #[error("AEAD encryption failed")]
     EncryptionFailed,
-
-    #[error("Argon2id key derivation failed")]
-    KdfFailed,
 
     #[error("invalid vault payload: {0}")]
     InvalidPayload(String),

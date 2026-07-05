@@ -357,13 +357,34 @@ pub struct ProseIdentity {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_profile: Option<String>,
 
-    /// Additional prose blocks keyed by name.
-    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    /// Additional prose blocks keyed by name. Serialized in sorted-key order so
+    /// an unchanged identity re-exports byte-identically (no spurious delta every
+    /// sync — Hermes agents carry many built-in `personality:*` blocks).
+    #[serde(
+        default,
+        skip_serializing_if = "HashMap::is_empty",
+        serialize_with = "serialize_sorted_map"
+    )]
     pub custom_blocks: HashMap<String, String>,
 
     /// Unknown fields preserved for forward compatibility.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// Serialize a `HashMap` as a JSON object with keys in sorted order, so exports
+/// are deterministic regardless of the map's (arbitrary) iteration order.
+fn serialize_sorted_map<S>(map: &HashMap<String, String>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    use serde::ser::SerializeMap;
+    let sorted: std::collections::BTreeMap<&String, &String> = map.iter().collect();
+    let mut m = serializer.serialize_map(Some(sorted.len()))?;
+    for (k, v) in sorted {
+        m.serialize_entry(k, v)?;
+    }
+    m.end()
 }
 
 // ---------------------------------------------------------------------------
@@ -625,6 +646,49 @@ mod tests {
         let json = serde_json::to_string(&prose).unwrap();
         let deserialized: ProseIdentity = serde_json::from_str(&json).unwrap();
         assert_eq!(prose, deserialized);
+    }
+
+    #[test]
+    fn prose_custom_blocks_serialize_sorted_and_deterministic() {
+        // Many keys so a HashMap's arbitrary order would otherwise vary run to
+        // run (the Hermes `personality:*` churn). Building the map in shuffled
+        // insertion order and re-serializing must still be byte-stable + sorted.
+        let keys = [
+            "personality:witty",
+            "system_prompt",
+            "personality:noir",
+            "active_personality",
+            "personality:kawaii",
+            "b",
+            "a",
+        ];
+        let prose = ProseIdentity {
+            soul: None,
+            operating_instructions: None,
+            identity_profile: None,
+            custom_blocks: keys
+                .iter()
+                .map(|k| (k.to_string(), format!("v-{k}")))
+                .collect(),
+            extra: HashMap::new(),
+        };
+        let j1 = serde_json::to_string(&prose).unwrap();
+        let j2 = serde_json::to_string(&prose).unwrap();
+        assert_eq!(j1, j2, "custom_blocks must serialize deterministically");
+        // Keys appear in sorted order in the JSON.
+        let mut sorted = keys.to_vec();
+        sorted.sort();
+        let positions: Vec<usize> = sorted
+            .iter()
+            .map(|k| j1.find(&format!("\"{k}\"")).expect("key present"))
+            .collect();
+        assert!(
+            positions.windows(2).all(|w| w[0] < w[1]),
+            "custom_blocks keys must be sorted in the output"
+        );
+        // Round-trip still holds.
+        let back: ProseIdentity = serde_json::from_str(&j1).unwrap();
+        assert_eq!(prose, back);
     }
 
     #[test]

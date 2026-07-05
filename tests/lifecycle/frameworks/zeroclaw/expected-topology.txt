@@ -1,0 +1,17 @@
+# ZeroClaw 0.8.2 — what the standard bare install (official install.sh,
+# --prebuilt --skip-quickstart) declares in ~/.zeroclaw after the Z1 probe
+# (`zeroclaw --version` + `zeroclaw status`), verified empirically against the
+# pinned image (WP2). One home-relative path per line; the Z1 check asserts
+# every entry exists and soft-warns on extras.
+#
+# Config shape verified separately at Z1: `schema_version = 3`, NO top-level
+# `workspace_dir` (the install root IS the workspace — alf's WP0 fallback
+# maps it directly), NO `[agents.*]` blocks (the implicit sole agent; the
+# framework itself creates the alias-`default` row in brain.db on first
+# `memory reindex` — Z3-nuance evidence).
+#
+# Z2 (`zeroclaw memory reindex`) is expected to add, NOT asserted here:
+#   data/memory/brain.db            (the REAL captured schema)
+#   data/state/memory_hygiene_state.json
+#   shared/
+config.toml

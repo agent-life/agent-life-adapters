@@ -1,13 +1,13 @@
 //! Vault-key resolution: figure out which 32-byte key to use, given
-//! CLI flags, env vars, runtime default paths, and passphrase mode.
+//! CLI flags, env vars, and per-agent runtime default paths.
 //!
 //! Resolution order (first hit wins):
 //!
 //! 1. `--vault-key-file PATH`           (explicit file)
 //! 2. `--vault-key-env VAR` / `ALF_VAULT_KEY` env (base64 key)
-//! 3. `--vault-passphrase-file PATH` or `ALF_VAULT_PASSPHRASE` (Argon2id mode)
-//! 4. Default file for the runtime (`~/.openclaw/state/.alf-vault-key`
-//!    or `~/.zeroclaw/state/.alf-vault-key`)
+//! 3. Default file for the runtime + agent scope
+//!    (`~/.{openclaw|zeroclaw}/state/{alf_agent_id}/.alf-vault-key`, or the
+//!    legacy `~/.{rt}/state/.alf-vault-key` when no agent scope applies)
 //!
 //! Modules outside this file must never read the key bytes directly —
 //! they get a `VaultKey` (which is `Zeroize`-on-drop) and pass it
@@ -16,9 +16,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{anyhow, Context, Result};
+use uuid::Uuid;
 
-use alf_core::{Argon2Params, VaultKey, RECOMMENDED_ARGON2};
+use alf_core::VaultKey;
+
+use crate::errors::{codes, CliError};
 
 /// Flags shared by `alf export`, `alf import`, and every `alf vault *`
 /// subcommand that needs a key.
@@ -29,15 +32,6 @@ pub struct VaultKeyArgs {
     /// `--vault-key-env VAR`: name of env var holding base64 key.
     /// Defaults to `ALF_VAULT_KEY` when `--vault-key-env` is omitted.
     pub key_env: Option<String>,
-    /// `--vault-passphrase-file PATH`: passphrase from file (Argon2id).
-    pub passphrase_file: Option<PathBuf>,
-    /// `--vault-passphrase-env VAR`: passphrase from env var.
-    pub passphrase_env: Option<String>,
-    /// `--vault-salt`: base64 salt for passphrase mode. If omitted, a
-    /// fixed per-runtime salt is used so the same passphrase reproduces
-    /// the same key across hosts. Use a record-stored salt for new
-    /// records via `kdf_params.extra.salt`.
-    pub salt_b64: Option<String>,
 }
 
 /// Source of the vault key, useful for status messages.
@@ -45,8 +39,6 @@ pub struct VaultKeyArgs {
 pub enum KeySource {
     File(PathBuf),
     Env(String),
-    PassphraseFile(PathBuf),
-    PassphraseEnv(String),
     DefaultFile(PathBuf),
 }
 
@@ -55,19 +47,21 @@ impl KeySource {
         match self {
             Self::File(p) => format!("file:{}", p.display()),
             Self::Env(v) => format!("env:{v}"),
-            Self::PassphraseFile(p) => format!("passphrase-file:{}", p.display()),
-            Self::PassphraseEnv(v) => format!("passphrase-env:{v}"),
             Self::DefaultFile(p) => format!("default-file:{}", p.display()),
         }
     }
 }
 
-/// Resolve a vault key for a given runtime.
+/// Resolve a vault key for the given runtime + agent scope.
 ///
 /// Returns `Ok(None)` if no key source was supplied AND no default file
 /// exists — callers may then fall back to metadata-only behavior. Other
 /// failures (file exists but unreadable, bad base64, etc.) return Err.
-pub fn resolve(args: &VaultKeyArgs, runtime: &str) -> Result<Option<(VaultKey, KeySource)>> {
+pub fn resolve(
+    args: &VaultKeyArgs,
+    runtime: &str,
+    agent: Option<Uuid>,
+) -> Result<Option<(VaultKey, KeySource)>> {
     // 1. Explicit --vault-key-file.
     if let Some(path) = &args.key_file {
         let key = load_from_file(path)?;
@@ -86,31 +80,8 @@ pub fn resolve(args: &VaultKeyArgs, runtime: &str) -> Result<Option<(VaultKey, K
         }
     }
 
-    // 3. Passphrase mode.
-    if let Some(path) = &args.passphrase_file {
-        let pass = fs::read_to_string(path)
-            .with_context(|| format!("Failed to read passphrase file {}", path.display()))?;
-        let key = derive_from_passphrase(pass.trim(), args.salt_b64.as_deref(), runtime)?;
-        return Ok(Some((key, KeySource::PassphraseFile(path.clone()))));
-    }
-    if let Some(env_name) = &args.passphrase_env {
-        let pass = std::env::var(env_name)
-            .with_context(|| format!("Passphrase env var {env_name} not set"))?;
-        let key = derive_from_passphrase(pass.trim(), args.salt_b64.as_deref(), runtime)?;
-        return Ok(Some((key, KeySource::PassphraseEnv(env_name.clone()))));
-    }
-    if let Ok(pass) = std::env::var("ALF_VAULT_PASSPHRASE") {
-        if !pass.is_empty() {
-            let key = derive_from_passphrase(pass.trim(), args.salt_b64.as_deref(), runtime)?;
-            return Ok(Some((
-                key,
-                KeySource::PassphraseEnv("ALF_VAULT_PASSPHRASE".into()),
-            )));
-        }
-    }
-
-    // 4. Runtime default file.
-    if let Some(path) = default_key_path(runtime)? {
+    // 3. Default key file for (runtime, agent scope).
+    if let Some(path) = default_key_path(runtime, agent)? {
         if path.is_file() {
             let key = load_from_file(&path)?;
             return Ok(Some((key, KeySource::DefaultFile(path))));
@@ -120,16 +91,32 @@ pub fn resolve(args: &VaultKeyArgs, runtime: &str) -> Result<Option<(VaultKey, K
     Ok(None)
 }
 
-/// Resolve a vault key and bail if none is available.
-pub fn resolve_required(args: &VaultKeyArgs, runtime: &str) -> Result<(VaultKey, KeySource)> {
-    match resolve(args, runtime)? {
-        Some(pair) => Ok(pair),
-        None => bail!(
-            "No vault key resolved. Provide one of: --vault-key-file, --vault-key-env, \
-             --vault-passphrase-file, --vault-passphrase-env, ALF_VAULT_KEY env, \
-             ALF_VAULT_PASSPHRASE env, or place a base64 key at the runtime default \
-             path (~/.{runtime}/state/.alf-vault-key)."
-        ),
+/// Resolve a vault key and fail with a coded error if none is available.
+pub fn resolve_required(
+    args: &VaultKeyArgs,
+    runtime: &str,
+    agent: Option<Uuid>,
+) -> Result<(VaultKey, KeySource)> {
+    match resolve(args, runtime, agent)? {
+        Some(resolved) => Ok(resolved),
+        None => {
+            let flags = "--vault-key-file, --vault-key-env, or the ALF_VAULT_KEY env var";
+            let remedy = match default_key_path(runtime, agent)? {
+                Some(p) => format!(
+                    "Run 'alf vault keygen --out {}' to create a default key, or pass \
+                     one of: {flags}. Pass --agent <alias-or-id> if the wrong agent \
+                     was selected.",
+                    p.display()
+                ),
+                None => format!("Pass one of: {flags}."),
+            };
+            Err(CliError {
+                code: codes::VAULT_KEY_UNRESOLVED,
+                cause: format!("No vault key resolved for runtime '{runtime}'."),
+                remedy,
+            }
+            .into())
+        }
     }
 }
 
@@ -139,75 +126,71 @@ fn load_from_file(path: &Path) -> Result<VaultKey> {
     VaultKey::from_base64(&raw).map_err(|e| anyhow!("Invalid key in {}: {e}", path.display()))
 }
 
-fn derive_from_passphrase(
-    passphrase: &str,
-    salt_b64: Option<&str>,
-    runtime: &str,
-) -> Result<VaultKey> {
-    use base64::{engine::general_purpose::STANDARD as B64, Engine};
-
-    let salt: Vec<u8> = match salt_b64 {
-        Some(s) => B64
-            .decode(s.as_bytes())
-            .map_err(|_| anyhow!("--vault-salt is not valid base64"))?,
-        None => default_passphrase_salt(runtime).into(),
-    };
-
-    let params = Argon2Params {
-        memory_cost: RECOMMENDED_ARGON2.memory_cost,
-        time_cost: RECOMMENDED_ARGON2.time_cost,
-        parallelism: RECOMMENDED_ARGON2.parallelism,
-    };
-    let (key, _kdf) = VaultKey::from_passphrase(passphrase, &salt, params)
-        .map_err(|e| anyhow!("Argon2id derivation failed: {e}"))?;
-    Ok(key)
-}
-
-/// Stable per-runtime salt used when the user provides a passphrase but
-/// no explicit salt. Documented in vault-key-management.md so users
-/// know what their passphrase derives to across machines.
-fn default_passphrase_salt(runtime: &str) -> &'static [u8] {
-    match runtime {
-        "openclaw" => b"alf.v1.openclaw.passphrase.salt",
-        "zeroclaw" => b"alf.v1.zeroclaw.passphrase.salt",
-        _ => b"alf.v1.default.passphrase.salt",
-    }
-}
-
-/// Path of the default vault key file for a runtime.
+/// Path of the default vault key file for a runtime + agent scope.
 ///
-/// `~/.openclaw/state/.alf-vault-key` or `~/.zeroclaw/state/.alf-vault-key`.
-/// Returns `Ok(None)` for unknown runtimes (no default file applies).
-pub fn default_key_path(runtime: &str) -> Result<Option<PathBuf>> {
+/// `(openclaw|zeroclaw, Some(id))` → `~/.{rt}/state/{id}/.alf-vault-key`;
+/// `(.., None)` → the legacy `~/.{rt}/state/.alf-vault-key`. Returns
+/// `Ok(None)` for unknown runtimes (no default file applies).
+pub fn default_key_path(runtime: &str, agent: Option<Uuid>) -> Result<Option<PathBuf>> {
     let home = alf_core::home_dir().context("Could not determine home directory")?;
-    let path = match runtime {
-        "openclaw" => home.join(".openclaw").join("state").join(".alf-vault-key"),
-        "zeroclaw" => home.join(".zeroclaw").join("state").join(".alf-vault-key"),
+    let state_dir = match runtime {
+        "openclaw" => home.join(".openclaw").join("state"),
+        "zeroclaw" => home.join(".zeroclaw").join("state"),
+        // WP5: `~/.hermes/state/<id>/.alf-vault-key`. `state/` is outside every
+        // profile's synced unit (profiles hold a `state.db` *file*, never a
+        // `state/` dir), so the key never travels in an archive.
+        "hermes" => home.join(".hermes").join("state"),
         _ => return Ok(None),
+    };
+    let path = match agent {
+        Some(id) => state_dir.join(id.to_string()).join(".alf-vault-key"),
+        None => state_dir.join(".alf-vault-key"),
     };
     Ok(Some(path))
 }
 
-/// Path of the agent-managed ALF vault: `~/.alf/vault/credentials.json`.
+/// The pre-WP1 install-scoped key path — migration source only.
+pub(crate) fn legacy_default_key_path(runtime: &str) -> Result<Option<PathBuf>> {
+    default_key_path(runtime, None)
+}
+
+/// Path of the agent-managed ALF vault.
 ///
-/// Runtime-neutral — the vault is ALF's own store, deliberately separate from
-/// any runtime keystore. `alf vault add` writes here, and the adapter merges
-/// this file into the archive's Layer 4 on `alf sync`. Unlike the vault key,
-/// this file holds only ciphertext, so it is safe to sync.
-pub fn default_vault_path() -> Result<PathBuf> {
+/// `Some(id)` → `~/.alf/vault/{id}/credentials.json`; `None` → the legacy
+/// install-scoped `~/.alf/vault/credentials.json`. Runtime-neutral — the
+/// vault is ALF's own store, deliberately separate from any runtime keystore.
+/// `alf vault add` writes here, and the adapters merge this file into the
+/// archive's Layer 4 on `alf sync`. Unlike the vault key, this file holds
+/// only ciphertext, so it is safe to sync.
+pub fn default_vault_path(agent: Option<Uuid>) -> Result<PathBuf> {
     let home = alf_core::home_dir().context("Could not determine home directory")?;
-    Ok(home.join(".alf").join("vault").join("credentials.json"))
+    Ok(match agent {
+        Some(id) => alf_core::agent_vault_path(&home, id),
+        None => alf_core::legacy_vault_path(&home),
+    })
+}
+
+/// The pre-WP1 install-scoped vault path — migration source only.
+pub(crate) fn legacy_default_vault_path() -> Result<PathBuf> {
+    default_vault_path(None)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::tests::{RestoreEnv, HOME_LOCK};
     use tempfile::TempDir;
 
     fn temp_key_file(key: &VaultKey, dir: &TempDir) -> PathBuf {
         let path = dir.path().join("key");
         fs::write(&path, key.to_base64()).unwrap();
         path
+    }
+
+    fn uuid(n: u8) -> Uuid {
+        let mut bytes = [0u8; 16];
+        bytes[15] = n;
+        Uuid::from_bytes(bytes)
     }
 
     #[test]
@@ -220,9 +203,9 @@ mod tests {
             key_file: Some(path.clone()),
             ..Default::default()
         };
-        let (resolved, src) = resolve(&args, "openclaw").unwrap().unwrap();
+        let (resolved, source) = resolve(&args, "openclaw", None).unwrap().unwrap();
         assert_eq!(resolved.fingerprint(), key.fingerprint());
-        assert_eq!(src, KeySource::File(path));
+        assert_eq!(source, KeySource::File(path));
     }
 
     #[test]
@@ -235,54 +218,264 @@ mod tests {
             key_env: Some(env_var.to_string()),
             ..Default::default()
         };
-        let (resolved, src) = resolve(&args, "openclaw").unwrap().unwrap();
+        let (resolved, source) = resolve(&args, "openclaw", None).unwrap().unwrap();
         assert_eq!(resolved.fingerprint(), key.fingerprint());
-        assert_eq!(src, KeySource::Env(env_var.to_string()));
+        assert_eq!(source, KeySource::Env(env_var.to_string()));
 
         std::env::remove_var(env_var);
-    }
-
-    #[test]
-    fn passphrase_file_resolves() {
-        let dir = TempDir::new().unwrap();
-        let pass_path = dir.path().join("passphrase");
-        fs::write(&pass_path, "correct horse battery staple").unwrap();
-
-        let args = VaultKeyArgs {
-            passphrase_file: Some(pass_path.clone()),
-            ..Default::default()
-        };
-        let (k1, _) = resolve(&args, "openclaw").unwrap().unwrap();
-        let (k2, _) = resolve(&args, "openclaw").unwrap().unwrap();
-        assert_eq!(
-            k1.fingerprint(),
-            k2.fingerprint(),
-            "passphrase should be stable"
-        );
-
-        // Different runtime salt -> different key.
-        let (k_z, _) = resolve(&args, "zeroclaw").unwrap().unwrap();
-        assert_ne!(k1.fingerprint(), k_z.fingerprint());
     }
 
     #[test]
     fn returns_none_when_no_source() {
         let args = VaultKeyArgs::default();
         // Use a fake runtime so default_key_path returns None.
-        let result = resolve(&args, "fakeruntime").unwrap();
+        let result = resolve(&args, "fakeruntime", None).unwrap();
         assert!(result.is_none());
     }
 
+    /// U-1: legacy (agent-less) key paths keep the exact pre-WP1 strings.
     #[test]
-    fn default_key_path_per_runtime() {
-        let p = default_key_path("openclaw").unwrap().unwrap();
-        assert!(p.to_string_lossy().contains(".openclaw"));
-        assert!(p.to_string_lossy().ends_with(".alf-vault-key"));
+    fn default_key_path_legacy_when_no_agent() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
 
-        let z = default_key_path("zeroclaw").unwrap().unwrap();
-        assert!(z.to_string_lossy().contains(".zeroclaw"));
+        let p = default_key_path("openclaw", None).unwrap().unwrap();
+        assert_eq!(
+            p,
+            tmp.path()
+                .join(".openclaw")
+                .join("state")
+                .join(".alf-vault-key")
+        );
+        let z = default_key_path("zeroclaw", None).unwrap().unwrap();
+        assert_eq!(
+            z,
+            tmp.path()
+                .join(".zeroclaw")
+                .join("state")
+                .join(".alf-vault-key")
+        );
+        assert!(default_key_path("unknownruntime", None).unwrap().is_none());
+        // The legacy aliases resolve identically (migration reads them).
+        assert_eq!(legacy_default_key_path("openclaw").unwrap().unwrap(), p);
+    }
 
-        let unknown = default_key_path("unknownruntime").unwrap();
-        assert!(unknown.is_none());
+    /// U-2: per-agent key paths are distinct per agent; hermes resolves under
+    /// `~/.hermes/state/` (WP5); unknown runtimes have no default file.
+    #[test]
+    fn default_key_path_per_agent_distinct() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+
+        let a = default_key_path("openclaw", Some(uuid(1)))
+            .unwrap()
+            .unwrap();
+        let b = default_key_path("openclaw", Some(uuid(2)))
+            .unwrap()
+            .unwrap();
+        assert_ne!(a, b, "two agents must get distinct default key paths");
+        assert_eq!(
+            a,
+            tmp.path()
+                .join(".openclaw")
+                .join("state")
+                .join(uuid(1).to_string())
+                .join(".alf-vault-key")
+        );
+
+        // WP5: hermes resolves under `~/.hermes/state/<id>/.alf-vault-key`,
+        // mirroring the openclaw/zeroclaw arms.
+        assert_eq!(
+            default_key_path("hermes", Some(uuid(1))).unwrap().unwrap(),
+            tmp.path()
+                .join(".hermes")
+                .join("state")
+                .join(uuid(1).to_string())
+                .join(".alf-vault-key")
+        );
+        assert_eq!(
+            default_key_path("hermes", None).unwrap().unwrap(),
+            tmp.path()
+                .join(".hermes")
+                .join("state")
+                .join(".alf-vault-key")
+        );
+        assert!(default_key_path("unknownruntime", Some(uuid(1)))
+            .unwrap()
+            .is_none());
+    }
+
+    /// U-4: explicit file/env always beat the per-agent default file (DoD).
+    #[test]
+    fn explicit_file_and_env_win_over_per_agent_default() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+
+        // Seed a per-agent default key.
+        let default_key = VaultKey::generate();
+        let default_path = default_key_path("openclaw", Some(uuid(1)))
+            .unwrap()
+            .unwrap();
+        fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+        fs::write(&default_path, default_key.to_base64()).unwrap();
+
+        // Explicit file wins.
+        let dir = TempDir::new().unwrap();
+        let explicit_key = VaultKey::generate();
+        let explicit_path = temp_key_file(&explicit_key, &dir);
+        let args = VaultKeyArgs {
+            key_file: Some(explicit_path),
+            ..Default::default()
+        };
+        let (resolved, _) = resolve(&args, "openclaw", Some(uuid(1))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), explicit_key.fingerprint());
+
+        // Explicit env wins.
+        let env_key = VaultKey::generate();
+        let env_var = "ALF_TEST_WP1_ENV_KEY";
+        std::env::set_var(env_var, env_key.to_base64());
+        let args = VaultKeyArgs {
+            key_env: Some(env_var.to_string()),
+            ..Default::default()
+        };
+        let (resolved, _) = resolve(&args, "openclaw", Some(uuid(1))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), env_key.fingerprint());
+        std::env::remove_var(env_var);
+    }
+
+    /// U-5: with no flags, the per-agent default file resolves for the scoped
+    /// agent, and the legacy file resolves for a scope-less context.
+    #[test]
+    fn default_file_resolves_per_agent() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+
+        let agent_key = VaultKey::generate();
+        let agent_path = default_key_path("openclaw", Some(uuid(7)))
+            .unwrap()
+            .unwrap();
+        fs::create_dir_all(agent_path.parent().unwrap()).unwrap();
+        fs::write(&agent_path, agent_key.to_base64()).unwrap();
+
+        let legacy_key = VaultKey::generate();
+        let legacy_path = default_key_path("openclaw", None).unwrap().unwrap();
+        fs::create_dir_all(legacy_path.parent().unwrap()).unwrap();
+        fs::write(&legacy_path, legacy_key.to_base64()).unwrap();
+
+        let args = VaultKeyArgs::default();
+        let (resolved, source) = resolve(&args, "openclaw", Some(uuid(7))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), agent_key.fingerprint());
+        assert_eq!(source, KeySource::DefaultFile(agent_path));
+
+        let (resolved, source) = resolve(&args, "openclaw", None).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), legacy_key.fingerprint());
+        assert_eq!(source, KeySource::DefaultFile(legacy_path));
+    }
+
+    /// Pin the full 3-step resolution order: explicit file → env → per-agent
+    /// default file. All three sources present ⇒ file wins; drop the file ⇒
+    /// env wins; drop the env ⇒ the default file resolves.
+    #[test]
+    fn resolve_order_is_file_env_default() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+
+        let default_key = VaultKey::generate();
+        let default_path = default_key_path("openclaw", Some(uuid(9)))
+            .unwrap()
+            .unwrap();
+        fs::create_dir_all(default_path.parent().unwrap()).unwrap();
+        fs::write(&default_path, default_key.to_base64()).unwrap();
+
+        let env_key = VaultKey::generate();
+        let env_var = "ALF_TEST_ORDER_ENV_KEY";
+        std::env::set_var(env_var, env_key.to_base64());
+
+        let dir = TempDir::new().unwrap();
+        let file_key = VaultKey::generate();
+        let file_path = temp_key_file(&file_key, &dir);
+
+        // 1. File beats env and default.
+        let args = VaultKeyArgs {
+            key_file: Some(file_path),
+            key_env: Some(env_var.to_string()),
+        };
+        let (resolved, source) = resolve(&args, "openclaw", Some(uuid(9))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), file_key.fingerprint());
+        assert!(matches!(source, KeySource::File(_)));
+
+        // 2. Env beats default.
+        let args = VaultKeyArgs {
+            key_file: None,
+            key_env: Some(env_var.to_string()),
+        };
+        let (resolved, source) = resolve(&args, "openclaw", Some(uuid(9))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), env_key.fingerprint());
+        assert!(matches!(source, KeySource::Env(_)));
+
+        // 3. Default file resolves when nothing explicit is passed.
+        std::env::remove_var(env_var);
+        std::env::remove_var("ALF_VAULT_KEY");
+        let args = VaultKeyArgs::default();
+        let (resolved, source) = resolve(&args, "openclaw", Some(uuid(9))).unwrap().unwrap();
+        assert_eq!(resolved.fingerprint(), default_key.fingerprint());
+        assert!(matches!(source, KeySource::DefaultFile(_)));
+    }
+
+    /// U-6: the unresolved-key error is coded and its remedy names the exact
+    /// per-agent keygen command.
+    #[test]
+    fn resolve_required_remedy_names_per_agent_keygen_command() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::env::remove_var("ALF_VAULT_KEY");
+
+        // VaultKey has no Debug (deliberately unprintable), so unwrap_err()
+        // is unavailable — match instead.
+        let expect_err = |r: Result<(VaultKey, KeySource)>| match r {
+            Ok(_) => panic!("resolution must fail with no key source"),
+            Err(e) => e,
+        };
+
+        let args = VaultKeyArgs::default();
+        let err = expect_err(resolve_required(&args, "openclaw", Some(uuid(3))));
+        let cli_err = err.downcast_ref::<CliError>().expect("coded error");
+        assert_eq!(cli_err.code, codes::VAULT_KEY_UNRESOLVED);
+        assert!(cli_err.remedy.contains("alf vault keygen --out"));
+        assert!(
+            cli_err
+                .remedy
+                .contains(&format!("{}/.alf-vault-key", uuid(3))),
+            "remedy must name the per-agent key path: {}",
+            cli_err.remedy
+        );
+        assert!(cli_err.remedy.contains("--agent"));
+
+        // Hermes (WP5): has a per-agent default key path, so the remedy names
+        // `keygen` + the per-agent path, exactly like openclaw.
+        let err = expect_err(resolve_required(&args, "hermes", Some(uuid(3))));
+        let cli_err = err.downcast_ref::<CliError>().expect("coded error");
+        assert_eq!(cli_err.code, codes::VAULT_KEY_UNRESOLVED);
+        assert!(cli_err.remedy.contains("alf vault keygen --out"));
+        assert!(
+            cli_err
+                .remedy
+                .contains(&format!("{}/.alf-vault-key", uuid(3))),
+            "remedy must name the per-agent key path: {}",
+            cli_err.remedy
+        );
+        assert!(cli_err.remedy.contains("--agent"));
     }
 }

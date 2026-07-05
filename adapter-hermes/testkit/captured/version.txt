@@ -1,0 +1,5 @@
+Hermes Agent v0.17.0 (2026.6.19) · upstream 571092ee
+Project: /home/agent/.hermes/hermes-agent
+Python: 3.11.15
+OpenAI SDK: 2.24.0
+Up to date

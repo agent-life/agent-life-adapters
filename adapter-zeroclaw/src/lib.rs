@@ -22,12 +22,14 @@
 use std::path::Path;
 
 use anyhow::Result;
+use uuid::Uuid;
 
 pub use alf_core::adapter::{
     ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
 };
-pub use alf_core::Adapter;
+pub use alf_core::{Adapter, AgentBinding};
 
+pub mod brain_db;
 pub mod config_parser;
 pub mod export;
 pub mod identity_parser;
@@ -70,7 +72,7 @@ impl Adapter for ZeroClawAdapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
-        import::import(alf_file, workspace, options.vault_key)
+        import::import(alf_file, workspace, options.vault_key, options.mode)
     }
 
     fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {
@@ -79,5 +81,26 @@ impl Adapter for ZeroClawAdapter {
 
     fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
         import::enumerate_archive(alf_file)
+    }
+
+    fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
+        export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP3: enumerate agents from the shared `brain.db` + `[agents.*]` config
+    /// (overrides the WP0 single-agent fallback).
+    fn discover_agents(&self, install: &Path) -> Result<Vec<AgentBinding>> {
+        export::discover_agents(install)
+    }
+
+    /// WP3: export one agent's per-`agent_id` slice of the shared `brain.db`,
+    /// stamping the mapping's `alf_agent_id` as the archive identity.
+    fn export_agent(
+        &self,
+        binding: &AgentBinding,
+        alf_agent_id: Uuid,
+        output: &Path,
+    ) -> Result<ExportReport> {
+        export::export_agent(binding, alf_agent_id, output)
     }
 }

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 #
-# Generate synthetic test workspaces for OpenClaw and ZeroClaw.
+# Generate a synthetic OpenClaw test workspace.
+#
+# NOTE (WP2): the ZeroClaw synthetic path (memory.db seed/mutate) was retired —
+# it encoded the wrong DB schema. Real-install ZeroClaw coverage now lives in
+# the lifecycle harness: tests/lifecycle/ (see its README).
 #
 # Usage:
 #   ./scripts/generate_fixtures.sh              # Generate baseline (round 0)
@@ -15,7 +19,7 @@
 #
 # Requirements: bash, python3 (for SQLite — uses stdlib sqlite3 module)
 #
-# The generated workspaces are used for:
+# The generated workspace is used for:
 #   - Manual sync testing:  alf sync -r openclaw -w scripts/fixtures/openclaw-workspace
 #   - Delta computation:    export round 0, mutate, export round 1, compute delta
 #   - E2E integration:      sync → mutate → sync → verify delta sequence
@@ -25,12 +29,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 OC_DIR="$FIXTURES_DIR/openclaw-workspace"
-ZC_DIR="$FIXTURES_DIR/zeroclaw-workspace"
 STATE_FILE="$FIXTURES_DIR/.mutation-round"
 
-# Fixed agent IDs (portable across machines)
+# Fixed agent ID (portable across machines)
 OC_AGENT_ID="a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
-ZC_AGENT_ID="f6e5d4c3-b2a1-4f7e-8d9c-0a1b2c3d4e5f"
 
 # ── Argument parsing ───────────────────────────────────────────────
 
@@ -74,33 +76,6 @@ set_round() {
     echo "$1" > "$STATE_FILE"
 }
 
-# Run SQL against the ZeroClaw memory.db via Python (no sqlite3 CLI needed)
-run_sql() {
-    local db_path="$1"
-    shift
-    python3 -c "
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-conn.executescript(sys.stdin.read())
-conn.commit()
-conn.close()
-" "$db_path"
-}
-
-# Query a single value from the ZeroClaw memory.db
-query_sql() {
-    local db_path="$1"
-    local sql="$2"
-    python3 -c "
-import sqlite3, sys
-conn = sqlite3.connect(sys.argv[1])
-cur = conn.execute(sys.argv[2])
-row = cur.fetchone()
-print(row[0] if row else '?')
-conn.close()
-" "$db_path" "$sql"
-}
-
 # ── Status ─────────────────────────────────────────────────────────
 
 if [ "$ACTION" = "status" ]; then
@@ -115,12 +90,6 @@ if [ "$ACTION" = "status" ]; then
             oc_files=$(find "$OC_DIR" -type f | wc -l | tr -d ' ')
             oc_mem=$(find "$OC_DIR/memory" -name "*.md" -type f 2>/dev/null | wc -l | tr -d ' ')
             echo "  Files: $oc_files total, $oc_mem memory files"
-        fi
-        echo ""
-        echo "ZeroClaw workspace: $ZC_DIR"
-        if [ -f "$ZC_DIR/memory.db" ]; then
-            zc_rows=$(query_sql "$ZC_DIR/memory.db" "SELECT COUNT(*) FROM memories;")
-            echo "  Memory rows: $zc_rows"
         fi
     fi
     exit 0
@@ -140,7 +109,7 @@ fi
 
 generate_baseline() {
     echo "=== Generating baseline fixtures (round 0) ==="
-    mkdir -p "$OC_DIR/memory" "$ZC_DIR/workspace"
+    mkdir -p "$OC_DIR/memory"
 
     # ── OpenClaw workspace ─────────────────────────────────────────
 
@@ -265,55 +234,12 @@ Postgres for metadata and S3 for blob storage.
 - Row-level security in Postgres for tenant isolation
 OCEOF
 
-    # ── ZeroClaw workspace ─────────────────────────────────────────
-
-    echo "$ZC_AGENT_ID" > "$ZC_DIR/.alf-agent-id"
-
-    cat > "$ZC_DIR/config.toml" << 'ZCEOF'
-[memory]
-backend = "sqlite"
-auto_save = true
-embedding_provider = "none"
-vector_weight = 0.7
-keyword_weight = 0.3
-
-[identity]
-format = "openclaw"
-
-[secrets]
-encrypt = false
-ZCEOF
-
-    cat > "$ZC_DIR/workspace/SOUL.md" << 'ZCEOF'
-# Meridian
-
-You are Meridian, a coding assistant focused on full-stack web development.
-You specialize in TypeScript, React, and Node.js ecosystems. You write
-clean, tested code and explain your reasoning clearly.
-ZCEOF
-
-    cat > "$ZC_DIR/workspace/IDENTITY.md" << 'ZCEOF'
-# Identity
-Role: Coding Assistant
-Name: Meridian
-Specialization: Full-Stack Web Development
-Communication Style: Clear explanations with code examples
-ZCEOF
-
-    # Create SQLite database with memories
-    python3 "$SCRIPT_DIR/seed_zeroclaw_baseline.py" "$ZC_DIR/memory.db"
-
     set_round 0
     echo ""
     echo "  OpenClaw workspace: $OC_DIR"
     echo "    Agent ID: $OC_AGENT_ID"
     oc_mem=$(find "$OC_DIR/memory" -name "*.md" -type f | wc -l | tr -d ' ')
     echo "    Memory files: $oc_mem"
-    echo ""
-    echo "  ZeroClaw workspace: $ZC_DIR"
-    echo "    Agent ID: $ZC_AGENT_ID"
-    zc_rows=$(query_sql "$ZC_DIR/memory.db" "SELECT COUNT(*) FROM memories;")
-    echo "    Memory rows: $zc_rows"
     echo ""
     echo "=== Baseline generated (round 0) ==="
 }
@@ -371,13 +297,9 @@ Blocking items:
 After Redis migration, focus shifts to the SLO dashboard work.
 OCEOF
 
-    # ── ZeroClaw: 3 new rows + 1 update
-    python3 "$SCRIPT_DIR/mutate_zeroclaw.py" "$ZC_DIR/memory.db" 1
-
     set_round 1
     echo ""
     echo "  OpenClaw changes: +1 daily log, +1 MEMORY.md section, updated active-context"
-    echo "  ZeroClaw changes: +3 new rows, 1 updated row"
     echo ""
     echo "=== Round 1 applied ==="
 }
@@ -448,13 +370,9 @@ E2E tests passing against the deployed test stack. Moving to Phase 3
 - cargo lambda build needs --flatten bootstrap for SAM CodeUri to work
 OCEOF
 
-    # ── ZeroClaw: 2 new rows + 1 delete + 1 update
-    python3 "$SCRIPT_DIR/mutate_zeroclaw.py" "$ZC_DIR/memory.db" 2
-
     set_round 2
     echo ""
     echo "  OpenClaw changes: +1 daily log, removed 1 section from 2026-01-15, updated project-alf"
-    echo "  ZeroClaw changes: +2 new rows, 1 deleted row, 1 updated row"
     echo ""
     echo "=== Round 2 applied ==="
 }
@@ -483,13 +401,9 @@ calculation service. #reliability #sprint
 EOF
     done
 
-    # ── ZeroClaw: 10 new rows
-    python3 "$SCRIPT_DIR/mutate_zeroclaw.py" "$ZC_DIR/memory.db" 3
-
     set_round 3
     echo ""
     echo "  OpenClaw changes: +5 daily logs (2026-01-19 through 2026-01-23)"
-    echo "  ZeroClaw changes: +10 new rows"
     echo ""
     echo "=== Round 3 applied ==="
 }
@@ -534,10 +448,5 @@ echo "  OpenClaw ($OC_AGENT_ID):"
 oc_mem=$(find "$OC_DIR/memory" -name "*.md" -type f | wc -l | tr -d ' ')
 echo "    Memory files: $oc_mem"
 echo ""
-echo "  ZeroClaw ($ZC_AGENT_ID):"
-zc_rows=$(query_sql "$ZC_DIR/memory.db" "SELECT COUNT(*) FROM memories;")
-echo "    Memory rows:  $zc_rows"
-echo ""
 echo "  Test sync:"
 echo "    alf sync -r openclaw -w $OC_DIR"
-echo "    alf sync -r zeroclaw -w $ZC_DIR"

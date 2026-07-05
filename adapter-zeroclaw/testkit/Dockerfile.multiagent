@@ -1,0 +1,38 @@
+# ZeroClaw multi-agent reference install — research spike (NO alf installed).
+#
+# Goal: a typical/idiomatic install as a non-root user would have it, with TWO
+# agents (agent_a, agent_b), so we can inspect the REAL on-disk layout and the
+# REAL memory DB schema. Shares ONLY the base OS with the other framework images.
+#
+# Trust hierarchy: what this install puts on disk > the framework source > docs.
+#
+# Build:   docker build -f Dockerfile.multiagent -t zeroclaw-multiagent .
+# Inspect: ./inspect.sh   (build + run + capture into captured/)
+FROM debian:bookworm-slim
+
+# Pinned to the verified target (capture plan D11). The captured/ artifacts and
+# the alf adapter are validated against ZeroClaw v0.8.2.
+ARG ZEROCLAW_REF=v0.8.2
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl git sqlite3 tree libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Typical user installs in their own $HOME, not as root.
+RUN useradd -m -s /bin/bash agent
+USER agent
+WORKDIR /home/agent
+
+# Idiomatic install: the prebuilt binary path (what the installer offers by
+# default when prompted) + skip the interactive quickstart. Installs the
+# `zeroclaw` binary to ~/.cargo/bin and sets ~/.zeroclaw as the config dir.
+RUN curl -fsSL "https://raw.githubusercontent.com/zeroclaw-labs/zeroclaw/${ZEROCLAW_REF}/install.sh" \
+      | sh -s -- --prebuilt --skip-quickstart
+
+ENV PATH="/home/agent/.cargo/bin:${PATH}"
+
+# Two-agent setup is applied at inspect time (setup-agents.sh) so we can iterate
+# on the idiomatic config without rebuilding the install layer.
+CMD ["bash"]

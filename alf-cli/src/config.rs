@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 /// Top-level config file structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -15,6 +16,29 @@ pub struct Config {
 
     #[serde(default)]
     pub defaults: DefaultsConfig,
+
+    /// Discovered-agent mapping (`[[agents]]`). Must stay the last field so
+    /// the TOML array-of-tables serializes after `[service]`/`[defaults]`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentEntry>,
+}
+
+/// One row of the discovered-agent mapping. Maintained by `alf check` /
+/// `alf agents` / selector first-contact; users edit `enabled` only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AgentEntry {
+    /// Reserved for multi-runtime hosts; None ⇒ `[defaults].runtime`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    pub runtime_agent: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_agent_id: Option<String>,
+    pub alf_agent_id: Uuid,
+    pub workspace: String,
+    pub enabled: bool,
+    /// Unknown keys preserved across rewrites (forward compat).
+    #[serde(flatten)]
+    pub extra: std::collections::BTreeMap<String, toml::Value>,
 }
 
 /// Service connection settings.
@@ -132,15 +156,81 @@ impl Config {
             }
         }
 
+        // Symmetric fallback for the service URL: a file that doesn't set
+        // `[service] api_url` (it deserializes to the default) can be pointed
+        // elsewhere via ALF_API_URL — used by containers/runtimes so no config
+        // pre-write is required. A URL explicitly set in the file wins.
+        if config.service.api_url == default_api_url() {
+            if let Ok(url) = std::env::var("ALF_API_URL") {
+                if !url.is_empty() {
+                    config.service.api_url = url;
+                }
+            }
+        }
+
         Ok(config)
     }
 
     /// Save the config to `~/.alf/config.toml`, creating the directory
     /// if needed.
-    #[allow(dead_code)]
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
         self.save_to(&path)
+    }
+
+    /// Rows of the `[[agents]]` mapping that belong to `runtime` (row runtime
+    /// matches, or is None — legacy/hand-written rows default to any runtime).
+    pub fn agents_for_runtime(&self, runtime: &str) -> Vec<&AgentEntry> {
+        self.agents
+            .iter()
+            .filter(|a| a.runtime.as_deref().map(|r| r == runtime).unwrap_or(true))
+            .collect()
+    }
+
+    /// Find a mapping row by alias-or-id within `runtime`'s rows: a selector
+    /// that parses as a UUID matches `alf_agent_id`, otherwise it must equal
+    /// the `runtime_agent` alias exactly.
+    pub fn find_agent(&self, runtime: &str, selector: &str) -> Option<&AgentEntry> {
+        let rows = self.agents_for_runtime(runtime);
+        if let Ok(id) = Uuid::parse_str(selector) {
+            if let Some(row) = rows.iter().find(|a| a.alf_agent_id == id) {
+                return Some(row);
+            }
+        }
+        rows.into_iter().find(|a| a.runtime_agent == selector)
+    }
+
+    /// Insert or replace a mapping row, keyed by `alf_agent_id`.
+    pub fn upsert_agent(&mut self, entry: AgentEntry) {
+        match self
+            .agents
+            .iter_mut()
+            .find(|a| a.alf_agent_id == entry.alf_agent_id)
+        {
+            Some(existing) => *existing = entry,
+            None => self.agents.push(entry),
+        }
+    }
+
+    /// Flip a row's `enabled` flag (idempotent) and return the updated row.
+    /// Errors when no row matches the selector.
+    pub fn set_agent_enabled(
+        &mut self,
+        runtime: &str,
+        selector: &str,
+        enabled: bool,
+    ) -> Result<AgentEntry> {
+        let id = match self.find_agent(runtime, selector) {
+            Some(row) => row.alf_agent_id,
+            None => anyhow::bail!("No agent matching '{selector}' for runtime '{runtime}'"),
+        };
+        let row = self
+            .agents
+            .iter_mut()
+            .find(|a| a.alf_agent_id == id)
+            .expect("row found by find_agent");
+        row.enabled = enabled;
+        Ok(row.clone())
     }
 
     /// Save the config to a specific path, creating parent directories
@@ -189,6 +279,7 @@ mod tests {
                 runtime: "zeroclaw".into(),
                 workspace: Some("/home/user/.openclaw/workspace".into()),
             },
+            agents: Vec::new(),
         };
 
         config.save_to(&path).unwrap();
@@ -200,6 +291,7 @@ mod tests {
     fn load_missing_file_returns_defaults() {
         let _lock = HOME_LOCK.lock().unwrap();
         std::env::remove_var("ALF_API_KEY");
+        std::env::remove_var("ALF_API_URL");
 
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("nonexistent.toml");
@@ -210,6 +302,9 @@ mod tests {
 
     #[test]
     fn load_partial_config_fills_defaults() {
+        let _lock = HOME_LOCK.lock().unwrap();
+        std::env::remove_var("ALF_API_URL");
+
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("config.toml");
 
@@ -263,6 +358,27 @@ mod tests {
         std::env::remove_var("ALF_API_KEY");
 
         assert_eq!(config.service.api_key, "alf_sk_from_env");
+    }
+
+    #[test]
+    fn api_url_env_fallback_and_file_precedence() {
+        let _lock = HOME_LOCK.lock().unwrap();
+
+        let dir = TempDir::new().unwrap();
+
+        // File without api_url → ALF_API_URL fills it in.
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[service]\napi_key = \"my-key\"\n").unwrap();
+        std::env::set_var("ALF_API_URL", "http://localhost:9099");
+        let config = Config::load_from(&path).unwrap();
+        assert_eq!(config.service.api_url, "http://localhost:9099");
+
+        // File with an explicit non-default api_url wins over the env var.
+        let path = dir.path().join("config-explicit.toml");
+        fs::write(&path, "[service]\napi_url = \"https://custom.example\"\n").unwrap();
+        let config = Config::load_from(&path).unwrap();
+        std::env::remove_var("ALF_API_URL");
+        assert_eq!(config.service.api_url, "https://custom.example");
     }
 
     #[test]
@@ -331,5 +447,130 @@ mod tests {
     fn resolve_workspace_errors_when_unset() {
         let err = Config::default().resolve_workspace(None).unwrap_err();
         assert!(err.to_string().contains("workspace"));
+    }
+
+    // -----------------------------------------------------------------------
+    // [[agents]] mapping (WP0)
+    // -----------------------------------------------------------------------
+
+    fn agent_entry(alias: &str, id: &str, workspace: &str, enabled: bool) -> AgentEntry {
+        AgentEntry {
+            runtime: Some("openclaw".into()),
+            runtime_agent: alias.into(),
+            runtime_agent_id: None,
+            alf_agent_id: Uuid::parse_str(id).unwrap(),
+            workspace: workspace.into(),
+            enabled,
+            extra: std::collections::BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn agents_mapping_round_trip() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut config = Config::default();
+        let mut row_a = agent_entry(
+            "main",
+            "cfef1150-0000-4000-8000-0000000000aa",
+            "/home/u/.openclaw/workspace",
+            true,
+        );
+        // Unknown key must survive a save/load cycle via `extra`.
+        row_a
+            .extra
+            .insert("future_key".into(), toml::Value::String("preserved".into()));
+        let mut row_b = agent_entry(
+            "helper",
+            "cfef1150-0000-4000-8000-0000000000bb",
+            "/home/u/.openclaw/workspace-helper",
+            false,
+        );
+        row_b.runtime_agent_id = None; // explicit: optional field omitted
+        config.agents = vec![row_a.clone(), row_b.clone()];
+
+        config.save_to(&path).unwrap();
+        let loaded = Config::load_from(&path).unwrap();
+        assert_eq!(loaded.agents, vec![row_a, row_b]);
+        assert_eq!(
+            loaded.agents[0].extra.get("future_key"),
+            Some(&toml::Value::String("preserved".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_agents_parses_empty() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(&path, "[service]\napi_key = \"my-key\"\n").unwrap();
+
+        let config = Config::load_from(&path).unwrap();
+        assert!(config.agents.is_empty());
+    }
+
+    #[test]
+    fn agents_serialize_as_array_of_tables_after_defaults() {
+        let config = Config {
+            agents: vec![agent_entry(
+                "main",
+                "cfef1150-0000-4000-8000-0000000000cc",
+                "/ws",
+                true,
+            )],
+            ..Default::default()
+        };
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let agents_pos = toml_str.find("[[agents]]").expect("array of tables");
+        let defaults_pos = toml_str.find("[defaults]").expect("defaults table");
+        assert!(
+            agents_pos > defaults_pos,
+            "[[agents]] must serialize after [defaults]:\n{toml_str}"
+        );
+        // An empty mapping serializes no [[agents]] block at all.
+        assert!(!toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .contains("agents"));
+    }
+
+    #[test]
+    fn find_agent_by_alias_and_by_id() {
+        let id = "cfef1150-0000-4000-8000-0000000000dd";
+        let config = Config {
+            agents: vec![agent_entry("main", id, "/ws", true)],
+            ..Default::default()
+        };
+
+        assert_eq!(
+            config.find_agent("openclaw", "main").unwrap().alf_agent_id,
+            Uuid::parse_str(id).unwrap()
+        );
+        assert_eq!(
+            config.find_agent("openclaw", id).unwrap().runtime_agent,
+            "main"
+        );
+        assert!(config.find_agent("openclaw", "nope").is_none());
+        // Runtime scoping: the row is invisible to another runtime.
+        assert!(config.find_agent("zeroclaw", "main").is_none());
+    }
+
+    #[test]
+    fn upsert_agent_replaces_by_id_and_set_enabled_flips() {
+        let mut config = Config::default();
+        let id = "cfef1150-0000-4000-8000-0000000000ee";
+        config.upsert_agent(agent_entry("main", id, "/ws", true));
+        assert_eq!(config.agents.len(), 1);
+
+        // Same id, refreshed workspace → replaced, not duplicated.
+        config.upsert_agent(agent_entry("main", id, "/ws-moved", true));
+        assert_eq!(config.agents.len(), 1);
+        assert_eq!(config.agents[0].workspace, "/ws-moved");
+
+        let row = config.set_agent_enabled("openclaw", "main", false).unwrap();
+        assert!(!row.enabled);
+        // Idempotent.
+        let row = config.set_agent_enabled("openclaw", "main", false).unwrap();
+        assert!(!row.enabled);
+        assert!(config.set_agent_enabled("openclaw", "ghost", true).is_err());
     }
 }

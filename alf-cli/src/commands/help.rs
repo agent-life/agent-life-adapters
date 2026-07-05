@@ -55,10 +55,10 @@ pub fn run(topic: Option<&str>, _json: bool) -> Result<()> {
         "files" => print_files(),
         "troubleshoot" => print_troubleshoot(),
         "export" | "import" | "validate" | "vault" | "sync" | "restore" | "purge" | "login"
-        | "check" => delegate_command_help(topic),
+        | "check" | "agents" => delegate_command_help(topic),
         _ => {
             eprintln!("Unknown topic: {}", topic);
-            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, vault, sync, restore, purge, login, check");
+            eprintln!("Topics: overview, status, files, troubleshoot, export, import, validate, vault, sync, restore, purge, login, check, agents");
             std::process::exit(1);
         }
     }
@@ -113,6 +113,7 @@ fn print_overview() -> Result<()> {
     println!("  vault      Layer 4 credentials: keygen, encrypt, decrypt, list, delete");
     println!("  sync       Incremental sync to the cloud");
     println!("  restore    Download and restore from the cloud");
+    println!("  agents     List discovered agents and enable/disable them for sync");
     println!("  purge      Remove cloud sync data and agent registration");
     println!("  login      Authenticate with the agent-life service");
     println!("  help       Show this help (alf help [topic])");
@@ -255,7 +256,9 @@ fn print_next_steps(status: &context::StatusSummary) {
         steps.push("Run 'alf sync -r <runtime> -w <workspace>' to track an agent.");
     }
     if status.agents.len() > 1 {
-        steps.push("Multiple agents tracked; use '-a <agent-id>' for restore. List IDs above.");
+        steps.push(
+            "Multiple agents tracked; use '--agent <alias-or-id>' for restore. List IDs above.",
+        );
     }
     if steps.is_empty() {
         println!("Next steps: You're set. Use 'alf sync' or 'alf restore' as needed.");
@@ -307,7 +310,7 @@ fn print_troubleshoot() -> Result<()> {
     println!("    Run a full sync first: 'alf sync -r <runtime> -w <workspace>'.");
     println!();
     println!("  Multiple agents — which to restore?");
-    println!("    Pass '-a <agent-id>'. List IDs with 'alf help status'.");
+    println!("    Pass '--agent <alias-or-id>'. List agents with 'alf agents'.");
     println!();
     println!("  Workspace not found");
     println!("    Ensure the path exists and is the agent workspace (e.g. contains SOUL.md or config.toml).");

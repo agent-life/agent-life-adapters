@@ -1,0 +1,48 @@
+# Lifecycle harness — PR guards only.
+#
+# The full container-based lifecycle run is a LOCAL, dev-owned, pre-release
+# check (see tests/lifecycle/README.md), not a CI step: the bind-mounted home
+# dir is created by the container's `agent` user and isn't accessible to the CI
+# runner (uid mismatch across the bind mount), and we deliberately don't run
+# the Z-stage lifecycle in CI. CI keeps only the cheap, container-free guards —
+# the secret-pattern gate and the harness's own unit tests. Run the lifecycle
+# locally:  python3 tests/lifecycle/driver.py --framework <fw> --llm none --backend none
+name: lifecycle-nollm
+
+on:
+  pull_request:
+    paths:
+      - "alf-cli/**"
+      - "alf-core/**"
+      - "adapter-openclaw/**"
+      - "adapter-zeroclaw/**"
+      - "adapter-hermes/**"
+      - "tests/lifecycle/**"
+      - ".github/workflows/lifecycle-nollm.yml"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    name: lifecycle (${{ matrix.framework }}, no-LLM/no-backend)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        framework: [zeroclaw]
+    steps:
+      - uses: actions/checkout@v4
+
+      # Secret-pattern gate: no real key shape may exist anywhere in the tree.
+      # (Committed fake markers are …-FAKE-… and do not match; the regex
+      # *pattern* string doesn't match itself — '[' is not alphanumeric.)
+      - name: Secret-pattern gate
+        run: '! git grep -IE "alf_[A-Za-z0-9]{32}"'
+
+      - name: Harness self-tests (redaction + scenario drift guard)
+        run: python3 -m unittest discover -s tests/lifecycle -p 'test_*.py' -v

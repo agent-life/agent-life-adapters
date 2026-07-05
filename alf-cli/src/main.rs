@@ -7,10 +7,14 @@ mod api_client;
 mod commands;
 mod config;
 mod context;
+mod discovery;
+mod errors;
 mod fs_private;
 pub mod output;
+mod selector;
 mod state;
 mod vault_key;
+mod vault_migrate;
 
 use clap::{Parser, Subcommand};
 use colored::Colorize;
@@ -32,6 +36,11 @@ struct Cli {
     /// Output human-readable text instead of JSON
     #[arg(long, global = true, env = "ALF_HUMAN")]
     human: bool,
+
+    /// Agent to operate on: a runtime alias or an alf agent id from the
+    /// [[agents]] mapping (falls back to ALF_AGENT, then the sole enabled agent)
+    #[arg(long, global = true, value_name = "ALIAS_OR_ID")]
+    agent: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -129,6 +138,11 @@ enum Command {
         /// Path to the .alf file to import
         alf_file: PathBuf,
 
+        /// Memory restore mode for a live per-agent store (ZeroClaw brain.db):
+        /// total (exact, default) or merge (keep local-only rows).
+        #[arg(long, value_enum, default_value_t = RestoreModeArg::Total)]
+        mode: RestoreModeArg,
+
         #[command(flatten)]
         key: VaultKeyCli,
     },
@@ -162,6 +176,10 @@ enum Command {
         --force-first-sync: required when the cloud already has an agent with this ID but no \
         local state exists; uploads the current workspace as a fresh snapshot, overwriting \
         cloud history. See docs/how_alf_syncs.md (case E3) before using this.\n\n\
+        The agent to sync comes from --agent (alias or id), then the ALF_AGENT environment \
+        variable, then the sole enabled agent in the [[agents]] mapping. --all syncs every \
+        enabled agent sequentially. A first sync with an empty mapping discovers and maps \
+        the install's agents automatically.\n\n\
         Example: alf sync -r openclaw -w ./my-agent\n\
         Example: alf sync --recover -r openclaw -w ./my-agent\n\n\
         Layer 4 (credentials) is the agent's explicit ALF vault, already AEAD-encrypted \
@@ -175,6 +193,10 @@ enum Command {
         /// Path to the agent workspace directory
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+
+        /// Sync every enabled agent (collects per-agent results; never fail-fast)
+        #[arg(long, conflicts_with = "agent")]
+        all: bool,
 
         /// Pull cloud snapshot + deltas to repair a missing local base snapshot
         #[arg(long)]
@@ -197,8 +219,11 @@ enum Command {
         Vault key: same behavior as `alf import` — with a resolved key, Layer 4 is decrypted into \
         the runtime; without a key, restore still applies other layers and warnings explain that \
         secrets were not restored.\n\n\
-        Example: alf restore -r openclaw -w ./my-agent -a <agent-id>\n\
-        Example: alf restore --at-sequence 3 -r openclaw -w ./preview -a <agent-id>"
+        The agent comes from the global --agent (an alias from the [[agents]] mapping, or a \
+        UUID — an unmapped UUID restores by id onto a fresh host), then ALF_AGENT, then the \
+        sole enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
+        Example: alf restore -r openclaw -w ./my-agent --agent <alias-or-id>\n\
+        Example: alf restore --at-sequence 3 -r openclaw -w ./preview --agent <alias-or-id>"
     )]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw, hermes)
@@ -209,10 +234,6 @@ enum Command {
         #[arg(short, long)]
         workspace: Option<PathBuf>,
 
-        /// Agent ID to restore (if omitted, uses the single tracked agent from ~/.alf/state/)
-        #[arg(short, long)]
-        agent: Option<String>,
-
         /// Restore the workspace as it was after sequence N. Read-only preview;
         /// ~/.alf/state/ is not modified.
         #[arg(long, value_name = "N")]
@@ -221,6 +242,11 @@ enum Command {
         /// Preview the files that would be written; touches neither the workspace nor ~/.alf/state/
         #[arg(long)]
         dry_run: bool,
+
+        /// Memory restore mode for a live per-agent store (ZeroClaw brain.db):
+        /// total (exact, default) or merge (keep local-only rows).
+        #[arg(long, value_enum, default_value_t = RestoreModeArg::Total)]
+        mode: RestoreModeArg,
 
         #[command(flatten)]
         key: VaultKeyCli,
@@ -232,6 +258,8 @@ enum Command {
         snapshot and delta blobs in storage for this agent and deletes the agent row. It does not \
         delete files under the workspace. It resets ~/.alf/state/ for this agent so the next \
         `alf sync` uploads a full snapshot again.\n\n\
+        The agent comes from the global --agent (alias or id), then ALF_AGENT, then the sole \
+        enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
         Example: alf purge -r openclaw -w ./my-agent"
     )]
     Purge {
@@ -242,10 +270,6 @@ enum Command {
         /// Path to the agent workspace directory (used for CLI consistency; not modified)
         #[arg(short, long)]
         workspace: Option<PathBuf>,
-
-        /// Agent ID to purge (if omitted, uses the single tracked agent from ~/.alf/state/)
-        #[arg(short, long)]
-        agent: Option<String>,
     },
 
     /// Authenticate with the agent-life service
@@ -265,6 +289,9 @@ enum Command {
         long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
         whether alf can find the workspace, memory files, API key, and service. \
         Use this before sync to diagnose configuration issues.\n\n\
+        Check also discovers the install's agents and records them in the [[agents]] \
+        mapping in ~/.alf/config.toml. Discovery is information-only: it never changes \
+        an existing agent's id or enabled flag — enabling is explicit (alf agents enable).\n\n\
         Example: alf check -r openclaw\n\
         Example: alf check -r openclaw -w ~/custom-workspace"
     )]
@@ -276,6 +303,27 @@ enum Command {
         /// Path to the agent workspace directory (auto-discovered if omitted)
         #[arg(short, long)]
         workspace: Option<PathBuf>,
+    },
+
+    /// List discovered agents and manage which are enabled for sync
+    #[command(
+        long_about = "Agents lists the [[agents]] mapping in ~/.alf/config.toml — the agents \
+        `alf check` discovered in this install — joined with each agent's sync state from \
+        ~/.alf/state/. Subcommands enable or disable an agent for sync; both are idempotent. \
+        Disabling keeps the cloud archive and local state.\n\n\
+        Without -r, the list spans every runtime and enable/disable resolve the name across \
+        all runtimes (erroring if it is ambiguous); -r scopes to one runtime.\n\n\
+        Example: alf agents\n\
+        Example: alf agents enable main\n\
+        Example: alf agents -r zeroclaw enable default"
+    )]
+    Agents {
+        /// Scope to one runtime (openclaw, zeroclaw, hermes); default: all
+        #[arg(short, long)]
+        runtime: Option<String>,
+
+        #[command(subcommand)]
+        command: Option<AgentsCommand>,
     },
 
     /// Show help (overview, status, files, troubleshoot, or per-command)
@@ -307,13 +355,29 @@ enum Command {
 }
 
 #[derive(Subcommand)]
+enum AgentsCommand {
+    /// List mapped agents with their sync state (default)
+    List,
+    /// Enable an agent for sync (registers lazily on first sync)
+    Enable {
+        /// Agent alias or alf agent id
+        agent: String,
+    },
+    /// Disable an agent (cloud archive and local state are kept)
+    Disable {
+        /// Agent alias or alf agent id
+        agent: String,
+    },
+}
+
+#[derive(Subcommand)]
 enum VaultCommand {
     /// Generate a fresh 32-byte vault key
     #[command(
         long_about = "Generates a cryptographically-random 32-byte vault key and writes\n\
         it as base64 to the given file with mode 0600. Pass --stdout to print the\n\
         key on stdout instead (use for piping into env vars on ephemeral hosts).\n\n\
-        Example: alf vault keygen --out ~/.openclaw/state/.alf-vault-key"
+        Example: alf vault keygen --out ~/.openclaw/state/<alf-agent-id>/.alf-vault-key"
     )]
     Keygen {
         /// File to write the base64-encoded key to (mode 0600)
@@ -382,10 +446,11 @@ enum VaultCommand {
     /// Add an account credential to the agent's vault
     #[command(
         long_about = "Encrypts a credential under the resolved vault key and appends it\n\
-        to the ALF vault. The default target is ~/.alf/vault/credentials.json, which\n\
-        `alf sync` merges into the archive's encrypted Layer 4 and `alf restore` brings\n\
-        back on another host. The vault is ALF's own store — separate from any runtime\n\
-        keystore — and the agent chooses exactly what goes in it.\n\n\
+        to the ALF vault. The default target is the selected agent's vault at\n\
+        ~/.alf/vault/<alf-agent-id>/credentials.json, which `alf sync` merges into the\n\
+        archive's encrypted Layer 4 and `alf restore` brings back on another host. The\n\
+        vault is ALF's own store — separate from any runtime keystore — and the agent\n\
+        chooses exactly what goes in it.\n\n\
         The secret may come from --secret, --secret-file, stdin, or --secret-json (a\n\
         JSON object whose user/password/token fields are mapped automatically). Every\n\
         record is tagged `alf-vault`.\n\n\
@@ -456,16 +521,16 @@ enum VaultCommand {
 
     /// Decrypt one record and print its payload
     #[command(
-        long_about = "Reads credentials.json (or the entry inside a .alf archive),\n\
+        long_about = "Reads the agent's vault (or --in credentials.json / .alf archive),\n\
         decrypts a single selected record under the resolved key, and prints the\n\
         plaintext envelope. Refuses to print to non-TTY stdout without --yes-insecure.\n\n\
         Select with one of: --id <UUID>, --label <STR>, --service <STR>.\n\n\
-        Example: alf vault decrypt --in credentials.json --label kleo@agent-life.run"
+        Example: alf vault decrypt --label kleo@agent-life.run"
     )]
     Decrypt {
-        /// Path to credentials.json or .alf archive.
+        /// Path to credentials.json or .alf archive [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
 
         /// Record selector: UUID.
         #[arg(long)]
@@ -479,7 +544,7 @@ enum VaultCommand {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Runtime for default key path resolution.
+        /// Runtime for default key + vault path resolution.
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 
@@ -494,28 +559,33 @@ enum VaultCommand {
     /// List plaintext descriptors (no key required)
     #[command(
         long_about = "Lists the plaintext descriptor fields of every credential in\n\
-        the given file or archive. Never touches ciphertext or keys — useful for\n\
-        triage and for picking a record to surgically delete.\n\n\
-        Example: alf vault list --in credentials.json"
+        the agent's vault (or --in file/archive). Never touches ciphertext or keys —\n\
+        useful for triage and for picking a record to surgically delete.\n\n\
+        Example: alf vault list\n\
+        Example: alf vault list --in backup.alf"
     )]
     List {
-        /// Path to credentials.json or .alf archive.
+        /// Path to credentials.json or .alf archive [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
+
+        /// Runtime for default vault path resolution (alias scoping).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
     },
 
     /// Remove a single credential record (NO key required)
     #[command(
-        long_about = "Drops one record from credentials.json. Selecting works on\n\
-        plaintext descriptors so the agent never needs to decrypt anything — the\n\
-        surgical-delete path for ephemeral hosts that provisioned an account on\n\
-        the user's behalf and now needs to remove it.\n\n\
-        Example: alf vault delete --in credentials.json --label kleo@agent-life.run"
+        long_about = "Drops one record from the agent's vault (or --in credentials.json).\n\
+        Selecting works on plaintext descriptors so the agent never needs to decrypt\n\
+        anything — the surgical-delete path for ephemeral hosts that provisioned an\n\
+        account on the user's behalf and now needs to remove it.\n\n\
+        Example: alf vault delete --label kleo@agent-life.run"
     )]
     Delete {
-        /// Path to credentials.json to mutate.
+        /// Path to credentials.json to mutate [default: the agent's vault].
         #[arg(short = 'i', long = "in")]
-        input: PathBuf,
+        input: Option<PathBuf>,
 
         /// Record selector: UUID.
         #[arg(long)]
@@ -529,9 +599,71 @@ enum VaultCommand {
         #[arg(short, long)]
         service: Option<String>,
 
-        /// Write to a different file (default: overwrite --in).
+        /// Write to a different file (default: overwrite the input).
         #[arg(short, long)]
         out: Option<PathBuf>,
+
+        /// Runtime for default vault path resolution (alias scoping).
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+    },
+
+    /// Rotate the vault key: re-encrypt every record under a new key
+    #[command(
+        name = "rotate-key",
+        long_about = "Decrypts every record in the agent's vault under the OLD key\n\
+        (resolved with the usual flags/default-file order) and re-encrypts under a\n\
+        NEW key — a freshly generated one by default, or --new-key-file. Crash-safe:\n\
+        the new key is persisted before the vault is rewritten, and an interrupted\n\
+        run self-heals on the next invocation. Never prints key material; the JSON\n\
+        carries fingerprints only.\n\n\
+        Point-in-time restores of pre-rotation sequences always need the old key —\n\
+        keep a copy until you no longer need that history.\n\n\
+        Example: alf vault rotate-key -r openclaw --agent main"
+    )]
+    RotateKey {
+        /// Path to credentials.json [default: the agent's vault].
+        #[arg(short = 'i', long = "in")]
+        input: Option<PathBuf>,
+
+        /// Use an existing key file as the NEW key (default: generate one).
+        #[arg(long, value_name = "PATH")]
+        new_key_file: Option<PathBuf>,
+
+        /// Write the new key here (0600; refuses to overwrite without --force).
+        #[arg(long, value_name = "PATH")]
+        new_key_out: Option<PathBuf>,
+
+        /// Overwrite an existing --new-key-out file.
+        #[arg(long)]
+        force: bool,
+
+        /// Runtime for default key + vault path resolution.
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        #[command(flatten)]
+        key: VaultKeyCli,
+    },
+
+    /// Move a legacy install-scoped vault to the per-agent layout
+    #[command(
+        long_about = "Moves the pre-multi-agent vault (~/.alf/vault/credentials.json)\n\
+        and vault key (~/.<runtime>/state/.alf-vault-key) to their per-agent locations.\n\
+        Runs automatically before vault/sync/export/import/restore when the target is\n\
+        unambiguous; this command is the explicit escape hatch for ambiguous installs\n\
+        (several enabled agents, cross-runtime evidence). Ciphertext moves verbatim —\n\
+        no key is required. --dry-run reports the decision without writing.\n\n\
+        Example: alf vault migrate -r openclaw --agent main"
+    )]
+    Migrate {
+        /// Runtime whose legacy key path and agent mapping apply.
+        #[arg(short, long, default_value = "openclaw")]
+        runtime: String,
+
+        /// Report the migration decision without writing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -545,18 +677,6 @@ pub struct VaultKeyCli {
     /// Name of an env var holding a base64 vault key (default: ALF_VAULT_KEY).
     #[arg(long, value_name = "VAR")]
     pub vault_key_env: Option<String>,
-
-    /// Path to a file containing a passphrase (Argon2id mode).
-    #[arg(long, value_name = "PATH")]
-    pub vault_passphrase_file: Option<PathBuf>,
-
-    /// Name of an env var holding a passphrase (Argon2id mode).
-    #[arg(long, value_name = "VAR")]
-    pub vault_passphrase_env: Option<String>,
-
-    /// Base64-encoded salt for passphrase mode (default: per-runtime constant).
-    #[arg(long, value_name = "BASE64")]
-    pub vault_salt: Option<String>,
 }
 
 impl VaultKeyCli {
@@ -564,9 +684,26 @@ impl VaultKeyCli {
         VaultKeyArgs {
             key_file: self.vault_key_file.clone(),
             key_env: self.vault_key_env.clone(),
-            passphrase_file: self.vault_passphrase_file.clone(),
-            passphrase_env: self.vault_passphrase_env.clone(),
-            salt_b64: self.vault_salt.clone(),
+        }
+    }
+}
+
+/// Memory restore mode for runtimes with a mutable per-agent store (ZeroClaw
+/// `brain.db`). Ignored by file/markdown runtimes.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, Default)]
+pub enum RestoreModeArg {
+    /// Replace the agent's slice so it exactly equals the archive (default).
+    #[default]
+    Total,
+    /// Upsert the archive over the current slice, keeping local-only rows.
+    Merge,
+}
+
+impl From<RestoreModeArg> for alf_core::RestoreMode {
+    fn from(m: RestoreModeArg) -> Self {
+        match m {
+            RestoreModeArg::Total => alf_core::RestoreMode::Total,
+            RestoreModeArg::Merge => alf_core::RestoreMode::Merge,
         }
     }
 }
@@ -578,6 +715,10 @@ fn main() {
         std::env::set_var("ALF_HUMAN", "1");
     }
 
+    // The global --agent selector, threaded into every agent-scoped command.
+    let agent_flag = cli.agent.clone();
+    let agent = agent_flag.as_deref();
+
     let result = match cli.command {
         Command::Export {
             runtime,
@@ -587,8 +728,13 @@ fn main() {
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::export::run(&runtime, &workspace, output.as_deref(), dry_run)
+            commands::export::run(
+                &runtime,
+                workspace.as_deref(),
+                agent,
+                output.as_deref(),
+                dry_run,
+            )
         })(),
 
         Command::Add {
@@ -601,15 +747,10 @@ fn main() {
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            // `--allow-root` on its own (no file path) needs no workspace.
-            let workspace = match config.resolve_workspace(workspace) {
-                Ok(w) => Some(w),
-                Err(_) if allow_root.is_some() && path.is_none() => None,
-                Err(e) => return Err(e),
-            };
             commands::add::run(
                 &runtime,
                 workspace.as_deref(),
+                agent,
                 path.as_deref(),
                 external,
                 allow_root.as_deref(),
@@ -621,12 +762,19 @@ fn main() {
             runtime,
             workspace,
             alf_file,
+            mode,
             key,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::import::run(&runtime, &alf_file, &workspace, &key.to_args())
+            commands::import::run(
+                &runtime,
+                &alf_file,
+                workspace.as_deref(),
+                agent,
+                mode.into(),
+                &key.to_args(),
+            )
         })(),
 
         Command::Validate {
@@ -637,45 +785,47 @@ fn main() {
         Command::Sync {
             runtime,
             workspace,
+            all,
             recover,
             force_first_sync,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::sync::run(&runtime, &workspace, recover, force_first_sync)
+            commands::sync::run(
+                &runtime,
+                workspace.as_deref(),
+                agent,
+                all,
+                recover,
+                force_first_sync,
+            )
         })(),
 
         Command::Restore {
             runtime,
             workspace,
-            agent,
             at_sequence,
             dry_run,
+            mode,
             key,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
             commands::restore::run(
                 &runtime,
-                &workspace,
-                agent.as_deref(),
+                workspace.as_deref(),
+                agent,
                 at_sequence,
                 dry_run,
+                mode.into(),
                 &key.to_args(),
             )
         })(),
 
-        Command::Purge {
-            runtime,
-            workspace,
-            agent,
-        } => (|| -> anyhow::Result<()> {
+        Command::Purge { runtime, workspace } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            let workspace = config.resolve_workspace(workspace)?;
-            commands::purge::run(&runtime, &workspace, agent.as_deref())
+            commands::purge::run(&runtime, workspace.as_deref(), agent)
         })(),
 
         Command::Login { key } => commands::login::run(key.as_deref()),
@@ -683,16 +833,40 @@ fn main() {
         Command::Check { runtime, workspace } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
-            commands::check::run(&runtime, workspace.as_deref())
+            commands::check::run(&runtime, workspace.as_deref(), agent)
         })(),
+
+        // No -r ⇒ span all runtimes: rows are runtime-tagged, so scoping
+        // to [defaults].runtime would strand zeroclaw/hermes rows (and
+        // break the `alf agents enable <alias>` remedies sync emits).
+        Command::Agents { runtime, command } => match command.unwrap_or(AgentsCommand::List) {
+            AgentsCommand::List => commands::agents::list(runtime.as_deref()),
+            AgentsCommand::Enable { agent } => commands::agents::enable(runtime.as_deref(), &agent),
+            AgentsCommand::Disable { agent } => {
+                commands::agents::disable(runtime.as_deref(), &agent)
+            }
+        },
 
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
 
-        Command::Vault { command } => dispatch_vault(command),
+        Command::Vault { command } => dispatch_vault(command, agent),
     };
 
     if let Err(err) = result {
-        let hint = error_hint(&err);
+        // Coded errors (WP0 agent-facing classes) carry their own remedy and a
+        // machine-readable code; everything else keeps the legacy shape.
+        if let Some(cli_err) = err.downcast_ref::<errors::CliError>() {
+            if output::human_mode() {
+                eprintln!("{} {}", "error:".red().bold(), cli_err.cause);
+                if !cli_err.remedy.is_empty() {
+                    eprintln!("{}", cli_err.remedy);
+                }
+            } else {
+                output::json_error_coded(cli_err.code, &cli_err.cause, &cli_err.remedy);
+            }
+            process::exit(1);
+        }
+        let hint = output::error_hint(&err);
         if output::human_mode() {
             eprintln!("{} {err:#}", "error:".red().bold());
             if !hint.is_empty() {
@@ -705,8 +879,9 @@ fn main() {
     }
 }
 
-fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
+fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> {
     match cmd {
+        // keygen touches no default paths — no scope, no migration trigger.
         VaultCommand::Keygen { out, stdout, force } => {
             commands::vault::keygen(out.as_deref(), force, stdout)
         }
@@ -721,18 +896,24 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             agent_id,
             runtime,
             key,
-        } => commands::vault::encrypt(
-            input.as_deref(),
-            &service,
-            &credential_type,
-            description.as_deref(),
-            label.as_deref(),
-            &tags,
-            &capabilities,
-            agent_id.as_deref(),
-            &key.to_args(),
-            &runtime,
-        ),
+        } => {
+            // encrypt only prints a record (no vault file) — lenient scope.
+            let (config, scope) = vault_scope(&runtime, agent, /* strict: */ false)?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::encrypt(
+                input.as_deref(),
+                &service,
+                &credential_type,
+                description.as_deref(),
+                label.as_deref(),
+                &tags,
+                &capabilities,
+                agent_id.as_deref(),
+                scope,
+                &key.to_args(),
+                &runtime,
+            )
+        }
         VaultCommand::Add {
             input,
             service,
@@ -749,23 +930,28 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             update,
             runtime,
             key,
-        } => commands::vault::add(
-            input.as_deref(),
-            &service,
-            &credential_type,
-            username.as_deref(),
-            secret.as_deref(),
-            secret_file.as_deref(),
-            secret_json.as_deref(),
-            label.as_deref(),
-            description.as_deref(),
-            &tags,
-            &fields,
-            agent_id.as_deref(),
-            update,
-            &key.to_args(),
-            &runtime,
-        ),
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::add(
+                input.as_deref(),
+                &service,
+                &credential_type,
+                username.as_deref(),
+                secret.as_deref(),
+                secret_file.as_deref(),
+                secret_json.as_deref(),
+                label.as_deref(),
+                description.as_deref(),
+                &tags,
+                &fields,
+                agent_id.as_deref(),
+                scope,
+                update,
+                &key.to_args(),
+                &runtime,
+            )
+        }
         VaultCommand::Decrypt {
             input,
             id,
@@ -774,49 +960,83 @@ fn dispatch_vault(cmd: VaultCommand) -> anyhow::Result<()> {
             runtime,
             yes_insecure,
             key,
-        } => commands::vault::decrypt(
-            &input,
-            &commands::vault::Selector { id, label, service },
-            &key.to_args(),
-            &runtime,
-            yes_insecure,
-        ),
-        VaultCommand::List { input } => commands::vault::list(&input),
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::decrypt(
+                input.as_deref(),
+                &commands::vault::Selector { id, label, service },
+                scope,
+                &key.to_args(),
+                &runtime,
+                yes_insecure,
+            )
+        }
+        VaultCommand::List { input, runtime } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::list(input.as_deref(), scope)
+        }
         VaultCommand::Delete {
             input,
             id,
             label,
             service,
             out,
-        } => commands::vault::delete(
-            &input,
-            &commands::vault::Selector { id, label, service },
-            out.as_deref(),
-        ),
+            runtime,
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::delete(
+                input.as_deref(),
+                &commands::vault::Selector { id, label, service },
+                out.as_deref(),
+                scope,
+            )
+        }
+        VaultCommand::RotateKey {
+            input,
+            new_key_file,
+            new_key_out,
+            force,
+            runtime,
+            key,
+        } => {
+            let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
+            vault_migrate::require_migrated(&config, &runtime)?;
+            commands::vault::rotate_key(
+                input.as_deref(),
+                new_key_file.as_deref(),
+                new_key_out.as_deref(),
+                force,
+                scope,
+                &key.to_args(),
+                &runtime,
+            )
+        }
+        VaultCommand::Migrate { runtime, dry_run } => {
+            let config = Config::load()?;
+            commands::vault::migrate(&config, &runtime, agent, dry_run)
+        }
     }
 }
 
-/// One-line hint for known error kinds to guide users to fix or get more help.
-fn error_hint(err: &anyhow::Error) -> String {
-    let msg = err.to_string();
-    if msg.contains("API key") || msg.contains("api_key") || msg.contains("Unauthorized") {
-        return "Run 'alf login' to set an API key, or 'alf help troubleshoot' for more.".into();
-    }
-    if msg.contains("No agent ID specified") || msg.contains("no agents are tracked") {
-        return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
-    }
-    if msg.contains("Unknown runtime") {
-        return "Supported runtimes: openclaw, zeroclaw, hermes. Run 'alf help troubleshoot' for more."
-            .into();
-    }
-    if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
-        return "Run 'alf help troubleshoot' for workspace and path guidance.".into();
-    }
-    if msg.contains("Local delta base missing") {
-        return "See docs/how_alf_syncs.md (case E4) for the recovery procedure.".into();
-    }
-    if msg.contains("already exists in the cloud") {
-        return "See docs/how_alf_syncs.md (case E3) before using --force-first-sync.".into();
-    }
-    String::new()
+/// Vault scope resolution (WP1): the agent whose per-agent vault/key default
+/// paths apply. Strict for commands consulting a default path (ambiguity is a
+/// coded error, D9); lenient when the caller passed an explicit `--in` (the
+/// default-file key step then simply won't resolve). The scope also supplies
+/// the credential record's `agent_id` default — an explicit `--agent-id` only
+/// overrides the record's metadata field, never the paths.
+fn vault_scope(
+    runtime: &str,
+    agent: Option<&str>,
+    strict: bool,
+) -> anyhow::Result<(Config, Option<uuid::Uuid>)> {
+    let config = Config::load()?;
+    let scope = if strict {
+        selector::vault_scope_agent_id(&config, runtime, agent)?
+    } else {
+        selector::vault_scope_agent_id_lenient(&config, runtime, agent)?
+    };
+    Ok((config, scope))
 }

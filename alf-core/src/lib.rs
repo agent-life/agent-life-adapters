@@ -30,11 +30,13 @@ pub mod partition;
 pub mod paths;
 pub mod principals;
 pub mod rebuild;
+pub mod reconcile;
 pub mod validation;
 
 pub use adapter::{
-    Adapter, ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport,
-    WorkspaceEnumeration,
+    ensure_workspace_agent_id, verify_archive_agent, Adapter, AgentBinding, ArchiveEnumeration,
+    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode,
+    WorkspaceEnumeration, AGENT_ID_FILE,
 };
 pub use archive::{
     safe_extract_path, AlfReader, AlfWriter, DeltaMemoryEntry, DeltaReader, DeltaWriter,
@@ -42,8 +44,8 @@ pub use archive::{
 };
 pub use credentials::*;
 pub use crypto::{
-    decrypt_record, encrypt_payload, Algorithm, Argon2Params, CryptoError, EncryptedBlob, VaultKey,
-    VaultPayload, RECOMMENDED_ARGON2, VAULT_PAYLOAD_VERSION,
+    decrypt_record, encrypt_payload, Algorithm, CryptoError, EncryptedBlob, VaultKey, VaultPayload,
+    VAULT_PAYLOAD_VERSION,
 };
 pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,
@@ -57,7 +59,8 @@ pub use include::{
 pub use manifest::*;
 pub use memory::*;
 pub use partition::{PartitionAssigner, PartitionReader, PartitionWriter};
-pub use paths::home_dir;
+pub use paths::{agent_vault_path, home_dir, legacy_vault_path};
 pub use principals::*;
-pub use rebuild::rebuild_snapshot;
+pub use rebuild::{rebuild_snapshot, replace_memory_records};
+pub use reconcile::{reconcile, ReconcileOutcome, ReconcileStats};
 pub use validation::*;

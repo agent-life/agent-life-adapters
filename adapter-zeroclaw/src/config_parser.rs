@@ -280,14 +280,31 @@ pub fn redact_secrets(raw_toml: &str) -> String {
 
 /// Detect the memory backend heuristically when `config.toml` is missing.
 ///
-/// Checks for `memory.db` (SQLite) or `memory/` directory (Markdown).
+/// Checks for the real shared store `data/memory/brain.db` (SQLite) — or the
+/// older `memory/brain.db` — then a `memory/` directory (Markdown).
 pub fn detect_backend_heuristic(zeroclaw_dir: &Path) -> MemoryBackend {
-    if zeroclaw_dir.join("memory.db").is_file() {
+    let brain_db = zeroclaw_dir.join("data").join("memory").join("brain.db");
+    if brain_db.is_file() || zeroclaw_dir.join("memory").join("brain.db").is_file() {
         MemoryBackend::Sqlite
-    } else if zeroclaw_dir.join("workspace").join("memory").is_dir() {
+    } else if zeroclaw_dir.join("memory").is_dir() {
         MemoryBackend::Markdown
     } else {
         MemoryBackend::None
+    }
+}
+
+/// Enumerate the agent aliases declared as `[agents.<alias>]` blocks in a
+/// ZeroClaw `config.toml`. These are the agents the user configured (drives the
+/// first-run enable classification); the runtime-native ids come from the
+/// `brain.db` `agents` table. A malformed config yields an empty list.
+pub fn discovered_config_agents(raw_toml: &str) -> Vec<String> {
+    let value: toml::Value = match raw_toml.parse() {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    match value.get("agents").and_then(|a| a.as_table()) {
+        Some(tbl) => tbl.keys().cloned().collect(),
+        None => Vec::new(),
     }
 }
 
@@ -396,7 +413,27 @@ bot_token = "123:ABC"
     #[test]
     fn detect_backend_heuristic_sqlite() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("memory.db"), b"sqlite").unwrap();
+        let db = tmp.path().join("data").join("memory").join("brain.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        fs::write(&db, b"sqlite").unwrap();
         assert_eq!(detect_backend_heuristic(tmp.path()), MemoryBackend::Sqlite);
+    }
+
+    #[test]
+    fn discovered_config_agents_reads_dotted_blocks() {
+        let raw = r#"
+[memory]
+backend = "sqlite"
+
+[agents.agent_a]
+model = "x"
+
+[agents.agent_b]
+model = "y"
+"#;
+        let mut agents = discovered_config_agents(raw);
+        agents.sort();
+        assert_eq!(agents, vec!["agent_a".to_string(), "agent_b".to_string()]);
+        assert!(discovered_config_agents("[memory]\nbackend=\"sqlite\"").is_empty());
     }
 }

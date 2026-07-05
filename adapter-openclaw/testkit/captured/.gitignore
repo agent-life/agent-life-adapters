@@ -1,0 +1,7 @@
+# Populated agent homes + any home archive embed the live runtime key — never commit.
+home/
+*.zip
+*.tar
+*.tar.*
+# Per-model comparison output (run-specific, churny) — keep local for inspection.
+by-model/

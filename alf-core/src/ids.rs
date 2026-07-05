@@ -50,6 +50,53 @@ pub fn identity_id(agent_id: Uuid) -> Uuid {
     Uuid::new_v5(&ALF_ID_NAMESPACE, format!("identity:{agent_id}").as_bytes())
 }
 
+/// Content-addressed birth id for a memory record extracted from a workspace
+/// file (WP4.1).
+///
+/// Replaces the positional `path:section_index` scheme: a purely positional id
+/// gets reassigned to a *different* section's content whenever the runtime
+/// inserts, removes, or re-ranks sections in place. A content-addressed id is
+/// only ever the *birth* name of a record — once synced, `reconcile` carries
+/// the id forward across edits, so changing content does not orphan history.
+///
+/// `occurrence` disambiguates byte-identical sections within the same file and
+/// MUST be computed over the file's full section list in order (the index among
+/// same-content sections), never over a filtered subset — otherwise the id
+/// stops being a pure function of the file.
+///
+/// The hash covers the content with trailing whitespace trimmed: a section's
+/// trailing blank lines belong to the file layout, not the memory — moving a
+/// section to or from the end of a file must not change its identity. (The
+/// byte-exact text still travels in the raw layer.)
+pub fn memory_record_id(
+    runtime_ns: &Uuid,
+    agent_id: Uuid,
+    origin_file: &str,
+    content: &str,
+    occurrence: u32,
+) -> Uuid {
+    let hash = sha256_hex(content.trim_end().as_bytes());
+    Uuid::new_v5(
+        runtime_ns,
+        format!("content-v1:{agent_id}:{origin_file}:{hash}:{occurrence}").as_bytes(),
+    )
+}
+
+/// Lowercase hex SHA-256 of `bytes`. Shared by the content-addressed id scheme
+/// and reconcile's collision re-mint.
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(64);
+    for b in digest {
+        use std::fmt::Write;
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
 /// Stable id for a principal (Layer 2), keyed by a durable `role` (e.g.
 /// `"human"`) rather than the display name — so renaming a principal is an
 /// update, not a delete + create.

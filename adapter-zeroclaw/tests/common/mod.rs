@@ -34,13 +34,13 @@ pub fn isolate_home() {
 ///     memory/2026-01-15.md
 /// ```
 ///
-/// Returns the workspace path (`root/workspace`) — the `-w` argument the
-/// adapter's `export`/`import` expect. The Markdown backend keeps the fixture
-/// hermetic (no SQLite seeding required) while still exercising the memory
-/// layer.
+/// Returns the install root (`root`) — the `-w` argument the adapter's
+/// `export`/`import` expect. The Markdown backend keeps the fixture hermetic
+/// (no SQLite seeding required) while still exercising the memory layer. The
+/// layout is flat (config + files directly under the root), matching the
+/// real/harness ZeroClaw install.
 pub fn make_markdown_home(root: &Path) -> std::path::PathBuf {
-    let workspace = root.join("workspace");
-    fs::create_dir_all(workspace.join("memory")).unwrap();
+    fs::create_dir_all(root.join("memory")).unwrap();
 
     fs::write(
         root.join("config.toml"),
@@ -48,37 +48,29 @@ pub fn make_markdown_home(root: &Path) -> std::path::PathBuf {
     )
     .unwrap();
 
-    fs::write(workspace.join("SOUL.md"), "# Aria\n\n_assistant_\n").unwrap();
+    fs::write(root.join("SOUL.md"), "# Aria\n\n_assistant_\n").unwrap();
     fs::write(
-        workspace.join("IDENTITY.md"),
+        root.join("IDENTITY.md"),
         "# IDENTITY.md\n\n- **Name:** Aria\n- **Runtime:** zeroclaw\n",
     )
     .unwrap();
+    fs::write(root.join("AGENTS.md"), "# AGENTS.md\n\nWorkspace home.\n").unwrap();
     fs::write(
-        workspace.join("AGENTS.md"),
-        "# AGENTS.md\n\nWorkspace home.\n",
-    )
-    .unwrap();
-    fs::write(
-        workspace.join("USER.md"),
+        root.join("USER.md"),
         "# USER.md - About Sam\n\n- **Name:** Sam\n",
     )
     .unwrap();
+    fs::write(root.join("TOOLS.md"), "# TOOLS.md\n\nEmail via himalaya.\n").unwrap();
     fs::write(
-        workspace.join("TOOLS.md"),
-        "# TOOLS.md\n\nEmail via himalaya.\n",
-    )
-    .unwrap();
-    fs::write(
-        workspace.join("HEARTBEAT.md"),
+        root.join("HEARTBEAT.md"),
         "# HEARTBEAT.md\n\nCheck markers.\n",
     )
     .unwrap();
     fs::write(
-        workspace.join("memory/2026-01-15.md"),
+        root.join("memory/2026-01-15.md"),
         "# 2026-01-15\n\nSam prefers concise replies.\n",
     )
     .unwrap();
 
-    workspace
+    root.to_path_buf()
 }

@@ -157,6 +157,7 @@ agent-life-adapters/
 │   └── workflows/
 │       ├── build.yml           # Build alf CLI for Linux (x64, arm64), macOS (x64, arm64), Windows (x64)
 │       ├── test-install.yml    # Install script tests (Linux Docker + macOS native)
+│       ├── lifecycle-nollm.yml # Lifecycle harness, no-LLM/no-backend tier (zero secrets)
 │       └── release.yml         # Build, release, upload to S3 with SHA256 checksums
 │
 └── tests/                      # Top-level integration tests (if present)
@@ -497,27 +498,25 @@ python3 scripts/generate_synthetic_data.py
 cargo test -p alf-cli --test integration_tests
 ```
 
-**E2E integration testing with fixtures**: The `scripts/generate_fixtures.sh` script creates and mutates OpenClaw and ZeroClaw fixture workspaces under `scripts/fixtures/`. Use it to drive multi-step sync sequences and to test restore against real workspace data.
+**E2E integration testing with fixtures**: The `scripts/generate_fixtures.sh` script creates and mutates an OpenClaw fixture workspace under `scripts/fixtures/`. Use it to drive multi-step sync sequences and to test restore against real workspace data. (The ZeroClaw synthetic fixture was retired in WP2 — it encoded the wrong DB schema; real-install ZeroClaw coverage now lives in the [lifecycle harness](tests/lifecycle/README.md).)
 
 **Commands:**
 
 | Invocation | Purpose |
 | ---------- | ------- |
-| `./scripts/generate_fixtures.sh` | Generate baseline (round 0) workspaces. Creates `openclaw-workspace` and `zeroclaw-workspace` with fixed agent IDs. |
+| `./scripts/generate_fixtures.sh` | Generate the baseline (round 0) `openclaw-workspace` with a fixed agent ID. |
 | `./scripts/generate_fixtures.sh --mutate N` | Apply mutation round 1, 2, or 3. Mutations are cumulative (round 2 includes round 1’s changes) and idempotent. |
 | `./scripts/generate_fixtures.sh --reset` | Delete fixtures and regenerate baseline from scratch. |
-| `./scripts/generate_fixtures.sh --status` | Show current mutation round and workspace stats (file counts, memory rows). |
+| `./scripts/generate_fixtures.sh --status` | Show current mutation round and workspace stats (file counts). |
 
-**Requirements:** `bash`, `python3` (stdlib `sqlite3` for ZeroClaw). Paths are relative to the repo root; run from the project root.
+**Requirements:** `bash`, `python3`. Paths are relative to the repo root; run from the project root.
 
 **Testing multiple sync sequences:** Each sync should advance the sequence number (0 → 1 → 2 …). Use fixtures and mutations to simulate changes between syncs:
 
 1. Build the CLI: `cargo build` (or `cargo build --release`). Use `./target/debug/alf` or `./target/release/alf`, or install so `alf` is on `PATH`.
 2. Generate baseline: `./scripts/generate_fixtures.sh`.
 3. First sync (sequence 0):  
-   `alf sync -r openclaw -w scripts/fixtures/openclaw-workspace`  
-   and/or  
-   `alf sync -r zeroclaw -w scripts/fixtures/zeroclaw-workspace`.  
+   `alf sync -r openclaw -w scripts/fixtures/openclaw-workspace`.  
    Confirm output shows “Snapshot uploaded (sequence: 0)” (or “Delta uploaded” if state already existed).
 4. Apply mutations and sync again:  
    `./scripts/generate_fixtures.sh --mutate 1`  
@@ -603,7 +602,7 @@ INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localho
 
 **Workspace coverage** (`scripts/integration_walkthrough_for_workspace.py`) covers Layer 5 (WP3 — `alf add`): how an agent explicitly opts arbitrary files into sync (ALF never auto-walks a workspace), where the tracked-file whitelist and removal log live (`.alf-include.json` / `.alf-sync-log.md`, both synced so they travel on restore), and how a change to a tracked file triggers a fresh snapshot (a non-destructive rollover) while memory-only changes still ride deltas. Drives the real `alf` CLI against the live service and verifies each effect in Neon + S3. Same `.env` variables as the main script.
 
-**Memory & chunking** (`scripts/integration_walkthrough_for_memory.py`) covers Layer 3: the source-handler table that decides each file's `memory_type`, `namespace`, and chunking strategy (`OneRecordPerFile` vs the fence-aware, empty-body-dropping `SplitByHeading`). It seeds a demo workspace, runs the real `alf export`, and shows per file how many records came out — contrasted with what the old structure-blind splitter produced (e.g. a procedure `6→1`, a daily journal `4→2` with the H1 date header no longer a record). Unlike the others it is **fully local**: no `.env`, service, Neon, or S3 — only a built `alf` binary.
+**Real-install lifecycle harness** (`tests/lifecycle/driver.py`) supersedes the retired memory walkthrough: it runs the Z1–Z13 lifecycle against a **real framework install** (official installer, hardened version pin) in Docker with the locally built `alf` injected, in automated and `--interactive` modes, with backend inspection (⊙ API/S3/Neon) and a no-LLM seeding tier that runs with zero secrets in CI. See [tests/lifecycle/README.md](tests/lifecycle/README.md) for the runbook.
 
 Unlike the Rust E2E tests (which verify API contracts), the service-backed walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
 
@@ -623,8 +622,8 @@ python3 scripts/integration_walkthrough_for_vault.py --no-pause
 # Workspace-coverage walkthrough (WP3 — alf add; separate test agent UUID)
 python3 scripts/integration_walkthrough_for_workspace.py --no-pause
 
-# Memory & chunking walkthrough (fully local — only needs a built `alf`, no deps/.env)
-python3 scripts/integration_walkthrough_for_memory.py --no-pause
+# Real-install lifecycle harness (supersedes the retired memory walkthrough)
+python3 tests/lifecycle/driver.py --framework zeroclaw --llm none --backend none --ci --stages Z1-Z3,Z13
 
 # Custom report path
 python3 scripts/integration_walkthrough.py --report results/report.md

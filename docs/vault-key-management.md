@@ -15,7 +15,7 @@ For the cryptographic design and threat model, see
 | Artifact | What it is | Default path | Synced to the cloud? |
 |----------|------------|--------------|----------------------|
 | **Vault file** | `credentials.json` — a `CredentialsDocument`: a list of independently AEAD-encrypted `CredentialRecord`s | `~/.alf/vault/credentials.json` | **Yes** — it becomes Layer 4 of the `.alf` archive. It holds only ciphertext, so syncing it is safe. |
-| **Vault key** | A 32-byte secret, base64-encoded, one line | `~/.openclaw/state/.alf-vault-key` (or `~/.zeroclaw/state/.alf-vault-key`) | **Never** — not in the archive, never sent to the sync service. |
+| **Vault key** | A 32-byte secret, base64-encoded, one line | `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` (legacy installs: `~/.<runtime>/state/.alf-vault-key` until migrated) | **Never** — not in the archive, never sent to the sync service. |
 
 The vault file is **runtime-neutral**: it lives under ALF's own home (`~/.alf/`),
 not inside any runtime's directory. The vault **key** defaults to a path inside
@@ -70,11 +70,14 @@ The CLI resolves the key from the **first** source that succeeds (see
 1. **`--vault-key-file PATH`** — explicit file containing base64-encoded 32 bytes.
 2. **Environment variable** — **`ALF_VAULT_KEY`** by default, or the name passed
    with **`--vault-key-env VAR`**.
-3. **`--vault-passphrase-file`** / **`--vault-passphrase-env`** — Argon2id
-   derives a 32-byte key; use **`--vault-salt`** (base64) for a stable salt
-   across machines (document the salt with your backup).
-4. **Default file** — `~/.openclaw/state/.alf-vault-key` or
-   `~/.zeroclaw/state/.alf-vault-key`, selected by **`-r` / `--runtime`**.
+3. **Default file** — `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` for the
+   selected agent (openclaw/zeroclaw; hermes has no default key path yet). When
+   no agent is mapped, the legacy install-scoped
+   `~/.<runtime>/state/.alf-vault-key` applies.
+
+Vault keys are **key-only**: 256-bit random values held in files or env vars.
+There is no passphrase mode and no key derivation — a key exists only where it
+was written or exported.
 
 `alf vault add` and `alf vault decrypt` **require** a resolvable key and fail
 loudly if none is found. `alf export` / `alf sync` do **not** need a key — the

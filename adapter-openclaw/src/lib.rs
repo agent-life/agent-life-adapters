@@ -21,13 +21,14 @@
 use std::path::Path;
 
 use anyhow::Result;
+use uuid::Uuid;
 
 // Re-export the shared types so `crate::ExportReport` / `crate::ImportReport`
 // continue to resolve in export.rs and import.rs without changes.
 pub use alf_core::adapter::{
     ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
 };
-pub use alf_core::Adapter;
+pub use alf_core::{Adapter, AgentBinding};
 
 pub mod export;
 pub mod identity_parser;
@@ -85,5 +86,68 @@ impl Adapter for OpenClawAdapter {
 
     fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
         import::enumerate_archive(alf_file)
+    }
+
+    fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
+        export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP4: enumerate agents from `openclaw.json` `agents.list[]`, one
+    /// `InWorkspaceFiles` binding per per-agent workspace dir (`<root>/workspace`
+    /// for `main`, the entry's explicit `workspace` for named agents) — overrides
+    /// the WP0 single-agent fallback. The WP0 default `export_agent`/`import_agent`
+    /// already retarget `binding.workspace`, so no override of those is needed —
+    /// OpenClaw's dir-isolation makes them correct.
+    fn discover_agents(&self, install: &Path) -> Result<Vec<AgentBinding>> {
+        export::discover_agents(install)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alf_core::AGENT_ID_FILE;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn resolve_agent_id_reads_workspace_file_first() {
+        let tmp = TempDir::new().unwrap();
+        let id = uuid::Uuid::parse_str("cfef1150-0000-4000-8000-000000000001").unwrap();
+        fs::write(tmp.path().join(AGENT_ID_FILE), id.to_string()).unwrap();
+        assert_eq!(OpenClawAdapter.resolve_agent_id(tmp.path()).unwrap(), id);
+        // And it never persists a derivation.
+        fs::remove_file(tmp.path().join(AGENT_ID_FILE)).unwrap();
+        let derived = OpenClawAdapter.resolve_agent_id(tmp.path()).unwrap();
+        assert!(!tmp.path().join(AGENT_ID_FILE).exists());
+        // Deterministic: the same workspace derives the same id.
+        assert_eq!(
+            OpenClawAdapter.resolve_agent_id(tmp.path()).unwrap(),
+            derived
+        );
+    }
+
+    /// The WP0 seam against the unmodified adapter export: the default
+    /// `export_agent` write-through makes `manifest.agent.id` equal the given
+    /// mapping id.
+    #[test]
+    fn default_export_agent_stamps_given_id() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(ws.join("SOUL.md"), "# Test Agent\n\nsoul").unwrap();
+
+        let id = uuid::Uuid::parse_str("cfef1150-0000-4000-8000-000000000002").unwrap();
+        let binding = &OpenClawAdapter.discover_agents(&ws).unwrap()[0];
+        let out = tmp.path().join("out.alf");
+        OpenClawAdapter.export_agent(binding, id, &out).unwrap();
+
+        let reader =
+            alf_core::AlfReader::new(fs::File::open(&out).unwrap()).expect("readable archive");
+        assert_eq!(reader.manifest().agent.id, id);
     }
 }

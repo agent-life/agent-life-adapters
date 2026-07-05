@@ -1,0 +1,16 @@
+# Hermes GOAL 2 — both profiles (agents) RUN against the LLM proxy
+# Each profile has its OWN state.db; no shared store, no cross-contamination:
+
+## profiles/agent_a/state.db
+1 session(s), 4 message(s)
+user: Remember and save to memory: agent_a favorite color is teal.
+assistant: 
+tool: {"success": true, "done": true, "target": "user", "usage": "2% —
+assistant: Saved: agent_a's favorite color is teal.
+
+## profiles/agent_b/state.db
+1 session(s), 4 message(s)
+user: Remember and save to memory: agent_b favorite animal is the otte
+assistant: 
+tool: {"success": true, "done": true, "target": "user", "usage": "2% —
+assistant: Saved. agent_b's favorite animal is the otter.

@@ -120,19 +120,26 @@ pub mod tests {
     /// Shared lock for tests that mutate the HOME env var across modules.
     pub static HOME_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Restore HOME, ALF_HOME, and ALF_API_KEY when dropped.
-    struct RestoreEnv {
+    /// Restore HOME, ALF_HOME, ALF_API_KEY, ALF_API_URL, ALF_AGENT, and
+    /// ALF_VAULT_KEY when dropped.
+    pub struct RestoreEnv {
         home: Option<std::ffi::OsString>,
         alf_home: Option<std::ffi::OsString>,
         api_key: Option<std::ffi::OsString>,
+        api_url: Option<std::ffi::OsString>,
+        alf_agent: Option<std::ffi::OsString>,
+        vault_key: Option<std::ffi::OsString>,
     }
 
     impl RestoreEnv {
-        fn snapshot() -> Self {
+        pub fn snapshot() -> Self {
             Self {
                 home: env::var_os("HOME"),
                 alf_home: env::var_os("ALF_HOME"),
                 api_key: env::var_os("ALF_API_KEY"),
+                api_url: env::var_os("ALF_API_URL"),
+                alf_agent: env::var_os("ALF_AGENT"),
+                vault_key: env::var_os("ALF_VAULT_KEY"),
             }
         }
     }
@@ -150,6 +157,18 @@ pub mod tests {
             match &self.api_key {
                 Some(v) => env::set_var("ALF_API_KEY", v),
                 None => env::remove_var("ALF_API_KEY"),
+            }
+            match &self.api_url {
+                Some(v) => env::set_var("ALF_API_URL", v),
+                None => env::remove_var("ALF_API_URL"),
+            }
+            match &self.alf_agent {
+                Some(v) => env::set_var("ALF_AGENT", v),
+                None => env::remove_var("ALF_AGENT"),
+            }
+            match &self.vault_key {
+                Some(v) => env::set_var("ALF_VAULT_KEY", v),
+                None => env::remove_var("ALF_VAULT_KEY"),
             }
         }
     }

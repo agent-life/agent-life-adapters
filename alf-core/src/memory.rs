@@ -119,6 +119,19 @@ impl MemoryStatus {
             other => other,
         }
     }
+
+    /// Whether a record with this status should be materialized into a
+    /// reconstructed workspace (cross-runtime restore, when the verbatim
+    /// `raw/{runtime}/` tree is absent).
+    ///
+    /// `Superseded` records have a live replacement already present, and
+    /// `Deleted` records are tombstones — materializing either would resurrect
+    /// content the agent replaced or removed. `Active` and `Archived` (old but
+    /// not replaced) are materialized, so no unreplaced memory is lost on a
+    /// cross-runtime migration. Unknown values default to `Active` (visible).
+    pub fn is_materialized(&self) -> bool {
+        !matches!(self.effective(), Self::Superseded | Self::Deleted)
+    }
 }
 
 forward_compatible_enum! {
@@ -676,6 +689,17 @@ mod tests {
         assert_eq!(MemoryType::Unknown("custom".into()).to_string(), "custom");
         assert_eq!(MemoryStatus::Active.to_string(), "active");
         assert_eq!(EntityType::Person.to_string(), "person");
+    }
+
+    #[test]
+    fn status_is_materialized() {
+        // Active/Archived materialize into a reconstructed workspace; the
+        // Superseded/Deleted tombstones do not (§8.1). Unknown → Active.
+        assert!(MemoryStatus::Active.is_materialized());
+        assert!(MemoryStatus::Archived.is_materialized());
+        assert!(!MemoryStatus::Superseded.is_materialized());
+        assert!(!MemoryStatus::Deleted.is_materialized());
+        assert!(MemoryStatus::Unknown("weird".into()).is_materialized());
     }
 
     #[test]

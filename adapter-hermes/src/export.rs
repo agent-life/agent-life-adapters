@@ -17,6 +17,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use alf_core::adapter::{AgentBinding, MemorySource};
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, FileEntry, IdentityLayerInfo, LayerInventory,
     Manifest, MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
@@ -50,10 +51,67 @@ const RAW_DIRS: &[&str] = &["memories", "skill-bundles", "cron"];
 const SCHEMA_SIDECAR: &str = ".alf-state-db-schema.json";
 
 // ---------------------------------------------------------------------------
+// Agent discovery (WP5 multi-agent)
+// ---------------------------------------------------------------------------
+
+/// Discover the Hermes profiles in an install (WP5 override of the WP0 single-
+/// agent fallback).
+///
+/// Hermes is profile-isolated: each agent is a Hermes *profile* with its own
+/// `state.db` (session-keyed, no agent column) + `memories/*.md`. Two shapes:
+///
+/// - The **default profile** is `install` (`~/.hermes`) itself, interleaved with
+///   the shared runtime (`node/`, `bin/`, `hermes-agent/`, caches). Its binding
+///   workspace is `install`; [`export`]'s allowlist excludes the runtime *and*
+///   the nested `profiles/` by construction (`ROOT_FILES` + `RAW_DIRS` only), so
+///   the default-profile archive carries agent data only.
+/// - **Named profiles** live at `install/profiles/<name>/` and are clean
+///   (agent data only).
+///
+/// Each profile becomes one [`MemorySource::PerAgentDb`] binding at
+/// `<profile>/state.db` — a descriptor, not an existence guarantee: the DB is
+/// created lazily on first session run, so the path need not exist. Every
+/// profile is a real, user-configured agent, so `default_enabled` is true
+/// (design §10: Hermes `default` is on, unlike ZeroClaw's vestigial `default`).
+/// The `default` binding is always present, so the result is never empty —
+/// it is itself the single-agent fallback. Read-only; never writes the install.
+pub fn discover_agents(install: &Path) -> Result<Vec<AgentBinding>> {
+    let mut bindings = vec![profile_binding("default", install)];
+    let profiles_dir = install.join("profiles");
+    if let Ok(entries) = fs::read_dir(&profiles_dir) {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        for name in names {
+            let dir = profiles_dir.join(&name);
+            bindings.push(profile_binding(&name, &dir));
+        }
+    }
+    Ok(bindings)
+}
+
+/// One `PerAgentDb` binding for the Hermes profile rooted at `dir`.
+fn profile_binding(name: &str, dir: &Path) -> AgentBinding {
+    AgentBinding {
+        runtime_agent: name.to_string(),
+        runtime_agent_id: None,
+        workspace: dir.to_path_buf(),
+        memory_source: MemorySource::PerAgentDb {
+            path: dir.join("state.db"),
+        },
+        default_enabled: true,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Agent ID persistence
 // ---------------------------------------------------------------------------
 
-fn resolve_agent_id_readonly(home: &Path) -> Result<Uuid> {
+pub(crate) fn resolve_agent_id_readonly(home: &Path) -> Result<Uuid> {
     let id_file = home.join(".alf-agent-id");
     if id_file.is_file() {
         let raw = fs::read_to_string(&id_file).context("Failed to read .alf-agent-id")?;
@@ -478,6 +536,70 @@ fn load_agent_vault(vault_path: Option<&Path>) -> Result<Option<alf_core::Creden
 }
 
 // ---------------------------------------------------------------------------
+// Runtime version detection
+// ---------------------------------------------------------------------------
+
+/// First `<digits>.<digits>.<digits>` run in `text`, if any. Hand-rolled to
+/// avoid a regex dependency; mirrors the harness kit's `\d+\.\d+\.\d+` scan.
+fn extract_semver(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            let parts: Vec<&str> = run.split('.').collect();
+            if parts.len() >= 3
+                && parts[..3]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Best-effort Hermes version via `hermes --version` (e.g.
+/// `"Hermes Agent v0.17.0 (2026.6.19) ..."` → `"0.17.0"`). `None` when the
+/// binary is absent or unparseable — Hermes has no version field in
+/// `config.yaml` or `state.db`, so the CLI is the only source. Host unit tests
+/// (no `hermes` on PATH) correctly yield `None`; live runs execute `alf` inside
+/// the container where `hermes` resolves.
+fn detect_hermes_version() -> Option<String> {
+    let output = std::process::Command::new("hermes")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        stdout.into_owned()
+    };
+    extract_semver(&text)
+}
+
+/// Best-effort `state.db` `schema_version` (16 on a real install), or `None`
+/// when there is no `state.db` (lazy install) or no version row.
+fn detect_state_schema_version(home: &Path) -> Option<i64> {
+    let db = home.join("state.db");
+    if !db.is_file() {
+        return None;
+    }
+    let sv = session_extractor::capture_state_schema(&db)
+        .ok()?
+        .schema_version;
+    (sv >= 0).then_some(sv)
+}
+
+// ---------------------------------------------------------------------------
 // Export entry point
 // ---------------------------------------------------------------------------
 
@@ -490,7 +612,8 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
     let config = load_config(home)?;
     let agent_id = resolve_agent_id(home)?;
     let agent_name = identity_parser::detect_agent_name(home, &config);
-    let runtime_version: Option<String> = None;
+    let runtime_version = detect_hermes_version();
+    let schema_version = detect_state_schema_version(home);
 
     // Records: curated memory + sessions.
     let records = collect_records(home, agent_id, runtime_version.as_deref())?;
@@ -532,11 +655,11 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
         ));
     }
 
-    // Other layers.
+    // Other layers. Per-agent vault path (WP1): the CLI migrates any legacy
+    // install-scoped vault before export — no legacy fallback here.
     let identity = identity_parser::parse_identity(home, &config, agent_id)?;
     let principals = principals_parser::parse_principals(home, agent_id)?;
-    let vault_path =
-        alf_core::home_dir().map(|h| h.join(".alf").join("vault").join("credentials.json"));
+    let vault_path = alf_core::home_dir().map(|h| alf_core::agent_vault_path(&h, agent_id));
     let credentials = load_agent_vault(vault_path.as_deref())?;
 
     // D4: warn about plaintext `.env` keys not covered by the vault.
@@ -586,7 +709,14 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
             name: agent_name.clone(),
             source_runtime: RUNTIME.to_string(),
             source_runtime_version: runtime_version,
-            extra: std::collections::HashMap::new(),
+            extra: schema_version
+                .map(|sv| {
+                    std::collections::HashMap::from([(
+                        "schema_version".to_string(),
+                        serde_json::json!(sv),
+                    )])
+                })
+                .unwrap_or_default(),
         },
         layers: LayerInventory {
             identity: has_identity.then(|| IdentityLayerInfo {
@@ -747,6 +877,33 @@ mod tests {
     }
 
     #[test]
+    fn extract_semver_variants() {
+        assert_eq!(
+            extract_semver("Hermes Agent v0.17.0 (2026.6.19) built abc").as_deref(),
+            Some("0.17.0")
+        );
+        assert_eq!(extract_semver("0.17.0").as_deref(), Some("0.17.0"));
+        assert_eq!(extract_semver("1.2.3.4-rc").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver("no version at all"), None);
+        assert_eq!(extract_semver("only v1.2 here"), None);
+    }
+
+    #[test]
+    fn detect_hermes_version_is_graceful() {
+        // Best-effort: must never panic whether or not `hermes` is on PATH.
+        let _ = detect_hermes_version();
+    }
+
+    #[test]
+    fn state_schema_version_present_and_absent() {
+        assert_eq!(
+            detect_state_schema_version(make_home(true).path()),
+            Some(16)
+        );
+        assert_eq!(detect_state_schema_version(make_home(false).path()), None);
+    }
+
+    #[test]
     fn export_curated_only() {
         let dir = make_home(false);
         let out = dir.path().join("out.alf");
@@ -860,5 +1017,96 @@ mod tests {
         let report = export(dir.path(), &out).unwrap();
         assert!(!report.raw_sources.iter().any(|s| s == ".env"));
         assert!(!report.raw_sources.iter().any(|s| s.starts_with("logs/")));
+    }
+
+    #[test]
+    fn discover_agents_enumerates_default_and_named_profiles() {
+        let dir = make_home(false);
+        let home = dir.path();
+        // A named profile with a lazy (absent) state.db.
+        let prof = home.join("profiles").join("agent_a");
+        fs::create_dir_all(prof.join("memories")).unwrap();
+        fs::write(prof.join("SOUL.md"), "# Agent A\n").unwrap();
+
+        let bindings = discover_agents(home).unwrap();
+        assert_eq!(bindings.len(), 2);
+
+        let default = &bindings[0];
+        assert_eq!(default.runtime_agent, "default");
+        assert_eq!(default.workspace.as_path(), home);
+        assert!(default.default_enabled);
+        assert!(default.runtime_agent_id.is_none());
+        assert_eq!(
+            default.memory_source,
+            MemorySource::PerAgentDb {
+                path: home.join("state.db")
+            }
+        );
+
+        let named = &bindings[1];
+        assert_eq!(named.runtime_agent, "agent_a");
+        assert_eq!(named.workspace, prof);
+        assert_eq!(
+            named.memory_source,
+            MemorySource::PerAgentDb {
+                path: prof.join("state.db")
+            }
+        );
+        // Lazy tolerance: the profile binds even though state.db does not exist.
+        assert!(!prof.join("state.db").exists());
+    }
+
+    #[test]
+    fn discover_agents_default_only_when_no_profiles_dir() {
+        let dir = make_home(false);
+        let bindings = discover_agents(dir.path()).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].runtime_agent, "default");
+        assert_eq!(bindings[0].workspace.as_path(), dir.path());
+    }
+
+    #[test]
+    fn default_profile_export_excludes_runtime_and_nested_profiles() {
+        // The default profile's workspace is `~/.hermes` itself, interleaved
+        // with the shared runtime. Exporting it must carry agent data only —
+        // no runtime dirs, no nested named profiles, no state.db binary.
+        let dir = make_home(true);
+        let home = dir.path();
+        for d in ["node", "bin", "hermes-agent"] {
+            fs::create_dir_all(home.join(d)).unwrap();
+            fs::write(home.join(d).join("junk.txt"), "runtime").unwrap();
+        }
+        let nested = home.join("profiles").join("agent_a").join("memories");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("MEMORY.md"), "OTHER PROFILE DATA").unwrap();
+        // The per-agent vault KEY lives under `~/.hermes/state/<id>/` (WP5). It
+        // must NEVER travel in an archive — `state/` is not in the allowlist.
+        let key_dir = home
+            .join("state")
+            .join("11111111-1111-1111-1111-111111111111");
+        fs::create_dir_all(&key_dir).unwrap();
+        fs::write(key_dir.join(".alf-vault-key"), "TOPSECRETKEYBYTES").unwrap();
+
+        let out = home.join("out.alf");
+        let report = export(home, &out).unwrap();
+
+        for leaked in [
+            "node",
+            "bin",
+            "hermes-agent",
+            "profiles",
+            "state.db",
+            "state/",
+        ] {
+            assert!(
+                !report.raw_sources.iter().any(|s| s.starts_with(leaked)),
+                "default-profile export leaked {leaked:?}: {:?}",
+                report.raw_sources
+            );
+        }
+        // Sanity: it DID carry the agent data + the schema sidecar.
+        assert!(report.raw_sources.iter().any(|s| s == "SOUL.md"));
+        assert!(report.raw_sources.iter().any(|s| s == "memories/MEMORY.md"));
+        assert!(report.raw_sources.iter().any(|s| s == SCHEMA_SIDECAR));
     }
 }

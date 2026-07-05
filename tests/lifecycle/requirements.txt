@@ -1,0 +1,7 @@
+# Lifecycle harness dependencies (same four as scripts/requirements.txt).
+# The no-LLM / no-backend tier (the CI tier) runs on the stdlib alone —
+# these are only imported when the corresponding lane is actually used.
+requests
+psycopg2-binary
+boto3
+python-dotenv

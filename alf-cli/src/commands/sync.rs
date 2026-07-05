@@ -20,7 +20,9 @@ use crate::adapter;
 use crate::api_client::{ApiClient, RegisterAgentOutcome};
 use crate::commands::restore::pull_cloud_base;
 use crate::config::Config;
+use crate::errors::{codes, CliError};
 use crate::output;
+use crate::selector::{self, SelectedAgent, SelectorSource};
 use crate::state::{local_base_exists, local_base_path, state_file_path, AgentState};
 
 use alf_core::archive::{AlfReader, DeltaWriter};
@@ -35,7 +37,8 @@ use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Seek};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 #[derive(Serialize)]
 struct SyncResult {
@@ -49,6 +52,53 @@ struct SyncResult {
     /// True iff this sync invocation pulled the cloud base because the local
     /// base was missing (i.e. went through the `--recover` path).
     recovered: bool,
+    /// The agent this sync operated on and how it was selected (WP0).
+    agent: SyncAgentRef,
+}
+
+#[derive(Serialize)]
+struct SyncAgentRef {
+    runtime_agent: String,
+    alf_agent_id: Uuid,
+    source: SelectorSource,
+}
+
+/// One JSON object for `alf sync --all`: per-agent results, never fail-fast.
+#[derive(Serialize)]
+struct SyncAllResult {
+    ok: bool,
+    all: bool,
+    results: Vec<SyncAllEntry>,
+}
+
+#[derive(Serialize)]
+struct SyncAllEntry {
+    runtime_agent: String,
+    alf_agent_id: Uuid,
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sequence: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_changes: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+
+/// Result of one agent's sync, decoupled from output so `--all` can collect
+/// several and the single-agent path emits exactly one JSON object.
+struct SyncOutcome {
+    sequence: u64,
+    delta: bool,
+    changes: Option<SyncChanges>,
+    no_changes: bool,
+    recovered: bool,
+    /// Full snapshot forced on the delta path (tracked files changed).
+    resnapshot: bool,
+    snapshot_path: PathBuf,
 }
 
 #[derive(Serialize)]
@@ -127,7 +177,7 @@ pub(crate) fn check_first_sync_safety(
             "Agent {} already exists in the cloud (latest_sequence = {}), \
              but no local sync state was found at ~/.alf/state/. \
              Refusing to upload as first sync to avoid overwriting cloud history. \
-             Either run `alf restore -r {} -w <workspace> -a {}` first to hydrate state, \
+             Either run `alf restore -r {} -w <workspace> --agent {}` first to hydrate state, \
              or pass --force-first-sync to overwrite the cloud agent with the current workspace. \
              See docs/how_alf_syncs.md (case E3).",
             agent_id,
@@ -185,11 +235,27 @@ pub(crate) enum SyncMode {
     Recover { base_sequence: u64 },
 }
 
-pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: bool) -> Result<()> {
+pub fn run(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+    all: bool,
+    recover: bool,
+    force_first_sync: bool,
+) -> Result<()> {
     let human = output::human_mode();
 
-    let config = Config::load()?;
-    let client = ApiClient::from_config(&config)?;
+    // clap's conflicts_with cannot see the global --agent when it is matched
+    // before the subcommand (`alf --agent x sync --all`), so enforce the
+    // conflict here too — --agent must never be silently ignored.
+    if all && agent.is_some() {
+        bail!(
+            "--all cannot be combined with --agent: --all syncs every enabled agent. \
+             Drop --all to sync only the selected agent, or drop --agent."
+        );
+    }
+
+    let mut config = Config::load()?;
 
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
@@ -199,7 +265,195 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
         )
     })?;
 
-    if !workspace.exists() {
+    // Install root for discovery/lazy-init: -w flag → [defaults].workspace →
+    // the runtime's own configured/default location (same order alf check uses).
+    let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+
+    if all {
+        return run_all(
+            &mut config,
+            adapt.as_ref(),
+            runtime,
+            &install,
+            recover,
+            force_first_sync,
+            human,
+        );
+    }
+
+    // Selection (and its enabled gate) runs BEFORE ApiClient::from_config so
+    // selection errors are observable without an API key.
+    let selected =
+        selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?;
+    selector::require_enabled_for_sync(&selected)?;
+
+    // WP1: move any legacy vault/key to the per-agent layout before export —
+    // adapters read only per-agent vault paths (no legacy fallback), so an
+    // unmigrated vault would silently drop Layer 4 from the upload.
+    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
+
+    let client = ApiClient::from_config(&config)?;
+    let outcome = sync_one(
+        &client,
+        adapt.as_ref(),
+        runtime,
+        &selected,
+        workspace_flag,
+        recover,
+        force_first_sync,
+        human,
+    )?;
+
+    if human {
+        print_human_outcome(&outcome, selected.alf_agent_id)?;
+    } else {
+        output::json(&SyncResult {
+            ok: true,
+            sequence: outcome.sequence,
+            delta: outcome.delta,
+            changes: outcome.changes,
+            snapshot_path: outcome.snapshot_path.to_string_lossy().into(),
+            no_changes: outcome.no_changes,
+            recovered: outcome.recovered,
+            agent: SyncAgentRef {
+                runtime_agent: selected.alias.clone(),
+                alf_agent_id: selected.alf_agent_id,
+                source: selected.source,
+            },
+        });
+    }
+
+    Ok(())
+}
+
+/// `alf sync --all`: sync every enabled agent sequentially, collecting
+/// per-agent results — one agent's failure must not block the others'
+/// backups. Emits ONE JSON object and exits 1 itself when any agent failed
+/// (avoids a second JSON object from main's error path).
+#[allow(clippy::too_many_arguments)]
+fn run_all(
+    config: &mut Config,
+    adapt: &dyn adapter::Adapter,
+    runtime: &str,
+    install: &Path,
+    recover: bool,
+    force_first_sync: bool,
+    human: bool,
+) -> Result<()> {
+    let selected = selector::select_all_enabled(config, adapt, runtime, install)?;
+
+    // WP1: one migration pass for the runtime before any agent exports.
+    crate::vault_migrate::require_migrated(config, runtime)?;
+
+    let client = ApiClient::from_config(config)?;
+
+    let mut results = Vec::with_capacity(selected.len());
+    for sel in &selected {
+        output::progress(&format!(
+            "Syncing agent '{}' ({})...",
+            sel.alias, sel.alf_agent_id
+        ));
+        match sync_one(
+            &client,
+            adapt,
+            runtime,
+            sel,
+            None,
+            recover,
+            force_first_sync,
+            /* human: */ false,
+        ) {
+            Ok(outcome) => results.push(SyncAllEntry {
+                runtime_agent: sel.alias.clone(),
+                alf_agent_id: sel.alf_agent_id,
+                ok: true,
+                sequence: Some(outcome.sequence),
+                no_changes: outcome.no_changes.then_some(true),
+                error: None,
+                code: None,
+                hint: None,
+            }),
+            Err(err) => {
+                let (code, hint) = match err.downcast_ref::<CliError>() {
+                    Some(c) => (Some(c.code.to_string()), Some(c.remedy.clone())),
+                    None => {
+                        let h = output::error_hint(&err);
+                        (None, (!h.is_empty()).then_some(h))
+                    }
+                };
+                results.push(SyncAllEntry {
+                    runtime_agent: sel.alias.clone(),
+                    alf_agent_id: sel.alf_agent_id,
+                    ok: false,
+                    sequence: None,
+                    no_changes: None,
+                    error: Some(format!("{err:#}")),
+                    code,
+                    hint,
+                });
+            }
+        }
+    }
+
+    let all_ok = results.iter().all(|r| r.ok);
+    if human {
+        for r in &results {
+            if r.ok {
+                println!(
+                    "{} {}  sequence={}{}",
+                    "✓".green().bold(),
+                    r.runtime_agent,
+                    r.sequence.unwrap_or(0),
+                    if r.no_changes == Some(true) {
+                        "  (no changes)"
+                    } else {
+                        ""
+                    }
+                );
+            } else {
+                println!(
+                    "{} {}  {}",
+                    "✗".red().bold(),
+                    r.runtime_agent,
+                    r.error.as_deref().unwrap_or("failed")
+                );
+            }
+        }
+    } else {
+        output::json(&SyncAllResult {
+            ok: all_ok,
+            all: true,
+            results,
+        });
+    }
+    if !all_ok {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Sync one selected agent: export via the agent-aware seam, decide the mode,
+/// execute it. No stdout output — callers render the outcome.
+#[allow(clippy::too_many_arguments)]
+fn sync_one(
+    client: &ApiClient,
+    adapt: &dyn adapter::Adapter,
+    runtime: &str,
+    selected: &SelectedAgent,
+    workspace_flag: Option<&Path>,
+    recover: bool,
+    force_first_sync: bool,
+    human: bool,
+) -> Result<SyncOutcome> {
+    // Fail closed on identity drift BEFORE any network traffic: the workspace
+    // and the mapping must agree on who this agent is.
+    check_identity_drift(selected)?;
+
+    let (workspace, adhoc) = selector::effective_workspace(selected, workspace_flag);
+
+    // A mapped per-agent workspace is adapter-owned and may not exist yet
+    // (`export_agent` creates it); only validate an explicit -w target.
+    if adhoc && !workspace.exists() {
         bail!(
             "Workspace directory does not exist: {}",
             workspace.display()
@@ -224,7 +478,7 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
     // the cleaned include list and the log are captured in this sync. The
     // include list is a runtime-agnostic workspace convention (alf_core), so
     // this applies to every runtime whose adapter packs the tracked files.
-    let removed = alf_core::prune_and_log_missing(workspace)?;
+    let removed = alf_core::prune_and_log_missing(&workspace)?;
     for rel in &removed {
         output::progress(&format!(
             "  Removed {rel} from sync (file no longer present; logged to {})",
@@ -232,12 +486,15 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
         ));
     }
 
-    // Export workspace to a temp file to discover the agent ID.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("snapshot.alf");
 
     output::progress("  Exporting workspace...");
-    let report = adapt.export(workspace, &temp_alf)?;
+    // Export through the agent-aware seam: the mapping's id is written through
+    // to the workspace, so manifest.agent.id == selected.alf_agent_id.
+    let mut binding = selected.binding.clone();
+    binding.workspace = workspace.clone();
+    let report = adapt.export_agent(&binding, selected.alf_agent_id, &temp_alf)?;
     output::progress(&format!(
         "  Exported {} memory records",
         report.memory_records
@@ -249,7 +506,19 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
 
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
     let reader = AlfReader::new(Cursor::new(&alf_bytes))?;
-    let agent_id = reader.manifest().agent.id;
+    // Contract assertion (the WP0 seam): the archive identity must be the
+    // selected agent — everything downstream (state, register, upload) keys
+    // off selected.alf_agent_id.
+    let manifest_id = reader.manifest().agent.id;
+    if manifest_id != selected.alf_agent_id {
+        bail!(
+            "Export produced agent id {} but the selected agent is {} — the \
+             workspace and the [[agents]] mapping disagree. Run `alf check` to reconcile.",
+            manifest_id,
+            selected.alf_agent_id
+        );
+    }
+    let agent_id = selected.alf_agent_id;
 
     // Decide the sync mode strictly from (sequence, base_present, recover).
     let state = AgentState::load(agent_id)?;
@@ -264,7 +533,7 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
 
     match mode {
         SyncMode::FirstSync => execute_first_sync(
-            &client,
+            client,
             agent_id,
             runtime,
             &report.agent_name,
@@ -272,10 +541,9 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
             &temp_alf,
             &snapshot_path,
             force_first_sync,
-            human,
         ),
         SyncMode::Delta { base_sequence } => execute_delta(
-            &client,
+            client,
             agent_id,
             runtime,
             base_sequence,
@@ -284,21 +552,20 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
             &temp_alf,
             &snapshot_path,
             /* recovered: */ false,
-            human,
         ),
         SyncMode::Recover { base_sequence } => {
             output::progress(&format!(
                 "  Local base missing — recovering from cloud (base sequence {base_sequence})..."
             ));
             // pull_cloud_base writes base.alf and state.toml under ~/.alf/state/.
-            let cloud = pull_cloud_base(&client, agent_id)?;
+            let cloud = pull_cloud_base(client, agent_id)?;
             output::progress(&format!(
                 "  Recovered local base at sequence {} ({})",
                 cloud.latest_sequence,
                 cloud.local_base.display()
             ));
             execute_delta(
-                &client,
+                client,
                 agent_id,
                 runtime,
                 cloud.latest_sequence,
@@ -307,7 +574,6 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
                 &temp_alf,
                 &snapshot_path,
                 /* recovered: */ true,
-                human,
             )
         }
         SyncMode::BailMissingBase {
@@ -324,6 +590,117 @@ pub fn run(runtime: &str, workspace: &Path, recover: bool, force_first_sync: boo
     }
 }
 
+/// Fail-closed pre-network drift guard: a workspace `.alf-agent-id` that
+/// disagrees with the mapping means syncing would upload one agent's data
+/// under another's identity. Coded so the agent LLM can heal it.
+fn check_identity_drift(selected: &SelectedAgent) -> Result<()> {
+    let id_file = selected.workspace.join(alf_core::AGENT_ID_FILE);
+    if !id_file.is_file() {
+        return Ok(());
+    }
+    let raw = fs::read_to_string(&id_file)
+        .with_context(|| format!("Failed to read {}", id_file.display()))?;
+    if let Ok(ws_id) = Uuid::parse_str(raw.trim()) {
+        if ws_id != selected.alf_agent_id {
+            return Err(CliError {
+                code: codes::AGENT_ID_DRIFT,
+                cause: format!(
+                    "Agent identity drift: {} contains {} but the mapping for '{}' expects {}.",
+                    id_file.display(),
+                    ws_id,
+                    selected.alias,
+                    selected.alf_agent_id
+                ),
+                remedy: format!(
+                    "Run: echo {} > {} to keep the mapped history, or run 'alf check' \
+                     after intentional identity changes.",
+                    selected.alf_agent_id,
+                    id_file.display()
+                ),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Human rendering for a single-agent sync outcome (labels match the pre-WP0
+/// output).
+fn print_human_outcome(outcome: &SyncOutcome, agent_id: Uuid) -> Result<()> {
+    if outcome.no_changes {
+        println!(
+            "{} No changes detected — already up to date",
+            "✓".green().bold()
+        );
+        return Ok(());
+    }
+    let label = match (outcome.delta, outcome.resnapshot, outcome.recovered) {
+        (true, _, false) => "Delta uploaded",
+        (true, _, true) => "Delta uploaded (recovered)",
+        (false, true, false) => "Re-snapshot uploaded (tracked files changed)",
+        (false, true, true) => "Re-snapshot uploaded (recovered; tracked files changed)",
+        (false, false, _) => "Snapshot uploaded",
+    };
+    let state_path = state_file_path(agent_id)?;
+    println!(
+        "{} {} (sequence: {})",
+        "✓".green().bold(),
+        label,
+        outcome.sequence
+    );
+    println!("  Snapshot base: {}", outcome.snapshot_path.display());
+    println!("  State file:    {}", state_path.display());
+    Ok(())
+}
+
+/// Wrap a registration failure as a coded, machine-distinguishable error.
+/// HTTP 402 (subscription/agent limit) gets a dedicated remedy quoting the
+/// server detail carried in the cause.
+fn wrap_registration(err: anyhow::Error) -> anyhow::Error {
+    let cause = format!("{err:#}");
+    let remedy = if cause.contains("HTTP 402") {
+        "The service refused registration (subscription/agent limit — see the server \
+         message in the error). Upgrade the subscription or `alf purge` an unused \
+         agent, then re-run alf sync."
+            .to_string()
+    } else {
+        "check your API key (alf login) and network, then re-run alf sync; \
+         registration is the one-time backend step before first upload — nothing \
+         was uploaded"
+            .to_string()
+    };
+    CliError {
+        code: codes::REGISTRATION_FAILED,
+        cause,
+        remedy,
+    }
+    .into()
+}
+
+/// Wrap a snapshot/delta upload failure. The local base was not advanced, so
+/// a re-run retries the same upload — except on a sequence conflict, where a
+/// plain retry pushes the same stale base and fails identically: the remedy
+/// must point at restore (how_alf_syncs.md E7), not a retry loop.
+fn wrap_upload(err: anyhow::Error) -> anyhow::Error {
+    let cause = format!("{err:#}");
+    let remedy = if cause.contains("Sequence conflict") {
+        "another host advanced this agent's cloud state; run the 'alf restore' \
+         command shown in the error to pull the latest state, then re-run alf sync \
+         — a plain retry hits the same conflict"
+            .to_string()
+    } else {
+        "check network connectivity and re-run alf sync; the local delta base \
+         was not advanced, so the next sync retries this upload"
+            .to_string()
+    };
+    CliError {
+        code: codes::SYNC_UPLOAD_FAILED,
+        cause,
+        remedy,
+    }
+    .into()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_first_sync(
     client: &ApiClient,
@@ -334,40 +711,32 @@ fn execute_first_sync(
     temp_alf: &Path,
     snapshot_path: &Path,
     force_first_sync: bool,
-    human: bool,
-) -> Result<()> {
+) -> Result<SyncOutcome> {
     output::progress("  First sync — registering agent and uploading snapshot...");
 
-    let outcome = client.register_agent(agent_id, agent_name, runtime)?;
+    // Lazy provisioning: the client-supplied id is the mapping id; a 409 feeds
+    // the E3 guard below.
+    let outcome = client
+        .register_agent(agent_id, agent_name, runtime)
+        .map_err(wrap_registration)?;
 
     check_first_sync_safety(agent_id, runtime, &outcome, force_first_sync)?;
 
-    let upload = client.upload_snapshot(agent_id, alf_bytes)?;
+    let upload = client
+        .upload_snapshot(agent_id, alf_bytes)
+        .map_err(wrap_upload)?;
 
     persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
 
-    if human {
-        let state_path = state_file_path(agent_id)?;
-        println!(
-            "{} Snapshot uploaded (sequence: {})",
-            "✓".green().bold(),
-            upload.sequence
-        );
-        println!("  Snapshot base: {}", snapshot_path.display());
-        println!("  State file:    {}", state_path.display());
-    } else {
-        output::json(&SyncResult {
-            ok: true,
-            sequence: upload.sequence,
-            delta: false,
-            changes: None,
-            snapshot_path: snapshot_path.to_string_lossy().into(),
-            no_changes: false,
-            recovered: false,
-        });
-    }
-
-    Ok(())
+    Ok(SyncOutcome {
+        sequence: upload.sequence,
+        delta: false,
+        changes: None,
+        no_changes: false,
+        recovered: false,
+        resnapshot: false,
+        snapshot_path: snapshot_path.to_path_buf(),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -381,8 +750,7 @@ fn execute_delta(
     temp_alf: &Path,
     snapshot_path: &Path,
     recovered: bool,
-    human: bool,
-) -> Result<()> {
+) -> Result<SyncOutcome> {
     output::progress(&format!(
         "  Computing delta since sequence {base_sequence}..."
     ));
@@ -399,8 +767,38 @@ fn execute_delta(
     let prev_identity = prev_reader.read_identity()?;
     let prev_principals = prev_reader.read_principals()?;
 
-    let mut curr_reader = AlfReader::new(Cursor::new(alf_bytes))?;
-    let curr_records = curr_reader.read_all_memory()?;
+    // WP4.1: reconcile the fresh export against the base BEFORE anything is
+    // diffed, uploaded, or persisted. Matched records carry their id and
+    // created_at/observed_at forward, so in-place curation (OpenClaw rewriting
+    // MEMORY.md) becomes clean updates instead of id churn, and mtime-only
+    // re-stamps produce no delta at all.
+    let exported_records = {
+        let mut reader = AlfReader::new(Cursor::new(alf_bytes))?;
+        reader.read_all_memory()?
+    };
+    let reconciled = alf_core::reconcile::reconcile(&prev_records, exported_records);
+    let effective_bytes: std::borrow::Cow<'_, [u8]> = if reconciled.rewritten {
+        output::progress(&format!(
+            "  Reconciled memory identities: {} carried, {} updated in place, {} new, {} removed",
+            reconciled.stats.carried,
+            reconciled.stats.heading_matched + reconciled.stats.id_matched,
+            reconciled.stats.created,
+            reconciled.stats.deleted
+        ));
+        let bytes = alf_core::replace_memory_records(alf_bytes, &reconciled.records)
+            .context("Failed to rewrite archive with reconciled memory records")?;
+        // ONE buffer feeds everything downstream: the re-snapshot upload uses
+        // `effective_bytes` and `persist_local` copies `temp_alf` — if they
+        // ever diverged, local base and cloud record ids would part ways
+        // permanently on the re-snapshot path.
+        fs::write(temp_alf, &bytes).context("Failed to persist reconciled archive")?;
+        std::borrow::Cow::Owned(bytes)
+    } else {
+        std::borrow::Cow::Borrowed(alf_bytes)
+    };
+    let curr_records = reconciled.records;
+
+    let mut curr_reader = AlfReader::new(Cursor::new(effective_bytes.as_ref()))?;
     // The freshly-exported archive already carries the live vault (Layer 4),
     // so we diff it here against the previous base — never re-reading the vault
     // file and never decrypting. Diff is by credential `id` (see
@@ -420,35 +818,19 @@ fn execute_delta(
     // base at the current sequence; prior deltas retained for point-in-time).
     if tracked_files_changed(runtime, &mut prev_reader, &mut curr_reader)? {
         output::progress("  Tracked workspace files changed — uploading full snapshot...");
-        let upload = client.upload_snapshot(agent_id, alf_bytes)?;
+        let upload = client
+            .upload_snapshot(agent_id, effective_bytes.as_ref())
+            .map_err(wrap_upload)?;
         persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
-        if human {
-            let state_path = state_file_path(agent_id)?;
-            let label = if recovered {
-                "Re-snapshot uploaded (recovered; tracked files changed)"
-            } else {
-                "Re-snapshot uploaded (tracked files changed)"
-            };
-            println!(
-                "{} {} (sequence: {})",
-                "✓".green().bold(),
-                label,
-                upload.sequence
-            );
-            println!("  Snapshot base: {}", snapshot_path.display());
-            println!("  State file:    {}", state_path.display());
-        } else {
-            output::json(&SyncResult {
-                ok: true,
-                sequence: upload.sequence,
-                delta: false,
-                changes: None,
-                snapshot_path: snapshot_path.to_string_lossy().into(),
-                no_changes: false,
-                recovered,
-            });
-        }
-        return Ok(());
+        return Ok(SyncOutcome {
+            sequence: upload.sequence,
+            delta: false,
+            changes: None,
+            no_changes: false,
+            recovered,
+            resnapshot: true,
+            snapshot_path: snapshot_path.to_path_buf(),
+        });
     }
 
     let delta_entries = compute_delta(&prev_records, &curr_records);
@@ -473,23 +855,15 @@ fn execute_delta(
         && raw_changed.is_empty()
         && raw_deleted.is_empty()
     {
-        if human {
-            println!(
-                "{} No changes detected — already up to date",
-                "✓".green().bold()
-            );
-        } else {
-            output::json(&SyncResult {
-                ok: true,
-                sequence: base_sequence,
-                delta: false,
-                changes: None,
-                snapshot_path: snapshot_path.to_string_lossy().into(),
-                no_changes: true,
-                recovered,
-            });
-        }
-        return Ok(());
+        return Ok(SyncOutcome {
+            sequence: base_sequence,
+            delta: false,
+            changes: None,
+            no_changes: true,
+            recovered,
+            resnapshot: false,
+            snapshot_path: snapshot_path.to_path_buf(),
+        });
     }
 
     let creates = delta_entries
@@ -635,53 +1009,36 @@ fn execute_delta(
         "  Uploading delta ({} bytes)...",
         delta_bytes.len()
     ));
-    let upload = client.push_delta(agent_id, base_sequence, &delta_bytes)?;
+    let upload = client
+        .push_delta(agent_id, base_sequence, &delta_bytes)
+        .map_err(wrap_upload)?;
 
     persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
 
-    if human {
-        let state_path = state_file_path(agent_id)?;
-        let label = if recovered {
-            "Delta uploaded (recovered)"
-        } else {
-            "Delta uploaded"
-        };
-        println!(
-            "{} {} (sequence: {})",
-            "✓".green().bold(),
-            label,
-            upload.sequence
-        );
-        println!("  Snapshot base: {}", snapshot_path.display());
-        println!("  State file:    {}", state_path.display());
-    } else {
-        output::json(&SyncResult {
-            ok: true,
-            sequence: upload.sequence,
-            delta: true,
-            changes: Some(SyncChanges {
-                creates,
-                updates,
-                deletes,
-                credentials: LayerChanges {
-                    creates: cred_diff.created.len(),
-                    updates: cred_diff.updated.len(),
-                    deletes: cred_diff.deleted.len(),
-                },
-                principals: LayerChanges {
-                    creates: princ_diff.created.len(),
-                    updates: princ_diff.updated.len(),
-                    deletes: princ_diff.deleted.len(),
-                },
-                identity: id_changed,
-            }),
-            snapshot_path: snapshot_path.to_string_lossy().into(),
-            no_changes: false,
-            recovered,
-        });
-    }
-
-    Ok(())
+    Ok(SyncOutcome {
+        sequence: upload.sequence,
+        delta: true,
+        changes: Some(SyncChanges {
+            creates,
+            updates,
+            deletes,
+            credentials: LayerChanges {
+                creates: cred_diff.created.len(),
+                updates: cred_diff.updated.len(),
+                deletes: cred_diff.deleted.len(),
+            },
+            principals: LayerChanges {
+                creates: princ_diff.created.len(),
+                updates: princ_diff.updated.len(),
+                deletes: princ_diff.deleted.len(),
+            },
+            identity: id_changed,
+        }),
+        no_changes: false,
+        recovered,
+        resnapshot: false,
+        snapshot_path: snapshot_path.to_path_buf(),
+    })
 }
 
 /// Whether any agent-tracked file (`alf add`) — or the include list / sync log
@@ -788,6 +1145,30 @@ fn diff_raw_trees(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// A 409 sequence conflict must steer to restore, not a retry loop — a
+    /// plain re-run pushes the same stale base and fails identically.
+    #[test]
+    fn wrap_upload_sequence_conflict_points_at_restore() {
+        let err = wrap_upload(anyhow::anyhow!(
+            "Sequence conflict: your local state is at sequence 3 but the \
+             server is at 4. Pull the latest changes first:\n  \
+             alf restore -r <runtime> -w <workspace> --agent <id>"
+        ));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::SYNC_UPLOAD_FAILED);
+        assert!(cli.remedy.contains("alf restore"), "remedy: {}", cli.remedy);
+        assert!(
+            !cli.remedy.contains("re-run alf sync;"),
+            "must not suggest a blind retry: {}",
+            cli.remedy
+        );
+
+        // Any other upload error keeps the retry remedy.
+        let err = wrap_upload(anyhow::anyhow!("connection reset by peer"));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert!(cli.remedy.contains("re-run alf sync"));
+    }
 
     fn state_with(seq: Option<u64>) -> AgentState {
         AgentState {

@@ -24,7 +24,9 @@ use alf_core::{
 
 /// UUID v5 namespace for generating deterministic record IDs.
 /// Distinct from OpenClaw's namespace to avoid ID collisions.
-const ZEROCLAW_NS: Uuid = Uuid::from_bytes([
+/// `pub(crate)`: the sqlite extractor derives its deterministic id fallback
+/// under the same namespace.
+pub(crate) const ZEROCLAW_NS: Uuid = Uuid::from_bytes([
     0x7a, 0x65, 0x72, 0x6f, 0x63, 0x6c, 0x61, 0x77, // "zeroclaw"
     0x2d, 0x61, 0x6c, 0x66, 0x2d, 0x6e, 0x73, 0x31, // "-alf-ns1"
 ]);
@@ -163,10 +165,13 @@ fn classify_file(relative_path: &str) -> FileClassification {
 // Record generation
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic UUID v5 for a record.
-fn record_id(relative_path: &str, section_index: usize) -> Uuid {
-    let name = format!("{relative_path}:{section_index}");
-    Uuid::new_v5(&ZEROCLAW_NS, name.as_bytes())
+/// Content-addressed *birth* id for a record (WP4.1) — same scheme as the
+/// OpenClaw adapter: identity is minted from what a section says, not where it
+/// sits, so in-place curation (insert/remove/re-rank) never reassigns ids to
+/// different content. Once synced, `alf_core::reconcile` carries ids forward
+/// across edits; existing agents' positional ids are kept by content matching.
+fn record_id(agent_id: Uuid, relative_path: &str, content: &str, occurrence: u32) -> Uuid {
+    alf_core::ids::memory_record_id(&ZEROCLAW_NS, agent_id, relative_path, content, occurrence)
 }
 
 /// Parse a single markdown file into memory records.
@@ -194,8 +199,17 @@ fn parse_memory_file(
 
     let mut records = Vec::with_capacity(sections.len());
 
-    for (idx, section) in sections.iter().enumerate() {
-        let id = record_id(relative_path, idx);
+    // Occurrence counts duplicate contents over the full section list so birth
+    // ids stay a pure function of the file (keys trimmed to match the id
+    // derivation — see `alf_core::ids::memory_record_id`).
+    let mut occurrences: HashMap<&str, u32> = HashMap::new();
+
+    for section in sections.iter() {
+        let occ = occurrences
+            .entry(section.content.trim_end())
+            .and_modify(|c| *c += 1)
+            .or_insert(0);
+        let id = record_id(agent_id, relative_path, &section.content, *occ);
         let created_at = classification.observed_at.unwrap_or(file_mtime);
 
         let raw_source = serde_json::json!({
@@ -376,11 +390,14 @@ mod tests {
 
     #[test]
     fn deterministic_ids() {
-        let id1 = record_id("memory/2026-01-15.md", 0);
-        let id2 = record_id("memory/2026-01-15.md", 0);
-        let id3 = record_id("memory/2026-01-15.md", 1);
+        let agent = Uuid::nil();
+        let id1 = record_id(agent, "memory/2026-01-15.md", "## A\nbody", 0);
+        let id2 = record_id(agent, "memory/2026-01-15.md", "## A\nbody", 0);
+        let id3 = record_id(agent, "memory/2026-01-15.md", "## A\nbody", 1);
+        let id4 = record_id(agent, "memory/2026-01-15.md", "## A\nedited", 0);
         assert_eq!(id1, id2);
         assert_ne!(id1, id3);
+        assert_ne!(id1, id4);
     }
 
     #[test]

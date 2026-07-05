@@ -22,3 +22,78 @@ pub fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
         std::fs::write(path, content)
     }
 }
+
+/// Write UTF-8 text atomically with owner-only permissions: a 0600 temp file
+/// in the same directory, `sync_all`, then rename over `path`. A crash leaves
+/// either the old file or the new one whole — never a truncated mix. Use for
+/// secrets whose loss is unrecoverable (the vault document, migration stamps).
+pub fn write_private_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| std::io::Error::other("path has no file name"))?;
+    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+
+    {
+        #[cfg(unix)]
+        let mut f = {
+            use std::fs::OpenOptions;
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+
+    match std::fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn write_private_atomic_replaces_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("credentials.json");
+
+        write_private_atomic(&path, "{\"v\":1}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\":1}");
+
+        write_private_atomic(&path, "{\"v\":2}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"v\":2}");
+
+        // No .tmp sibling left behind.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file must not survive");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_private_atomic_sets_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("secret");
+        write_private_atomic(&path, "s").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+}

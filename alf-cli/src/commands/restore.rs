@@ -19,12 +19,14 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
-use crate::state::{local_base_path, resolve_agent_id, AgentState};
+use crate::selector;
+use crate::state::{local_base_path, AgentState};
 use crate::vault_key::{self, VaultKeyArgs};
+use crate::vault_migrate;
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
-use alf_core::{FileEntry, ImportOptions};
+use alf_core::{FileEntry, ImportOptions, RestoreMode};
 
 use anyhow::Context;
 use anyhow::Result;
@@ -226,19 +228,17 @@ fn fetch_point_in_time(
 
 pub fn run(
     runtime: &str,
-    workspace: &Path,
+    workspace_flag: Option<&Path>,
     agent_arg: Option<&str>,
     at_sequence: Option<u64>,
     dry_run: bool,
+    mode: RestoreMode,
     key_args: &VaultKeyArgs,
 ) -> Result<()> {
     let human = output::human_mode();
     let preview = at_sequence.is_some();
 
-    let config = Config::load()?;
-    let client = ApiClient::from_config(&config)?;
-
-    let agent_id: Uuid = resolve_agent_id(agent_arg)?;
+    let mut config = Config::load()?;
 
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
         anyhow::anyhow!(
@@ -248,9 +248,38 @@ pub fn run(
         )
     })?;
 
+    // Alias-or-id via the mapping; an unmapped UUID passes through verbatim
+    // (restore-by-UUID onto a fresh host); legacy sole-state-file fallback
+    // when the mapping is empty.
+    let agent_id: Uuid = selector::resolve_for_cloud_op(
+        &mut config,
+        adapt.as_ref(),
+        runtime,
+        workspace_flag,
+        agent_arg,
+    )?;
+
+    // Workspace: -w flag → the agent's mapped workspace → [defaults].workspace.
+    let workspace: PathBuf = match workspace_flag {
+        Some(w) => w.to_path_buf(),
+        None => match config.agents.iter().find(|a| a.alf_agent_id == agent_id) {
+            Some(row) => PathBuf::from(&row.workspace),
+            None => config.resolve_workspace(None)?,
+        },
+    };
+    let workspace = workspace.as_path();
+
+    let client = ApiClient::from_config(&config)?;
+
     if dry_run {
         return run_dry_run(&client, agent_id, adapt.as_ref(), at_sequence, human);
     }
+
+    // WP1: move any legacy vault/key to the per-agent layout before the
+    // adapter writes Layer 4 — otherwise the key leg is missed on the first
+    // post-upgrade restore and the legacy file survives as a shadow vault.
+    // (After the dry-run gate: --dry-run writes nothing.)
+    vault_migrate::require_migrated(&config, runtime)?;
 
     if human {
         if let Some(n) = at_sequence {
@@ -301,15 +330,16 @@ pub fn run(
     fs::write(&temp_alf, &final_bytes)?;
 
     output::progress("  Importing into workspace...");
-    let resolved_key = vault_key::resolve(key_args, runtime)?;
-    if let Some((_, src)) = &resolved_key {
+    let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
+    if let Some((_, source)) = &resolved_key {
         output::progress(&format!(
             "Using vault key from {} — credentials will be decrypted and restored",
-            src.label()
+            source.label()
         ));
     }
     let import_options = ImportOptions {
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
+        mode,
     };
     let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
 

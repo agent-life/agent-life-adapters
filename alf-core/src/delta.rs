@@ -234,7 +234,11 @@ fn content_eq_ignoring_updated_at<T: serde::Serialize>(a: &T, b: &T) -> bool {
 
 /// Apply a set of delta entries to a base set of memory records.
 ///
-/// - `Create`: inserts the record (skips if ID already exists)
+/// - `Create`: inserts the record; on an ID collision it REPLACES the existing
+///   record (upsert). This matches the service indexer's `ON CONFLICT DO
+///   UPDATE` semantics — the two used to diverge (skip here, upsert there), so
+///   a pathological or replayed stream could make a CLI rebuild and the cloud
+///   index disagree on a colliding id's content.
 /// - `Update`: replaces the record with matching ID (skips if not found)
 /// - `Delete`: removes the record with matching ID (skips if not found)
 ///
@@ -247,12 +251,20 @@ pub fn apply_delta(base: &[MemoryRecord], entries: &[DeltaMemoryEntry]) -> Vec<M
 
     // Track which indices have been deleted so we can remove them at the end
     let mut deleted: Vec<bool> = vec![false; records.len()];
-    let mut appended = Vec::new();
+    let mut appended: Vec<MemoryRecord> = Vec::new();
+    let mut appended_index: HashMap<Uuid, usize> = HashMap::new();
 
     for entry in entries {
         match entry.operation {
             DeltaOperation::Create => {
-                if !index.contains_key(&entry.record.id) {
+                if let Some(&i) = index.get(&entry.record.id) {
+                    // Upsert: last write wins, like the indexer.
+                    records[i] = entry.record.clone();
+                    deleted[i] = false;
+                } else if let Some(&j) = appended_index.get(&entry.record.id) {
+                    appended[j] = entry.record.clone();
+                } else {
+                    appended_index.insert(entry.record.id, appended.len());
                     appended.push(entry.record.clone());
                 }
             }
@@ -739,17 +751,40 @@ mod tests {
     }
 
     #[test]
-    fn create_skips_duplicate_id() {
+    fn create_on_existing_id_replaces() {
+        // Upsert semantics, aligned with the service indexer's
+        // ON CONFLICT (agent_id, id) DO UPDATE — last write wins.
         let id = Uuid::now_v7();
         let base = vec![make_record(id, "existing")];
         let entries = vec![DeltaMemoryEntry {
             operation: DeltaOperation::Create,
-            record: make_record(id, "duplicate"),
+            record: make_record(id, "replacement"),
         }];
 
         let result = apply_delta(&base, &entries);
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].content, "existing"); // not overwritten
+        assert_eq!(result[0].content, "replacement");
+    }
+
+    #[test]
+    fn create_on_duplicate_appended_id_replaces() {
+        // Two Creates with the same id in one delta: the later one wins;
+        // no duplicate ids in the result.
+        let id = Uuid::now_v7();
+        let entries = vec![
+            DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: make_record(id, "first"),
+            },
+            DeltaMemoryEntry {
+                operation: DeltaOperation::Create,
+                record: make_record(id, "second"),
+            },
+        ];
+
+        let result = apply_delta(&[], &entries);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].content, "second");
     }
 
     #[test]

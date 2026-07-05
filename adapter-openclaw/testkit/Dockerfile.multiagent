@@ -1,0 +1,33 @@
+# OpenClaw multi-agent reference install — research spike (NO alf installed).
+#
+# Goal: a typical/idiomatic install as a non-root user would have it, with TWO
+# agents (agent_a, agent_b), so we can inspect the REAL on-disk layout and the
+# REAL memory/session storage. Shares ONLY the base OS with the other images.
+#
+# Trust hierarchy: what this install puts on disk > the framework source > docs.
+#
+# Build:   docker build -f Dockerfile.multiagent -t openclaw-multiagent .
+# Inspect: ./inspect.sh
+FROM debian:bookworm-slim
+
+ARG OPENCLAW_VERSION=2026.6.11
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates curl git sqlite3 tree gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# OpenClaw is an npm package; engines require Node >=22.19. Install Node 22.x.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN npm install -g "openclaw@${OPENCLAW_VERSION}"
+
+# Typical user runs the agent as themselves (config in their $HOME).
+RUN useradd -m -s /bin/bash agent
+USER agent
+WORKDIR /home/agent
+
+CMD ["bash"]

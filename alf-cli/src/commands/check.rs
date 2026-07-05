@@ -7,6 +7,8 @@ use crate::api_client::{AgentInfo, ApiClient};
 use crate::config::Config;
 use crate::context;
 use crate::output;
+use crate::selector;
+use crate::vault_migrate::{self, MigrationOutcome};
 
 use alf_core::CredentialsDocument;
 use anyhow::Result;
@@ -14,6 +16,7 @@ use colored::Colorize;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
+use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
 // JSON output types
@@ -31,10 +34,36 @@ struct CheckResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     openclaw: Option<OpenClawInfo>,
     alf: AlfInfo,
+    /// Discovered-agent mapping section (WP0). Absent for unknown runtimes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents: Option<AgentsSection>,
     env: EnvInfo,
     vault: VaultInfo,
     issues: Vec<Issue>,
     suggestions: Vec<String>,
+}
+
+/// Outcome of discovery + reconcile against the `[[agents]]` mapping.
+#[derive(Serialize)]
+struct AgentsSection {
+    first_run: bool,
+    agents: Vec<AgentRow>,
+    /// Aliases discovered this run that were not in the mapping.
+    new: Vec<String>,
+    /// Aliases in the mapping that were not discovered this run.
+    removed: Vec<String>,
+    drift: Vec<crate::discovery::DriftWarning>,
+}
+
+#[derive(Serialize)]
+struct AgentRow {
+    runtime_agent: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime_agent_id: Option<String>,
+    alf_agent_id: String,
+    workspace: String,
+    enabled: bool,
+    status: &'static str,
 }
 
 #[derive(Serialize)]
@@ -111,14 +140,23 @@ struct EnvInfo {
     alf_human: Option<String>,
     alf_api_key_set: bool,
     alf_vault_key_set: bool,
-    alf_vault_passphrase_set: bool,
 }
 
-/// Location and state of the agent's credential vault (`~/.alf/vault/credentials.json`).
+/// Location and state of the agent's credential vault
+/// (`~/.alf/vault/{alf_agent_id}/credentials.json`, or the legacy
+/// install-scoped path on mapping-less hosts).
 #[derive(Serialize)]
 struct VaultInfo {
     path: String,
     exists: bool,
+    /// The agent scope the vault path belongs to (WP1). Absent on
+    /// mapping-less hosts (legacy install-scoped vault).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_id: Option<Uuid>,
+    /// A pre-WP1 install-scoped vault still exists alongside the per-agent
+    /// scope — migration is pending (see the issues list). Omitted when false.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    legacy_vault_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_count: Option<usize>,
     /// Server-side credential count (delta-folded) from `GET /v1/agents/:id`.
@@ -144,16 +182,23 @@ struct Issue {
 // Workspace auto-discovery
 // ---------------------------------------------------------------------------
 
-struct ResolvedWorkspace {
-    path: PathBuf,
-    source: String,
+pub(crate) struct ResolvedWorkspace {
+    pub(crate) path: PathBuf,
+    pub(crate) source: String,
     /// The workspace path the runtime's own config points at, if any
     /// (openclaw → `~/.openclaw/openclaw.json`; zeroclaw → `~/.zeroclaw/config.toml`).
     /// Used for the workspace-mismatch warning.
     runtime_configured_path: Option<String>,
 }
 
-fn resolve_workspace(flag: Option<&Path>, config: &Config, runtime: &str) -> ResolvedWorkspace {
+/// Workspace/install discovery: `-w` flag → `[defaults].workspace` → the
+/// runtime's own configured/default location. Also reused by the selector-
+/// driven commands to resolve the install root for discovery lazy-init.
+pub(crate) fn resolve_workspace(
+    flag: Option<&Path>,
+    config: &Config,
+    runtime: &str,
+) -> ResolvedWorkspace {
     // The runtime's own configured workspace, for the mismatch diagnostic.
     // Hermes has no separate workspace — HERMES_HOME *is* the workspace.
     let configured = match runtime {
@@ -538,9 +583,9 @@ fn build_suggestions(result: &CheckResult) -> Vec<String> {
 // Command entry point
 // ---------------------------------------------------------------------------
 
-pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
+pub fn run(runtime: &str, workspace_arg: Option<&Path>, agent: Option<&str>) -> Result<()> {
     let human = output::human_mode();
-    let config = Config::load()?;
+    let mut config = Config::load()?;
 
     output::progress(&format!("Checking {} environment...", runtime));
 
@@ -564,6 +609,96 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         exists: ws_exists,
         writable: ws_writable,
     };
+
+    // Agent discovery + mapping reconcile (WP0). Unknown runtimes keep the
+    // legacy output shape (no agents section); a discovery failure becomes a
+    // warning issue — check is a diagnostic and must not hard-fail.
+    let mut agents_section: Option<AgentsSection> = None;
+    let mut agent_issues: Vec<Issue> = Vec::new();
+    if let Some(adapt) = crate::adapter::get_adapter(runtime) {
+        match crate::discovery::discover_and_reconcile(&config, adapt.as_ref(), runtime, ws_path) {
+            Ok(outcome) => {
+                // Guard: an ad-hoc `-w` check must not hijack a non-empty
+                // mapping that doesn't contain this workspace (an empty
+                // mapping may still be seeded via -w).
+                let mapped = config.agents_for_runtime(runtime);
+                let flag_workspace_unmapped = resolved.source == "flag"
+                    && !mapped.is_empty()
+                    && !mapped.iter().any(|a| Path::new(&a.workspace) == ws_path);
+                if flag_workspace_unmapped {
+                    agent_issues.push(Issue {
+                        severity: "info".into(),
+                        code: "agents_mapping_skipped_flag_workspace".into(),
+                        message: format!(
+                            "-w path ({}) is not in the [[agents]] mapping — discovery was not persisted",
+                            ws_path.display()
+                        ),
+                        suggestion:
+                            "Run 'alf check' without -w (or from the mapped install) to update the mapping"
+                                .into(),
+                    });
+                } else if ws_exists {
+                    crate::discovery::persist(&mut config, &outcome)?;
+                    agent_issues.extend(collect_unpersisted_id_issues(&outcome));
+                }
+
+                agent_issues.extend(collect_agent_issues(&outcome));
+                agents_section = Some(build_agents_section(outcome));
+            }
+            Err(e) => {
+                agent_issues.push(Issue {
+                    severity: "warning".into(),
+                    code: "agent_discovery_failed".into(),
+                    message: format!("Agent discovery failed: {e:#}"),
+                    suggestion: "Fix the reported file (e.g. a malformed .alf-agent-id) and re-run alf check".into(),
+                });
+            }
+        }
+    }
+
+    // Vault scope (WP1): the agent whose per-agent vault applies. Lenient —
+    // check is a diagnostic and never errors on ambiguity or an unknown
+    // selector; it just falls back to the legacy install-scoped view.
+    let vault_scope: Option<Uuid> = selector::vault_scope_agent_id_lenient(&config, runtime, agent)
+        .ok()
+        .flatten();
+
+    // WP1: check is the natural upgrade touchpoint — perform the legacy-vault
+    // migration when the target is unambiguous, report otherwise. Never a
+    // hard failure.
+    match vault_migrate::ensure_migrated(&config, runtime, None) {
+        Ok(MigrationOutcome::NotNeeded) => {}
+        Ok(MigrationOutcome::Migrated { vault, key, agent }) => {
+            if let Some(p) = vault {
+                output::progress(&format!(
+                    "  Migrated legacy vault to {} (agent {agent})",
+                    p.display()
+                ));
+            }
+            if let Some(p) = key {
+                output::progress(&format!(
+                    "  Migrated legacy vault key to {} (agent {agent})",
+                    p.display()
+                ));
+            }
+        }
+        Ok(MigrationOutcome::Blocked(err)) => {
+            agent_issues.push(Issue {
+                severity: "warning".into(),
+                code: err.code.into(),
+                message: err.cause,
+                suggestion: err.remedy,
+            });
+        }
+        Err(e) => {
+            agent_issues.push(Issue {
+                severity: "warning".into(),
+                code: "vault_migration_failed".into(),
+                message: format!("Legacy vault migration failed: {e:#}"),
+                suggestion: "Fix the reported file problem and re-run alf check".into(),
+            });
+        }
+    }
 
     // Check resources
     let resources = if ws_exists {
@@ -599,17 +734,32 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     // ALF state
     let status = context::gather_status()?;
     let api_key_set = status.api_key_set;
-    let agent_tracked = !status.agents.is_empty();
-    let last_synced_sequence = status.agents.first().map(|a| a.last_synced_sequence);
-    let last_synced_at = status.agents.first().and_then(|a| a.last_synced_at.clone());
+    // The global --agent scopes the tracked/last-synced section to one agent
+    // (information-only; unknown selectors just fall back to the default view).
+    let scoped = agent
+        .and_then(|sel| config.find_agent(runtime, sel))
+        .map(|row| row.alf_agent_id)
+        .and_then(|id| status.agents.iter().find(|a| a.agent_id == id).cloned());
+    let (agent_tracked, last_synced_sequence, last_synced_at) = match (&scoped, agent) {
+        (Some(a), _) => (true, Some(a.last_synced_sequence), a.last_synced_at.clone()),
+        (None, Some(_)) => (false, None, None),
+        (None, None) => (
+            !status.agents.is_empty(),
+            status.agents.first().map(|a| a.last_synced_sequence),
+            status.agents.first().and_then(|a| a.last_synced_at.clone()),
+        ),
+    };
 
     // Fetch the server's view of the agent once: it confirms connectivity AND
     // yields the delta-folded credential count used for vault parity (WS-B).
+    // Scoping (WP1): prefer the vault-scoped agent (--agent / sole enabled)
+    // so parity compares the per-agent vault against ITS cloud counts, not
+    // whichever state file happens to sort first.
     let server_agent: Option<AgentInfo> = if api_key_set && agent_tracked {
         ApiClient::from_config(&config).ok().and_then(|c| {
-            status
-                .agents
-                .first()
+            vault_scope
+                .and_then(|id| status.agents.iter().find(|a| a.agent_id == id))
+                .or_else(|| status.agents.first())
                 .and_then(|a| c.get_agent(a.agent_id).ok())
         })
     } else {
@@ -636,7 +786,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     // Vault parity (WS-B): compare the local vault count to the server's
     // delta-folded credential count. Divergence ⇒ the vault has not fully synced
     // (e.g. credentials added but not yet pushed, or a diverged local base).
-    let mut vault = gather_vault();
+    let mut vault = gather_vault(vault_scope);
     vault.server_credential_count = server_agent
         .as_ref()
         .and_then(|a| a.layer_counts.as_ref())
@@ -648,6 +798,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
 
     // Collect issues
     let mut issues = collect_issues(&workspace_info, &resources, &alf_info, &resolved, runtime);
+    issues.extend(agent_issues);
     if vault.parity_ok == Some(false) {
         issues.push(Issue {
             severity: "warning".into(),
@@ -682,6 +833,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
         alfignore,
         openclaw,
         alf: alf_info,
+        agents: agents_section,
         env: gather_env(),
         vault,
         issues,
@@ -696,6 +848,120 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Agents section (WP0)
+// ---------------------------------------------------------------------------
+
+fn status_label(status: crate::discovery::RowStatus) -> &'static str {
+    match status {
+        crate::discovery::RowStatus::Existing => "existing",
+        crate::discovery::RowStatus::New => "new",
+        crate::discovery::RowStatus::Removed => "removed",
+        crate::discovery::RowStatus::Drift => "drift",
+    }
+}
+
+fn build_agents_section(outcome: crate::discovery::ReconcileOutcome) -> AgentsSection {
+    let agents = outcome
+        .rows
+        .iter()
+        .map(|r| AgentRow {
+            runtime_agent: r.entry.runtime_agent.clone(),
+            runtime_agent_id: r.entry.runtime_agent_id.clone(),
+            alf_agent_id: r.entry.alf_agent_id.to_string(),
+            workspace: r.entry.workspace.clone(),
+            enabled: r.entry.enabled,
+            status: status_label(r.status),
+        })
+        .collect();
+    let aliases_with = |status: crate::discovery::RowStatus| -> Vec<String> {
+        outcome
+            .rows
+            .iter()
+            .filter(|r| r.status == status)
+            .map(|r| r.entry.runtime_agent.clone())
+            .collect()
+    };
+    AgentsSection {
+        first_run: outcome.first_run,
+        agents,
+        new: aliases_with(crate::discovery::RowStatus::New),
+        removed: aliases_with(crate::discovery::RowStatus::Removed),
+        drift: outcome.drift,
+    }
+}
+
+/// Issues derived from a reconcile outcome. Warnings only — none of these
+/// flip `ready_to_sync` (discovery is information-only).
+fn collect_agent_issues(outcome: &crate::discovery::ReconcileOutcome) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for row in &outcome.rows {
+        match row.status {
+            crate::discovery::RowStatus::New if !row.entry.enabled => {
+                issues.push(Issue {
+                    severity: "info".into(),
+                    code: "agent_discovered_new".into(),
+                    message: format!(
+                        "New agent '{}' discovered — not enabled.",
+                        row.entry.runtime_agent
+                    ),
+                    suggestion: format!("Run: alf agents enable {}", row.entry.runtime_agent),
+                });
+            }
+            crate::discovery::RowStatus::Removed => {
+                issues.push(Issue {
+                    severity: "warning".into(),
+                    code: "agent_removed".into(),
+                    message: format!(
+                        "Agent '{}' is mapped but no longer discovered in this install.",
+                        row.entry.runtime_agent
+                    ),
+                    suggestion: "Mapping and cloud archive are preserved; edit ~/.alf/config.toml to drop the row if this is intentional".into(),
+                });
+            }
+            _ => {}
+        }
+    }
+    for d in &outcome.drift {
+        issues.push(Issue {
+            severity: "warning".into(),
+            code: "agent_identity_drift".into(),
+            message: d.message.clone(),
+            suggestion: d.remedy.clone(),
+        });
+    }
+    issues
+}
+
+/// After a persist: rows whose workspace exists but still lacks its
+/// `.alf-agent-id` (persist writes it best-effort; failure is a warning,
+/// never fatal).
+fn collect_unpersisted_id_issues(outcome: &crate::discovery::ReconcileOutcome) -> Vec<Issue> {
+    let mut issues = Vec::new();
+    for row in &outcome.rows {
+        if !matches!(
+            row.status,
+            crate::discovery::RowStatus::New | crate::discovery::RowStatus::Existing
+        ) {
+            continue;
+        }
+        let ws = Path::new(&row.entry.workspace);
+        if ws.is_dir() && !ws.join(alf_core::AGENT_ID_FILE).is_file() {
+            issues.push(Issue {
+                severity: "warning".into(),
+                code: "agent_id_not_persisted".into(),
+                message: format!(
+                    "Could not persist {} into {}",
+                    alf_core::AGENT_ID_FILE,
+                    ws.display()
+                ),
+                suggestion: "Check workspace permissions; export retries the write".into(),
+            });
+        }
+    }
+    issues
 }
 
 // ---------------------------------------------------------------------------
@@ -776,6 +1042,25 @@ fn print_human(result: &CheckResult) {
     }
     println!();
 
+    if let Some(ref agents) = result.agents {
+        println!("  Agents:");
+        for row in &agents.agents {
+            println!(
+                "    {}  {}  {}  ({})",
+                row.runtime_agent,
+                row.alf_agent_id,
+                if row.enabled { "enabled" } else { "disabled" },
+                row.status
+            );
+        }
+        if !agents.drift.is_empty() {
+            for d in &agents.drift {
+                println!("    {} {}", "⚠".yellow().bold(), d.message);
+            }
+        }
+        println!();
+    }
+
     println!("  Environment:");
     println!(
         "    HOME:                 {}",
@@ -795,14 +1080,6 @@ fn print_human(result: &CheckResult) {
     println!(
         "    ALF_VAULT_KEY:        {}",
         if result.env.alf_vault_key_set {
-            "set"
-        } else {
-            "unset"
-        }
-    );
-    println!(
-        "    ALF_VAULT_PASSPHRASE: {}",
-        if result.env.alf_vault_passphrase_set {
             "set"
         } else {
             "unset"
@@ -854,14 +1131,14 @@ fn gather_env() -> EnvInfo {
         alf_human: val("ALF_HUMAN"),
         alf_api_key_set: set("ALF_API_KEY"),
         alf_vault_key_set: set("ALF_VAULT_KEY"),
-        alf_vault_passphrase_set: set("ALF_VAULT_PASSPHRASE"),
     }
 }
 
-/// Locate the credential vault and, if present, count its records. Never fails:
-/// a missing or malformed vault yields `credential_count: None`.
-fn gather_vault() -> VaultInfo {
-    match crate::vault_key::default_vault_path() {
+/// Locate the (per-agent, WP1) credential vault and, if present, count its
+/// records. Never fails: a missing or malformed vault yields
+/// `credential_count: None`.
+fn gather_vault(scope: Option<Uuid>) -> VaultInfo {
+    match crate::vault_key::default_vault_path(scope) {
         Ok(path) => {
             let exists = path.is_file();
             let credential_count = exists
@@ -869,9 +1146,17 @@ fn gather_vault() -> VaultInfo {
                 .flatten()
                 .and_then(|raw| serde_json::from_str::<CredentialsDocument>(&raw).ok())
                 .map(|doc| doc.credentials.len());
+            // A leftover install-scoped vault next to a per-agent scope means
+            // migration is pending (the issues list carries the remedy).
+            let legacy_vault_present = scope.is_some()
+                && crate::vault_key::default_vault_path(None)
+                    .map(|p| p.is_file())
+                    .unwrap_or(false);
             VaultInfo {
                 path: path.to_string_lossy().into_owned(),
                 exists,
+                agent_id: scope,
+                legacy_vault_present,
                 credential_count,
                 server_credential_count: None,
                 parity_ok: None,
@@ -880,6 +1165,8 @@ fn gather_vault() -> VaultInfo {
         Err(_) => VaultInfo {
             path: "(unknown)".into(),
             exists: false,
+            agent_id: None,
+            legacy_vault_present: false,
             credential_count: None,
             server_credential_count: None,
             parity_ok: None,
@@ -1070,16 +1357,13 @@ mod tests {
         let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
         let prev_api = std::env::var_os("ALF_API_KEY");
         let prev_vk = std::env::var_os("ALF_VAULT_KEY");
-        let prev_pp = std::env::var_os("ALF_VAULT_PASSPHRASE");
 
         std::env::set_var("ALF_API_KEY", "super-secret-key");
         std::env::set_var("ALF_VAULT_KEY", "vault-secret-value");
-        std::env::remove_var("ALF_VAULT_PASSPHRASE");
 
         let env = gather_env();
         assert!(env.alf_api_key_set);
         assert!(env.alf_vault_key_set);
-        assert!(!env.alf_vault_passphrase_set);
 
         // Contract: secret VALUES must never be serialized — only presence.
         let json = serde_json::to_string(&env).unwrap();
@@ -1091,7 +1375,6 @@ mod tests {
 
         restore_var("ALF_API_KEY", prev_api);
         restore_var("ALF_VAULT_KEY", prev_vk);
-        restore_var("ALF_VAULT_PASSPHRASE", prev_pp);
     }
 
     #[test]
@@ -1102,10 +1385,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         std::env::set_var("ALF_HOME", tmp.path());
 
-        // No vault file yet.
-        let v = gather_vault();
+        // No vault file yet (mapping-less host: legacy install-scoped path).
+        let v = gather_vault(None);
         assert!(!v.exists);
         assert_eq!(v.credential_count, None);
+        assert_eq!(v.agent_id, None);
+        assert!(!v.legacy_vault_present);
 
         // A well-formed (empty) vault parses and counts.
         let vault = tmp
@@ -1115,15 +1400,66 @@ mod tests {
             .join("credentials.json");
         std::fs::create_dir_all(vault.parent().unwrap()).unwrap();
         std::fs::write(&vault, r#"{"credentials":[]}"#).unwrap();
-        let v = gather_vault();
+        let v = gather_vault(None);
         assert!(v.exists);
         assert_eq!(v.credential_count, Some(0));
 
         // Malformed JSON: present but uncounted, never panics.
         std::fs::write(&vault, "{ not json").unwrap();
-        let v = gather_vault();
+        let v = gather_vault(None);
         assert!(v.exists);
         assert_eq!(v.credential_count, None);
+
+        restore_var("ALF_HOME", prev_alf_home);
+    }
+
+    /// WP1: a scoped gather reads the per-agent vault path, reports the
+    /// scope, and flags a pending legacy vault.
+    #[test]
+    fn gather_vault_per_agent_scope_and_legacy_flag() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_alf_home = std::env::var_os("ALF_HOME");
+
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        let id = Uuid::parse_str("cfef1150-0000-4000-8000-0000000000aa").unwrap();
+
+        // Per-agent vault with one record; a legacy vault sits alongside.
+        let agent_vault = alf_core::agent_vault_path(tmp.path(), id);
+        std::fs::create_dir_all(agent_vault.parent().unwrap()).unwrap();
+        std::fs::write(
+            &agent_vault,
+            r#"{"credentials":[{
+                "id":"00000000-0000-0000-0000-000000000001",
+                "agent_id":"00000000-0000-0000-0000-000000000001",
+                "service":"x","credential_type":"api_key",
+                "encrypted_payload":"AAAA",
+                "encryption":{"algorithm":"xchacha20-poly1305","nonce":"AAAA"},
+                "created_at":"2026-01-01T00:00:00Z"
+            }]}"#,
+        )
+        .unwrap();
+        let legacy = tmp
+            .path()
+            .join(".alf")
+            .join("vault")
+            .join("credentials.json");
+        std::fs::write(&legacy, r#"{"credentials":[]}"#).unwrap();
+
+        let v = gather_vault(Some(id));
+        assert_eq!(v.path, agent_vault.to_string_lossy());
+        assert!(v.exists);
+        assert_eq!(v.credential_count, Some(1));
+        assert_eq!(v.agent_id, Some(id));
+        assert!(
+            v.legacy_vault_present,
+            "pending legacy vault must be flagged"
+        );
+
+        // Legacy gone ⇒ flag clears.
+        std::fs::remove_file(&legacy).unwrap();
+        let v = gather_vault(Some(id));
+        assert!(!v.legacy_vault_present);
 
         restore_var("ALF_HOME", prev_alf_home);
     }

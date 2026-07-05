@@ -5,10 +5,14 @@ were the WP2 scope; Z5–Z12 (round-2 memory, vault, delta sync, the second
 agent, cross-agent isolation, per-agent vault, and restore) land with the WP3
 adapter fix. Backend-dependent stages raise SkipStage on `--backend none`.
 ONE execution path: assertions are identical in automated and interactive modes
-(D8) — the narrator only adds rendering.
+(D8) — the narrator only adds rendering. Stages are framework-agnostic and speak
+through the kit contract; how each framework physically stores memory (ZeroClaw's
+shared `brain.db`, OpenClaw's per-agent markdown, Hermes's per-profile `state.db`)
+is described by `kit.memory_store_label` / `seed_narrative()` — never hardcoded.
 
 WP3 flipped the pilot XFAIL (`wp3-brain-db-extraction`) to a plain PASS at Z4:
-the adapter now reads the real brain.db, so all four markers reach the archive.
+the ZeroClaw adapter now reads the real brain.db, so all four markers reach the
+archive.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ from __future__ import annotations
 import time
 import tomllib
 
-from . import archives, scenario, snapshots, sqlite_util, verify
+from . import archives, scenario, snapshots, verify
 from .contract import SkipStage
 from .report import Check, StageResult
 
@@ -84,17 +88,15 @@ def z01_install_probe(run, result: StageResult):
 
     if run.llm == "proxy":
         kit.wire_llm(run.container, run.creds)
-        home_cfg = (run.paths.home / "config.toml")
-        text = home_cfg.read_text(encoding="utf-8") if home_cfg.is_file() else ""
-        wired = "agentlife" in text and 'embedding_provider = "none"' in text
-        result.add(_passfail(wired, "LLM proxy provider wired (embedding_provider=none)"))
+        wired, cfg_text = kit.llm_wired()
+        result.add(_passfail(wired, "LLM proxy provider wired"))
         # Redaction self-check: the rendered config diff must not echo the key.
         from .redact import redact
-        rendered = redact(text)
+        rendered = redact(cfg_text)
         result.add(_passfail(
             run.creds.runtime_api_key not in rendered,
             "no key echoed — central redaction covers the wired config"))
-        nar.show_diff("framework config.toml (wired, redacted)", rendered)
+        nar.show_diff("framework config (wired, redacted)", rendered)
     else:
         result.add(Check(name="LLM wiring", status="SKIP",
                          detail="tier --llm none (CI tier has zero secrets)"))
@@ -127,7 +129,7 @@ def z02_seed_markers(run, result: StageResult):
             is judged from the framework's OWN store, so model phrasing is
             irrelevant.
         """)
-        nar.flow("prompts ──framework──▶ LLM proxy ──▶ real store (brain.db)")
+        nar.flow(f"prompts ──framework──▶ LLM proxy ──▶ real store ({kit.memory_store_label})")
         for turn in turns:
             log = kit.llm_turn(run.container, slot, turn)
             from .redact import redact
@@ -140,16 +142,10 @@ def z02_seed_markers(run, result: StageResult):
         result.add(_passfail(count >= 4, "framework memory stats count >= 4",
                              f"count={count}"))
     else:
-        nar.explain("""
-            No-LLM tier: `memory reindex` materializes the EMPTY real-schema
-            store, then the seeder inserts the four round-1 marker rows through
-            the real DDL (agents row ensured first; UNIQUE(agent_id,key)
-            respected; embedding NULL; RFC3339 timestamps). This proves the
-            plumbing deterministically — same store, no model.
-        """)
-        nar.flow("seed_markers.py ──real DDL──▶ brain.db (FTS via triggers, never direct)")
+        nar.explain(kit.seed_narrative())
+        nar.flow(kit.seed_flow())
         kit.seed_markers(run.container, slot, round=1)
-        result.add(Check(name="real store materialized + 4 category-correct rows seeded",
+        result.add(Check(name=f"{kit.memory_store_label} seeded with 4 round-1 markers",
                          status="PASS"))
 
     dump = kit.dump_memory(run.container, slot)
@@ -231,10 +227,10 @@ def z03_alf_check(run, result: StageResult):
                          f"[[agents]] rows={len(mapping)}"))
     agent_id = str(mapping[0].get("alf_agent_id", "")) if mapping else ""
     ws = mapping[0].get("workspace", "") if mapping else ""
-    # WP3 discovery maps each agent to a per-agent workspace under the install
-    # root (`<install>/agents/<alias>/workspace`) so each carries its own
-    # `.alf-agent-id` pin; the shared brain.db is the memory source.
-    result.add(_passfail(ws.startswith(kit.home_mount) and "/agents/" in ws,
+    # Discovery maps each agent to a per-agent workspace under the install root
+    # (ZeroClaw: `agents/<alias>/workspace`; OpenClaw: `workspace-<name>`) so each
+    # carries its own `.alf-agent-id` pin. The kit owns the layout predicate.
+    result.add(_passfail(kit.is_per_agent_workspace(ws),
                          "mapped workspace is the per-agent workspace under the install root",
                          ws))
     run.state["alf_agent_id"] = agent_id
@@ -289,9 +285,9 @@ def z04_first_sync(run, result: StageResult):
         First `alf sync`: exports the workspace, lazily registers the agent
         (POST /v1/agents) and uploads the sequence-0 snapshot. The ⊙ lane then
         confirms cause → effect: API row, snapshot object, empty delta feed.
-        Content parity runs on the product path (`alf export` copy-out): raw
-        config parity asserts GREEN; brain.db marker parity is the pilot's
-        pre-registered XFAIL — WP3's exit criterion.
+        Content parity runs on the product path (`alf export` copy-out): the raw
+        framework source is preserved, and the seeded markers reach the archive
+        (this memory-layer parity was the ZeroClaw pilot's XFAIL, now a PASS).
     """)
     nar.flow(f"{kit.home_mount} ──alf sync──▶ POST /v1/agents + PUT snapshot ──▶ S3 + Neon ⊙")
 
@@ -347,21 +343,20 @@ def z04_first_sync(run, result: StageResult):
     host_alf = run.paths.alf_home / "z4-export.alf"
     if host_alf.is_file():
         names = archives.entries(host_alf)
-        raw_cfg = f"raw/{kit.name}/config.toml"
-        result.add(_passfail(raw_cfg in names,
-                             "parity (green): archive holds the raw framework config",
-                             f"{len(names)} entries"))
-        # WP3: the zeroclaw adapter now reads the real brain.db, so all four
-        # markers land in the memory layer. This was the pilot XFAIL
-        # (`wp3-brain-db-extraction`) — flipped to a plain PASS now that the
-        # extraction ships. A partial fix (n<4) FAILs, never XFAILs.
+        raw_entry = kit.raw_parity_entry()
+        result.add(_passfail(raw_entry in names,
+                             "parity (green): archive preserves the raw framework source",
+                             f"{raw_entry} in {len(names)} entries"))
+        # The adapter reads the framework's real store, so all four markers land
+        # in the memory layer (ZeroClaw's was the pilot XFAIL, now a plain PASS).
+        # A partial fix (n<4) FAILs, never XFAILs.
         marks = scenario.markers(slot, 1)
-        hits = archives.scan_markers(host_alf, marks, prefix="memory/")
+        hits = archives.scan_markers(host_alf, marks, prefix=kit.archive_marker_prefix())
         found = [m for m, where in hits.items() if where]
         result.add(_passfail(
             len(found) == len(marks),
-            "parity: memory layer carries the 4 brain.db markers",
-            f"{len(found)}/{len(marks)} markers in memory/*"))
+            "parity: archive carries the 4 seeded markers",
+            f"{len(found)}/{len(marks)} markers captured"))
         nar.show_data("export entries", names[:12])
     else:
         result.add(_passfail(False, "alf export copy-out readable on the host"))
@@ -393,8 +388,19 @@ def z05_second_round(run, result: StageResult):
     result.add(_passfail(v2.covered == v2.total,
                          f"round-2 coverage via the framework's own store = {v2.coverage}"))
     v1 = verify.check_coverage({slot: dump}, round=1)
-    result.add(_passfail(v1.covered == v1.total,
-                         "round-1 markers still present (append-shaped, not replaced)"))
+    if run.llm == "proxy" and kit.memory_shape == "curated":
+        # WP4.1: a real model legitimately curates a curated store IN PLACE —
+        # round-1 survival is not a promise the framework makes. Informational
+        # here; curation delta-coherence is Z14's job, and overwritten content
+        # stays recoverable via point-in-time restore (--at-sequence).
+        result.add(Check(
+            name="round-1 marker survival (informational — curated store)",
+            status="PASS",
+            detail=f"{v1.coverage} survived; in-place curation is legitimate for "
+                   f"{kit.memory_store_label}"))
+    else:
+        result.add(_passfail(v1.covered == v1.total,
+                             "round-1 markers still present (append-shaped, not replaced)"))
 
 
 # ---------------------------------------------------------------------------
@@ -485,14 +491,12 @@ def z07_delta_sync(run, result: StageResult):
 def z08_second_agent(run, result: StageResult):
     kit, nar = run.kit, run.narrator
     slot_b = "agent_b"
-    nar.explain("""
-        Configure a SECOND agent via the framework's own CLI. Stores stay lazy:
-        the config gains the `[agents.<b>]` block now; brain.db gets b's row when
-        b is first populated (Z10).
-    """)
+    nar.explain(
+        "Configure a SECOND agent via the framework's own CLI. Stores stay lazy: "
+        "the config gains the agent now; its "
+        f"{kit.memory_store_label} fills only when b is first populated (Z10).")
     kit.create_agent(run.container, slot_b)
-    text = kit._config.read_text(encoding="utf-8") if kit._config.is_file() else ""
-    result.add(_passfail(f"[agents.{slot_b}]" in text,
+    result.add(_passfail(kit.agent_declared(run.container, slot_b),
                          "framework config declares the second agent", slot_b))
     run.state["slot_b"] = slot_b
 
@@ -519,6 +523,15 @@ def z09_enable_second(run, result: StageResult):
     result.add(_passfail(bool(enj) and enj.get("enabled") is True,
                          f"alf agents enable {slot_b} → enabled", str(enj)[:80]))
 
+    # Register agent b for teardown BEFORE it registers with the backend at Z10
+    # (same discipline as main at Z3). Its alf_agent_id is deterministic (derived
+    # from the fixed workspace path), so without this the second agent leaks and
+    # every subsequent backend-real run collides on E3 ("already exists").
+    b_id = str(enj.get("alf_agent_id") or "") if enj else ""
+    if b_id and b_id not in run.manifest.lifecycle_agents:
+        run.manifest.lifecycle_agents.append(b_id)
+        run.manifest.save(run.paths.manifest)
+
 
 # ---------------------------------------------------------------------------
 # Z10 — agent-b turns + sync — isolation both ways ⊙
@@ -530,21 +543,30 @@ def z10_agent_b_isolation(run, result: StageResult):
     kit, nar = run.kit, run.narrator
     slot_a = kit.agent_slots[0]
     slot_b = run.state.get("slot_b", "agent_b")
-    nar.explain("""
-        Populate agent b's OWN marked memories in the shared brain.db, sync, and
-        assert isolation BOTH ways: b's archive carries only b's markers, and a's
-        slice is untouched. The `agent_id` filter is what keeps the shared store
-        clean.
-    """)
+    nar.explain(kit.isolation_narrative())
     if run.llm == "proxy":
         for turn in scenario.turns(slot_b, round=1):
             kit.llm_turn(run.container, slot_b, turn)
     else:
         kit.seed_markers(run.container, slot_b, round=1)
 
-    proc, _ = run.container.exec_json(["alf", "sync", "-r", kit.name, "--all"], timeout=600)
+    # --force-first-sync: the harness's second agent has a DETERMINISTIC id (derived
+    # from its fixed workspace path), so across backend-real runs it re-registers the
+    # same cloud agent. E3 (the correct real-user safety) would refuse a first sync
+    # over existing cloud history; the harness owns this agent, so it takes the
+    # documented escape hatch to overwrite its own prior-run data. No-op for `main`
+    # (a delta, not a first sync) and for a genuinely first clean run.
+    proc, sres = run.container.exec_json(
+        ["alf", "sync", "-r", kit.name, "--all", "--force-first-sync"], timeout=600)
+    # On failure the coded error is the JSON on stdout; dump the full output to
+    # the run dir and surface a generous tail so the cause is visible.
+    sync_detail = ""
+    if proc.returncode:
+        full = (proc.stdout or "") + "\n---stderr---\n" + (proc.stderr or "")
+        (run.paths.run_dir / "z10-sync-all.txt").write_text(full, encoding="utf-8")
+        sync_detail = full.strip()[-600:]
     result.add(_passfail(proc.returncode == 0, "alf sync --all (a + b, b registers lazily)",
-                         (proc.stderr or "")[:120] if proc.returncode else ""))
+                         sync_detail))
 
     dumps = {slot_a: kit.dump_memory(run.container, slot_a),
              slot_b: kit.dump_memory(run.container, slot_b)}
@@ -559,10 +581,11 @@ def z10_agent_b_isolation(run, result: StageResult):
                        timeout=300)
     host_b = run.paths.alf_home / "z10-b.alf"
     if host_b.is_file():
+        prefix = kit.archive_marker_prefix()
         b_found = sum(1 for _, w in archives.scan_markers(
-            host_b, scenario.markers(slot_b, 1), prefix="memory/").items() if w)
+            host_b, scenario.markers(slot_b, 1), prefix=prefix).items() if w)
         a_leak = sum(1 for _, w in archives.scan_markers(
-            host_b, scenario.markers(slot_a, 1), prefix="memory/").items() if w)
+            host_b, scenario.markers(slot_a, 1), prefix=prefix).items() if w)
         result.add(_passfail(b_found == 4 and a_leak == 0,
                              "agent b's archive carries only b's markers",
                              f"b={b_found}/4 a_leak={a_leak}"))
@@ -619,41 +642,15 @@ def z11_vault_b_isolation(run, result: StageResult):
 def z12_restore(run, result: StageResult):
     if run.backend != "real":
         raise SkipStage("Z12 needs --backend real (restore pulls the cloud archive)")
-    import shutil
     kit, nar = run.kit, run.narrator
     slot_b = run.state.get("slot_b", "agent_b")
     nar.explain("""
-        The shared-store restore invariant: snapshot brain.db, mutate agent b's
-        slice, `alf restore --agent b` (default = total), and b's memory returns
-        to EXACTLY the archive WHILE every other agent's rows stay
-        byte-identical. brain.db is one shared store — this is the WP3 restore
-        headline.
+        The restore invariant: diverge agent b from its archive, `alf restore
+        --agent b`, and b returns to EXACTLY the archive WHILE every other agent
+        stays byte-identical. The kit owns the store-specific oracle — ZeroClaw
+        slices the shared brain.db; OpenClaw diffs the other workspace dirs.
     """)
-    if not kit._db.is_file():
-        result.add(_passfail(False, "brain.db present before Z12"))
-        return
-    baseline = run.paths.run_dir / "z12-brain-before.db"
-    shutil.copy2(kit._db, baseline)
-    b_before = sqlite_util.agent_row_count(kit._db, slot_b)
-
-    kit.mutate_slice(run.container, slot_b, round=2)
-    mutated = sqlite_util.agent_row_count(kit._db, slot_b)
-    result.add(_passfail(mutated != b_before,
-                         "mutate_slice diverged agent b's slice from its archive",
-                         f"rows {b_before} → {mutated}"))
-
-    proc, res = run.container.exec_json(
-        ["alf", "restore", "-r", kit.name, "--agent", slot_b], timeout=300)
-    result.add(_passfail(proc.returncode == 0 and bool(res) and res.get("ok") is True,
-                         f"alf restore --agent {slot_b} (default = total)",
-                         (proc.stderr or "")[:120] if proc.returncode else ""))
-
-    restored = sqlite_util.agent_row_count(kit._db, slot_b)
-    result.add(_passfail(restored == b_before,
-                         "total restore: agent b's slice equals the archive",
-                         f"rows now {restored} (was {b_before})"))
-    ok, detail = sqlite_util.db_identical_except_agent(baseline, kit._db, slot_b)
-    result.add(_passfail(ok, "restore leaves every OTHER agent byte-identical", detail))
+    kit.assert_restore_isolation(run, result, slot_b)
 
 
 # ---------------------------------------------------------------------------
@@ -731,6 +728,149 @@ def z13_idle_resync(run, result: StageResult):
 
 
 # ---------------------------------------------------------------------------
+# Z14 — curated in-place memory → reconcile delta shapes (WP4.1)
+# ---------------------------------------------------------------------------
+
+def z14_curated_memory(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if kit.memory_shape != "curated":
+        raise SkipStage(
+            f"{kit.name}: {kit.memory_store_label} is append-shaped — curation "
+            "semantics do not apply", wp="WP4.1")
+    slot = kit.agent_slots[0]
+    nar.explain(f"""
+        WP4.1: {kit.name} curates {kit.memory_store_label} IN PLACE — the
+        behaviour that used to scramble positional record ids. Base-aware
+        reconciliation must map each curation op to exactly the delta it
+        means: touch → no_changes; re-rank → raw-only; edit → 1 update
+        keeping the record's id; insert → 1 create; remove → 1 delete.
+    """)
+
+    if run.backend == "real":
+        nar.flow("curate op ──▶ alf sync ──▶ exact delta shape ⊙")
+        agent_id = run.state.get("alf_agent_id", "")
+
+        def sync_json():
+            _, res = run.container.exec_json(
+                ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+            return res or {}
+
+        def mem_changes(res):
+            ch = res.get("changes") or {}
+            return (ch.get("creates"), ch.get("updates"), ch.get("deletes"))
+
+        # Setup: normalize MEMORY.md to a deterministic multi-section baseline
+        # and sync it, so the measured ops below are independent of whatever a
+        # real LLM left in the file. pre_seq is captured AFTER this baseline.
+        kit.curate_memory(run.container, slot, "reset")
+        sync_json()
+        r0 = run.api.get(f"/agents/{agent_id}")
+        pre_seq = (r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0)) \
+            if r0.status_code == 200 else run.state.get("sequence", 0)
+
+        kit.curate_memory(run.container, slot, "touch")
+        res = sync_json()
+        result.add(_passfail(res.get("no_changes") is True,
+                             "touch (identical re-save) → no_changes",
+                             f"changes={res.get('changes')}"))
+
+        kit.curate_memory(run.container, slot, "reorder")
+        res = sync_json()
+        result.add(_passfail(
+            res.get("delta") is True and mem_changes(res) == (0, 0, 0),
+            "re-rank → raw-only delta (memory 0/0/0)",
+            f"changes={res.get('changes')}"))
+
+        kit.curate_memory(run.container, slot, "edit")
+        res = sync_json()
+        result.add(_passfail(mem_changes(res) == (0, 1, 0),
+                             "in-place edit (§1a) → exactly 1 update",
+                             f"changes={res.get('changes')}"))
+
+        kit.curate_memory(run.container, slot, "insert")
+        res = sync_json()
+        result.add(_passfail(mem_changes(res) == (1, 0, 0),
+                             "insert → exactly 1 create",
+                             f"changes={res.get('changes')}"))
+
+        kit.curate_memory(run.container, slot, "delete")
+        res = sync_json()
+        result.add(_passfail(mem_changes(res) == (0, 0, 1),
+                             "remove → exactly 1 delete",
+                             f"changes={res.get('changes')}"))
+        seq = res.get("sequence", 0)
+        run.state["sequence"] = seq
+
+        result.add(_passfail(seq == pre_seq + 4,
+                             "⊙ sequence advanced by exactly the 4 changing ops",
+                             f"{pre_seq} → {seq}"))
+        rd = run.api.get(f"/agents/{agent_id}/deltas?since={pre_seq}")
+        deltas = (rd.json() or {}).get("deltas", []) if rd.status_code == 200 else None
+        result.add(_passfail(isinstance(deltas, list) and len(deltas) == 4,
+                             "⊙ API: exactly 4 delta rows since the idle sync",
+                             f"got {None if deltas is None else len(deltas)}"))
+
+        # The overwritten memory is gone from the LIVE store (the agent's own
+        # curation), replaced by the edited value; history stays addressable
+        # via --at-sequence. The `reset` baseline put the round-1 marker in
+        # MEMORY.md deterministically, so both checks hold on every tier — but
+        # on the proxy tier the model may ALSO have written the marker into
+        # another memory file, so the absence check reads only MEMORY.md there.
+        dump = kit.dump_memory(run.container, slot)
+        edited = scenario.curated_marker(slot)
+        result.add(_passfail(edited in dump,
+                             "edited value present in the live store", edited))
+        old = scenario.marker_for(slot, "semantic", 1)
+        haystack = dump if run.llm == "none" else \
+            (kit._workspace(slot) / "MEMORY.md").read_text(encoding="utf-8", errors="replace")
+        result.add(_passfail(old not in haystack,
+                             "replaced round-1 marker absent from the curated file "
+                             "(recoverable via --at-sequence)", old))
+    else:
+        nar.flow("curate op ──▶ alf export ──▶ birth-id stability (content-addressed)")
+
+        def export_by_id(tag: str) -> dict:
+            ctr_path = f"/home/agent/.alf/z14-export-{tag}.alf"
+            run.container.exec(
+                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+                timeout=300)
+            host = run.paths.alf_home / f"z14-export-{tag}.alf"
+            if not host.is_file():
+                raise RuntimeError(f"z14 export {tag} not readable on the host")
+            recs = archives.memory_records(host)
+            by_id = {r["id"]: r for r in recs}
+            if len(by_id) != len(recs):
+                raise RuntimeError(f"z14 export {tag}: duplicate record ids in archive")
+            return by_id
+
+        # Deterministic baseline so the structural ops don't depend on model
+        # output shape (matches the backend lane's setup).
+        kit.curate_memory(run.container, slot, "reset")
+        base = export_by_id("a")
+        kit.curate_memory(run.container, slot, "reorder")
+        after = export_by_id("b")
+        result.add(_passfail(set(base) == set(after),
+                             "Z14': re-rank keeps every record id "
+                             "(content-addressed births)",
+                             f"{len(base)} records"))
+        stable_content = set(base) == set(after) and all(
+            after[k]["content"] == base[k]["content"] for k in base)
+        result.add(_passfail(stable_content,
+                             "Z14': per-id content identical across the re-rank"))
+
+        kit.curate_memory(run.container, slot, "edit")
+        edited = export_by_id("c")
+        removed, added = set(after) - set(edited), set(edited) - set(after)
+        result.add(_passfail(len(removed) == 1 and len(added) == 1,
+                             "Z14': one edited section changes exactly one birth id",
+                             f"removed={len(removed)} added={len(added)}"))
+        untouched = all(edited[k]["content"] == after[k]["content"]
+                        for k in set(after) & set(edited))
+        result.add(_passfail(untouched,
+                             "Z14': every other record's content untouched"))
+
+
+# ---------------------------------------------------------------------------
 # Registry — (stage_id, title, uses_alf, fn)
 # ---------------------------------------------------------------------------
 
@@ -748,6 +888,8 @@ REGISTRY = [
     ("z11", "Vault b + cross-agent read fails closed", True, z11_vault_b_isolation),
     ("z12", "Mutate slice → alf restore (total) — others byte-identical", True, z12_restore),
     ("z13", "Idle re-sync — no changes / Z13' determinism ⊙", True, z13_idle_resync),
+    ("z14", "Curated in-place memory — reconcile delta shapes (WP4.1)", True,
+     z14_curated_memory),
 ]
 
 STAGE_IDS = [sid for sid, *_ in REGISTRY]

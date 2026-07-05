@@ -480,6 +480,14 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
     let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for record in &all_records {
+        // Skip tombstones/replaced records: a Superseded record's replacement
+        // is already in this set, and a Deleted record is gone — materializing
+        // either would resurrect content the agent removed (WP4.1 §8.1). This
+        // only affects the structured fallback; a same-runtime restore prefers
+        // the verbatim raw tree and never reaches here.
+        if !record.status.is_materialized() {
+            continue;
+        }
         let origin_file = record.source.origin_file.as_deref().unwrap_or("");
 
         match record.namespace.as_str() {

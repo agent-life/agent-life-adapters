@@ -215,17 +215,15 @@ Dropping a header from a `SplitByHeading` file never loses data: the exact file 
 
 ### Stable Record ID Generation
 
-OpenClaw memories do not have native IDs. The adapter generates deterministic UUID v5 identifiers from a namespace UUID + the concatenation of `origin_file + ":" + section_index`. This ensures the same workspace export always produces the same record IDs, enabling delta computation across exports.
+OpenClaw memories do not have native IDs. The adapter mints a deterministic **content-addressed birth id** per section (WP4.1): `UUID v5(ALF_OPENCLAW_NS, "content-v1:{agent_id}:{origin_file}:{sha256(content)}:{occurrence}")`, where `occurrence` disambiguates byte-identical sections within one file and the hash covers the content with trailing whitespace trimmed (a section moved to the end of a file must not change identity).
 
-Example: `memory/2026-01-15.md` section 0 → `UUID v5(ALF_OPENCLAW_NS, "memory/2026-01-15.md:0")`.
-
-If a section's heading text changes but its position stays the same, the ID stays the same. If sections are reordered, IDs shift. This is an acceptable tradeoff — heading changes typically accompany content changes, and reordering is rare.
+A birth id only names a record at **first sight**. Once synced, `alf sync` runs base-aware reconciliation (`alf_core::reconcile`) between export and diff: fresh sections are matched to the previous base by exact content, then by heading, then by id, and matched records **carry the old id and original `created_at` forward**. So an in-place body edit under a stable heading is one clean `update`, a re-rank produces no memory delta at all, and existing agents' legacy positional ids are simply carried forever — no migration event. (The previous positional `path:section_index` scheme reassigned ids to *different* sections' content whenever the agent inserted, removed, or re-ranked sections — see `docs/multi-agent-support/wp4.1-robust-diff-delta-design.md`.)
 
 ### Field Mapping: MemoryRecord
 
 | ALF Field | OpenClaw Source | Notes |
 |-----------|----------------|-------|
-| `id` | Generated (UUID v5) | Deterministic from file path + section index. See above. |
+| `id` | Generated (UUID v5) | Content-addressed birth id; carried forward across edits by sync-time reconciliation. See above. |
 | `agent_id` | From gateway config or manifest | Derived from agent identity in `~/.openclaw/openclaw.json` or the workspace path. |
 | `content` | Section markdown text | Raw markdown preserved verbatim, including formatting. |
 | `memory_type` | Classified by source file | See classification table below. |
@@ -321,21 +319,22 @@ See [vault-key-management.md](../../docs/vault-key-management.md) for the vault 
 
 ### Raw Source Preservation
 
-All workspace Markdown files are included verbatim in the ALF archive under `raw/openclaw/`:
+**Every Markdown file in the workspace** is included verbatim in the ALF archive under `raw/openclaw/` — the known structural files (`ROOT_FILES`), everything under `memory/`, **and any other `*.md` the agent scattered into a top-level location of its own choosing**:
 
 ```
 raw/openclaw/SOUL.md
 raw/openclaw/IDENTITY.md
-raw/openclaw/AGENTS.md
-raw/openclaw/USER.md
-raw/openclaw/TOOLS.md
 raw/openclaw/MEMORY.md
 raw/openclaw/memory/2026-01-15.md
-raw/openclaw/memory/active-context.md
+raw/openclaw/procedures/deploy.md         ← agent-chosen procedural dir
+raw/openclaw/procedural_memory/note.md    ← name varies between runs
+raw/openclaw/secrets/token.md             ← agent-chosen secrets dir
 ...
 ```
 
-This ensures zero information loss. Even if the structured parsing misses nuances in a user's custom formatting, the raw files can always be re-parsed by a future improved adapter or imported directly by an OpenClaw-to-OpenClaw restore.
+A real OpenClaw agent stores memory wherever it decides, and the directory names vary between runs (verified: `procedures/` vs `procedural_memory/`, plus `secrets/`). Rather than a fixed allowlist that would silently drop novel locations, the adapter backs up **all workspace markdown** (bounded — markdown is the agent's memory medium; per-entry size is capped by the archive layer). Operational non-memory files (`*.json` workspace state, `state/`, `sessions/*.jsonl`) are not markdown and are never captured; `.git/` is excluded and `.alfignore` still applies. Files outside this set can still be opted in explicitly with `alf add`.
+
+This ensures zero information loss: even when structured parsing only covers the known `memory/` locations, the raw files always round-trip on an OpenClaw-to-OpenClaw restore and can be re-parsed by a future adapter. (Scattered files are raw-only today — captured and restored, but not yet extracted into structured `memory/` records; the dashboard shows them once a source-handler covers their location.)
 
 **Agent-tracked arbitrary files (`alf add`).** Beyond the known files above, the agent can opt arbitrary workspace files into the raw set with `alf add <path>` — a `notes.txt`, a nested `reports/q1.md`, a binary. The adapter never auto-walks the workspace; tracked paths are recorded in `<workspace>/.alf-include.json` and added to `raw/openclaw/` (raw only — no semantic parse), restored byte-identically. The include list and the removal log `.alf-sync-log.md` are themselves preserved in `raw/openclaw/`, so the tracked set and its history travel on restore. Because opaque files can't ride an incremental delta, a change to any tracked file makes `alf sync` upload a fresh snapshot (a non-destructive rollover); see [docs/how_alf_syncs.md](../docs/how_alf_syncs.md) §6.1.
 
@@ -344,7 +343,7 @@ This ensures zero information loss. Even if the structured parsing misses nuance
 
 ### Addressed
 
-**No native record IDs.** OpenClaw memories are continuous Markdown without identifiers. Solved with deterministic UUID v5 generation from file path + section index. Delta computation between exports works because the same section in the same file always produces the same ID.
+**No native record IDs.** OpenClaw memories are continuous Markdown without identifiers. Solved with content-addressed birth ids plus base-aware reconciliation at sync time (WP4.1): unchanged and edited sections keep their record identity across exports, even when the agent curates `MEMORY.md` in place (re-ranks, overwrites, inserts, removes).
 
 **No per-entry timestamps.** Daily log entries don't carry individual timestamps unless the agent wrote one. Solved by falling back to file date for daily logs and file mtime for other sources.
 

@@ -22,8 +22,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))       # tests/lifec
 sys.path.insert(0, str(Path(__file__).resolve().parent))           # this dir
 
 import seed_markers as seeder  # noqa: E402
-from alflab import scenario  # noqa: E402
+from alflab import scenario, sqlite_util  # noqa: E402
 from alflab.contract import FrameworkKit, PlacementRow, TurnLog  # noqa: E402
+from alflab.report import Check  # noqa: E402
 
 
 class ZeroClawKit(FrameworkKit):
@@ -33,6 +34,24 @@ class ZeroClawKit(FrameworkKit):
     home_mount = "/home/agent/.zeroclaw"
     agent_slots = ["default"]
     config_paths = ["config.toml"]
+    memory_store_label = "brain.db"                # one shared SQLite store
+    memory_topology = "shared"                      # partitioned by agent_id
+
+    def seed_narrative(self) -> str:
+        return ("No-LLM tier: `zeroclaw memory reindex` materializes the EMPTY "
+                "real-schema brain.db, then the seeder inserts the four round-1 "
+                "marker rows through the real DDL (agents row ensured first; "
+                "UNIQUE(agent_id,key) respected; embedding NULL; RFC3339 "
+                "timestamps). Deterministic plumbing — same store, no model.")
+
+    def seed_flow(self) -> str:
+        return "seed_markers.py ──real DDL──▶ brain.db (FTS via triggers, never direct)"
+
+    def isolation_narrative(self) -> str:
+        return ("Populate agent b's OWN marked memories in the shared brain.db, "
+                "sync, and assert isolation BOTH ways: b's archive carries only b's "
+                "markers, and a's slice is untouched. The agent_id filter is what "
+                "keeps the shared store clean.")
 
     # -- paths -----------------------------------------------------------------
 
@@ -228,6 +247,15 @@ class ZeroClawKit(FrameworkKit):
             )
             self._config.write_text(text + block, encoding="utf-8")
 
+    def agent_declared(self, ctr, slot: str) -> bool:
+        """ZeroClaw declares agents as `[agents.<alias>]` TOML blocks."""
+        text = self._config.read_text(encoding="utf-8") if self._config.is_file() else ""
+        return f"[agents.{slot}]" in text
+
+    def is_per_agent_workspace(self, ws: str) -> bool:
+        """ZeroClaw maps each agent to `<home>/agents/<alias>/workspace`."""
+        return ws.startswith(self.home_mount) and "/agents/" in ws
+
     def mutate_slice(self, ctr, slot: str, round: int) -> None:
         """Diverge the slot's brain.db slice from its archive so restore has
         something to correct: rewrite one row's content and delete another —
@@ -260,6 +288,43 @@ class ZeroClawKit(FrameworkKit):
             conn.commit()
         finally:
             conn.close()
+
+    def assert_restore_isolation(self, run, result, slot: str) -> None:
+        """Shared-store restore oracle: baseline brain.db, diverge the slot's
+        slice, `alf restore --agent <slot>` (total), and assert the slice equals
+        the archive again while every OTHER agent's rows stay byte-identical."""
+        import shutil
+
+        if not self._db.is_file():
+            result.add(Check(name="brain.db present before restore", status="FAIL"))
+            return
+        baseline = run.paths.run_dir / "z12-brain-before.db"
+        shutil.copy2(self._db, baseline)
+        b_before = sqlite_util.agent_row_count(self._db, slot)
+
+        self.mutate_slice(run.container, slot, round=2)
+        mutated = sqlite_util.agent_row_count(self._db, slot)
+        result.add(Check(
+            name="mutate_slice diverged agent b's slice from its archive",
+            status="PASS" if mutated != b_before else "FAIL",
+            detail=f"rows {b_before} → {mutated}"))
+
+        proc, res = run.container.exec_json(
+            ["alf", "restore", "-r", self.name, "--agent", slot], timeout=300)
+        result.add(Check(
+            name=f"alf restore --agent {slot} (default = total)",
+            status="PASS" if (proc.returncode == 0 and bool(res) and res.get("ok")) else "FAIL",
+            detail=(proc.stderr or "")[:120] if proc.returncode else ""))
+
+        restored = sqlite_util.agent_row_count(self._db, slot)
+        result.add(Check(
+            name="total restore: agent b's slice equals the archive",
+            status="PASS" if restored == b_before else "FAIL",
+            detail=f"rows now {restored} (was {b_before})"))
+        ok, detail = sqlite_util.db_identical_except_agent(baseline, self._db, slot)
+        result.add(Check(
+            name="restore leaves every OTHER agent byte-identical",
+            status="PASS" if ok else "FAIL", detail=detail))
 
     # -- alf addressing ------------------------------------------------------------
 

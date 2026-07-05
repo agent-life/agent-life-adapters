@@ -320,15 +320,19 @@ fn is_heading_or_blank(line: &str) -> bool {
 // Classification helpers
 // ---------------------------------------------------------------------------
 
-/// Generate a deterministic record ID from file path and section index.
+/// Content-addressed *birth* id for a record (WP4.1): UUIDv5 over the agent,
+/// the file, the section content's hash, and an occurrence index that
+/// disambiguates byte-identical sections within one file.
 ///
-/// NOTE: the ID is positional — it hashes `path:index`, so inserting or removing
-/// a section mid-file renumbers every later section and changes its ID, inflating
-/// the next delta. Acceptable today (procedures/curated are one record at index 0);
-/// a content-addressed scheme is deferred to a future "stable memory IDs" package.
-fn record_id(relative_path: &str, section_index: usize) -> Uuid {
-    let name = format!("{relative_path}:{section_index}");
-    Uuid::new_v5(&OPENCLAW_NS, name.as_bytes())
+/// This id names a record only at first sight — once synced, base-aware
+/// reconciliation (`alf_core::reconcile`) carries ids forward across in-place
+/// edits, so a record's identity survives curation. The previous positional
+/// `path:section_index` scheme reassigned ids to *different* sections' content
+/// whenever the agent inserted, removed, or re-ranked sections — the WP4.1
+/// founding defect. Existing agents' positional ids are never re-minted: the
+/// reconciler matches their unchanged content and keeps the old ids.
+fn record_id(agent_id: Uuid, relative_path: &str, content: &str, occurrence: u32) -> Uuid {
+    alf_core::ids::memory_record_id(&OPENCLAW_NS, agent_id, relative_path, content, occurrence)
 }
 
 /// Determine the extraction method based on file path.
@@ -468,11 +472,30 @@ pub(crate) fn parse_memory_file(
 
     let file_category = namespace.as_str();
 
+    // Birth ids are a pure function of the file: occurrence counts duplicate
+    // contents over the FULL section list, in order (never a filtered subset),
+    // so two exports of the same bytes always mint the same ids. Keys are
+    // trailing-whitespace-trimmed to match the id derivation — see
+    // `alf_core::ids::memory_record_id`.
+    let ids: Vec<Uuid> = {
+        let mut occurrences: HashMap<&str, u32> = HashMap::new();
+        sections
+            .iter()
+            .map(|section| {
+                let occ = occurrences
+                    .entry(section.content.trim_end())
+                    .and_modify(|c| *c += 1)
+                    .or_insert(0);
+                record_id(agent_id, relative_path, &section.content, *occ)
+            })
+            .collect()
+    };
+
     sections
         .into_iter()
         .enumerate()
         .map(|(idx, section)| {
-            let id = record_id(relative_path, idx);
+            let id = ids[idx];
 
             // Determine created_at: for daily logs use midnight of filename date,
             // otherwise fall back to file mtime.
@@ -680,18 +703,69 @@ Text.
 
     #[test]
     fn record_id_is_deterministic() {
-        let id1 = record_id("memory/2026-01-15.md", 0);
-        let id2 = record_id("memory/2026-01-15.md", 0);
+        let agent = Uuid::nil();
+        let id1 = record_id(agent, "memory/2026-01-15.md", "## A\ncontent", 0);
+        let id2 = record_id(agent, "memory/2026-01-15.md", "## A\ncontent", 0);
         assert_eq!(id1, id2);
     }
 
     #[test]
     fn record_id_differs_for_different_inputs() {
-        let id1 = record_id("memory/2026-01-15.md", 0);
-        let id2 = record_id("memory/2026-01-15.md", 1);
-        let id3 = record_id("memory/2026-01-16.md", 0);
-        assert_ne!(id1, id2);
-        assert_ne!(id1, id3);
+        let agent = Uuid::nil();
+        let base = record_id(agent, "memory/2026-01-15.md", "## A\ncontent", 0);
+        // Content, occurrence, file, and agent each contribute to the id.
+        assert_ne!(
+            base,
+            record_id(agent, "memory/2026-01-15.md", "## A\nedited", 0)
+        );
+        assert_ne!(
+            base,
+            record_id(agent, "memory/2026-01-15.md", "## A\ncontent", 1)
+        );
+        assert_ne!(
+            base,
+            record_id(agent, "memory/2026-01-16.md", "## A\ncontent", 0)
+        );
+        assert_ne!(
+            base,
+            record_id(
+                Uuid::from_u128(7),
+                "memory/2026-01-15.md",
+                "## A\ncontent",
+                0
+            )
+        );
+    }
+
+    #[test]
+    fn record_ids_stable_under_reorder() {
+        // The WP4.1 property the positional scheme lacked: re-ranking sections
+        // must not change any section's id.
+        let a = "## A\n\nContent one.\n\n## B\n\nContent two.\n";
+        let b = "## B\n\nContent two.\n\n## A\n\nContent one.\n";
+        let mtime = Utc::now();
+        let ids = |content: &str| -> Vec<Uuid> {
+            parse_memory_file("MEMORY.md", content, mtime, Uuid::nil())
+                .into_iter()
+                .map(|r| r.id)
+                .collect()
+        };
+        let mut ids_a = ids(a);
+        let mut ids_b = ids(b);
+        ids_a.sort();
+        ids_b.sort();
+        assert_eq!(ids_a, ids_b);
+    }
+
+    #[test]
+    fn duplicate_sections_get_distinct_ids() {
+        let content = "## Note\n\nsame text\n\n## Note\n\nsame text\n";
+        let records = parse_memory_file("memory/2026-01-15.md", content, Utc::now(), Uuid::nil());
+        assert_eq!(records.len(), 2);
+        assert_ne!(
+            records[0].id, records[1].id,
+            "occurrence disambiguates duplicates"
+        );
     }
 
     #[test]

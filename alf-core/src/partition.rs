@@ -34,9 +34,12 @@ pub enum PartitionError {
 /// Assigns memory records to quarterly partition files based on their
 /// timestamp.
 ///
-/// Uses `observed_at` if present, otherwise falls back to `created_at`.
-/// This matches the spec §4.1.1: "Records are assigned to partitions based
-/// on their observed timestamp."
+/// Uses the record's *effective timestamp*: `observed_at` if present,
+/// otherwise `created_at` — episodic records partition by when the events
+/// happened. NOTE: spec §4.1.1 currently says `created_at` only; every
+/// deployed writer uses this fallback, and codifying it is part of the
+/// pending WP4.1 data-format RFC (see
+/// docs/multi-agent-support/wp4.1-robust-diff-delta-design.md §7).
 pub struct PartitionAssigner;
 
 impl PartitionAssigner {

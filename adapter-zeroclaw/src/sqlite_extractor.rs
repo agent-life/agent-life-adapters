@@ -67,17 +67,48 @@ pub fn records_from_conn(
     runtime_version: Option<&str>,
 ) -> Result<Vec<MemoryRecord>> {
     let rows = read_agent_rows(conn, zc_agent_id)?;
+
+    // Supersession inverse map (WP4.1 §8.4). brain.db stores a FORWARD pointer
+    // (`superseded_by` = the native id of the row that REPLACED this one); the
+    // ALF `supersedes` field is the BACKWARD pointer (the record this one
+    // replaces). For a row T superseded by native id S, the record with native
+    // id S must carry `supersedes = T's ALF id`. Build native_S -> native_T,
+    // then resolve T's native id to its ALF uuid per row.
+    let mut superseding_to_superseded: HashMap<String, String> = HashMap::new();
+    for row in &rows {
+        if let Some(s) = row.superseded_by.as_deref().filter(|v| !v.is_empty()) {
+            superseding_to_superseded.insert(s.to_string(), row.id.clone());
+        }
+    }
+
     let mut records = Vec::with_capacity(rows.len());
-    for row in rows {
+    for row in &rows {
+        let supersedes = superseding_to_superseded
+            .get(&row.id)
+            .map(|superseded_native| row_alf_id(superseded_native, alf_agent_id));
         records.push(map_row_to_record(
             row,
             alf_agent_id,
             config,
             runtime_version,
+            supersedes,
         )?);
     }
     // Rows already come back ordered by created_at ASC.
     Ok(records)
+}
+
+/// ALF record id for a brain.db row's native id: the native UUID when it
+/// parses, else a DETERMINISTIC v5 fallback (a random one would churn every
+/// export — WP4.1 §8.3). Shared by the row mapper and the supersession map so
+/// both resolve a native id to the same ALF uuid.
+fn row_alf_id(native_id: &str, alf_agent_id: Uuid) -> Uuid {
+    Uuid::parse_str(native_id).unwrap_or_else(|_| {
+        Uuid::new_v5(
+            &crate::markdown_parser::ZEROCLAW_NS,
+            format!("brain-id:{alf_agent_id}:{native_id}").as_bytes(),
+        )
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -126,12 +157,13 @@ fn read_agent_rows(conn: &Connection, zc_agent_id: &str) -> Result<Vec<MemoryRow
 // ---------------------------------------------------------------------------
 
 fn map_row_to_record(
-    row: MemoryRow,
+    row: &MemoryRow,
     alf_agent_id: Uuid,
     config: &ZeroClawConfig,
     runtime_version: Option<&str>,
+    supersedes: Option<Uuid>,
 ) -> Result<MemoryRecord> {
-    let id = Uuid::parse_str(&row.id).unwrap_or_else(|_| Uuid::new_v4());
+    let id = row_alf_id(&row.id, alf_agent_id);
     let created_at = parse_timestamp(&row.created_at);
     let updated_at = if row.updated_at.is_empty() {
         None
@@ -160,13 +192,15 @@ fn map_row_to_record(
         tags.push("auto_save".to_string());
     }
 
-    // Supersession: a non-null `superseded_by` marks this row as superseded.
-    // Its value (the id that replaced this row) is preserved verbatim in
-    // `raw_source_format` for lossless restore; `supersedes` mirrors it when it
-    // parses as a UUID so the Memory Browser can render the chain.
-    let (status, supersedes) = match row.superseded_by.as_deref() {
-        Some(v) if !v.is_empty() => (MemoryStatus::Superseded, Uuid::parse_str(v).ok()),
-        _ => (MemoryStatus::Active, None),
+    // Supersession (WP4.1 §8.4): a non-null `superseded_by` marks THIS row as
+    // superseded (it was replaced). The ALF `supersedes` field points the other
+    // way — at the record THIS one replaced — and is supplied by the caller's
+    // inverse map (a row T whose `superseded_by` names this row's native id).
+    // The native forward pointer is preserved verbatim in `raw_source_format`
+    // for lossless restore.
+    let status = match row.superseded_by.as_deref() {
+        Some(v) if !v.is_empty() => MemoryStatus::Superseded,
+        _ => MemoryStatus::Active,
     };
 
     // Lossless stash: every native scalar column, so restore reconstructs the
@@ -186,7 +220,7 @@ fn map_row_to_record(
     Ok(MemoryRecord {
         id,
         agent_id: alf_agent_id,
-        content: row.content,
+        content: row.content.clone(),
         memory_type,
         source: SourceProvenance {
             runtime: RUNTIME.to_string(),
@@ -211,7 +245,7 @@ fn map_row_to_record(
         },
         status,
         namespace,
-        category: Some(row.category),
+        category: Some(row.category.clone()),
         supersedes,
         confidence: row.importance,
         entities: Vec::new(),
@@ -502,33 +536,60 @@ mod tests {
     }
 
     #[test]
-    fn superseded_row_marked_and_value_preserved() {
+    fn supersedes_points_backward_at_the_replaced_record() {
+        // brain.db stores a FORWARD pointer (old.superseded_by = new.id); the
+        // ALF `supersedes` field is BACKWARD (new.supersedes = old.id). §8.4.
         let dir = tempfile::tempdir().unwrap();
         let db = brain_db::real_schema_db(dir.path(), &[(A, "agent_a")]);
         let conn = Connection::open(&db).unwrap();
-        let replacer = "99999999-0000-0000-0000-000000000099";
+        let old_id = "55555555-0000-0000-0000-000000000005";
+        let new_id = "99999999-0000-0000-0000-000000000099";
+        // Old row, replaced by the new one.
         insert(
             &conn,
             A,
-            "55555555-0000-0000-0000-000000000005",
+            old_id,
             "old_fact",
             "outdated",
             "core",
             "2026-01-15T10:00:00Z",
-            Some(replacer),
+            Some(new_id),
             0.5,
             "default",
             None,
         );
-        let recs = records_from_conn(&conn, &config(), Uuid::nil(), A, None).unwrap();
-        assert_eq!(recs[0].status, MemoryStatus::Superseded);
-        assert_eq!(
-            recs[0].supersedes.map(|u| u.to_string()).as_deref(),
-            Some(replacer)
+        // The replacing row (created later; ordered after the old one).
+        insert(
+            &conn,
+            A,
+            new_id,
+            "new_fact",
+            "current",
+            "core",
+            "2026-01-15T11:00:00Z",
+            None,
+            0.9,
+            "default",
+            None,
         );
+
+        let recs = records_from_conn(&conn, &config(), Uuid::nil(), A, None).unwrap();
+        let old = recs.iter().find(|r| r.id.to_string() == old_id).unwrap();
+        let new = recs.iter().find(|r| r.id.to_string() == new_id).unwrap();
+
+        // The OLD record is marked superseded and points at nothing (it does
+        // not replace anything); its native forward pointer is preserved raw.
+        assert_eq!(old.status, MemoryStatus::Superseded);
+        assert_eq!(old.supersedes, None);
         assert_eq!(
-            recs[0].raw_source_format.as_ref().unwrap()["superseded_by"],
-            serde_json::json!(replacer)
+            old.raw_source_format.as_ref().unwrap()["superseded_by"],
+            serde_json::json!(new_id)
+        );
+        // The NEW record is active and its `supersedes` points BACK at the old.
+        assert_eq!(new.status, MemoryStatus::Active);
+        assert_eq!(
+            new.supersedes.map(|u| u.to_string()).as_deref(),
+            Some(old_id)
         );
     }
 

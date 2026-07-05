@@ -767,8 +767,38 @@ fn execute_delta(
     let prev_identity = prev_reader.read_identity()?;
     let prev_principals = prev_reader.read_principals()?;
 
-    let mut curr_reader = AlfReader::new(Cursor::new(alf_bytes))?;
-    let curr_records = curr_reader.read_all_memory()?;
+    // WP4.1: reconcile the fresh export against the base BEFORE anything is
+    // diffed, uploaded, or persisted. Matched records carry their id and
+    // created_at/observed_at forward, so in-place curation (OpenClaw rewriting
+    // MEMORY.md) becomes clean updates instead of id churn, and mtime-only
+    // re-stamps produce no delta at all.
+    let exported_records = {
+        let mut reader = AlfReader::new(Cursor::new(alf_bytes))?;
+        reader.read_all_memory()?
+    };
+    let reconciled = alf_core::reconcile::reconcile(&prev_records, exported_records);
+    let effective_bytes: std::borrow::Cow<'_, [u8]> = if reconciled.rewritten {
+        output::progress(&format!(
+            "  Reconciled memory identities: {} carried, {} updated in place, {} new, {} removed",
+            reconciled.stats.carried,
+            reconciled.stats.heading_matched + reconciled.stats.id_matched,
+            reconciled.stats.created,
+            reconciled.stats.deleted
+        ));
+        let bytes = alf_core::replace_memory_records(alf_bytes, &reconciled.records)
+            .context("Failed to rewrite archive with reconciled memory records")?;
+        // ONE buffer feeds everything downstream: the re-snapshot upload uses
+        // `effective_bytes` and `persist_local` copies `temp_alf` — if they
+        // ever diverged, local base and cloud record ids would part ways
+        // permanently on the re-snapshot path.
+        fs::write(temp_alf, &bytes).context("Failed to persist reconciled archive")?;
+        std::borrow::Cow::Owned(bytes)
+    } else {
+        std::borrow::Cow::Borrowed(alf_bytes)
+    };
+    let curr_records = reconciled.records;
+
+    let mut curr_reader = AlfReader::new(Cursor::new(effective_bytes.as_ref()))?;
     // The freshly-exported archive already carries the live vault (Layer 4),
     // so we diff it here against the previous base — never re-reading the vault
     // file and never decrypting. Diff is by credential `id` (see
@@ -789,7 +819,7 @@ fn execute_delta(
     if tracked_files_changed(runtime, &mut prev_reader, &mut curr_reader)? {
         output::progress("  Tracked workspace files changed — uploading full snapshot...");
         let upload = client
-            .upload_snapshot(agent_id, alf_bytes)
+            .upload_snapshot(agent_id, effective_bytes.as_ref())
             .map_err(wrap_upload)?;
         persist_local(agent_id, upload.sequence, temp_alf, snapshot_path)?;
         return Ok(SyncOutcome {

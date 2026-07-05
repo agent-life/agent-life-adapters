@@ -65,8 +65,37 @@ class FrameworkKit(ABC):
     agent_slots: list = ["default"]
     config_paths: list = []              # home-relative files of config interest
 
+    # -- narration: how THIS framework physically stores memory (design §3). The
+    #    stage narrator speaks through these so it never says "brain.db" for a
+    #    markdown framework. Override per kit.
+    memory_store_label: str = "its memory store"   # e.g. "brain.db", "MEMORY.md + memory/*.md"
+    memory_topology: str = "isolated"              # "shared" (one store, filtered) | "isolated"
+    # How the framework's agent treats its long-term store (WP4.1): "append"
+    # (rows/sections only ever added — ZeroClaw brain.db, Hermes sessions) or
+    # "curated" (rewritten in place — OpenClaw's MEMORY.md). Z14 runs only for
+    # curated stores; Z5's round-1 survival is informational on the LLM tier
+    # for them (a real model may legitimately overwrite earlier memories).
+    memory_shape: str = "append"                   # "append" | "curated"
+
     def __init__(self, env: KitEnv):
         self.env = env
+
+    def seed_narrative(self) -> str:
+        """Z2 no-LLM branch: prose for how the seeder writes the round-1 markers
+        into THIS framework's real store, deterministically (no model)."""
+        return (f"No-LLM tier: the seeder writes the four round-1 markers straight "
+                f"into {self.memory_store_label} — deterministic plumbing, same "
+                f"store, no model.")
+
+    def seed_flow(self) -> str:
+        """Z2 no-LLM data-flow line (framework-specific store)."""
+        return f"seed_markers.py ──▶ {self.memory_store_label}"
+
+    def isolation_narrative(self) -> str:
+        """Z10: how per-agent isolation is achieved in THIS framework."""
+        return ("Populate agent b's OWN marked memories, sync, and assert isolation "
+                "BOTH ways: b's archive carries only b's markers, and a's memory is "
+                "untouched.")
 
     # -- Z1 -------------------------------------------------------------------
     @abstractmethod
@@ -101,12 +130,64 @@ class FrameworkKit(ABC):
     def alf_target_args(self, slot: str) -> list:
         """Extra `alf` argv selecting this framework/agent (e.g. ['-r', name])."""
 
+    # -- topology predicates (stages speak through these, not store internals) --
+    def is_per_agent_workspace(self, ws: str) -> bool:             # Z3
+        """True if `ws` is a per-agent workspace in this framework's layout.
+        Default: anything under the framework home. ZeroClaw narrows to
+        `<home>/agents/<alias>/workspace`; OpenClaw uses `<home>/workspace-<name>`,
+        both of which start with `home_mount`."""
+        return ws.startswith(self.home_mount)
+
+    def agent_declared(self, ctr, slot: str) -> bool:              # Z8
+        """True if the framework's own config now declares `slot` (checked
+        through the config, not by string-matching one framework's dialect)."""
+        raise SkipStage(f"{self.name}: agent_declared lands with multi-agent", wp="WP4")
+
+    def raw_parity_entry(self) -> str:                             # Z4
+        """Archive entry that proves the framework's raw source round-tripped
+        (the fidelity safety net). Default is `raw/<name>/config.toml`; OpenClaw
+        has no config file, so it points at its durable `MEMORY.md`."""
+        return f"raw/{self.name}/config.toml"
+
+    def archive_marker_prefix(self) -> str:                        # Z4 / Z10
+        """Archive entry prefix to scan for seeded markers. ZeroClaw stores every
+        memory as a brain.db record → all markers land under `memory/`. OpenClaw's
+        agent may write a marker into any workspace file (a credential into
+        `TOOLS.md` → `raw/`), all captured, so it scans the whole archive."""
+        return "memory/"
+
+    def llm_wired(self) -> tuple:                                  # Z1 (proxy tier)
+        """After `wire_llm`: `(wired?, config_text)` — read the framework's own
+        config and report whether the LLM proxy provider is now present.
+        `config_text` feeds the redaction self-check. Default is ZeroClaw's
+        `config.toml` shape; OpenClaw checks `openclaw.json`."""
+        cfg = self.env.host_home / "config.toml"
+        text = cfg.read_text(encoding="utf-8") if cfg.is_file() else ""
+        return ("agentlife" in text and 'embedding_provider = "none"' in text, text)
+
     # -- WP3–5 slots (default: planned, not invisible) --------------------------
     def create_agent(self, ctr, slot: str) -> None:                # Z8
         raise SkipStage(f"{self.name}: create_agent lands with multi-agent", wp="WP4")
 
+    def curate_memory(self, ctr, slot: str, op: str) -> None:      # Z14 (WP4.1)
+        """Perform one in-place curation `op` on the slot's memory store:
+        'touch' (re-save identical bytes), 'reorder' (re-rank entries),
+        'edit' (rewrite one memory in place — the WP4.1 §1a shape),
+        'insert' (add one mid-store), 'delete' (remove the inserted one).
+        Only meaningful for kits declaring `memory_shape == "curated"`."""
+        raise SkipStage(f"{self.name}: curated-memory ops apply to curated stores only",
+                        wp="WP4.1")
+
     def mutate_slice(self, ctr, slot: str, round: int) -> None:    # Z12
         raise SkipStage(f"{self.name}: mutate_slice lands with the adapter fix", wp="WP3")
+
+    def assert_restore_isolation(self, run, result, slot: str) -> None:  # Z12
+        """Diverge `slot` from its archive, `alf restore --agent <slot>`, and
+        assert the slot returns to the archive while every OTHER agent stays
+        byte-identical — measured through THIS framework's store (ZeroClaw:
+        brain.db rows; OpenClaw: the other workspace dirs). Appends Checks to
+        `result`."""
+        raise SkipStage(f"{self.name}: restore isolation lands with the adapter fix", wp="WP3")
 
     def native_memory_stats(self, ctr, slot: str) -> dict:         # parity oracle
         raise SkipStage(f"{self.name}: native stats parity lands with the adapter fix",

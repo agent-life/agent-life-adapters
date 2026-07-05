@@ -30,6 +30,7 @@ pub mod partition;
 pub mod paths;
 pub mod principals;
 pub mod rebuild;
+pub mod reconcile;
 pub mod validation;
 
 pub use adapter::{
@@ -60,5 +61,6 @@ pub use memory::*;
 pub use partition::{PartitionAssigner, PartitionReader, PartitionWriter};
 pub use paths::{agent_vault_path, home_dir, legacy_vault_path};
 pub use principals::*;
-pub use rebuild::rebuild_snapshot;
+pub use rebuild::{rebuild_snapshot, replace_memory_records};
+pub use reconcile::{reconcile, ReconcileOutcome, ReconcileStats};
 pub use validation::*;

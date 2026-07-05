@@ -43,8 +43,24 @@ pub fn collect_curated_memory(
 
     let entries = split_entries(&content);
     let mut records = Vec::with_capacity(entries.len());
+    // Occurrence disambiguates byte-identical entries (WP4.1 §8.5): two
+    // identical curated lines would otherwise hash to one content-derived id
+    // and `compute_delta`'s map would silently drop one. Occurrence 0 keeps the
+    // historical id, so the common (distinct-entry) case never churns.
+    let mut occurrences: HashMap<&str, u32> = HashMap::new();
     for (idx, entry) in entries.iter().enumerate() {
-        records.push(make_record(entry, idx, agent_id, runtime_version, mtime));
+        let occ = occurrences
+            .entry(entry.as_str())
+            .and_modify(|c| *c += 1)
+            .or_insert(0);
+        records.push(make_record(
+            entry,
+            idx,
+            *occ,
+            agent_id,
+            runtime_version,
+            mtime,
+        ));
     }
     Ok(records)
 }
@@ -90,15 +106,20 @@ fn split_h2(content: &str) -> Vec<String> {
 fn make_record(
     entry: &str,
     entry_index: usize,
+    occurrence: u32,
     agent_id: Uuid,
     runtime_version: Option<&str>,
     mtime: DateTime<Utc>,
 ) -> MemoryRecord {
-    // Content-derived id (D2): stable across re-exports of an unchanged entry.
-    let id = Uuid::new_v5(
-        &alf_core::ids::ALF_ID_NAMESPACE,
-        format!("hermes-curated:{entry}").as_bytes(),
-    );
+    // Content-derived id (D2): stable across re-exports of an unchanged entry,
+    // reorder-proof. Occurrence disambiguates true duplicates (§8.5); the first
+    // occurrence keeps the historical id string so distinct entries never churn.
+    let id_name = if occurrence == 0 {
+        format!("hermes-curated:{entry}")
+    } else {
+        format!("hermes-curated:{entry}:{occurrence}")
+    };
+    let id = Uuid::new_v5(&alf_core::ids::ALF_ID_NAMESPACE, id_name.as_bytes());
 
     MemoryRecord {
         id,
@@ -204,6 +225,30 @@ mod tests {
         let b = collect_curated_memory(tmp.path(), Uuid::new_v4(), None).unwrap();
         assert_eq!(a[0].id, b[0].id, "same content → same id (no delta churn)");
         assert_ne!(a[0].id, a[1].id);
+    }
+
+    #[test]
+    fn duplicate_entries_get_distinct_ids() {
+        // Two byte-identical curated entries must not collide to one id (§8.5),
+        // and the first occurrence must keep the historical content-only id so
+        // distinct entries never churn on upgrade.
+        let tmp = tempfile::tempdir().unwrap();
+        write_memory(tmp.path(), "Same note.\n§\nSame note.");
+        let recs = collect_curated_memory(tmp.path(), Uuid::new_v4(), None).unwrap();
+        assert_eq!(recs.len(), 2);
+        assert_ne!(
+            recs[0].id, recs[1].id,
+            "occurrence disambiguates duplicates"
+        );
+        // First occurrence == the historical content-only id.
+        let legacy = Uuid::new_v5(
+            &alf_core::ids::ALF_ID_NAMESPACE,
+            b"hermes-curated:Same note.",
+        );
+        assert_eq!(
+            recs[0].id, legacy,
+            "occurrence 0 keeps the old id (no churn)"
+        );
     }
 
     #[test]

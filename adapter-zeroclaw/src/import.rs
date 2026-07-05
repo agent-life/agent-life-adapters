@@ -539,6 +539,13 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
     let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for record in &all_records {
+        // Skip tombstones/replaced records (WP4.1 §8.1) — ZeroClaw's brain.db
+        // extractor is the one adapter that actually emits `Superseded` rows
+        // (from `superseded_by`), so without this filter a cross-runtime
+        // restore resurrects them next to their replacements.
+        if !record.status.is_materialized() {
+            continue;
+        }
         let origin_file = record.source.origin_file.as_deref().unwrap_or("");
 
         match record.namespace.as_str() {

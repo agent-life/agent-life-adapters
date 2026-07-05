@@ -151,43 +151,7 @@ pub fn rebuild_snapshot(
 
     // ── 3. Re-partition memory records ────────────────────────────
 
-    let mut partition_groups: BTreeMap<String, Vec<MemoryRecord>> = BTreeMap::new();
-    for record in &memory_records {
-        let file_path = PartitionAssigner::partition_for_record(record);
-        partition_groups
-            .entry(file_path)
-            .or_default()
-            .push(record.clone());
-    }
-
-    let today = Utc::now().date_naive();
-    let partitions: Vec<(MemoryPartitionInfo, Vec<MemoryRecord>)> = partition_groups
-        .into_iter()
-        .map(|(file_path, records)| {
-            let (from, to) = PartitionAssigner::date_range_for_partition(&file_path)
-                .unwrap_or_else(|| {
-                    // Fallback: use the first record's timestamp for from, no to
-                    let first = records.first().expect("partition group is non-empty");
-                    let ts = first
-                        .temporal
-                        .observed_at
-                        .unwrap_or(first.temporal.created_at);
-                    (ts.date_naive(), today)
-                });
-
-            let sealed = to < today;
-
-            let info = MemoryPartitionInfo {
-                file: file_path,
-                from,
-                to: Some(to),
-                record_count: records.len() as u64,
-                sealed,
-                extra: std::collections::HashMap::new(),
-            };
-            (info, records)
-        })
-        .collect();
+    let partitions = partition_records(&memory_records);
 
     // ── 4. Build new manifest ─────────────────────────────────────
 
@@ -250,6 +214,132 @@ pub fn rebuild_snapshot(
 
     let inner = writer.finish()?;
     Ok(inner.into_inner())
+}
+
+/// Rewrite a snapshot's memory layer with the given records, carrying every
+/// other layer (identity, principals, credentials, attachments, raw sources,
+/// artifacts) through unchanged.
+///
+/// Used by `alf sync` to persist reconciled record identities (WP4.1) into the
+/// archive that is both uploaded and kept as the local delta base — the two
+/// must be the same bytes, or local and cloud ids diverge on the re-snapshot
+/// path.
+///
+/// Records are re-partitioned: reconciliation carries `created_at` backwards
+/// to a record's first observation, so the export's original partition layout
+/// may be stale. Unlike [`rebuild_snapshot`], the manifest is cloned from the
+/// input — `created_at`, the agent block, and the sync cursor are NOT
+/// restamped (the layer inventory is recomputed by `AlfWriter::finish()`).
+pub fn replace_memory_records(
+    snapshot_bytes: &[u8],
+    records: &[MemoryRecord],
+) -> Result<Vec<u8>, RebuildError> {
+    let mut base = AlfReader::new(Cursor::new(snapshot_bytes))?;
+    let manifest = base.manifest().clone();
+
+    let identity = base.read_identity()?;
+    let principals = base.read_principals()?;
+    let credentials = base.read_credentials()?;
+    let attachments = base.read_attachments()?;
+
+    let all_files = base.file_names();
+    let raw_paths: Vec<String> = all_files
+        .iter()
+        .filter(|p| p.starts_with("raw/") && !p.ends_with('/'))
+        .cloned()
+        .collect();
+    let mut raw_sources: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    for path in &raw_paths {
+        raw_sources.insert(path.clone(), base.read_raw_entry(path)?);
+    }
+
+    let artifact_paths: Vec<String> = all_files
+        .iter()
+        .filter(|p| p.starts_with("artifacts/") && !p.ends_with('/'))
+        .cloned()
+        .collect();
+    let mut artifact_files: Vec<(String, Vec<u8>)> = Vec::new();
+    for path in &artifact_paths {
+        artifact_files.push((path.clone(), base.read_raw_entry(path)?));
+    }
+
+    let partitions = partition_records(records);
+
+    let buf = Cursor::new(Vec::new());
+    let mut writer = AlfWriter::new(buf, manifest)?;
+
+    if let Some(ref id) = identity {
+        writer.set_identity(id)?;
+    }
+    if let Some(ref p) = principals {
+        writer.set_principals(p)?;
+    }
+    if let Some(ref c) = credentials {
+        writer.set_credentials(c)?;
+    }
+    for (info, group) in &partitions {
+        writer.add_memory_partition(info.clone(), group)?;
+    }
+    if let Some(ref att) = attachments {
+        writer.set_attachments(att)?;
+    }
+    for (path, data) in &artifact_files {
+        writer.add_artifact(path, data)?;
+    }
+    for (full_path, data) in &raw_sources {
+        if let Some(rest) = full_path.strip_prefix("raw/") {
+            if let Some(slash_pos) = rest.find('/') {
+                let runtime = &rest[..slash_pos];
+                let relative = &rest[slash_pos + 1..];
+                writer.add_raw_source(runtime, relative, data)?;
+            }
+        }
+    }
+
+    let inner = writer.finish()?;
+    Ok(inner.into_inner())
+}
+
+/// Group records into quarterly partitions with computed partition metadata.
+/// Shared by [`rebuild_snapshot`] and [`replace_memory_records`].
+fn partition_records(records: &[MemoryRecord]) -> Vec<(MemoryPartitionInfo, Vec<MemoryRecord>)> {
+    let mut partition_groups: BTreeMap<String, Vec<MemoryRecord>> = BTreeMap::new();
+    for record in records {
+        let file_path = PartitionAssigner::partition_for_record(record);
+        partition_groups
+            .entry(file_path)
+            .or_default()
+            .push(record.clone());
+    }
+
+    let today = Utc::now().date_naive();
+    partition_groups
+        .into_iter()
+        .map(|(file_path, records)| {
+            let (from, to) = PartitionAssigner::date_range_for_partition(&file_path)
+                .unwrap_or_else(|| {
+                    // Fallback: use the first record's timestamp for from, no to
+                    let first = records.first().expect("partition group is non-empty");
+                    let ts = first
+                        .temporal
+                        .observed_at
+                        .unwrap_or(first.temporal.created_at);
+                    (ts.date_naive(), today)
+                });
+
+            let sealed = to < today;
+
+            let info = MemoryPartitionInfo {
+                file: file_path,
+                from,
+                to: Some(to),
+                record_count: records.len() as u64,
+                sealed,
+                extra: std::collections::HashMap::new(),
+            };
+            (info, records)
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -1008,5 +1098,87 @@ mod tests {
         let rebuilt = rebuild_snapshot(&base, &[delta.as_slice()]).unwrap();
         let count = read_credentials(&rebuilt).map_or(0, |d| d.credentials.len());
         assert_eq!(count, 0);
+    }
+
+    // -- replace_memory_records (WP4.1) ----------------------------------------
+
+    /// Snapshot with an identity, records, and a raw source file — the layers
+    /// replace_memory_records must carry through untouched.
+    fn build_snapshot_with_raw(records: &[MemoryRecord]) -> Vec<u8> {
+        let buf = Cursor::new(Vec::new());
+        let mut writer = AlfWriter::new(buf, make_manifest()).unwrap();
+        writer.set_identity(&make_identity(1, "soul text")).unwrap();
+        let mut groups: BTreeMap<String, Vec<MemoryRecord>> = BTreeMap::new();
+        for r in records {
+            let path = PartitionAssigner::partition_for_record(r);
+            groups.entry(path).or_default().push(r.clone());
+        }
+        for (file_path, group_records) in &groups {
+            let (from, to) = PartitionAssigner::date_range_for_partition(file_path).unwrap();
+            let info = MemoryPartitionInfo {
+                file: file_path.clone(),
+                from,
+                to: Some(to),
+                record_count: group_records.len() as u64,
+                sealed: false,
+                extra: HashMap::new(),
+            };
+            writer.add_memory_partition(info, group_records).unwrap();
+        }
+        writer
+            .add_raw_source("test", "MEMORY.md", b"verbatim raw bytes")
+            .unwrap();
+        let inner = writer.finish().unwrap();
+        inner.into_inner()
+    }
+
+    #[test]
+    fn replace_memory_records_preserves_other_layers() {
+        let base = build_snapshot_with_raw(&[make_record(1, "old", 1)]);
+        let base_manifest = AlfReader::new(Cursor::new(&base))
+            .unwrap()
+            .manifest()
+            .clone();
+
+        let replacement = vec![make_record(2, "new content", 1)];
+        let rewritten = replace_memory_records(&base, &replacement).unwrap();
+        let mut reader = AlfReader::new(Cursor::new(&rewritten)).unwrap();
+
+        // Memory layer replaced.
+        let records = reader.read_all_memory().unwrap();
+        assert_eq!(records, replacement);
+        // Identity carried.
+        let identity = reader.read_identity().unwrap().expect("identity present");
+        assert_eq!(identity.prose.unwrap().soul.as_deref(), Some("soul text"));
+        // Raw source byte-identical.
+        let raw = reader.read_raw_entry("raw/test/MEMORY.md").unwrap();
+        assert_eq!(raw, b"verbatim raw bytes");
+        // Manifest metadata cloned, not restamped.
+        let manifest = reader.manifest();
+        assert_eq!(manifest.created_at, base_manifest.created_at);
+        assert_eq!(manifest.agent.id, base_manifest.agent.id);
+    }
+
+    #[test]
+    fn replace_memory_records_repartitions_across_quarters() {
+        // Base holds one Q1 record; the replacement moves a record's anchor to
+        // Q3 (reconcile carries created_at/observed_at backwards or forwards),
+        // so the partition layout must follow the records, not the export.
+        let base = build_snapshot_with_raw(&[make_record(1, "q1", 1)]);
+        let replacement = vec![make_record(1, "q1", 1), make_record(2, "q3", 8)];
+        let rewritten = replace_memory_records(&base, &replacement).unwrap();
+        let reader = AlfReader::new(Cursor::new(&rewritten)).unwrap();
+        let names = reader.file_names();
+        assert!(names.contains(&"memory/2026-Q1.jsonl".to_string()));
+        assert!(names.contains(&"memory/2026-Q3.jsonl".to_string()));
+    }
+
+    #[test]
+    fn replace_memory_records_empty_set() {
+        let base = build_snapshot_with_raw(&[make_record(1, "old", 1)]);
+        let rewritten = replace_memory_records(&base, &[]).unwrap();
+        let mut reader = AlfReader::new(Cursor::new(&rewritten)).unwrap();
+        assert!(reader.read_all_memory().unwrap().is_empty());
+        assert!(reader.read_identity().unwrap().is_some());
     }
 }

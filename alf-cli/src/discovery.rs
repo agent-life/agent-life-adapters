@@ -643,6 +643,92 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_two_agent_reconcile_by_workspace_path() {
+        // Shaped like adapter-openclaw's agents.list[]: `main` at `<root>/workspace`
+        // and a named agent at its explicit `workspace-<name>`, both with
+        // `runtime_agent_id: None`. To ISOLATE rule 2 (workspace path), discovery
+        // reports different aliases than the mapping stored while the workspaces
+        // stay put — so rule 1 (runtime id) and rule 3 (alias) both miss and only
+        // workspace-path matching can preserve each alf_agent_id.
+        let existing = vec![
+            entry("main", uuid(1), "/home/u/.openclaw/workspace", true),
+            entry(
+                "researcher",
+                uuid(2),
+                "/home/u/.openclaw/workspace-researcher",
+                true,
+            ),
+        ];
+        let out = reconcile(
+            &existing,
+            &[
+                binding("primary", "/home/u/.openclaw/workspace"),
+                binding("researcher-v2", "/home/u/.openclaw/workspace-researcher"),
+            ],
+            "openclaw",
+            &ctx_derived(&[
+                ("/home/u/.openclaw/workspace", uuid(0xD1)),
+                ("/home/u/.openclaw/workspace-researcher", uuid(0xD2)),
+            ]),
+        );
+
+        assert_eq!(out.rows.len(), 2);
+        assert!(out.rows.iter().all(|r| r.status == RowStatus::Existing));
+        let by_ws = |ws: &str| {
+            out.rows
+                .iter()
+                .find(|r| r.entry.workspace == ws)
+                .expect("row for workspace")
+        };
+        // Matched by workspace path alone; each alf_agent_id preserved.
+        assert_eq!(
+            by_ws("/home/u/.openclaw/workspace").entry.alf_agent_id,
+            uuid(1)
+        );
+        assert_eq!(
+            by_ws("/home/u/.openclaw/workspace-researcher")
+                .entry
+                .alf_agent_id,
+            uuid(2)
+        );
+        assert!(out.drift.is_empty());
+    }
+
+    #[test]
+    fn openclaw_main_id_survives_workspace_string_change() {
+        // `main`'s stored workspace string differs from the discovered
+        // `<root>/workspace` (e.g. an older mapping, or a default relocated via
+        // `agents.defaults.workspace`). With `runtime_agent_id: None`, rule 2
+        // (workspace) misses but rule 3 (alias "main") matches — the alf_agent_id
+        // survives and the workspace refreshes to the discovered path.
+        let existing = vec![entry(
+            "main",
+            uuid(1),
+            "/home/u/.openclaw/workspace-legacy",
+            true,
+        )];
+        let out = reconcile(
+            &existing,
+            &[binding("main", "/home/u/.openclaw/workspace")],
+            "openclaw",
+            &ctx_derived(&[("/home/u/.openclaw/workspace", uuid(0xD1))]),
+        );
+
+        assert_eq!(out.rows.len(), 1);
+        assert_eq!(out.rows[0].status, RowStatus::Existing);
+        assert_eq!(
+            out.rows[0].entry.alf_agent_id,
+            uuid(1),
+            "id survives a workspace-string change via the alias match"
+        );
+        assert_eq!(
+            out.rows[0].entry.workspace, "/home/u/.openclaw/workspace",
+            "workspace refreshed to the discovered path"
+        );
+        assert!(out.drift.is_empty());
+    }
+
+    #[test]
     fn zeroclaw_shaped_bindings_reconcile_by_runtime_id() {
         // Shaped like adapter-zeroclaw/testkit/captured/: two agents sharing
         // one brain.db, partitioned by agent_id.

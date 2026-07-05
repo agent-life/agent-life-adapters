@@ -28,7 +28,7 @@ use uuid::Uuid;
 pub use alf_core::adapter::{
     ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
 };
-pub use alf_core::Adapter;
+pub use alf_core::{Adapter, AgentBinding};
 
 pub mod export;
 pub mod identity_parser;
@@ -90,6 +90,16 @@ impl Adapter for OpenClawAdapter {
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
         export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP4: enumerate agents from `openclaw.json` `agents.list[]`, one
+    /// `InWorkspaceFiles` binding per per-agent workspace dir (`<root>/workspace`
+    /// for `main`, the entry's explicit `workspace` for named agents) — overrides
+    /// the WP0 single-agent fallback. The WP0 default `export_agent`/`import_agent`
+    /// already retarget `binding.workspace`, so no override of those is needed —
+    /// OpenClaw's dir-isolation makes them correct.
+    fn discover_agents(&self, install: &Path) -> Result<Vec<AgentBinding>> {
+        export::discover_agents(install)
     }
 }
 

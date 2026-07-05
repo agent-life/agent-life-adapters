@@ -22,8 +22,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
 RUN npm install -g "openclaw@${OPENCLAW_VERSION}"
 
 # Build-time version guard: the pinned package must deliver its own version.
-RUN test "$(openclaw --version 2>/dev/null | tail -1)" = "${OPENCLAW_VERSION}" \
-    || { echo "VERSION GUARD FAILED: expected '${OPENCLAW_VERSION}', got '$(openclaw --version 2>/dev/null | tail -1)'"; exit 1; }
+# `openclaw --version` prints "OpenClaw <version> (<commit>)", so substring-match
+# the pinned version rather than demanding a bare equal.
+RUN v="$(openclaw --version 2>/dev/null | tail -1)"; \
+    case "$v" in \
+      *"${OPENCLAW_VERSION}"*) echo "version guard ok: $v" ;; \
+      *) echo "VERSION GUARD FAILED: expected '${OPENCLAW_VERSION}', got '$v'"; exit 1 ;; \
+    esac
 
 RUN useradd -m -s /bin/bash agent
 USER agent

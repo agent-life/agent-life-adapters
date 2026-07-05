@@ -15,6 +15,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use alf_core::{AgentBinding, MemorySource};
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, FileEntry, IdentityLayerInfo, LayerInventory,
     Manifest, MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
@@ -93,6 +94,112 @@ fn detect_openclaw_version() -> Option<String> {
 /// Best-effort home directory (honors `ALF_HOME`).
 fn dirs_home() -> Option<std::path::PathBuf> {
     alf_core::home_dir()
+}
+
+// ---------------------------------------------------------------------------
+// Agent discovery (WP4 multi-agent)
+// ---------------------------------------------------------------------------
+
+/// Locate the OpenClaw install root (`~/.openclaw`) from any workspace path by
+/// walking up to the directory that holds `openclaw.json`. Falls back to
+/// `workspace` itself (which yields the single-agent default binding).
+///
+/// Kept install-relative (not `home_dir()`-based, unlike [`detect_openclaw_version`])
+/// so discovery is deterministic under test and never reads a developer's real
+/// `~/.openclaw`.
+pub(crate) fn openclaw_home(workspace: &Path) -> PathBuf {
+    for anc in workspace.ancestors().take(6) {
+        if anc.join("openclaw.json").is_file() {
+            return anc.to_path_buf();
+        }
+    }
+    workspace.to_path_buf()
+}
+
+/// Discover the agents in an OpenClaw install (WP4 override of the WP0 single-
+/// agent fallback).
+///
+/// OpenClaw is directory-isolated: each agent owns a workspace subtree holding
+/// its real memory (`MEMORY.md`, `memory/*.md`, identity files), listed in
+/// `openclaw.json` `agents.list[]`. Each entry becomes one `InWorkspaceFiles`
+/// binding at that per-agent workspace — the entry's explicit `workspace` field
+/// when it recorded one (named agents, created via `agents add --workspace`),
+/// else the convention default (verified on 2026.6.11): the pre-existing `main`
+/// agent's workspace is `<root>/workspace`, any other workspace-less agent's is
+/// `<root>/workspace-<id>`. Its store is created lazily on first run. Every
+/// declared agent is user-configured, so `default_enabled` is true (design
+/// §6/§10 — OpenClaw has no vestigial system agent, unlike ZeroClaw's `default`).
+/// Read-only; never writes the install.
+///
+/// Falls back to the WP0 single-`main` binding (workspace = `install`) when
+/// `openclaw.json` is absent, unreadable, or declares no agents — preserving the
+/// single-agent zero-friction path.
+pub fn discover_agents(install: &Path) -> Result<Vec<AgentBinding>> {
+    let root = openclaw_home(install);
+    match read_openclaw_agents(&root) {
+        Some(bindings) if !bindings.is_empty() => Ok(bindings),
+        _ => Ok(vec![AgentBinding {
+            runtime_agent: "main".to_string(),
+            runtime_agent_id: None,
+            workspace: install.to_path_buf(),
+            memory_source: MemorySource::InWorkspaceFiles,
+            default_enabled: true,
+        }]),
+    }
+}
+
+/// Parse `<root>/openclaw.json` `agents.list[]` into per-agent bindings. Returns
+/// `None` when the file is missing/unparseable or has no `agents.list` array;
+/// entries without a string `id` are skipped.
+fn read_openclaw_agents(root: &Path) -> Option<Vec<AgentBinding>> {
+    let content = fs::read_to_string(root.join("openclaw.json")).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&content).ok()?;
+    let agents = json.get("agents")?;
+    let list = agents.get("list")?.as_array()?;
+    // A user can relocate the default agent's workspace via
+    // `agents.defaults.workspace` — the same field `alf check`'s
+    // `read_openclaw_workspace` honors. Honor it here too so the adapter and the
+    // CLI agree on where `main` lives.
+    let default_ws = agents
+        .get("defaults")
+        .and_then(|d| d.get("workspace"))
+        .and_then(|w| w.as_str())
+        .map(PathBuf::from);
+    let bindings = list
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_string();
+            let workspace = entry
+                .get("workspace")
+                .and_then(|w| w.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| default_workspace(root, &id, default_ws.as_deref()));
+            Some(AgentBinding {
+                runtime_agent: id,
+                runtime_agent_id: None,
+                workspace,
+                memory_source: MemorySource::InWorkspaceFiles,
+                default_enabled: true,
+            })
+        })
+        .collect();
+    Some(bindings)
+}
+
+/// Convention workspace for an `agents.list[]` entry that recorded no explicit
+/// `workspace` (verified on OpenClaw 2026.6.11): the pre-existing default agent
+/// `main` uses `agents.defaults.workspace` if the user set it, else
+/// `<root>/workspace`; any other workspace-less agent follows the
+/// `workspace-<name>` convention (defensive — named agents normally carry an
+/// explicit `workspace`).
+fn default_workspace(root: &Path, id: &str, default_ws: Option<&Path>) -> PathBuf {
+    if id == "main" {
+        default_ws
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| root.join("workspace"))
+    } else {
+        root.join(format!("workspace-{id}"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -224,6 +331,57 @@ pub fn enumerate(workspace: &Path) -> Result<EnumerationResult> {
                 size,
             });
         }
+    }
+
+    // Scatter capture. A real OpenClaw agent stores memory in agent-chosen
+    // top-level locations whose names vary between runs — verified across
+    // independent installs: `procedures/deploy.md`, `procedural_memory/*.md`,
+    // `secrets/*.md` (see the WP4.1 DoD fidelity finding). A fixed allowlist
+    // would play whack-a-mole against those names, so instead back up EVERY
+    // workspace markdown file as raw. Markdown is the agent's memory medium, so
+    // this is bounded (and per-entry size is capped by the archive layer);
+    // operational non-memory files (`*.json` workspace state, `state/`,
+    // `sessions/*.jsonl`) are not markdown and never match. Already-captured
+    // files (ROOT_FILES, `memory/**`) and VCS internals are skipped, and
+    // `.alfignore` still applies for user control.
+    let captured: HashSet<String> = files.iter().map(|f| f.path.clone()).collect();
+    let mut scattered: Vec<(String, PathBuf)> = WalkDir::new(workspace)
+        .follow_links(false)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter(|e| e.path().extension().and_then(|x| x.to_str()) == Some("md"))
+        .map(|e| {
+            let rel = e
+                .path()
+                .strip_prefix(workspace)
+                .unwrap_or(e.path())
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, e.path().to_path_buf())
+        })
+        .filter(|(rel, _)| {
+            // Skip what the dedicated ROOT_FILES / memory/ passes already own
+            // (whether they captured or `.alfignore`-excluded it — re-handling
+            // here would double-count exclusions) and VCS internals.
+            !captured.contains(rel)
+                && !ROOT_FILES.contains(&rel.as_str())
+                && !rel.starts_with("memory/")
+                && !rel.starts_with(".git/")
+                && !rel.contains("/.git/")
+        })
+        .collect();
+    scattered.sort();
+    for (rel, abs) in &scattered {
+        if is_alfignored(&matcher, rel) {
+            excluded += 1;
+            continue;
+        }
+        let size = fs::metadata(abs).map(|m| m.len()).unwrap_or(0);
+        files.push(FileEntry {
+            path: rel.clone(),
+            size,
+        });
     }
 
     // Agent-managed include list — arbitrary files the agent opted into via
@@ -849,6 +1007,47 @@ mod tests {
             enumerated_paths(&result),
             vec!["SOUL.md", "memory/2026-01-15.md"]
         );
+    }
+
+    /// Scatter capture: agent-chosen top-level memory dirs (whose names vary
+    /// between runs — `procedures/`, `procedural_memory/`, `secrets/`) are
+    /// backed up as raw. Markdown only; operational non-md files are skipped.
+    #[test]
+    fn scatter_capture_backs_up_top_level_markdown() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("MEMORY.md", "mem"),
+            ("memory/2026-01-15.md", "daily"),
+            ("procedures/deploy.md", "PROC-MARKER"),
+            ("procedural_memory/other.md", "PROC2"),
+            ("secrets/token.md", "sk-FAKE"),
+            ("openclaw-workspace-state.json", "{}"),
+        ]);
+        let paths = enumerated_paths(&enumerate(&ws).unwrap());
+        // Scattered markdown is captured...
+        assert!(paths.contains(&"procedures/deploy.md".to_string()));
+        assert!(paths.contains(&"procedural_memory/other.md".to_string()));
+        assert!(paths.contains(&"secrets/token.md".to_string()));
+        // ...the known scopes still work, and non-markdown is not captured.
+        assert!(paths.contains(&"MEMORY.md".to_string()));
+        assert!(paths.contains(&"memory/2026-01-15.md".to_string()));
+        assert!(!paths.iter().any(|p| p.ends_with(".json")));
+    }
+
+    /// Scatter capture respects `.alfignore` and never double-counts an
+    /// exclusion that the memory/ or root passes already handled.
+    #[test]
+    fn scatter_capture_respects_alfignore_without_double_count() {
+        let (_dir, ws) = create_workspace(&[
+            ("SOUL.md", "soul"),
+            ("memory/2026-01-15.md", "a"),
+            ("procedures/deploy.md", "proc"),
+            (".alfignore", "memory/2026-01-15.md\nprocedures/\n"),
+        ]);
+        let result = enumerate(&ws).unwrap();
+        // One memory file + one scattered dir excluded, counted once each.
+        assert_eq!(result.excluded_by_alfignore, 2);
+        assert_eq!(enumerated_paths(&result), vec!["SOUL.md"]);
     }
 
     /// EX-5: `.alfignore` itself never appears in the file list.

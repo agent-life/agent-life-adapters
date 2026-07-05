@@ -492,16 +492,23 @@ one record. Session files follow the same rule.
 
 **SQLite backend**: Use the `MemoryEntry.id` field directly. ZeroClaw
 generates UUIDs for each entry, so IDs are inherently stable across
-exports.
+exports. A row whose native id is not a parseable UUID gets a
+**deterministic** v5 fallback derived from the native id string (WP4.1 —
+the previous random fallback re-minted a fresh id on every export,
+producing a permanent delete+create pair per sync for such rows).
 
-**Markdown backend**: Use the same UUID v5 strategy as the OpenClaw
-adapter — deterministic IDs derived from `(file_path, section_index)`
-using a fixed namespace UUID.
+**Markdown backend**: Same content-addressed birth-id scheme as the
+OpenClaw adapter (WP4.1), carried forward across in-place edits by
+sync-time reconciliation (`alf_core::reconcile`):
 
 ```
 ZEROCLAW_NS = fixed 16-byte namespace UUID
-record_id = UUID_v5(ZEROCLAW_NS, "{relative_path}:{section_index}")
+record_id = UUID_v5(ZEROCLAW_NS,
+    "content-v1:{agent_id}:{relative_path}:{sha256(content)}:{occurrence}")
 ```
+
+Existing agents' legacy positional ids are never re-minted — the
+reconciler matches unchanged content and keeps the old ids.
 
 ### Field Mapping: MemoryRecord
 

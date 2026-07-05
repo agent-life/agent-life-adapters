@@ -56,6 +56,22 @@ def scan_markers(path: Path, markers: list[str], prefix: str = "") -> dict:
     return hits
 
 
+def memory_records(path: Path) -> list[dict]:
+    """All structured memory records (the `memory/*.jsonl` partition lines) in
+    the archive — the Z14' oracle for birth-id stability under curation."""
+    records: list[dict] = []
+    with zipfile.ZipFile(path) as z:
+        for name in sorted(z.namelist()):
+            if not (name.startswith("memory/") and name.endswith(".jsonl")):
+                continue
+            text = z.read(name).decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                line = line.strip()
+                if line:
+                    records.append(json.loads(line))
+    return records
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

@@ -409,6 +409,12 @@ fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
     let mut curated: Vec<String> = Vec::new();
     let mut transcripts: Vec<String> = Vec::new();
     for record in &all_records {
+        // Skip tombstones/replaced records (WP4.1 §8.1): consistent with the
+        // other adapters' reconstruction, so a Superseded/Deleted record never
+        // resurfaces in a cross-runtime restore.
+        if !record.status.is_materialized() {
+            continue;
+        }
         if is_session_record(record) {
             transcripts.push(record.content.clone());
         } else {

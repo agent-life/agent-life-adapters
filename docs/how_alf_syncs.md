@@ -113,17 +113,30 @@ Instead, in the delta path, `alf sync` compares the tracked files (and the inclu
 
 Deletions are handled before export: if a tracked file no longer exists on disk, `alf sync` removes it from `.alf-include.json` and appends a note to `.alf-sync-log.md` (so the agent can later answer "what happened to notes.txt"). That removal is itself a tracked change, so it re-snapshots; on restore the file is simply absent.
 
-### 6.2 Memory record chunking and delta granularity (WP2)
+### 6.2 Memory record identity, chunking, and delta granularity (WP2, WP4.1)
 
 What becomes a *memory record* — and therefore what a delta can carry — is decided per file by the OpenClaw adapter's source-handler table (`SOURCE_HANDLERS` in [`adapter-openclaw/src/memory_parser.rs`](../adapter-openclaw/src/memory_parser.rs), first match wins). Each location maps to a `memory_type`, a `namespace`, and a chunking strategy: `OneRecordPerFile` (procedures, `memory/curated/`, active-context, and any other `memory/*.md`) or a fence-aware `SplitByHeading` (daily journals, `MEMORY.md`). `SplitByHeading` ignores `## ` lines inside ` ``` ` code fences and drops empty-bodied sections — including a leading `# date` header — so a daily file yields one record per real entry, not a spurious date-header fragment. Full mapping: [adapter-openclaw/README.md](../adapter-openclaw/README.md#mapping-openclaw-memory-to-alf).
 
-Record IDs are **positional** — `UUID v5(origin_file + ":" + section_index)` — and `compute_delta` diffs memory by id, so chunking directly shapes the delta:
+Record IDs are **content-addressed birth ids** (WP4.1) — `UUID v5(ns, "content-v1:{agent_id}:{origin_file}:{sha256(content)}:{occurrence}")`, with the hash covering trailing-whitespace-trimmed content and `occurrence` disambiguating byte-identical duplicates within one file. A birth id names a record only at first sight; from then on identity is **carried forward by reconciliation** (§6.3). Both markdown adapters (OpenClaw and ZeroClaw's markdown backend) share the scheme; ZeroClaw's brain.db and Hermes sessions keep their native stable ids.
 
-- Editing a section's body → an **update** for that id.
-- Appending a new `## ` entry at the end of a daily file → a single **create** (earlier records' indices are unchanged).
-- Inserting or removing a section in the **middle** of a file shifts every later section's index, so each later record gets a new id: the delta shows N deletes + N creates rather than one insert. This is an accepted tradeoff — mid-file edits are rare, and `OneRecordPerFile` files (procedures/curated) are always index 0 and so insertion-stable. A content-addressed id scheme is a possible future "stable memory IDs" change.
+Two historical notes retained for archive archaeology: **0.1.8** re-chunked existing daily / `MEMORY.md` files (dropped `# date` header records, renumbered survivors — one larger-than-usual delta, absorbed by the indexer's truncate-and-reload). Before **WP4.1**, ids were *positional* (`path:section_index`): an insert/remove/re-rank renumbered every later section, reassigning ids to different sections' content. Existing agents' positional ids are never re-minted — reconciliation matches their unchanged content and carries the old ids forever, so the WP4.1 upgrade produces **no** migration delta.
 
-**One-time effect on upgrade to 0.1.8.** The first sync from the fixed adapter re-chunks existing daily / `MEMORY.md` files. Any that previously emitted a `# date` header record or empty `## ` sections will show those records **deleted** and the survivors **renumbered** — a single larger-than-usual delta, then stable. The Phase 5 indexer's truncate-and-reload absorbs this server-side; no migration is required.
+### 6.3 Base-aware reconciliation (WP4.1)
+
+OpenClaw's real agent *curates* `MEMORY.md` in place — overwrites sections, re-ranks them, drops what stopped mattering — so re-extraction alone cannot tell "the same memory, edited" from "one memory deleted, another created". `alf sync` therefore runs `alf_core::reconcile` between export and diff: the fresh records are matched against the local base snapshot in five deterministic passes (exact id+content, exact content per file, markdown heading per file, id fallback, leftovers), and matched records **carry the base record's `id` and `created_at`/`observed_at` forward**. Unchanged records are carried verbatim, so volatile re-stamps (file-mtime `updated_at`, shifted line numbers) never surface as spurious updates. The pass table and guarantees live in [`alf-core/src/reconcile.rs`](../alf-core/src/reconcile.rs) and the design doc ([wp4.1-robust-diff-delta-design.md](multi-agent-support/wp4.1-robust-diff-delta-design.md) §5).
+
+What each workspace event now costs (asserted by lifecycle stage **Z14**):
+
+| Event on a curated file | Memory delta | Raw delta |
+| --- | --- | --- |
+| Touch / re-save identical bytes | nothing (`no_changes`) | — |
+| Reorder / re-rank sections | nothing | 1 file |
+| Edit one section's body (heading stable) | exactly 1 update — same id, original `created_at` | 1 file |
+| Add / remove a section | exactly 1 create / delete | 1 file |
+| Rename a heading and edit its body | 1 delete + 1 create (lineage break, accepted) | 1 file |
+| Move a section to another file | 1 delete + 1 create (matching is per-file by design) | 2 files |
+
+The reconciled records are written back into the export archive **before** anything is uploaded or persisted — one buffer feeds the delta diff, the tracked-file re-snapshot upload, and the local base (`replace_memory_records` in [`alf-core/src/rebuild.rs`](../alf-core/src/rebuild.rs)). That single-buffer rule is load-bearing: if the uploaded snapshot and the persisted base ever diverged, local and cloud record ids would part ways permanently. Consequences worth knowing: `created_at` is frozen at a record's first observation (stable partition assignment; updates may rewrite nominally "sealed" partitions — sealing is advisory, spec RFC pending); reconciliation runs only in `sync` (plain `alf export` is identity-naive and mints birth ids); an overwritten memory is gone from the *live* store because the agent chose to overwrite it, and stays recoverable via `alf restore --at-sequence N` (§10).
 
 ## 7. State transitions in `sync.rs`
 

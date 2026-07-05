@@ -35,6 +35,7 @@ ZEROCLAW_CATEGORY = {
 # single implicit agent maps to slot "default".
 PERSONAS = {
     "default": "ATLAS",
+    "main": "ATLAS",       # OpenClaw's always-present primary agent (WP4)
     "agent_a": "ATLAS",
     "agent_b": "NOVA",
 }
@@ -69,6 +70,14 @@ def marker_for(slot: str, turn_type: str, round: int) -> str:
         return f"sk-{persona.lower()}-r{round}-FAKE-{nonce}"
     abbrev = {"semantic": "SEM", "episodic": "EPI", "procedural": "PROC"}[turn_type]
     return f"{persona}-{abbrev}{round}-{nonce}"
+
+
+def curated_marker(slot: str) -> str:
+    """Z14 (WP4.1): the value the curation 'edit' op writes OVER the round-1
+    semantic marker. Same persona/nonce, CUR1 type tag — deliberately not a
+    superstring of the original, so 'old marker absent' assertions cannot
+    false-positive on substring overlap."""
+    return marker_for(slot, "semantic", 1).replace("SEM1", "CUR1")
 
 
 def _prompt(persona: str, turn_type: str, round: int, marker: str) -> str:

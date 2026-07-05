@@ -52,6 +52,21 @@ def build_image(tag: str, context_dir: Path, build_args: Optional[dict] = None,
         stream(f"built image {tag}")
 
 
+def seed_home_from_image(image: str, src_path: str, host_dest: Path,
+                         seed_name: str) -> None:
+    """Populate `host_dest` (the run's fresh home) from `image`'s `src_path`,
+    for frameworks whose runtime lives inside the framework home (Hermes). Uses a
+    throwaway (created, never started) container + `docker cp`, which preserves
+    the image's `agent` ownership. The runner's post-start chown then aligns it
+    to the host uid. So the per-run mounted home is the real colocated install a
+    user has — runtime + data — instead of an empty dir the mount would leave."""
+    _run(["docker", "create", "--name", seed_name, image], timeout=120)
+    try:
+        _run(["docker", "cp", f"{seed_name}:{src_path}/.", str(host_dest)], timeout=600)
+    finally:
+        _run(["docker", "rm", "-f", seed_name], check=False)
+
+
 class DockerContainer:
     """One `sleep infinity` container; every stage is a `docker exec`."""
 

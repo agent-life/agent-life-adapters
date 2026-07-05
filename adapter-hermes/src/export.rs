@@ -17,6 +17,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use alf_core::adapter::{AgentBinding, MemorySource};
 use alf_core::{
     AgentMetadata, AlfWriter, CredentialsLayerInfo, FileEntry, IdentityLayerInfo, LayerInventory,
     Manifest, MemoryInventory, MemoryPartitionInfo, PartitionAssigner, PrincipalsLayerInfo,
@@ -48,6 +49,63 @@ const RAW_DIRS: &[&str] = &["memories", "skill-bundles", "cron"];
 
 /// The schema sidecar's archive-relative path under `raw/hermes/`.
 const SCHEMA_SIDECAR: &str = ".alf-state-db-schema.json";
+
+// ---------------------------------------------------------------------------
+// Agent discovery (WP5 multi-agent)
+// ---------------------------------------------------------------------------
+
+/// Discover the Hermes profiles in an install (WP5 override of the WP0 single-
+/// agent fallback).
+///
+/// Hermes is profile-isolated: each agent is a Hermes *profile* with its own
+/// `state.db` (session-keyed, no agent column) + `memories/*.md`. Two shapes:
+///
+/// - The **default profile** is `install` (`~/.hermes`) itself, interleaved with
+///   the shared runtime (`node/`, `bin/`, `hermes-agent/`, caches). Its binding
+///   workspace is `install`; [`export`]'s allowlist excludes the runtime *and*
+///   the nested `profiles/` by construction (`ROOT_FILES` + `RAW_DIRS` only), so
+///   the default-profile archive carries agent data only.
+/// - **Named profiles** live at `install/profiles/<name>/` and are clean
+///   (agent data only).
+///
+/// Each profile becomes one [`MemorySource::PerAgentDb`] binding at
+/// `<profile>/state.db` — a descriptor, not an existence guarantee: the DB is
+/// created lazily on first session run, so the path need not exist. Every
+/// profile is a real, user-configured agent, so `default_enabled` is true
+/// (design §10: Hermes `default` is on, unlike ZeroClaw's vestigial `default`).
+/// The `default` binding is always present, so the result is never empty —
+/// it is itself the single-agent fallback. Read-only; never writes the install.
+pub fn discover_agents(install: &Path) -> Result<Vec<AgentBinding>> {
+    let mut bindings = vec![profile_binding("default", install)];
+    let profiles_dir = install.join("profiles");
+    if let Ok(entries) = fs::read_dir(&profiles_dir) {
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().is_dir())
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| !n.starts_with('.'))
+            .collect();
+        names.sort();
+        for name in names {
+            let dir = profiles_dir.join(&name);
+            bindings.push(profile_binding(&name, &dir));
+        }
+    }
+    Ok(bindings)
+}
+
+/// One `PerAgentDb` binding for the Hermes profile rooted at `dir`.
+fn profile_binding(name: &str, dir: &Path) -> AgentBinding {
+    AgentBinding {
+        runtime_agent: name.to_string(),
+        runtime_agent_id: None,
+        workspace: dir.to_path_buf(),
+        memory_source: MemorySource::PerAgentDb {
+            path: dir.join("state.db"),
+        },
+        default_enabled: true,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Agent ID persistence
@@ -860,5 +918,96 @@ mod tests {
         let report = export(dir.path(), &out).unwrap();
         assert!(!report.raw_sources.iter().any(|s| s == ".env"));
         assert!(!report.raw_sources.iter().any(|s| s.starts_with("logs/")));
+    }
+
+    #[test]
+    fn discover_agents_enumerates_default_and_named_profiles() {
+        let dir = make_home(false);
+        let home = dir.path();
+        // A named profile with a lazy (absent) state.db.
+        let prof = home.join("profiles").join("agent_a");
+        fs::create_dir_all(prof.join("memories")).unwrap();
+        fs::write(prof.join("SOUL.md"), "# Agent A\n").unwrap();
+
+        let bindings = discover_agents(home).unwrap();
+        assert_eq!(bindings.len(), 2);
+
+        let default = &bindings[0];
+        assert_eq!(default.runtime_agent, "default");
+        assert_eq!(default.workspace.as_path(), home);
+        assert!(default.default_enabled);
+        assert!(default.runtime_agent_id.is_none());
+        assert_eq!(
+            default.memory_source,
+            MemorySource::PerAgentDb {
+                path: home.join("state.db")
+            }
+        );
+
+        let named = &bindings[1];
+        assert_eq!(named.runtime_agent, "agent_a");
+        assert_eq!(named.workspace, prof);
+        assert_eq!(
+            named.memory_source,
+            MemorySource::PerAgentDb {
+                path: prof.join("state.db")
+            }
+        );
+        // Lazy tolerance: the profile binds even though state.db does not exist.
+        assert!(!prof.join("state.db").exists());
+    }
+
+    #[test]
+    fn discover_agents_default_only_when_no_profiles_dir() {
+        let dir = make_home(false);
+        let bindings = discover_agents(dir.path()).unwrap();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].runtime_agent, "default");
+        assert_eq!(bindings[0].workspace.as_path(), dir.path());
+    }
+
+    #[test]
+    fn default_profile_export_excludes_runtime_and_nested_profiles() {
+        // The default profile's workspace is `~/.hermes` itself, interleaved
+        // with the shared runtime. Exporting it must carry agent data only —
+        // no runtime dirs, no nested named profiles, no state.db binary.
+        let dir = make_home(true);
+        let home = dir.path();
+        for d in ["node", "bin", "hermes-agent"] {
+            fs::create_dir_all(home.join(d)).unwrap();
+            fs::write(home.join(d).join("junk.txt"), "runtime").unwrap();
+        }
+        let nested = home.join("profiles").join("agent_a").join("memories");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("MEMORY.md"), "OTHER PROFILE DATA").unwrap();
+        // The per-agent vault KEY lives under `~/.hermes/state/<id>/` (WP5). It
+        // must NEVER travel in an archive — `state/` is not in the allowlist.
+        let key_dir = home
+            .join("state")
+            .join("11111111-1111-1111-1111-111111111111");
+        fs::create_dir_all(&key_dir).unwrap();
+        fs::write(key_dir.join(".alf-vault-key"), "TOPSECRETKEYBYTES").unwrap();
+
+        let out = home.join("out.alf");
+        let report = export(home, &out).unwrap();
+
+        for leaked in [
+            "node",
+            "bin",
+            "hermes-agent",
+            "profiles",
+            "state.db",
+            "state/",
+        ] {
+            assert!(
+                !report.raw_sources.iter().any(|s| s.starts_with(leaked)),
+                "default-profile export leaked {leaked:?}: {:?}",
+                report.raw_sources
+            );
+        }
+        // Sanity: it DID carry the agent data + the schema sidecar.
+        assert!(report.raw_sources.iter().any(|s| s == "SOUL.md"));
+        assert!(report.raw_sources.iter().any(|s| s == "memories/MEMORY.md"));
+        assert!(report.raw_sources.iter().any(|s| s == SCHEMA_SIDECAR));
     }
 }

@@ -64,6 +64,12 @@ class FrameworkKit(ABC):
     home_mount: str = ""                 # container path of the framework home
     agent_slots: list = ["default"]
     config_paths: list = []              # home-relative files of config interest
+    # Some frameworks install their RUNTIME inside the framework home (Hermes:
+    # ~/.hermes/hermes-agent + node + bin). The harness bind-mounts a fresh host
+    # dir over the home per run, which would shadow that runtime. When True, the
+    # runner seeds the run's home from the image's home_mount first, so the
+    # mounted home is the real colocated install a user has (not an empty dir).
+    seed_home_from_image: bool = False
 
     # -- narration: how THIS framework physically stores memory (design §3). The
     #    stage narrator speaks through these so it never says "brain.db" for a

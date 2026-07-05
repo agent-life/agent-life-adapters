@@ -1,14 +1,27 @@
-# Hermes lifecycle image — hardened pin (WP2 stub; the kit lands in WP5).
+# Hermes lifecycle image (WP5). Hardened pin; kit-driven stages.
 #
 # Derived from adapter-hermes/testkit/Dockerfile.multiagent (SOFT branch pin);
 # hardened to the verified release tag. The Hermes installer self-installs its
 # own Node 22 and uv — this is a HEAVY build (uv sync + frontend build).
 # Invariants: NO alf, NO secrets in any layer (D6).
 #
+# TYPICAL COLOCATED INSTALL: a default Hermes install puts BOTH the runtime
+# (hermes-agent/venv/node/bin) AND agent data under HERMES_HOME (~/.hermes) —
+# exactly what a real user has. The lifecycle harness bind-mounts a fresh host
+# dir over HERMES_HOME per run, which would shadow the colocated runtime; the
+# runner therefore SEEDS each run's home from this image's ~/.hermes first (kit
+# `seed_home_from_image`), so the mounted home IS the real install (runtime +
+# data) and the venv's absolute `/home/agent/.hermes/...` paths resolve. No
+# code/data split — the image install stays the standard one users get.
+#
 # Build:  docker build -t alf-lifecycle-hermes tests/lifecycle/frameworks/hermes
 FROM debian:bookworm-slim
 
-ARG HERMES_REF=v0.17.0
+# Upstream tags releases by DATE (`v2026.6.19`), not by the semver the CLI
+# reports. `hermes --version` prints "Hermes Agent v0.17.0 (2026.6.19) …", so the
+# 0.17.0 release is git tag v2026.6.19 — HERMES_REF is the clone ref, and
+# HERMES_VERSION is the CLI-reported semver the guard/kit match on.
+ARG HERMES_REF=v2026.6.19
 ARG HERMES_VERSION=0.17.0
 ENV DEBIAN_FRONTEND=noninteractive
 
@@ -20,6 +33,8 @@ RUN apt-get update \
 RUN useradd -m -s /bin/bash agent
 USER agent
 WORKDIR /home/agent
+# Standard colocated install: runtime + data both under HERMES_HOME (what users
+# get). The runner seeds each run's mounted home from this dir (see header).
 ENV HERMES_HOME=/home/agent/.hermes
 
 # Idiomatic install, non-interactive: skip the API-key wizard and the heavy

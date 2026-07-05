@@ -136,9 +136,10 @@ pub fn default_key_path(runtime: &str, agent: Option<Uuid>) -> Result<Option<Pat
     let state_dir = match runtime {
         "openclaw" => home.join(".openclaw").join("state"),
         "zeroclaw" => home.join(".zeroclaw").join("state"),
-        // WP5: hermes gets a per-agent key path (`~/.hermes/state/<id>/`) only
-        // after live-install verification — pinned to None until then.
-        "hermes" => return Ok(None),
+        // WP5: `~/.hermes/state/<id>/.alf-vault-key`. `state/` is outside every
+        // profile's synced unit (profiles hold a `state.db` *file*, never a
+        // `state/` dir), so the key never travels in an archive.
+        "hermes" => home.join(".hermes").join("state"),
         _ => return Ok(None),
     };
     let path = match agent {
@@ -261,8 +262,8 @@ mod tests {
         assert_eq!(legacy_default_key_path("openclaw").unwrap().unwrap(), p);
     }
 
-    /// U-2: per-agent key paths are distinct per agent; hermes stays None
-    /// until WP5; unknown runtimes have no default file.
+    /// U-2: per-agent key paths are distinct per agent; hermes resolves under
+    /// `~/.hermes/state/` (WP5); unknown runtimes have no default file.
     #[test]
     fn default_key_path_per_agent_distinct() {
         let _guard = HOME_LOCK.lock().unwrap();
@@ -286,9 +287,23 @@ mod tests {
                 .join(".alf-vault-key")
         );
 
-        // WP5 pin: hermes has no default key path yet, even with an agent.
-        assert!(default_key_path("hermes", Some(uuid(1))).unwrap().is_none());
-        assert!(default_key_path("hermes", None).unwrap().is_none());
+        // WP5: hermes resolves under `~/.hermes/state/<id>/.alf-vault-key`,
+        // mirroring the openclaw/zeroclaw arms.
+        assert_eq!(
+            default_key_path("hermes", Some(uuid(1))).unwrap().unwrap(),
+            tmp.path()
+                .join(".hermes")
+                .join("state")
+                .join(uuid(1).to_string())
+                .join(".alf-vault-key")
+        );
+        assert_eq!(
+            default_key_path("hermes", None).unwrap().unwrap(),
+            tmp.path()
+                .join(".hermes")
+                .join("state")
+                .join(".alf-vault-key")
+        );
         assert!(default_key_path("unknownruntime", Some(uuid(1)))
             .unwrap()
             .is_none());
@@ -448,10 +463,19 @@ mod tests {
         );
         assert!(cli_err.remedy.contains("--agent"));
 
-        // Hermes (no default path until WP5): the remedy is the flag list.
+        // Hermes (WP5): has a per-agent default key path, so the remedy names
+        // `keygen` + the per-agent path, exactly like openclaw.
         let err = expect_err(resolve_required(&args, "hermes", Some(uuid(3))));
         let cli_err = err.downcast_ref::<CliError>().expect("coded error");
-        assert!(!cli_err.remedy.contains("keygen"));
-        assert!(cli_err.remedy.contains("--vault-key-file"));
+        assert_eq!(cli_err.code, codes::VAULT_KEY_UNRESOLVED);
+        assert!(cli_err.remedy.contains("alf vault keygen --out"));
+        assert!(
+            cli_err
+                .remedy
+                .contains(&format!("{}/.alf-vault-key", uuid(3))),
+            "remedy must name the per-agent key path: {}",
+            cli_err.remedy
+        );
+        assert!(cli_err.remedy.contains("--agent"));
     }
 }

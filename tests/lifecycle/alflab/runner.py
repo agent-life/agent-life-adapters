@@ -23,7 +23,9 @@ from typing import Optional
 from . import provision, stages, ui
 from .config import HarnessConfig
 from .contract import KitEnv, SkipStage
-from .dockerctl import DockerContainer, DockerError, build_image, host_sha256, ALF_DIST
+from .dockerctl import (
+    DockerContainer, DockerError, build_image, host_sha256, seed_home_from_image, ALF_DIST,
+)
 from .narrator import InteractiveAbort, NullNarrator, RichNarrator
 from .provision import Manifest, RuntimeCreds
 from .report import RunReport, StageResult
@@ -317,6 +319,13 @@ def main(argv=None) -> int:
 
         run.container = DockerContainer(container_name, run.kit.image_tag)
         run.container.destroy()  # stale name from a crashed run
+        # Frameworks whose runtime lives inside the framework home (Hermes) need
+        # the run's fresh home seeded from the image, or the bind-mount would
+        # shadow the runtime. Makes the mounted home the real colocated install.
+        if run.kit.seed_home_from_image:
+            ui.ok(f"seeding {run.kit.home_mount} from image (real colocated install)")
+            seed_home_from_image(run.kit.image_tag, run.kit.home_mount, home,
+                                 f"{container_name}-seed")
         run.container.start(
             mounts=[
                 (home, run.kit.home_mount, "rw"),

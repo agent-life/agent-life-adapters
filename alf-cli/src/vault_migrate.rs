@@ -52,7 +52,8 @@ pub(crate) enum MigrationPlan {
         /// `(from, to)` for the vault leg, when a legacy vault exists.
         vault: Option<(PathBuf, PathBuf)>,
         /// `(from, to)` for the key leg, when a legacy key exists and the
-        /// runtime has a per-agent key path (hermes: always `None`, WP5).
+        /// runtime has a per-agent key path. All three runtimes now have one;
+        /// the leg is `None` only when no legacy key file is present to move.
         key: Option<(PathBuf, PathBuf)>,
     },
 }
@@ -168,8 +169,10 @@ pub(crate) fn plan_migration(
         None
     };
 
-    // Key leg. Hermes has no per-agent key path until WP5 — its (nonexistent)
-    // legacy key leg is always a no-op via `legacy_default_key_path`.
+    // Key leg. A fresh WP5 hermes install has no legacy no-agent key file
+    // (`~/.hermes/state/.alf-vault-key` was never written under the old None
+    // arm), so `legacy_key` is `None` and this leg is a no-op — the pre-WP5
+    // behavior is preserved without a special case.
     let key_leg = match (
         &legacy_key,
         vault_key::default_key_path(runtime, Some(agent))?,
@@ -197,8 +200,8 @@ pub(crate) fn plan_migration(
     };
 
     if vault_leg.is_none() && key_leg.is_none() {
-        // A legacy key exists but the runtime has no per-agent key path
-        // (hermes until WP5): nothing movable.
+        // A legacy vault or key file was seen but neither leg is movable
+        // (e.g. the legacy key path resolves to a file that isn't present).
         return Ok(MigrationPlan::NotNeeded);
     }
 

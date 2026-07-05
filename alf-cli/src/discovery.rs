@@ -439,6 +439,32 @@ mod tests {
         }
     }
 
+    /// A Hermes-shaped binding: profile-isolated, `runtime_agent_id: None`
+    /// (matched by workspace/alias), `PerAgentDb` at `<profile>/state.db`.
+    fn hermes_binding(alias: &str, workspace: &str) -> AgentBinding {
+        AgentBinding {
+            runtime_agent: alias.into(),
+            runtime_agent_id: None,
+            workspace: PathBuf::from(workspace),
+            memory_source: MemorySource::PerAgentDb {
+                path: PathBuf::from(workspace).join("state.db"),
+            },
+            default_enabled: true,
+        }
+    }
+
+    fn hermes_entry(alias: &str, id: Uuid, workspace: &str) -> AgentEntry {
+        AgentEntry {
+            runtime: Some("hermes".into()),
+            runtime_agent: alias.into(),
+            runtime_agent_id: None,
+            alf_agent_id: id,
+            workspace: workspace.into(),
+            enabled: true,
+            extra: BTreeMap::new(),
+        }
+    }
+
     fn ctx() -> AllocationContext {
         AllocationContext {
             workspace_ids: BTreeMap::new(),
@@ -689,6 +715,50 @@ mod tests {
             by_ws("/home/u/.openclaw/workspace-researcher")
                 .entry
                 .alf_agent_id,
+            uuid(2)
+        );
+        assert!(out.drift.is_empty());
+    }
+
+    #[test]
+    fn hermes_profiles_reconcile_by_workspace_path() {
+        // Hermes is profile-isolated: the default profile's workspace is the
+        // home root (`~/.hermes`) and each named profile is `profiles/<name>/`,
+        // all `runtime_agent_id: None` + `PerAgentDb`. The default alias is
+        // stable ("default"), while a re-checked named profile is reported under
+        // a different alias at the SAME workspace path — so for the named row
+        // rule 1 (runtime id) and rule 3 (alias) both miss and only workspace-
+        // path matching (rule 2) can preserve its alf_agent_id.
+        let existing = vec![
+            hermes_entry("default", uuid(1), "/home/u/.hermes"),
+            hermes_entry("agent_a", uuid(2), "/home/u/.hermes/profiles/agent_a"),
+        ];
+        let out = reconcile(
+            &existing,
+            &[
+                hermes_binding("default", "/home/u/.hermes"),
+                hermes_binding("agent_a_renamed", "/home/u/.hermes/profiles/agent_a"),
+            ],
+            "hermes",
+            &ctx_derived(&[
+                ("/home/u/.hermes", uuid(0xD1)),
+                ("/home/u/.hermes/profiles/agent_a", uuid(0xD2)),
+            ]),
+        );
+
+        assert_eq!(out.rows.len(), 2);
+        assert!(out.rows.iter().all(|r| r.status == RowStatus::Existing));
+        let by_ws = |ws: &str| {
+            out.rows
+                .iter()
+                .find(|r| r.entry.workspace == ws)
+                .expect("row for workspace")
+        };
+        // Default profile at the home root: id preserved.
+        assert_eq!(by_ws("/home/u/.hermes").entry.alf_agent_id, uuid(1));
+        // Named profile: id preserved by workspace path despite the alias change.
+        assert_eq!(
+            by_ws("/home/u/.hermes/profiles/agent_a").entry.alf_agent_id,
             uuid(2)
         );
         assert!(out.drift.is_empty());

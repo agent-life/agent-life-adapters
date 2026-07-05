@@ -22,7 +22,8 @@ use anyhow::Result;
 use uuid::Uuid;
 
 pub use alf_core::adapter::{
-    ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport, WorkspaceEnumeration,
+    AgentBinding, ArchiveEnumeration, ExportReport, FileEntry, ImportOptions, ImportReport,
+    WorkspaceEnumeration,
 };
 pub use alf_core::Adapter;
 
@@ -75,5 +76,16 @@ impl Adapter for HermesAdapter {
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
         export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP5: enumerate the Hermes profiles in an install — the default profile
+    /// (`~/.hermes` itself) plus each `profiles/<name>/` — one `PerAgentDb`
+    /// binding per profile. Overrides the WP0 single-agent fallback. The WP0
+    /// default `export_agent`/`import_agent` already retarget `binding.workspace`
+    /// and Hermes's export allowlist excludes the shared runtime by construction,
+    /// so no override of those is needed — Hermes's profile isolation makes them
+    /// correct (the OpenClaw posture).
+    fn discover_agents(&self, install: &Path) -> Result<Vec<AgentBinding>> {
+        export::discover_agents(install)
     }
 }

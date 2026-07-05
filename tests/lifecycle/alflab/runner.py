@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import provision, stages, ui
+from . import models, provision, stages, ui
 from .config import HarnessConfig
 from .contract import KitEnv, SkipStage
 from .dockerctl import (
@@ -257,8 +257,18 @@ def main(argv=None) -> int:
         # -- P2 mint + P4 probe (before any docker work) -----------------------
         if run.backend == "real":
             ui.section("OPS", "Mint runtime credentials (one per driver invocation)")
+            if args.model:
+                run_model = models.resolve(args.model)
+                if run_model is None:
+                    ui.warn(f"--model {args.model!r} is not a known alias/index; "
+                            "forwarding verbatim as a model id (must be in the "
+                            "proxy allowlist)")
+                    run_model = args.model
+            else:
+                run_model = models.default_for(args.framework)
+            ui.emit(f"  model: {run_model} ({models.label_for(run_model)})")
             run.creds = provision.mint(cfg.service_repo, args.framework, run_dir,
-                                       model=args.model)
+                                       model=run_model)
             provision.write_run_env(run_dir, run.creds)
             run.manifest.tenant_id = run.creds.tenant_id
             run.manifest.seed_agent_id = run.creds.seed_agent_id

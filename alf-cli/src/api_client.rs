@@ -244,11 +244,25 @@ impl ApiClient {
                 })
             }
             StatusCode::CONFLICT => {
-                let info = self.get_agent(agent_id)?;
-                Ok(RegisterAgentOutcome {
-                    info,
-                    already_existed: true,
-                })
+                // A 409 usually means this id is already registered (the E3
+                // guard's "already exists" path). But the service also returns
+                // 409 for a per-tenant NAME collision (`agents_tenant_name_unique`)
+                // while reporting it as "agent <id> already exists" — so confirm
+                // by id. If the id genuinely exists, it's the E3 case; if the
+                // follow-up GET 404s, the conflict was on the name, not the id.
+                match self.get_agent(agent_id) {
+                    Ok(info) => Ok(RegisterAgentOutcome {
+                        info,
+                        already_existed: true,
+                    }),
+                    Err(_) => bail!(
+                        "registration rejected (HTTP 409) but no agent exists with id \
+                         {agent_id} — the agent NAME '{name}' is already in use by another \
+                         agent in this tenant (names must be unique). This is usually two \
+                         agents from one install resolving to the same name; give them \
+                         distinct names and re-run `alf sync`."
+                    ),
+                }
             }
             status => {
                 let body = resp.text().unwrap_or_default();

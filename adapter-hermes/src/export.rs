@@ -536,6 +536,70 @@ fn load_agent_vault(vault_path: Option<&Path>) -> Result<Option<alf_core::Creden
 }
 
 // ---------------------------------------------------------------------------
+// Runtime version detection
+// ---------------------------------------------------------------------------
+
+/// First `<digits>.<digits>.<digits>` run in `text`, if any. Hand-rolled to
+/// avoid a regex dependency; mirrors the harness kit's `\d+\.\d+\.\d+` scan.
+fn extract_semver(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            let parts: Vec<&str> = run.split('.').collect();
+            if parts.len() >= 3
+                && parts[..3]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+            }
+        } else {
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Best-effort Hermes version via `hermes --version` (e.g.
+/// `"Hermes Agent v0.17.0 (2026.6.19) ..."` → `"0.17.0"`). `None` when the
+/// binary is absent or unparseable — Hermes has no version field in
+/// `config.yaml` or `state.db`, so the CLI is the only source. Host unit tests
+/// (no `hermes` on PATH) correctly yield `None`; live runs execute `alf` inside
+/// the container where `hermes` resolves.
+fn detect_hermes_version() -> Option<String> {
+    let output = std::process::Command::new("hermes")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        stdout.into_owned()
+    };
+    extract_semver(&text)
+}
+
+/// Best-effort `state.db` `schema_version` (16 on a real install), or `None`
+/// when there is no `state.db` (lazy install) or no version row.
+fn detect_state_schema_version(home: &Path) -> Option<i64> {
+    let db = home.join("state.db");
+    if !db.is_file() {
+        return None;
+    }
+    let sv = session_extractor::capture_state_schema(&db)
+        .ok()?
+        .schema_version;
+    (sv >= 0).then_some(sv)
+}
+
+// ---------------------------------------------------------------------------
 // Export entry point
 // ---------------------------------------------------------------------------
 
@@ -548,7 +612,8 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
     let config = load_config(home)?;
     let agent_id = resolve_agent_id(home)?;
     let agent_name = identity_parser::detect_agent_name(home, &config);
-    let runtime_version: Option<String> = None;
+    let runtime_version = detect_hermes_version();
+    let schema_version = detect_state_schema_version(home);
 
     // Records: curated memory + sessions.
     let records = collect_records(home, agent_id, runtime_version.as_deref())?;
@@ -644,7 +709,14 @@ pub fn export(home: &Path, output: &Path) -> Result<ExportReport> {
             name: agent_name.clone(),
             source_runtime: RUNTIME.to_string(),
             source_runtime_version: runtime_version,
-            extra: std::collections::HashMap::new(),
+            extra: schema_version
+                .map(|sv| {
+                    std::collections::HashMap::from([(
+                        "schema_version".to_string(),
+                        serde_json::json!(sv),
+                    )])
+                })
+                .unwrap_or_default(),
         },
         layers: LayerInventory {
             identity: has_identity.then(|| IdentityLayerInfo {
@@ -802,6 +874,33 @@ mod tests {
             c.execute("INSERT INTO messages (session_id,role,content,timestamp) VALUES ('20260101_120000_aa','user','hi',1767268800.0)", []).unwrap();
         }
         dir
+    }
+
+    #[test]
+    fn extract_semver_variants() {
+        assert_eq!(
+            extract_semver("Hermes Agent v0.17.0 (2026.6.19) built abc").as_deref(),
+            Some("0.17.0")
+        );
+        assert_eq!(extract_semver("0.17.0").as_deref(), Some("0.17.0"));
+        assert_eq!(extract_semver("1.2.3.4-rc").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver("no version at all"), None);
+        assert_eq!(extract_semver("only v1.2 here"), None);
+    }
+
+    #[test]
+    fn detect_hermes_version_is_graceful() {
+        // Best-effort: must never panic whether or not `hermes` is on PATH.
+        let _ = detect_hermes_version();
+    }
+
+    #[test]
+    fn state_schema_version_present_and_absent() {
+        assert_eq!(
+            detect_state_schema_version(make_home(true).path()),
+            Some(16)
+        );
+        assert_eq!(detect_state_schema_version(make_home(false).path()), None);
     }
 
     #[test]

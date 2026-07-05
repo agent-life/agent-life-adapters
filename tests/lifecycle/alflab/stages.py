@@ -667,21 +667,27 @@ def z13_idle_resync(run, result: StageResult):
         """)
         nar.flow("alf sync (idle) ──▶ no_changes ⊙ latest_sequence unchanged, deltas empty")
         # Scope to the primary agent: after the multi-agent stages a bare sync is
-        # ambiguous (default + agent_b both enabled). default's slice is idle
-        # since Z7, so this still resolves to no_changes.
+        # ambiguous (default + agent_b both enabled). The idle test is "THIS sync
+        # adds nothing", so baseline against the backend's current tip (like Z12's
+        # pre_seq), NOT run.state["sequence"] (frozen at Z7). The primary's
+        # sequence legitimately advanced past Z7: adding agent_b (Z8) rewrote the
+        # shared config.toml, which is a raw source in default's archive too, so
+        # Z10's `sync --all` uploaded a real config delta for default.
         slot = kit.agent_slots[0]
+        agent_id = run.state.get("alf_agent_id", "")
+        r0 = run.api.get(f"/agents/{agent_id}")
+        base_seq = ((r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0))
+                    if r0.status_code == 200 else run.state.get("sequence", 0))
         proc, res = run.container.exec_json(
             ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
         result.add(_passfail(bool(res) and res.get("no_changes") is True,
                              "idle re-sync: no_changes == true"))
-        agent_id = run.state.get("alf_agent_id", "")
-        seq = run.state.get("sequence", 0)
         r = run.api.get(f"/agents/{agent_id}")
         body = r.json() if r.status_code == 200 else {}
-        result.add(_passfail(body.get("latest_sequence") == seq,
-                             "⊙ API: latest_sequence unchanged",
-                             f"{body.get('latest_sequence')} == {seq}"))
-        rd = run.api.get(f"/agents/{agent_id}/deltas?since={seq}")
+        result.add(_passfail(body.get("latest_sequence") == base_seq,
+                             "⊙ API: latest_sequence unchanged by idle sync",
+                             f"{body.get('latest_sequence')} == {base_seq}"))
+        rd = run.api.get(f"/agents/{agent_id}/deltas?since={base_seq}")
         deltas = (rd.json() or {}).get("deltas", []) if rd.status_code == 200 else None
         result.add(_passfail(deltas == [], "⊙ API: deltas?since=<seq> empty",
                              f"HTTP {rd.status_code}"))

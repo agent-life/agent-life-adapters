@@ -95,6 +95,23 @@ class ZeroClawKit(FrameworkKit):
                        "has_workspace_dir": has_workspace_dir},
         }
 
+    @staticmethod
+    def _agent_block(alias: str) -> str:
+        """The explicit, runnable `[agents.<alias>]` block — IDENTICAL for every
+        agent (the `default` written here in `wire_llm` and any second agent
+        added in `create_agent`). 0.8.2 requires an explicit `risk_profile` to
+        run an agent standalone via `agent -a`; `zeroclaw agents create` alone
+        writes a delegating profile that fails validation (see `create_agent`).
+        Keeping the two agents symmetric is deliberate — a working second agent
+        looks exactly like the first."""
+        return (
+            f"[agents.{alias}]\n"
+            'model_provider = "custom.agentlife"\n'
+            'risk_profile = "assistant"\n'
+            'runtime_profile = "assistant"\n'
+            'channels = ["cli"]\n'
+        )
+
     def wire_llm(self, ctr, creds) -> None:
         """Point the sole agent at the LLM proxy (converse.sh wiring). 0.8.2
         requires a declared [agents.<alias>] block to drive an agent via the
@@ -115,11 +132,7 @@ class ZeroClawKit(FrameworkKit):
             f'uri = "{base}"\n'
             f'model = "{creds.llm_model_id}"\n'
             f'api_key = "{creds.runtime_api_key}"\n\n'
-            "[agents.default]\n"
-            'model_provider = "custom.agentlife"\n'
-            'risk_profile = "assistant"\n'
-            'runtime_profile = "assistant"\n'
-            'channels = ["cli"]\n\n'
+            + self._agent_block("default") + "\n"
             "[risk_profiles.assistant]\n"
             'level = "full"\n'
             "allowed_commands = []\n\n"
@@ -229,23 +242,51 @@ class ZeroClawKit(FrameworkKit):
 
     # -- Z8 / Z12 (WP3 multi-agent + restore) --------------------------------------
 
+    @staticmethod
+    def _replace_section(text: str, header: str, replacement: str) -> str:
+        """Replace the BODY of the top-level TOML section `header` (from the
+        header line up to the next `[...]` header or EOF) with `replacement`
+        (which itself includes the header line). Sub-tables like `[<header>.x]`
+        are preserved. If the section is absent, `replacement` is appended."""
+        if header not in text:
+            return f"{text.rstrip()}\n\n{replacement}"
+        lines = text.splitlines(keepends=True)
+        out, i, n = [], 0, len(lines)
+        while i < n:
+            if lines[i].strip() == header:
+                out.append(replacement if replacement.endswith("\n") else replacement + "\n")
+                out.append("\n")
+                i += 1
+                while i < n and not lines[i].lstrip().startswith("["):
+                    i += 1
+            else:
+                out.append(lines[i])
+                i += 1
+        return "".join(out)
+
     def create_agent(self, ctr, slot: str) -> None:
-        """Configure a second agent. `zeroclaw agents create <alias>` writes a
-        config-only `[agents.<alias>]` block (no brain.db row — that appears when
-        the slot is first seeded). We run the framework CLI, then ensure the
-        declared block exists host-side so discovery sees the agent regardless of
-        the CLI's exact output on this pin."""
+        """Configure a second agent, symmetric with `default`.
+
+        A real user runs `zeroclaw agents create <alias>` — but on 0.8.2 that
+        writes an `[agents.<alias>]` block that DELEGATES its risk profile
+        (`delegate_same_risk_profile = true`, no explicit `risk_profile`).
+        Running `zeroclaw agent -a <alias>` standalone (the documented, required
+        way to run an agent — there is no default agent) then fails validation
+        ("agents.<alias>.risk_profile does not name a configured risk_profiles
+        entry"), because delegation has no parent: the agent never initializes,
+        its turns no-op, no memory is written, and no brain.db `agents` row is
+        materialized (Z10 saw b=0/4). So after the CLI call we rewrite the top
+        block to the SAME explicit form `wire_llm` gives `default`
+        ([`_agent_block`]) — a working second agent looks exactly like the first.
+        The brain.db row still materializes lazily, on the first `agent -a` turn
+        (Z10). This mirrors what a real user must do on 0.8.2; the guide
+        documents it as a ZeroClaw second-agent onboarding step."""
         ctr.exec(["zeroclaw", "agents", "create", slot], timeout=60)
         text = self._config.read_text(encoding="utf-8") if self._config.is_file() else ""
-        if f"[agents.{slot}]" not in text:
-            block = (
-                f"\n[agents.{slot}]\n"
-                'model_provider = "custom.agentlife"\n'
-                'risk_profile = "assistant"\n'
-                'runtime_profile = "assistant"\n'
-                'channels = ["cli"]\n'
-            )
-            self._config.write_text(text + block, encoding="utf-8")
+        self._config.write_text(
+            self._replace_section(text, f"[agents.{slot}]", self._agent_block(slot)),
+            encoding="utf-8",
+        )
 
     def agent_declared(self, ctr, slot: str) -> bool:
         """ZeroClaw declares agents as `[agents.<alias>]` TOML blocks."""

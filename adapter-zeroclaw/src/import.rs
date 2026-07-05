@@ -825,7 +825,9 @@ mod tests {
         fs::create_dir_all(&target_ws).unwrap();
 
         let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
-        assert_eq!(import_report.agent_name, "ZCBot");
+        // Agent name round-trips as the per-agent alias (WP6 unique-name fix),
+        // not the shared-install SOUL.md H1 "ZCBot".
+        assert_eq!(import_report.agent_name, "agent_a");
         assert!(import_report.identity_imported);
         assert_eq!(import_report.principals_count, 1);
 

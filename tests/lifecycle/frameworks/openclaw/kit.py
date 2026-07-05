@@ -139,7 +139,7 @@ class OpenClawKit(FrameworkKit):
             "baseUrl": base,
             "apiKey": creds.runtime_api_key,
             "api": "openai-completions",
-            "models": [{"id": creds.llm_model_id, "name": "MiniMax"}],
+            "models": [{"id": creds.llm_model_id, "name": creds.llm_model_id}],
         })
         ctr.exec(["openclaw", "config", "set",
                   "models.providers.agent-life", provider], timeout=60)

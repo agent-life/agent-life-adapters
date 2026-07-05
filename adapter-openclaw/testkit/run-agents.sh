@@ -24,7 +24,7 @@ docker run --rm --env-file "$ENV_FILE" \
   openclaw agents add agent_b --non-interactive --workspace "$HOME/.openclaw/workspace-agent_b" 2>&1 | filter >/dev/null
 
   base="${LLM_PROXY_URL%/}"; case "$base" in */v1) ;; *) base="$base/v1";; esac
-  prov=$(printf "{\"baseUrl\":\"%s\",\"apiKey\":\"%s\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"%s\",\"name\":\"MiniMax\"}]}" "$base" "$RUNTIME_API_KEY" "$BEDROCK_MODEL_ID")
+  prov=$(printf "{\"baseUrl\":\"%s\",\"apiKey\":\"%s\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"%s\",\"name\":\"%s\"}]}" "$base" "$RUNTIME_API_KEY" "$BEDROCK_MODEL_ID" "$BEDROCK_MODEL_ID")
   openclaw config set models.providers.agent-life "$prov"     2>&1 | filter | grep -v "$RUNTIME_API_KEY" >/dev/null || true
   openclaw config set agents.defaults.model "agent-life/$BEDROCK_MODEL_ID" 2>&1 | filter >/dev/null
 

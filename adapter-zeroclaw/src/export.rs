@@ -133,7 +133,64 @@ fn detect_zeroclaw_version(zc_home: &Path) -> Option<String> {
             }
         }
     }
+    // 0.8.2's config.toml carries `schema_version` but no top-level `version`,
+    // so fall back to the installed binary: `zeroclaw --version` prints e.g.
+    // "zeroclaw 0.8.2". Host unit tests (no binary on PATH) yield None; live
+    // runs execute `alf` inside the container where `zeroclaw` resolves.
+    detect_zeroclaw_version_from_binary()
+}
+
+/// `zeroclaw --version` → first `X.Y.Z`, or `None` when the binary is absent.
+fn detect_zeroclaw_version_from_binary() -> Option<String> {
+    let output = std::process::Command::new("zeroclaw")
+        .arg("--version")
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let text = if stdout.trim().is_empty() {
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    } else {
+        stdout.into_owned()
+    };
+    extract_semver(&text)
+}
+
+/// First `<digits>.<digits>.<digits>` run in `text`, if any. Hand-rolled to
+/// avoid a regex dependency.
+fn extract_semver(text: &str) -> Option<String> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i].is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let run: String = chars[start..i].iter().collect();
+            let parts: Vec<&str> = run.split('.').collect();
+            if parts.len() >= 3
+                && parts[..3]
+                    .iter()
+                    .all(|p| !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()))
+            {
+                return Some(format!("{}.{}.{}", parts[0], parts[1], parts[2]));
+            }
+        } else {
+            i += 1;
+        }
+    }
     None
+}
+
+/// Best-effort top-level `schema_version` from ZeroClaw `config.toml` (=3 on
+/// 0.8.2), or `None` when absent. Recorded alongside `source_runtime_version`.
+fn detect_config_schema_version(zc_home: &Path) -> Option<i64> {
+    let content = fs::read_to_string(zc_home.join("config.toml")).ok()?;
+    content
+        .parse::<toml::Value>()
+        .ok()?
+        .get("schema_version")?
+        .as_integer()
 }
 
 // ---------------------------------------------------------------------------
@@ -428,7 +485,7 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
     let total_size = files.iter().map(|f| f.size).sum();
 
     let agent_id = resolve_agent_id_readonly(&zc_home)?;
-    let agent_name = identity_parser::detect_agent_name(&zc_home, &config);
+    let detected_name = identity_parser::detect_agent_name(&zc_home, &config);
     let runtime_version = detect_zeroclaw_version(&zc_home);
     let target = slice_target_for(workspace, &zc_home);
     let slice = read_memory_slice(
@@ -438,6 +495,9 @@ pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
         &target,
         runtime_version.as_deref(),
     )?;
+    // Match the real export path: the per-agent alias is the unique name a sync
+    // would register (see the WP6 note in `export`), so a dry-run preview shows it.
+    let agent_name = slice.provenance.alias.clone().unwrap_or(detected_name);
     warnings.extend(slice.warnings);
 
     // Surface (but do not prune — this is read-only) tracked files that have
@@ -830,7 +890,7 @@ fn export_impl(
     let config = load_config(install)?;
 
     // 2. Name + version
-    let agent_name = identity_parser::detect_agent_name(install, &config);
+    let detected_name = identity_parser::detect_agent_name(install, &config);
     let runtime_version = detect_zeroclaw_version(install);
 
     // 3. Extract the agent's memory slice (per-agent for the shared brain.db)
@@ -843,6 +903,12 @@ fn export_impl(
     )?;
     let export_warnings = slice.warnings;
     let provenance = slice.provenance;
+    // ALF agent names must be unique per tenant (service `agents_tenant_name_unique`).
+    // Every agent in the shared brain.db exports from the same install root, so the
+    // detected name (SOUL.md H1 / install dir) is IDENTICAL across agents and a second
+    // agent's registration 409s. Use the per-agent alias as the name — it is the
+    // agent's own identity in the brain.db and is unique per install (WP6).
+    let agent_name = provenance.alias.clone().unwrap_or(detected_name);
     let records = slice.records;
     let total_records = records.len() as u64;
 
@@ -917,6 +983,9 @@ fn export_impl(
     }
     if let Some(alias) = &provenance.alias {
         agent_extra.insert("zeroclaw_alias".to_string(), serde_json::json!(alias));
+    }
+    if let Some(sv) = detect_config_schema_version(install) {
+        agent_extra.insert("schema_version".to_string(), serde_json::json!(sv));
     }
 
     // 6. Build manifest
@@ -1100,6 +1169,38 @@ mod tests {
     }
 
     #[test]
+    fn extract_semver_variants() {
+        assert_eq!(extract_semver("zeroclaw 0.8.2").as_deref(), Some("0.8.2"));
+        assert_eq!(
+            extract_semver("zeroclaw v0.8.2 (build 9)").as_deref(),
+            Some("0.8.2")
+        );
+        assert_eq!(extract_semver("1.2.3.4").as_deref(), Some("1.2.3"));
+        assert_eq!(extract_semver("no digits here"), None);
+        assert_eq!(extract_semver("v0.8"), None);
+    }
+
+    #[test]
+    fn config_schema_version_present_and_absent() {
+        let (_d, root) =
+            create_zeroclaw_home("schema_version = 3\n[memory]\nbackend = \"sqlite\"\n", &[]);
+        assert_eq!(detect_config_schema_version(&root), Some(3));
+        let (_d2, root2) = create_zeroclaw_home("[memory]\nbackend = \"sqlite\"\n", &[]);
+        assert_eq!(detect_config_schema_version(&root2), None);
+    }
+
+    #[test]
+    fn detect_version_prefers_config_then_binary() {
+        // An explicit config `version` wins (offline, deterministic).
+        let (_d, root) = create_zeroclaw_home("version = \"9.9.9\"\nschema_version = 3\n", &[]);
+        assert_eq!(detect_zeroclaw_version(&root).as_deref(), Some("9.9.9"));
+        // No config version → binary fallback (absent in tests → None, or a real
+        // semver if installed); must not panic.
+        let (_d2, root2) = create_zeroclaw_home("schema_version = 3\n", &[]);
+        let _ = detect_zeroclaw_version(&root2);
+    }
+
+    #[test]
     fn export_sqlite_workspace() {
         let config = r#"
 [memory]
@@ -1118,7 +1219,9 @@ format = "openclaw"
         let output = dir.path().join("test.alf");
         let report = export(&root, &output).unwrap();
 
-        assert_eq!(report.agent_name, "ZCAgent");
+        // The agent NAME is the per-agent alias (unique per tenant), not the
+        // shared-install SOUL.md H1 "ZCAgent" — WP6 fix for the sync --all 409.
+        assert_eq!(report.agent_name, "agent_a");
         assert_eq!(report.memory_records, 2);
         assert!(report.identity_version.is_some());
         assert!(output.is_file());
@@ -1152,6 +1255,59 @@ backend = "markdown"
 
         assert_eq!(report.agent_name, "MdAgent");
         assert_eq!(report.memory_records, 2);
+    }
+
+    #[test]
+    fn two_agents_export_distinct_names() {
+        // Regression guard for the sync --all 409: two agents in one shared
+        // brain.db must export DISTINCT names (their aliases), or the second's
+        // registration violates the tenant's unique-name constraint.
+        use rusqlite::Connection;
+        const B: &str = "bbbbbbbb-0000-0000-0000-0000000000b2";
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"\n\
+                      [agents.agent_a]\n[agents.agent_b]\n";
+        // A shared SOUL.md → detect_agent_name is identical for both; only the
+        // alias distinguishes them.
+        let (dir, root) = create_zeroclaw_home(config, &[("SOUL.md", "# SharedSoul\n")]);
+        let db = brain_db::real_schema_db(
+            &root.join("data").join("memory"),
+            &[(A, "agent_a"), (B, "agent_b")],
+        );
+        let conn = Connection::open(&db).unwrap();
+        for (id, key, aid) in [
+            ("11111111-0000-0000-0000-000000000001", "k_a", A),
+            ("22222222-0000-0000-0000-000000000002", "k_b", B),
+        ] {
+            conn.execute(
+                "INSERT INTO memories (id, key, content, category, embedding, created_at, \
+                 updated_at, session_id, namespace, importance, superseded_by, agent_id) \
+                 VALUES (?1,?2,'c','core',NULL,'2026-01-15T10:00:00Z','2026-01-15T10:00:00Z',\
+                 NULL,'default',0.5,NULL,?3)",
+                rusqlite::params![id, key, aid],
+            )
+            .unwrap();
+        }
+
+        let export_alias = |alias: &str, zid: &str| {
+            let binding = AgentBinding {
+                runtime_agent: alias.to_string(),
+                runtime_agent_id: Some(zid.to_string()),
+                workspace: root.join("agents").join(alias).join("workspace"),
+                memory_source: MemorySource::SharedDb {
+                    path: db.clone(),
+                    filter_key: "agent_id".to_string(),
+                },
+                default_enabled: true,
+            };
+            let out = dir.path().join(format!("{alias}.alf"));
+            export_agent(&binding, Uuid::parse_str(zid).unwrap(), &out).unwrap()
+        };
+
+        let ra = export_alias("agent_a", A);
+        let rb = export_alias("agent_b", B);
+        assert_eq!(ra.agent_name, "agent_a");
+        assert_eq!(rb.agent_name, "agent_b");
+        assert_ne!(ra.agent_name, rb.agent_name);
     }
 
     #[test]

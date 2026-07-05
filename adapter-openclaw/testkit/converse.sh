@@ -21,7 +21,7 @@ docker run --rm --env-file "$ENV_FILE" \
   . /scenario.sh
   filter(){ grep -viE "unsettled top-level await|if \(await|^\s*\^" || true; }
   base="${LLM_PROXY_URL%/}"; case "$base" in */v1) ;; *) base="$base/v1";; esac
-  prov=$(printf "{\"baseUrl\":\"%s\",\"apiKey\":\"%s\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"%s\",\"name\":\"MiniMax\"}]}" "$base" "$RUNTIME_API_KEY" "$BEDROCK_MODEL_ID")
+  prov=$(printf "{\"baseUrl\":\"%s\",\"apiKey\":\"%s\",\"api\":\"openai-completions\",\"models\":[{\"id\":\"%s\",\"name\":\"%s\"}]}" "$base" "$RUNTIME_API_KEY" "$BEDROCK_MODEL_ID" "$BEDROCK_MODEL_ID")
   openclaw config set models.providers.agent-life "$prov" >/dev/null 2>&1 || true
   openclaw config set agents.defaults.model "agent-life/$BEDROCK_MODEL_ID" >/dev/null 2>&1 || true
   LOGS="$HOME/.openclaw/logs/conversation"; mkdir -p "$LOGS"

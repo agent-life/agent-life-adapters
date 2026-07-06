@@ -16,6 +16,9 @@ mod state;
 mod vault_key;
 mod vault_migrate;
 
+#[cfg(test)]
+mod doc_cli_lint;
+
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use std::path::PathBuf;

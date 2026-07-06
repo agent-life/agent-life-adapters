@@ -434,7 +434,7 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
     {
       "ok": false,
-      "error": "Agent a1b2c3d4-... already exists in the cloud (latest_sequence = 7), but no local sync state was found at ~/.alf/state/. Refusing to upload as first sync to avoid overwriting cloud history. Either run `alf restore -r openclaw -w <workspace> -a a1b2c3d4-...` first to hydrate state, or pass --force-first-sync to overwrite the cloud agent with the current workspace. See docs/how_alf_syncs.md (case E3).",
+      "error": "Agent a1b2c3d4-... already exists in the cloud (latest_sequence = 7), but no local sync state was found at ~/.alf/state/. Refusing to upload as first sync to avoid overwriting cloud history. Either run `alf restore -r openclaw -w <workspace> --agent a1b2c3d4-...` first to hydrate state, or pass --force-first-sync to overwrite the cloud agent with the current workspace. See docs/how_alf_syncs.md (case E3).",
       "hint": "See docs/how_alf_syncs.md (case E3) before using --force-first-sync."
     }
 

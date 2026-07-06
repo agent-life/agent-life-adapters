@@ -1,7 +1,7 @@
 ---
 name: agent-life
 description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from cloud, or migrate agent state.
-version: 1.9.0
+version: 2.0.0
 metadata:
   openclaw:
     requires:
@@ -197,7 +197,7 @@ Once you have previewed the restore, run the destructive command. It writes into
 
 If multiple agents are tracked locally, specify which one:
 
-    alf restore -r openclaw -w <workspace> -a <agent-id>
+    alf restore -r openclaw -w <workspace> --agent <agent-id>
 
 Output:
 

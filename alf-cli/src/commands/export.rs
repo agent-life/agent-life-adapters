@@ -4,9 +4,10 @@ use crate::adapter;
 use crate::config::Config;
 use crate::output;
 use crate::selector;
-use alf_core::FileEntry;
+use alf_core::{Adapter, FileEntry};
 use anyhow::{bail, Result};
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::Path;
 
@@ -23,16 +24,22 @@ struct ExportResult {
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct ExportDryRunResult {
+/// The `alf export --dry-run` preview. Also the `alf_export_dry_run` MCP tool
+/// result — hence the `JsonSchema` derive (the FileEntry field is schema-shimmed,
+/// as `alf_core::FileEntry` cannot derive `JsonSchema`).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ExportDryRunResult {
     ok: bool,
     dry_run: bool,
     agent_name: String,
     memory_records: u64,
+    #[schemars(with = "Vec<crate::schema::FileEntrySchema>")]
     files: Vec<FileEntry>,
     excluded_by_alfignore: u32,
     total_size: u64,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // Skipped when empty but declared on a non-Option, so `#[serde(default)]` is
+    // required or schemars over-requires it in the outputSchema (M2a §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
 
@@ -62,32 +69,13 @@ pub fn run(
     // and the selection's workspace; only an empty mapping keeps the legacy
     // selector-free path.
     if dry_run {
-        let (workspace, adhoc) = if config.agents_for_runtime(runtime).is_empty() {
-            (
-                config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?,
-                true,
-            )
-        } else {
-            let install = crate::commands::check::resolve_workspace_required(
-                workspace_flag,
-                &config,
-                runtime,
-            )?;
-            let selected = selector::select_current_agent(
-                &mut config,
-                adapter.as_ref(),
-                runtime,
-                &install,
-                agent,
-            )?;
-            selector::effective_workspace(&selected, workspace_flag)
-        };
-        // Only validate an explicit -w target. A mapped per-agent workspace is
-        // adapter-owned and may not exist on disk (shared-store runtimes derive
-        // the install root from it); the adapter's dry-run tolerates that.
-        if adhoc {
-            check_workspace_dir(&workspace)?;
-        }
+        let workspace = resolve_dry_run_workspace(
+            &mut config,
+            adapter.as_ref(),
+            runtime,
+            workspace_flag,
+            agent,
+        )?;
         return run_dry_run(adapter.as_ref(), &workspace, human);
     }
 
@@ -212,8 +200,84 @@ fn check_workspace_dir(workspace: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Resolve the workspace an `export --dry-run` should preview. `--dry-run` writes
+/// nothing (CLI-1/IN-2) — including the mapping and `.alf-agent-id` — but must
+/// preview the same workspace the real export would use. With a mapping present
+/// the selector is read-only (lazy init only fires on an empty mapping), so honor
+/// `--agent`/`ALF_AGENT` and the selection's workspace; only an empty mapping
+/// keeps the legacy selector-free path. Shared by the CLI dry-run branch and the
+/// MCP `alf_export_dry_run` tool.
+fn resolve_dry_run_workspace(
+    config: &mut Config,
+    adapter: &dyn Adapter,
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let (workspace, adhoc) = if config.agents_for_runtime(runtime).is_empty() {
+        (
+            config.resolve_workspace(workspace_flag.map(Path::to_path_buf))?,
+            true,
+        )
+    } else {
+        let install =
+            crate::commands::check::resolve_workspace_required(workspace_flag, config, runtime)?;
+        let selected = selector::select_current_agent(config, adapter, runtime, &install, agent)?;
+        selector::effective_workspace(&selected, workspace_flag)
+    };
+    // Only validate an explicit -w target. A mapped per-agent workspace is
+    // adapter-owned and may not exist on disk (shared-store runtimes derive the
+    // install root from it); the adapter's dry-run tolerates that.
+    if adhoc {
+        check_workspace_dir(&workspace)?;
+    }
+    Ok(workspace)
+}
+
+/// Enumerate the upload set for a resolved workspace and build the dry-run
+/// result — no printing, no writes. The seam both the CLI JSON path and the MCP
+/// `alf_export_dry_run` tool build their output from.
+fn build_dry_run_result(adapter: &dyn Adapter, workspace: &Path) -> Result<ExportDryRunResult> {
+    let preview = adapter.enumerate_workspace(workspace)?;
+    Ok(ExportDryRunResult {
+        ok: true,
+        dry_run: true,
+        agent_name: preview.agent_name,
+        memory_records: preview.memory_records,
+        files: preview.files,
+        excluded_by_alfignore: preview.excluded_by_alfignore,
+        total_size: preview.total_size,
+        warnings: preview.warnings,
+    })
+}
+
+/// MCP `alf_export_dry_run` seam: resolve the workspace and build the preview
+/// (no stdout — the caller renders). Never writes.
+pub(crate) fn dry_run_result(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+) -> Result<ExportDryRunResult> {
+    let mut config = Config::load()?;
+    let adapter = adapter::get_adapter(runtime).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown runtime '{}'. Supported: {}",
+            runtime,
+            adapter::supported_runtimes()
+        )
+    })?;
+    let workspace = resolve_dry_run_workspace(
+        &mut config,
+        adapter.as_ref(),
+        runtime,
+        workspace_flag,
+        agent,
+    )?;
+    build_dry_run_result(adapter.as_ref(), &workspace)
+}
+
 /// `alf export --dry-run` — enumerate the upload set, write nothing.
-fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -> Result<()> {
+fn run_dry_run(adapter: &dyn Adapter, workspace: &Path, human: bool) -> Result<()> {
     if human {
         println!(
             "{} Previewing {} export (dry run — nothing will be written)...",
@@ -229,7 +293,7 @@ fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -
         ));
     }
 
-    let preview = adapter.enumerate_workspace(workspace)?;
+    let result = build_dry_run_result(adapter, workspace)?;
 
     if human {
         println!(
@@ -237,37 +301,28 @@ fn run_dry_run(adapter: &dyn alf_core::Adapter, workspace: &Path, human: bool) -
             "✓".green().bold()
         );
         println!();
-        println!("  Agent:     {}", preview.agent_name);
-        println!("  Memories:  {}", preview.memory_records);
-        println!("  Files:     {}", preview.files.len());
-        for f in &preview.files {
+        println!("  Agent:     {}", result.agent_name);
+        println!("  Memories:  {}", result.memory_records);
+        println!("  Files:     {}", result.files.len());
+        for f in &result.files {
             println!("    {} ({})", f.path, format_size(f.size));
         }
-        if preview.excluded_by_alfignore > 0 {
+        if result.excluded_by_alfignore > 0 {
             println!(
                 "  Excluded:  {} file(s) by .alfignore",
-                preview.excluded_by_alfignore
+                result.excluded_by_alfignore
             );
         }
-        println!("  Total:     {}", format_size(preview.total_size));
-        if !preview.warnings.is_empty() {
+        println!("  Total:     {}", format_size(result.total_size));
+        if !result.warnings.is_empty() {
             println!();
             println!("  {} Warnings:", "⚠".yellow().bold());
-            for w in &preview.warnings {
+            for w in &result.warnings {
                 println!("    • {w}");
             }
         }
     } else {
-        output::json(&ExportDryRunResult {
-            ok: true,
-            dry_run: true,
-            agent_name: preview.agent_name,
-            memory_records: preview.memory_records,
-            files: preview.files,
-            excluded_by_alfignore: preview.excluded_by_alfignore,
-            total_size: preview.total_size,
-            warnings: preview.warnings,
-        });
+        output::json(&result);
     }
 
     Ok(())

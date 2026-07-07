@@ -16,7 +16,50 @@ use uuid::Uuid;
 
 use alf_core::{AlfReader, CredentialRecord, CredentialsDocument, RestoreMode, VaultKey};
 
-use crate::ImportReport;
+use crate::{ArchiveEnumeration, FileEntry, ImportReport};
+
+const RAW_PREFIX: &str = "raw/generic/";
+
+/// Enumerate the workspace files an [`import`] would write, without touching the
+/// filesystem. Backs `alf restore --dry-run` for the generic runtime.
+///
+/// Generic archives are raw-preferred (import always writes the `raw/generic/`
+/// tree verbatim), so the list is exact — paths and sizes come straight from the
+/// archive. A generic archive always carries `.alf-map.json` under `raw/generic/`,
+/// so `raw/generic/` is never empty in practice; the empty case is reported as a
+/// warning rather than a silent no-op.
+pub fn enumerate_archive(alf_file: &Path) -> Result<ArchiveEnumeration> {
+    let file = fs::File::open(alf_file)
+        .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
+    let mut alf = AlfReader::new(std::io::BufReader::new(file))?;
+
+    let mut raw: Vec<String> = alf
+        .file_names()
+        .iter()
+        .filter(|f| f.starts_with(RAW_PREFIX) && f.len() > RAW_PREFIX.len())
+        .cloned()
+        .collect();
+    raw.sort();
+
+    let mut warnings = Vec::new();
+    if raw.is_empty() {
+        warnings.push(
+            "Archive has no raw/generic/ sources — a generic restore would write nothing."
+                .to_string(),
+        );
+    }
+
+    let mut files = Vec::with_capacity(raw.len());
+    for name in &raw {
+        let size = alf.entry_size(name)?;
+        files.push(FileEntry {
+            path: name[RAW_PREFIX.len()..].to_string(),
+            size,
+        });
+    }
+
+    Ok(ArchiveEnumeration { files, warnings })
+}
 
 /// Import a generic `.alf` archive into `workspace`.
 ///

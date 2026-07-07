@@ -18,11 +18,14 @@ use crate::state::{local_base_exists, AgentState};
 
 use anyhow::Result;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use uuid::Uuid;
 
-#[derive(Serialize)]
-struct ListResult {
+/// The `alf agents list` result. Also the `alf_agents_list` MCP tool result
+/// (hence `JsonSchema`).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ListResult {
     ok: bool,
     /// The `-r` filter when one was given; absent ⇒ all runtimes.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -31,8 +34,8 @@ struct ListResult {
     agents: Vec<AgentListRow>,
 }
 
-#[derive(Serialize)]
-struct AgentListRow {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct AgentListRow {
     runtime: String,
     runtime_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -58,9 +61,9 @@ struct ToggleResult {
     note: Option<&'static str>,
 }
 
-/// `alf agents` / `alf agents list` — mapping rows joined with sync state.
-/// `runtime_filter` scopes to one runtime; `None` lists every row.
-pub fn list(runtime_filter: Option<&str>) -> Result<()> {
+/// Build the mapping-rows-joined-with-sync-state listing — no stdout. Shared by
+/// the CLI [`list`] and the MCP `alf_agents_list` tool.
+pub(crate) fn list_result(runtime_filter: Option<&str>) -> Result<ListResult> {
     let config = Config::load()?;
     let rows: Vec<&AgentEntry> = match runtime_filter {
         Some(r) => config.agents_for_runtime(r),
@@ -98,12 +101,26 @@ pub fn list(runtime_filter: Option<&str>) -> Result<()> {
         });
     }
 
+    Ok(ListResult {
+        ok: true,
+        runtime: runtime_filter.map(str::to_string),
+        mapping_path: Config::path()?.to_string_lossy().into_owned(),
+        agents,
+    })
+}
+
+/// `alf agents` / `alf agents list` — mapping rows joined with sync state.
+/// `runtime_filter` scopes to one runtime; `None` lists every row.
+pub fn list(runtime_filter: Option<&str>) -> Result<()> {
+    let result = list_result(runtime_filter)?;
+    let agents = &result.agents;
+
     if output::human_mode() {
         match runtime_filter {
             Some(r) => println!("Agents ({r}):"),
             None => println!("Agents:"),
         }
-        for a in &agents {
+        for a in agents {
             println!(
                 "  {}  [{}]  {}  {}  seq={}  last_synced={}  snapshot={}",
                 a.runtime_agent,
@@ -120,14 +137,9 @@ pub fn list(runtime_filter: Option<&str>) -> Result<()> {
             println!("      workspace: {}", a.workspace);
         }
         println!();
-        println!("Mapping: {}", Config::path()?.display());
+        println!("Mapping: {}", result.mapping_path);
     } else {
-        output::json(&ListResult {
-            ok: true,
-            runtime: runtime_filter.map(str::to_string),
-            mapping_path: Config::path()?.to_string_lossy().into_owned(),
-            agents,
-        });
+        output::json(&result);
     }
     Ok(())
 }

@@ -27,20 +27,21 @@ use crate::vault_migrate;
 
 use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
-use alf_core::{FileEntry, ImportOptions, RestoreMode};
+use alf_core::{Adapter, ArchiveEnumeration, FileEntry, ImportOptions, ImportReport, RestoreMode};
 
 use anyhow::Context;
 use anyhow::Result;
 use chrono::Utc;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[derive(Serialize)]
-struct RestoreResult {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct RestoreResult {
     ok: bool,
     agent_id: String,
     agent_name: String,
@@ -54,22 +55,94 @@ struct RestoreResult {
     /// Echoes the `--at-sequence N` flag; `None` for a head restore.
     #[serde(skip_serializing_if = "Option::is_none")]
     at_sequence: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
 
-#[derive(Serialize)]
-struct RestoreDryRunResult {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct RestoreDryRunResult {
     ok: bool,
     dry_run: bool,
     agent_id: String,
     sequence: u64,
+    #[schemars(with = "Vec<crate::schema::FileEntrySchema>")]
     would_write: Vec<FileEntry>,
     /// Echoes the `--at-sequence N` flag; `None` for a head preview.
     #[serde(skip_serializing_if = "Option::is_none")]
     at_sequence: Option<u64>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+}
+
+/// The `alf_restore` MCP tool result — one flat object covering both a completed
+/// restore and a dry-run preview (distinguished by `dry_run`). A single object
+/// schema is required: MCP mandates `outputSchema` have a root `type: "object"`,
+/// which a serde-untagged enum (`anyOf`, no root type) does not satisfy. The
+/// real-restore fields are `None` on a dry-run and vice-versa.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct RestoreToolResult {
+    ok: bool,
+    /// True when this was a dry-run preview (nothing written).
+    dry_run: bool,
+    /// True when `at_sequence` was given (point-in-time; local state not moved).
+    preview: bool,
+    agent_id: String,
+    sequence: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at_sequence: Option<u64>,
+    /// Real-restore only (absent on a dry-run).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runtime: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    memory_records: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workspace: Option<String>,
+    /// Dry-run only (the files a restore would write).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<Vec<crate::schema::FileEntrySchema>>")]
+    would_write: Option<Vec<FileEntry>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+impl From<RestoreResult> for RestoreToolResult {
+    fn from(r: RestoreResult) -> Self {
+        RestoreToolResult {
+            ok: r.ok,
+            dry_run: false,
+            preview: r.preview,
+            agent_id: r.agent_id,
+            sequence: r.sequence,
+            at_sequence: r.at_sequence,
+            agent_name: Some(r.agent_name),
+            runtime: Some(r.runtime),
+            memory_records: Some(r.memory_records),
+            workspace: Some(r.workspace),
+            would_write: None,
+            warnings: r.warnings,
+        }
+    }
+}
+
+impl From<RestoreDryRunResult> for RestoreToolResult {
+    fn from(d: RestoreDryRunResult) -> Self {
+        RestoreToolResult {
+            ok: d.ok,
+            dry_run: true,
+            preview: d.at_sequence.is_some(),
+            agent_id: d.agent_id,
+            sequence: d.sequence,
+            at_sequence: d.at_sequence,
+            agent_name: None,
+            runtime: None,
+            memory_records: None,
+            workspace: None,
+            would_write: Some(d.would_write),
+            warnings: d.warnings,
+        }
+    }
 }
 
 /// Result of a successful [`pull_cloud_base`] call.
@@ -233,18 +306,23 @@ fn fetch_point_in_time(
     fetch_restore_payload(client, agent_id, Some(up_to_sequence), progress)
 }
 
-pub fn run(
+/// Everything a restore needs, resolved once. Shared by the CLI `run` and the
+/// MCP `run_for_mcp` seam so the two resolve the agent/workspace identically.
+struct RestoreTarget {
+    config: Config,
+    adapt: Box<dyn Adapter>,
+    agent_id: Uuid,
+    workspace: PathBuf,
+    client: ApiClient,
+}
+
+/// Resolve the runtime adapter, agent id, workspace, and API client for a
+/// restore. No printing, no network beyond client construction.
+fn resolve_target(
     runtime: &str,
     workspace_flag: Option<&Path>,
     agent_arg: Option<&str>,
-    at_sequence: Option<u64>,
-    dry_run: bool,
-    mode: RestoreMode,
-    key_args: &VaultKeyArgs,
-) -> Result<()> {
-    let human = output::human_mode();
-    let preview = at_sequence.is_some();
-
+) -> Result<RestoreTarget> {
     let mut config = Config::load()?;
 
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -274,19 +352,218 @@ pub fn run(
             None => config.resolve_workspace(None)?,
         },
     };
-    let workspace = workspace.as_path();
 
     let client = ApiClient::from_config(&config)?;
 
+    Ok(RestoreTarget {
+        config,
+        adapt,
+        agent_id,
+        workspace,
+        client,
+    })
+}
+
+/// Perform a head or point-in-time restore and import the merged archive into
+/// `workspace`. Returns the raw import report plus the resolved cloud sequence.
+/// No printing — interstitial messages go to `progress` (stderr for the CLI, a
+/// progress notification for MCP).
+#[allow(clippy::too_many_arguments)]
+fn perform_restore(
+    client: &ApiClient,
+    agent_id: Uuid,
+    workspace: &Path,
+    runtime: &str,
+    adapt: &dyn Adapter,
+    at_sequence: Option<u64>,
+    mode: RestoreMode,
+    key_args: &VaultKeyArgs,
+    progress: Progress,
+) -> Result<(ImportReport, u64)> {
+    // Branch on at_sequence:
+    //   None    → head restore: pull_cloud_base writes base.alf + state.toml.
+    //   Some(n) → PIT preview: fetch only, leave ~/.alf/state untouched.
+    let (final_bytes, latest_sequence) = match at_sequence {
+        None => {
+            let base = pull_cloud_base(client, agent_id, progress)?;
+            (base.final_bytes, base.latest_sequence)
+        }
+        Some(n) => fetch_point_in_time(client, agent_id, n, progress)?,
+    };
+
+    // Import the merged archive into the workspace.
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_alf = temp_dir.path().join("restored.alf");
+    fs::write(&temp_alf, &final_bytes)?;
+
+    progress.emit("  Importing into workspace...");
+    let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
+    if let Some((_, source)) = &resolved_key {
+        progress.emit(&format!(
+            "Using vault key from {} — credentials will be decrypted and restored",
+            source.label()
+        ));
+    }
+    let import_options = ImportOptions {
+        vault_key: resolved_key.as_ref().map(|(k, _)| k),
+        mode,
+    };
+    let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
+    Ok((import_report, latest_sequence))
+}
+
+/// Assemble the JSON `RestoreResult` from a completed restore. Shared by the CLI
+/// JSON branch and the MCP `alf_restore` tool.
+fn build_restore_result(
+    agent_id: Uuid,
+    runtime: &str,
+    workspace: &Path,
+    report: &ImportReport,
+    latest_sequence: u64,
+    at_sequence: Option<u64>,
+) -> RestoreResult {
+    RestoreResult {
+        ok: true,
+        agent_id: agent_id.to_string(),
+        agent_name: report.agent_name.clone(),
+        sequence: latest_sequence,
+        runtime: runtime.to_string(),
+        memory_records: report.memory_records,
+        workspace: workspace.to_string_lossy().into(),
+        preview: at_sequence.is_some(),
+        at_sequence,
+        warnings: report.warnings.clone(),
+    }
+}
+
+/// Fetch and decode the archive for a dry-run and enumerate what a restore
+/// *would* write — touching nothing. Returns the enumeration plus the resolved
+/// cloud sequence. Uses [`fetch_restore_payload`] directly (never
+/// [`pull_cloud_base`]) so `~/.alf/state/` is untouched.
+fn perform_dry_run(
+    client: &ApiClient,
+    agent_id: Uuid,
+    adapt: &dyn Adapter,
+    at_sequence: Option<u64>,
+    progress: Progress,
+) -> Result<(ArchiveEnumeration, u64)> {
+    let (final_bytes, latest_sequence) =
+        fetch_restore_payload(client, agent_id, at_sequence, progress)?;
+
+    // Decode in a tempdir that is removed on exit — no workspace, no state.
+    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
+    let temp_alf = temp_dir.path().join("restored.alf");
+    fs::write(&temp_alf, &final_bytes)?;
+
+    let enumeration = adapt.enumerate_archive(&temp_alf)?;
+    Ok((enumeration, latest_sequence))
+}
+
+/// Assemble the JSON `RestoreDryRunResult` from a dry-run enumeration.
+fn build_dry_run_result(
+    agent_id: Uuid,
+    enumeration: ArchiveEnumeration,
+    latest_sequence: u64,
+    at_sequence: Option<u64>,
+) -> RestoreDryRunResult {
+    RestoreDryRunResult {
+        ok: true,
+        dry_run: true,
+        agent_id: agent_id.to_string(),
+        sequence: latest_sequence,
+        would_write: enumeration.files,
+        at_sequence,
+        warnings: enumeration.warnings,
+    }
+}
+
+/// MCP `alf_restore` seam: resolve, then either a dry-run preview or a real
+/// head/PIT restore. Returns the typed result the tool serializes; no stdout.
+///
+/// M3 will wrap this with the watch-loop pause (the loop must not sync a
+/// workspace mid-restore); the seam is factored so that hook has one call site.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_for_mcp(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+    at_sequence: Option<u64>,
+    dry_run: bool,
+    mode: RestoreMode,
+    key_args: &VaultKeyArgs,
+    progress: Progress,
+) -> Result<RestoreToolResult> {
+    let target = resolve_target(runtime, workspace_flag, agent)?;
+
     if dry_run {
-        return run_dry_run(&client, agent_id, adapt.as_ref(), at_sequence, human);
+        let (enumeration, latest_sequence) = perform_dry_run(
+            &target.client,
+            target.agent_id,
+            target.adapt.as_ref(),
+            at_sequence,
+            progress,
+        )?;
+        return Ok(build_dry_run_result(
+            target.agent_id,
+            enumeration,
+            latest_sequence,
+            at_sequence,
+        )
+        .into());
+    }
+
+    // WP1: move any legacy vault/key to the per-agent layout before the adapter
+    // writes Layer 4 (skipped for a dry-run, which writes nothing).
+    vault_migrate::require_migrated(&target.config, runtime)?;
+
+    let (report, latest_sequence) = perform_restore(
+        &target.client,
+        target.agent_id,
+        &target.workspace,
+        runtime,
+        target.adapt.as_ref(),
+        at_sequence,
+        mode,
+        key_args,
+        progress,
+    )?;
+    Ok(build_restore_result(
+        target.agent_id,
+        runtime,
+        &target.workspace,
+        &report,
+        latest_sequence,
+        at_sequence,
+    )
+    .into())
+}
+
+pub fn run(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent_arg: Option<&str>,
+    at_sequence: Option<u64>,
+    dry_run: bool,
+    mode: RestoreMode,
+    key_args: &VaultKeyArgs,
+) -> Result<()> {
+    let human = output::human_mode();
+    let preview = at_sequence.is_some();
+
+    let target = resolve_target(runtime, workspace_flag, agent_arg)?;
+    let agent_id = target.agent_id;
+    let workspace = target.workspace.as_path();
+    let adapt = target.adapt.as_ref();
+
+    if dry_run {
+        return run_dry_run(&target.client, agent_id, adapt, at_sequence, human);
     }
 
     // WP1: move any legacy vault/key to the per-agent layout before the
     // adapter writes Layer 4 — otherwise the key leg is missed on the first
     // post-upgrade restore and the legacy file survives as a shadow vault.
     // (After the dry-run gate: --dry-run writes nothing.)
-    vault_migrate::require_migrated(&config, runtime)?;
+    vault_migrate::require_migrated(&target.config, runtime)?;
 
     if human {
         if let Some(n) = at_sequence {
@@ -320,35 +597,17 @@ pub fn run(
         ));
     }
 
-    // Branch on at_sequence:
-    //   None    → head restore: pull_cloud_base writes base.alf + state.toml.
-    //   Some(n) → PIT preview: fetch only, leave ~/.alf/state untouched.
-    let (final_bytes, latest_sequence) = match at_sequence {
-        None => {
-            let base = pull_cloud_base(&client, agent_id, Progress::stderr())?;
-            (base.final_bytes, base.latest_sequence)
-        }
-        Some(n) => fetch_point_in_time(&client, agent_id, n, Progress::stderr())?,
-    };
-
-    // Import the merged archive into the workspace.
-    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &final_bytes)?;
-
-    output::progress("  Importing into workspace...");
-    let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
-    if let Some((_, source)) = &resolved_key {
-        output::progress(&format!(
-            "Using vault key from {} — credentials will be decrypted and restored",
-            source.label()
-        ));
-    }
-    let import_options = ImportOptions {
-        vault_key: resolved_key.as_ref().map(|(k, _)| k),
+    let (import_report, latest_sequence) = perform_restore(
+        &target.client,
+        agent_id,
+        workspace,
+        runtime,
+        adapt,
+        at_sequence,
         mode,
-    };
-    let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
+        key_args,
+        Progress::stderr(),
+    )?;
 
     if human {
         println!();
@@ -386,18 +645,14 @@ pub fn run(
             }
         }
     } else {
-        output::json(&RestoreResult {
-            ok: true,
-            agent_id: agent_id.to_string(),
-            agent_name: import_report.agent_name.clone(),
-            sequence: latest_sequence,
-            runtime: runtime.to_string(),
-            memory_records: import_report.memory_records,
-            workspace: workspace.to_string_lossy().into(),
-            preview,
+        output::json(&build_restore_result(
+            agent_id,
+            runtime,
+            workspace,
+            &import_report,
+            latest_sequence,
             at_sequence,
-            warnings: import_report.warnings.clone(),
-        });
+        ));
     }
 
     Ok(())
@@ -414,7 +669,7 @@ pub fn run(
 fn run_dry_run(
     client: &ApiClient,
     agent_id: Uuid,
-    adapt: &dyn alf_core::Adapter,
+    adapt: &dyn Adapter,
     at_sequence: Option<u64>,
     human: bool,
 ) -> Result<()> {
@@ -432,15 +687,8 @@ fn run_dry_run(
         ));
     }
 
-    let (final_bytes, latest_sequence) =
-        fetch_restore_payload(client, agent_id, at_sequence, Progress::stderr())?;
-
-    // Decode in a tempdir that is removed on exit — no workspace, no state.
-    let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
-    let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &final_bytes)?;
-
-    let enumeration = adapt.enumerate_archive(&temp_alf)?;
+    let (enumeration, latest_sequence) =
+        perform_dry_run(client, agent_id, adapt, at_sequence, Progress::stderr())?;
 
     if human {
         println!();
@@ -460,15 +708,12 @@ fn run_dry_run(
             }
         }
     } else {
-        output::json(&RestoreDryRunResult {
-            ok: true,
-            dry_run: true,
-            agent_id: agent_id.to_string(),
-            sequence: latest_sequence,
-            would_write: enumeration.files,
+        output::json(&build_dry_run_result(
+            agent_id,
+            enumeration,
+            latest_sequence,
             at_sequence,
-            warnings: enumeration.warnings,
-        });
+        ));
     }
 
     Ok(())
@@ -477,6 +722,65 @@ fn run_dry_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Offline pin for the backend-only `alf_restore` success shapes: the stdio
+    /// harness only exercises restore's error path (no backend), so validate
+    /// both `RestoreToolResult` variants against the declared schema here — this
+    /// catches the `#[serde(default)]`/skip drift the harness cannot reach (M2a §2).
+    #[test]
+    fn restore_tool_result_matches_declared_output_schema() {
+        let schema = serde_json::to_value(schemars::schema_for!(RestoreToolResult)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+
+        // Real restore: dry-run-only fields omitted, real-restore fields present.
+        let restored: RestoreToolResult = RestoreResult {
+            ok: true,
+            agent_id: "a1b2c3d4".into(),
+            agent_name: "Agent".into(),
+            sequence: 3,
+            runtime: "generic".into(),
+            memory_records: 5,
+            workspace: "/ws".into(),
+            preview: false,
+            at_sequence: None,
+            warnings: vec![],
+        }
+        .into();
+        let instance = serde_json::to_value(&restored).unwrap();
+        assert!(
+            instance.get("would_write").is_none() && instance.get("warnings").is_none(),
+            "empty/None fields must be omitted, not over-required: {instance}"
+        );
+        assert!(
+            validator.is_valid(&instance),
+            "restored variant must validate: {instance}"
+        );
+
+        // Dry-run: would_write + warnings populated, real-restore fields omitted.
+        let dry: RestoreToolResult = RestoreDryRunResult {
+            ok: true,
+            dry_run: true,
+            agent_id: "a1b2c3d4".into(),
+            sequence: 2,
+            would_write: vec![FileEntry {
+                path: "SOUL.md".into(),
+                size: 12,
+            }],
+            at_sequence: Some(2),
+            warnings: vec!["approximate".into()],
+        }
+        .into();
+        let instance = serde_json::to_value(&dry).unwrap();
+        assert!(
+            instance.get("agent_name").is_none(),
+            "real-restore fields must be omitted on a dry-run: {instance}"
+        );
+        assert!(
+            validator.is_valid(&instance),
+            "dry-run variant must validate: {instance}"
+        );
+    }
+
     use alf_core::archive::{AlfWriter, DeltaMemoryEntry, DeltaWriter};
     use alf_core::manifest::{
         AgentMetadata, ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaOperation,

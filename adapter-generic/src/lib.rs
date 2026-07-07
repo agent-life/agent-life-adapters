@@ -57,6 +57,14 @@ impl Adapter for GenericAdapter {
         export::resolve_agent_id_readonly(workspace)
     }
 
+    fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {
+        export::enumerate_workspace(workspace)
+    }
+
+    fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
+        import::enumerate_archive(alf_file)
+    }
+
     // `discover_agents` (single-agent default), `export_agent`, and
     // `import_agent` use the WP0 trait defaults: generic is directory-isolated
     // and single-agent, so the default write-through / fail-closed behavior is

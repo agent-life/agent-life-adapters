@@ -1,0 +1,226 @@
+//! `alf_configure` — validated read-modify-write of the generic runtime's
+//! `.alf-map.json` (design §6, §8). No CLI equivalent: the built-in adapters own
+//! their own extraction, so this tool is generic-only and errors on any other
+//! runtime.
+//!
+//! Two modes: `map` replaces the file wholesale; `patch` deep-merges into the
+//! existing map (objects merge recursively, scalars/arrays replace). Either way
+//! the result is parsed and validated **before** anything is written, so an
+//! invalid configuration is rejected with no partial application — the file on
+//! disk is never left half-written.
+
+use std::path::Path;
+
+use anyhow::{bail, Context, Result};
+use schemars::JsonSchema;
+use serde::Serialize;
+use serde_json::Value;
+
+use adapter_generic::{MemoryMap, MAP_FILE};
+
+use crate::config::Config;
+
+/// The `alf_configure` tool result: the effective (validated) map plus any
+/// non-fatal validation warnings (e.g. a non-canonical namespace).
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct ConfigureResult {
+    ok: bool,
+    map_path: String,
+    /// The effective `.alf-map.json` after applying `map`/`patch`, exactly as
+    /// written to disk.
+    map: Value,
+    // Skipped when empty on a non-Option ⇒ `#[serde(default)]` (M2a §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<String>,
+}
+
+/// Apply a `map` (full replacement) or `patch` (deep merge) to the workspace's
+/// `.alf-map.json`, validating before writing. Generic-only.
+pub(crate) fn configure(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    map: Option<Value>,
+    patch: Option<Value>,
+) -> Result<ConfigureResult> {
+    if runtime != "generic" {
+        bail!(
+            "alf_configure is only available for the generic runtime (got '{runtime}'). \
+             The openclaw/zeroclaw/hermes adapters own their own extraction — there is no \
+             map file to configure."
+        );
+    }
+
+    let config = Config::load()?;
+    let workspace =
+        crate::commands::check::resolve_workspace_required(workspace_flag, &config, runtime)?;
+    let map_path = workspace.join(MAP_FILE);
+
+    // Build the effective map from exactly one of map/patch.
+    let effective: Value = match (map, patch) {
+        (Some(_), Some(_)) => {
+            bail!("pass exactly one of `map` (full replacement) or `patch` (deep merge), not both")
+        }
+        (None, None) => {
+            bail!("pass one of `map` (full replacement) or `patch` (deep merge)")
+        }
+        (Some(m), None) => m,
+        (None, Some(p)) => {
+            let mut base = if map_path.is_file() {
+                let raw = std::fs::read_to_string(&map_path)
+                    .with_context(|| format!("reading {}", map_path.display()))?;
+                serde_json::from_str(&raw)
+                    .with_context(|| format!("{} is not valid JSON", map_path.display()))?
+            } else {
+                Value::Object(serde_json::Map::new())
+            };
+            merge(&mut base, p);
+            base
+        }
+    };
+
+    // Parse + validate BEFORE writing — a hard violation aborts with the file
+    // untouched (no partial application). Re-serialize the parsed map so the file
+    // on disk is exactly the shape the validator (and every later export) sees.
+    let parsed: MemoryMap = serde_json::from_value(effective).context(
+        "the resulting configuration is not a valid .alf-map.json (see .alf-map.json schema)",
+    )?;
+    let warnings = parsed.validate()?;
+
+    let serialized = format!(
+        "{}\n",
+        serde_json::to_string_pretty(&parsed).context("serializing the map")?
+    );
+
+    // A generic workspace may not exist yet on first contact — create it so the
+    // write lands, then atomic temp+rename so a crash can't leave a torn map.
+    if let Some(parent) = map_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating workspace {}", parent.display()))?;
+    }
+    atomic_write(&map_path, &serialized)?;
+
+    let map_value = serde_json::to_value(&parsed).context("re-encoding the written map")?;
+    Ok(ConfigureResult {
+        ok: true,
+        map_path: map_path.to_string_lossy().into_owned(),
+        map: map_value,
+        warnings,
+    })
+}
+
+/// Deep-merge `patch` into `base`: two objects merge key-by-key (recursively);
+/// anything else (scalars, arrays) is replaced by the patch value.
+fn merge(base: &mut Value, patch: Value) {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                merge(b.entry(k).or_insert(Value::Null), v);
+            }
+        }
+        (b, p) => *b = p,
+    }
+}
+
+/// Write `contents` to `path` atomically (sibling temp + rename), so a crash
+/// mid-write leaves any pre-existing map untouched.
+fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or(MAP_FILE);
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("finalizing {}", path.display())
+    })?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn valid_map() -> Value {
+        serde_json::json!({
+            "version": 1,
+            "memory_sources": [
+                { "id": "journal", "glob": "memories/*.md", "memory_type": "episodic",
+                  "namespace": "daily", "chunking": "by_heading", "timestamp": "filename_date" }
+            ]
+        })
+    }
+
+    #[test]
+    fn non_generic_runtime_errors() {
+        let err = configure("openclaw", None, Some(valid_map()), None).unwrap_err();
+        assert!(format!("{err:#}").contains("only available for the generic runtime"));
+    }
+
+    #[test]
+    fn map_writes_and_validates() {
+        let ws = TempDir::new().unwrap();
+        let result = configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+        assert!(result.ok);
+        // File exists and reloads through the real map parser.
+        let path = ws.path().join(MAP_FILE);
+        assert!(path.is_file());
+        let reloaded = MemoryMap::load(&path).unwrap();
+        assert_eq!(reloaded.version, 1);
+        assert_eq!(reloaded.memory_sources.len(), 1);
+    }
+
+    #[test]
+    fn invalid_map_is_rejected_without_writing() {
+        let ws = TempDir::new().unwrap();
+        // memory_type `summary` is non-canonical without the escape hatch → hard error.
+        let bad = serde_json::json!({
+            "version": 1,
+            "memory_sources": [
+                { "id": "s", "glob": "a/*.md", "memory_type": "summary",
+                  "namespace": "curated", "chunking": "per_file" }
+            ]
+        });
+        let err = configure("generic", Some(ws.path()), Some(bad), None).unwrap_err();
+        assert!(format!("{err:#}").contains("allow_noncanonical"));
+        // No partial application: the file was never written.
+        assert!(!ws.path().join(MAP_FILE).is_file());
+    }
+
+    #[test]
+    fn patch_merges_into_existing_map() {
+        let ws = TempDir::new().unwrap();
+        configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+
+        // Patch only the framework field; memory_sources must survive.
+        let patch = serde_json::json!({ "framework": "acme", "framework_version": "1.0" });
+        let result = configure("generic", Some(ws.path()), None, Some(patch)).unwrap();
+        assert_eq!(result.map["framework"], "acme");
+        assert_eq!(result.map["memory_sources"].as_array().unwrap().len(), 1);
+
+        let reloaded = MemoryMap::load(&ws.path().join(MAP_FILE)).unwrap();
+        assert_eq!(reloaded.framework.as_deref(), Some("acme"));
+        assert_eq!(reloaded.memory_sources.len(), 1);
+    }
+
+    #[test]
+    fn both_map_and_patch_errors() {
+        let ws = TempDir::new().unwrap();
+        let err = configure(
+            "generic",
+            Some(ws.path()),
+            Some(valid_map()),
+            Some(valid_map()),
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("exactly one"));
+    }
+
+    #[test]
+    fn neither_map_nor_patch_errors() {
+        let ws = TempDir::new().unwrap();
+        let err = configure("generic", Some(ws.path()), None, None).unwrap_err();
+        assert!(format!("{err:#}").contains("pass one of"));
+    }
+}

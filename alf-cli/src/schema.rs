@@ -82,3 +82,17 @@ pub struct WatchSource {
     pub last_tick: Option<String>,
     pub dirty_count: u64,
 }
+
+/// Schema shim for [`alf_core::FileEntry`], which lives in `alf-core` and so
+/// cannot derive `schemars::JsonSchema` (that crate is deliberately alf-cli-only
+/// — Lambda-ARM64 invariant). The MCP dry-run tools (`alf_export_dry_run`,
+/// `alf_restore`) carry `Vec<FileEntry>` in their results; annotate that field
+/// with `#[schemars(with = "Vec<crate::schema::FileEntrySchema>")]` so the tool's
+/// `outputSchema` describes the same `{path, size}` shape `FileEntry` serializes
+/// to. Only the schema derive is used — never constructed.
+#[derive(JsonSchema)]
+#[allow(dead_code)]
+pub(crate) struct FileEntrySchema {
+    pub path: String,
+    pub size: u64,
+}

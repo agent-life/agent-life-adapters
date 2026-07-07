@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -216,8 +217,10 @@ pub fn encrypt(
 // add — encrypt a credential and append it to the agent's vault
 // ===========================================================================
 
-#[derive(Serialize)]
-struct AddResult {
+/// The `alf vault add` result. Also the `alf_vault_add` MCP tool result (hence
+/// `JsonSchema`).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct AddResult {
     ok: bool,
     id: Uuid,
     service: String,
@@ -241,8 +244,10 @@ const SECRET_JSON_SECRET_KEYS: &[&str] = &["secret", "password", "token", "bot_t
 /// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
 /// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
 /// merge into the archive's Layer 4 on the next `alf sync`.
+/// Encrypt and upsert a credential, returning the result — no stdout. Shared by
+/// the CLI [`add`] (which prints it) and the MCP `alf_vault_add` tool.
 #[allow(clippy::too_many_arguments)]
-pub fn add(
+pub(crate) fn add_core(
     input: Option<&Path>,
     service: &str,
     credential_type: &str,
@@ -259,7 +264,7 @@ pub fn add(
     update: bool,
     key_args: &VaultKeyArgs,
     runtime: &str,
-) -> Result<()> {
+) -> Result<AddResult> {
     // 1. Resolve the target vault file.
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
@@ -440,29 +445,71 @@ pub fn add(
     write_private_atomic(&target, &serialized)
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
+    Ok(AddResult {
+        ok: true,
+        id: record.id,
+        service: record.service.clone(),
+        label: record.label.clone(),
+        updated,
+        written_to: target.display().to_string(),
+        total: doc.credentials.len(),
+    })
+}
+
+/// `alf vault add` — encrypt a credential and append it to the agent's vault.
+#[allow(clippy::too_many_arguments)]
+pub fn add(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    username: Option<&str>,
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    secret_json: Option<&Path>,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    fields: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    let result = add_core(
+        input,
+        service,
+        credential_type,
+        username,
+        secret,
+        secret_file,
+        secret_json,
+        label,
+        description,
+        tags,
+        fields,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )?;
+
     if output::human_mode() {
         println!(
             "{} {} credential in vault",
             "✓".green().bold(),
-            if updated { "Updated" } else { "Added" }
+            if result.updated { "Updated" } else { "Added" }
         );
-        println!("  Record ID:  {}", record.id);
-        println!("  Service:    {}", record.service);
-        if let Some(l) = &record.label {
+        println!("  Record ID:  {}", result.id);
+        println!("  Service:    {}", result.service);
+        if let Some(l) = &result.label {
             println!("  Label:      {l}");
         }
-        println!("  Written to: {}", target.display());
-        println!("  Total:      {} credential(s)", doc.credentials.len());
+        println!("  Written to: {}", result.written_to);
+        println!("  Total:      {} credential(s)", result.total);
     } else {
-        output::json(&AddResult {
-            ok: true,
-            id: record.id,
-            service: record.service.clone(),
-            label: record.label.clone(),
-            updated,
-            written_to: target.display().to_string(),
-            total: doc.credentials.len(),
-        });
+        output::json(&result);
     }
 
     Ok(())
@@ -472,15 +519,16 @@ pub fn add(
 // list
 // ===========================================================================
 
-#[derive(Serialize)]
-struct ListResult {
+/// The `alf vault list` result. Also the `alf_vault_list` MCP tool result.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ListResult {
     ok: bool,
     count: usize,
     credentials: Vec<DescriptorView>,
 }
 
-#[derive(Serialize)]
-struct DescriptorView {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct DescriptorView {
     id: Uuid,
     service: String,
     credential_type: String,
@@ -489,19 +537,22 @@ struct DescriptorView {
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     algorithm: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // Skipped when empty on a non-Option ⇒ `#[serde(default)]` (M2a §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
     created_at: chrono::DateTime<Utc>,
 }
 
-pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
+/// Build the plaintext-descriptor listing — no key touched, no stdout. Shared by
+/// the CLI [`list`] and the MCP `alf_vault_list` tool.
+pub(crate) fn list_core(input: Option<&Path>, scope: Option<Uuid>) -> Result<ListResult> {
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
         None => vault_key::default_vault_path(scope)?,
     };
     let doc = load_credentials_document(&target)?;
 
-    let views: Vec<DescriptorView> = doc
+    let credentials: Vec<DescriptorView> = doc
         .credentials
         .iter()
         .map(|c| DescriptorView {
@@ -519,9 +570,20 @@ pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
         })
         .collect();
 
+    Ok(ListResult {
+        ok: true,
+        count: credentials.len(),
+        credentials,
+    })
+}
+
+pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
+    let result = list_core(input, scope)?;
+    let views = &result.credentials;
+
     if output::human_mode() {
         println!("{} {} credential(s)", "▸".blue().bold(), views.len());
-        for v in &views {
+        for v in views {
             println!();
             println!("  {} {}", "•".bold(), v.id);
             println!("    service:     {}", v.service);
@@ -538,11 +600,7 @@ pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
             }
         }
     } else {
-        output::json(&ListResult {
-            ok: true,
-            count: views.len(),
-            credentials: views,
-        });
+        output::json(&result);
     }
 
     Ok(())
@@ -626,8 +684,9 @@ pub fn decrypt(
 // delete — surgical, NO KEY REQUIRED
 // ===========================================================================
 
-#[derive(Serialize)]
-struct DeleteResult {
+/// The `alf vault delete` result. Also the `alf_vault_delete` MCP tool result.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct DeleteResult {
     ok: bool,
     removed_id: Uuid,
     service: String,
@@ -636,12 +695,16 @@ struct DeleteResult {
     written_to: Option<String>,
 }
 
-pub fn delete(
+/// Remove one record and write the updated document. Returns the removed record
+/// (its plaintext descriptors), the remaining count, and the file written — the
+/// removed record carries the `description` the CLI human view prints, which the
+/// [`DeleteResult`] does not.
+fn delete_work(
     input: Option<&Path>,
     selector: &Selector,
     out: Option<&Path>,
     scope: Option<Uuid>,
-) -> Result<()> {
+) -> Result<(CredentialRecord, usize, PathBuf)> {
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
         None => vault_key::default_vault_path(scope)?,
@@ -655,7 +718,7 @@ pub fn delete(
         .expect("target_id came from doc");
     let removed = doc.credentials.remove(removed_index);
 
-    let output_path = out.unwrap_or(&target);
+    let output_path = out.unwrap_or(&target).to_path_buf();
     let serialized = serde_json::to_string_pretty(&doc).context("Failed to serialize document")?;
 
     // If the input is a .alf archive, deletion mutates only the
@@ -675,8 +738,37 @@ pub fn delete(
         );
     }
 
-    fs::write(output_path, serialized)
+    fs::write(&output_path, serialized)
         .with_context(|| format!("Failed to write {}", output_path.display()))?;
+
+    Ok((removed, doc.credentials.len(), output_path))
+}
+
+/// Surgical record delete (no key), returning the result — no stdout. Shared by
+/// the CLI [`delete`] and the MCP `alf_vault_delete` tool.
+pub(crate) fn delete_core(
+    input: Option<&Path>,
+    selector: &Selector,
+    out: Option<&Path>,
+    scope: Option<Uuid>,
+) -> Result<DeleteResult> {
+    let (removed, remaining, output_path) = delete_work(input, selector, out, scope)?;
+    Ok(DeleteResult {
+        ok: true,
+        removed_id: removed.id,
+        service: removed.service,
+        remaining,
+        written_to: Some(output_path.display().to_string()),
+    })
+}
+
+pub fn delete(
+    input: Option<&Path>,
+    selector: &Selector,
+    out: Option<&Path>,
+    scope: Option<Uuid>,
+) -> Result<()> {
+    let (removed, remaining, output_path) = delete_work(input, selector, out, scope)?;
 
     if output::human_mode() {
         println!("{} Deleted credential", "✓".green().bold());
@@ -685,14 +777,14 @@ pub fn delete(
         if let Some(d) = &removed.description {
             println!("  Description: {d}");
         }
-        println!("  Remaining:   {}", doc.credentials.len());
+        println!("  Remaining:   {remaining}");
         println!("  Written to:  {}", output_path.display());
     } else {
         output::json(&DeleteResult {
             ok: true,
             removed_id: removed.id,
             service: removed.service.clone(),
-            remaining: doc.credentials.len(),
+            remaining,
             written_to: Some(output_path.display().to_string()),
         });
     }

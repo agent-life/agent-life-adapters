@@ -28,7 +28,7 @@ use alf_core::{
 };
 
 use crate::map::{MemoryMap, MemorySourceSpec, MAP_FILE};
-use crate::ExportReport;
+use crate::{ExportReport, FileEntry, WorkspaceEnumeration};
 
 const RUNTIME: &str = "generic";
 
@@ -865,6 +865,69 @@ pub fn export(workspace: &Path, output: &Path) -> Result<ExportReport> {
         output_size_bytes: output_size,
         excluded_by_alfignore: collected.excluded_by_alfignore,
         missing_includes: collected.missing_includes,
+        warnings,
+    })
+}
+
+/// Build the `export --dry-run` preview for a generic workspace: the enumerated
+/// raw-tree file list plus the agent name and memory-record count.
+///
+/// Strictly read-only — writes no archive and, unlike [`export`], never persists
+/// `.alf-agent-id` (it resolves the id via [`resolve_agent_id_readonly`]). The
+/// file list is the same raw tree [`export`] would pack under `raw/generic/`, so
+/// a preview matches the eventual archive.
+pub fn enumerate_workspace(workspace: &Path) -> Result<WorkspaceEnumeration> {
+    if !workspace.is_dir() {
+        bail!(
+            "Workspace directory does not exist: {}",
+            workspace.display()
+        );
+    }
+    let map_path = workspace.join(MAP_FILE);
+    if !map_path.is_file() {
+        bail!(
+            "generic runtime requires a {MAP_FILE} in the workspace ({})",
+            workspace.display()
+        );
+    }
+    let map = MemoryMap::load(&map_path)?;
+    let mut warnings = map.validate()?;
+
+    let agent_id = resolve_agent_id_readonly(workspace)?;
+    let identity = build_identity(workspace, &map, agent_id)?;
+    let agent_name = agent_display_name(identity.as_ref(), &map, workspace);
+
+    let collected = collect(workspace, &map, agent_id)?;
+    warnings.extend(collected.warnings);
+    let memory_records = collected.records.len() as u64;
+
+    // The raw BTreeMap is already key-sorted, so the file list is deterministic.
+    let mut files = Vec::with_capacity(collected.raw.len());
+    let mut total_size = 0u64;
+    for (rel, source) in &collected.raw {
+        let size = match source {
+            RawSource::Bytes(bytes) => bytes.len() as u64,
+            RawSource::Path(path) => fs::metadata(path).map(|m| m.len()).unwrap_or(0),
+        };
+        total_size += size;
+        files.push(FileEntry {
+            path: rel.clone(),
+            size,
+        });
+    }
+
+    for rel in &collected.missing_includes {
+        warnings.push(format!(
+            "tracked file {rel} no longer exists (will be removed from sync on next `alf sync`)"
+        ));
+    }
+
+    Ok(WorkspaceEnumeration {
+        agent_name,
+        memory_records,
+        files,
+        excluded_by_alfignore: collected.excluded_by_alfignore,
+        total_size,
         warnings,
     })
 }

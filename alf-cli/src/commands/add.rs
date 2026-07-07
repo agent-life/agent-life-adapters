@@ -10,19 +10,24 @@
 use crate::config::Config;
 use crate::output;
 use crate::selector;
-use alf_core::{normalize_include_path, IncludeList};
+use alf_core::{normalize_include_path, Adapter, IncludeList};
 use anyhow::{bail, Result};
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 
-#[derive(Serialize)]
-struct AddResult {
+/// The `alf add` result. Also the `alf_track` MCP tool result (hence
+/// `JsonSchema`).
+#[derive(Debug, Serialize, JsonSchema)]
+pub(crate) struct AddResult {
     ok: bool,
     /// True if newly added; false if it was already tracked.
     added: bool,
     path: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    // Skipped when false but declared on a non-Option, so `#[serde(default)]` is
+    // required or schemars over-requires it in the outputSchema (M2a §2).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     external: bool,
 }
 
@@ -73,17 +78,61 @@ pub fn run(
         anyhow::anyhow!("a file path is required (or pass --allow-root <dir> on its own)")
     })?;
 
-    // Workspace: -w flag → the selection's workspace (lazy init applies).
+    let workspace = resolve_workspace(runtime, workspace_flag, agent, adapt.as_ref())?;
+    let workspace = workspace.as_path();
+
+    let result = if external {
+        add_external(runtime, workspace, path, yes_external)?
+    } else {
+        add_in_workspace(workspace, path)?
+    };
+    report(&result, runtime, workspace, human);
+    Ok(())
+}
+
+/// MCP `alf_track` seam: track a workspace file (or, with `external`, a blessed
+/// external file) and return the result — no stdout, no `--allow-root` blessing
+/// (that trust-boundary expansion stays a CLI/human ceremony, design L10).
+/// `external: true` carries its own consent (acts as the CLI's `--yes-external`),
+/// but every other safety property holds: a pre-blessed root is still required
+/// and the denylist still applies.
+pub(crate) fn track(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+    path: &str,
+    external: bool,
+) -> Result<AddResult> {
+    let adapt = crate::adapter::get_adapter(runtime).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Unknown runtime '{runtime}'. Supported runtimes: {}",
+            crate::adapter::supported_runtimes()
+        )
+    })?;
+    let workspace = resolve_workspace(runtime, workspace_flag, agent, adapt.as_ref())?;
+    if external {
+        add_external(runtime, &workspace, path, /* yes_external: */ true)
+    } else {
+        add_in_workspace(&workspace, path)
+    }
+}
+
+/// Resolve the workspace an add targets: `-w` flag → the selection's workspace
+/// (lazy init applies). Shared by the CLI `run` and the MCP `track` seam.
+fn resolve_workspace(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+    adapt: &dyn Adapter,
+) -> Result<PathBuf> {
     let workspace: PathBuf = match workspace_flag {
         Some(w) => w.to_path_buf(),
         None => {
             let mut config = Config::load()?;
             let install = crate::commands::check::resolve_workspace(None, &config, runtime).path;
-            selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?
-                .workspace
+            selector::select_current_agent(&mut config, adapt, runtime, &install, agent)?.workspace
         }
     };
-    let workspace = workspace.as_path();
 
     if !workspace.is_dir() {
         bail!(
@@ -91,15 +140,10 @@ pub fn run(
             workspace.display()
         );
     }
-
-    if external {
-        add_external(runtime, workspace, path, yes_external, human)
-    } else {
-        add_in_workspace(runtime, workspace, path, human)
-    }
+    Ok(workspace)
 }
 
-fn add_in_workspace(runtime: &str, workspace: &Path, path: &str, human: bool) -> Result<()> {
+fn add_in_workspace(workspace: &Path, path: &str) -> Result<AddResult> {
     // Rejects missing files, paths outside the workspace, and the sentinels.
     let rel = normalize_include_path(workspace, path)?;
     let mut list = IncludeList::load(workspace)?;
@@ -107,8 +151,12 @@ fn add_in_workspace(runtime: &str, workspace: &Path, path: &str, human: bool) ->
     if added {
         list.save(workspace)?;
     }
-    report(runtime, workspace, &rel, added, false, human);
-    Ok(())
+    Ok(AddResult {
+        ok: true,
+        added,
+        path: rel,
+        external: false,
+    })
 }
 
 fn add_external(
@@ -116,15 +164,15 @@ fn add_external(
     workspace: &Path,
     path: &str,
     yes_external: bool,
-    human: bool,
-) -> Result<()> {
-    // The reusable validation/denylist core is runtime-agnostic, but the
-    // export-side packing of `external/` entries is currently wired for Hermes
-    // (the motivating AGENTS.md case). Refuse elsewhere rather than silently
+) -> Result<AddResult> {
+    // The reusable validation/denylist core is runtime-agnostic, and the
+    // export-side packing of `external/` entries is wired for Hermes (the
+    // motivating AGENTS.md case) and the generic runtime (which packs externals
+    // under raw/generic/external/). Refuse elsewhere rather than silently
     // recording an entry no export will pack.
-    if runtime != "hermes" {
+    if runtime != "hermes" && runtime != "generic" {
         bail!(
-            "--external is currently supported only for the hermes runtime; \
+            "--external is currently supported only for the hermes and generic runtimes; \
              {runtime} external-file tracking is not yet wired"
         );
     }
@@ -139,6 +187,8 @@ fn add_external(
     let canon = alf_core::include::validate_external_source(Path::new(path), &roots)?;
 
     // Human gate: a trust-boundary crossing must not be silently agent-invokable.
+    // The MCP `track` seam passes `yes_external: true` — the agent's `external:
+    // true` argument IS its consent (the CLI's `--yes-external` equivalent).
     if !yes_external && !confirm_external(&canon)? {
         bail!("aborted: external add not confirmed");
     }
@@ -149,15 +199,12 @@ fn add_external(
     if added {
         list.save(workspace)?;
     }
-    report(
-        runtime,
-        workspace,
-        &canon.to_string_lossy(),
+    Ok(AddResult {
+        ok: true,
         added,
-        true,
-        human,
-    );
-    Ok(())
+        path: canon.to_string_lossy().into_owned(),
+        external: true,
+    })
 }
 
 fn confirm_external(canon: &Path) -> Result<bool> {
@@ -172,24 +219,60 @@ fn confirm_external(canon: &Path) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
 }
 
-fn report(runtime: &str, workspace: &Path, label: &str, added: bool, external: bool, human: bool) {
+fn report(result: &AddResult, runtime: &str, workspace: &Path, human: bool) {
     if human {
-        let kind = if external { "external file" } else { "" };
-        if added {
-            println!("{} Tracking {kind} {label} for sync", "✓".green().bold());
+        let kind = if result.external { "external file" } else { "" };
+        if result.added {
+            println!(
+                "{} Tracking {kind} {} for sync",
+                "✓".green().bold(),
+                result.path
+            );
         } else {
-            println!("{} {label} is already tracked", "✓".green().bold());
+            println!("{} {} is already tracked", "✓".green().bold(), result.path);
         }
         println!(
             "  Included in the next: alf sync -r {runtime} -w {}",
             workspace.display()
         );
     } else {
-        output::json(&AddResult {
-            ok: true,
-            added,
-            path: label.to_string(),
-            external,
-        });
+        output::json(result);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// The external-tracking gate (D3): only hermes and generic are wired for
+    /// `raw/{runtime}/external/` packing. Other runtimes bail at the runtime gate
+    /// before touching the include list; hermes and generic pass it (and then
+    /// fail later on the blessed-root requirement, which proves they got past the
+    /// gate itself). Pins that extending the gate to generic did not open it to
+    /// every runtime — hermes stays exactly as before.
+    #[test]
+    fn external_gate_allows_only_hermes_and_generic() {
+        let ws = TempDir::new().unwrap();
+        let gate_phrase = "hermes and generic";
+
+        // A non-wired runtime bails at the gate with the gate message.
+        for unwired in ["openclaw", "zeroclaw"] {
+            let err = add_external(unwired, ws.path(), "/etc/hosts", true).unwrap_err();
+            assert!(
+                format!("{err:#}").contains(gate_phrase),
+                "{unwired} external add must bail at the runtime gate: {err:#}"
+            );
+        }
+
+        // Wired runtimes pass the gate — they fail later (no blessed roots / the
+        // denylist), never with the gate message.
+        for wired in ["hermes", "generic"] {
+            let err = add_external(wired, ws.path(), "/etc/hosts", true).unwrap_err();
+            assert!(
+                !format!("{err:#}").contains(gate_phrase),
+                "{wired} must pass the runtime gate, not bail on it: {err:#}"
+            );
+        }
     }
 }

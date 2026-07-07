@@ -30,9 +30,12 @@ use alf_core::delta::{compute_delta, diff_credentials, diff_principals, identity
 use alf_core::manifest::{ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaSyncCursor};
 use alf_core::{CredentialsDocument, PrincipalsDocument};
 
+use crate::output::Progress;
+
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -40,8 +43,10 @@ use std::io::{Cursor, Read, Seek};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
-#[derive(Serialize)]
-struct SyncResult {
+/// The single-agent `alf sync` JSON result. Printed by the CLI and returned as
+/// the MCP `alf_sync` tool's structured content (built via [`build_sync_result`]).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct SyncResult {
     ok: bool,
     sequence: u64,
     delta: bool,
@@ -56,7 +61,7 @@ struct SyncResult {
     agent: SyncAgentRef,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct SyncAgentRef {
     runtime_agent: String,
     alf_agent_id: Uuid,
@@ -89,8 +94,9 @@ struct SyncAllEntry {
 }
 
 /// Result of one agent's sync, decoupled from output so `--all` can collect
-/// several and the single-agent path emits exactly one JSON object.
-struct SyncOutcome {
+/// several and the single-agent path emits exactly one JSON object. `pub(crate)`
+/// so the MCP `alf_sync` tool can drive [`run_one_agent`] and render the outcome.
+pub(crate) struct SyncOutcome {
     sequence: u64,
     delta: bool,
     changes: Option<SyncChanges>,
@@ -101,21 +107,21 @@ struct SyncOutcome {
     snapshot_path: PathBuf,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct SyncChanges {
     creates: usize,
     updates: usize,
     deletes: usize,
     /// Layer 4 (credentials) changes carried by this delta. Omitted when the
     /// vault was unchanged.
-    #[serde(skip_serializing_if = "LayerChanges::is_zero")]
+    #[serde(default, skip_serializing_if = "LayerChanges::is_zero")]
     credentials: LayerChanges,
     /// Layer 2 (principals) changes carried by this delta. Omitted when
     /// unchanged.
-    #[serde(skip_serializing_if = "LayerChanges::is_zero")]
+    #[serde(default, skip_serializing_if = "LayerChanges::is_zero")]
     principals: LayerChanges,
     /// Whether Layer 1 (identity) changed in this delta. Omitted when false.
-    #[serde(skip_serializing_if = "is_false")]
+    #[serde(default, skip_serializing_if = "is_false")]
     identity: bool,
 }
 
@@ -123,7 +129,7 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema, Default)]
 struct LayerChanges {
     creates: usize,
     updates: usize,
@@ -255,6 +261,68 @@ pub fn run(
         );
     }
 
+    if all {
+        let mut config = Config::load()?;
+        let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown runtime '{}'. Supported: {}",
+                runtime,
+                adapter::supported_runtimes()
+            )
+        })?;
+        // Install root for discovery/lazy-init: -w flag → [defaults].workspace →
+        // the runtime's own configured/default location (same order alf check
+        // uses). Generic requires an explicit workspace — fail here rather than
+        // let an empty path fall through to a stray CWD `.alf-agent-id` write (R1).
+        let install =
+            crate::commands::check::resolve_workspace_required(workspace_flag, &config, runtime)?;
+        return run_all(
+            &mut config,
+            adapt.as_ref(),
+            runtime,
+            &install,
+            recover,
+            force_first_sync,
+            human,
+        );
+    }
+
+    // CLI single-agent path: progress to stderr (unchanged), render the outcome.
+    let (outcome, selected) = run_one_agent(
+        runtime,
+        workspace_flag,
+        agent,
+        recover,
+        force_first_sync,
+        human,
+        Progress::stderr(),
+    )?;
+
+    if human {
+        print_human_outcome(&outcome, selected.alf_agent_id)?;
+    } else {
+        output::json(&build_sync_result(outcome, &selected));
+    }
+
+    Ok(())
+}
+
+/// Sync exactly one selected agent, end to end: load config, resolve the
+/// adapter + workspace, run the selector (+ enabled gate), migrate the vault,
+/// build the API client, and drive [`sync_one`]. No stdout output — the caller
+/// renders. Extracted as the MCP `alf_sync` seam so the tool reuses the whole
+/// single-agent pipeline (never the printing `run`). `progress` routes the
+/// interleaved status lines: [`Progress::stderr`] for the CLI, a callback for
+/// the MCP progress-notification bridge.
+pub(crate) fn run_one_agent(
+    runtime: &str,
+    workspace_flag: Option<&Path>,
+    agent: Option<&str>,
+    recover: bool,
+    force_first_sync: bool,
+    human: bool,
+    progress: Progress,
+) -> Result<(SyncOutcome, SelectedAgent)> {
     let mut config = Config::load()?;
 
     let adapt = adapter::get_adapter(runtime).ok_or_else(|| {
@@ -267,19 +335,10 @@ pub fn run(
 
     // Install root for discovery/lazy-init: -w flag → [defaults].workspace →
     // the runtime's own configured/default location (same order alf check uses).
-    let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
-
-    if all {
-        return run_all(
-            &mut config,
-            adapt.as_ref(),
-            runtime,
-            &install,
-            recover,
-            force_first_sync,
-            human,
-        );
-    }
+    // Generic requires an explicit workspace — fail here rather than let an
+    // empty path fall through to a stray CWD `.alf-agent-id` write (R1).
+    let install =
+        crate::commands::check::resolve_workspace_required(workspace_flag, &config, runtime)?;
 
     // Selection (and its enabled gate) runs BEFORE ApiClient::from_config so
     // selection errors are observable without an API key.
@@ -302,28 +361,30 @@ pub fn run(
         recover,
         force_first_sync,
         human,
+        progress,
     )?;
 
-    if human {
-        print_human_outcome(&outcome, selected.alf_agent_id)?;
-    } else {
-        output::json(&SyncResult {
-            ok: true,
-            sequence: outcome.sequence,
-            delta: outcome.delta,
-            changes: outcome.changes,
-            snapshot_path: outcome.snapshot_path.to_string_lossy().into(),
-            no_changes: outcome.no_changes,
-            recovered: outcome.recovered,
-            agent: SyncAgentRef {
-                runtime_agent: selected.alias.clone(),
-                alf_agent_id: selected.alf_agent_id,
-                source: selected.source,
-            },
-        });
-    }
+    Ok((outcome, selected))
+}
 
-    Ok(())
+/// Assemble the single-agent `SyncResult` JSON from a completed outcome and its
+/// selected agent. Shared by the CLI's `run` JSON branch and the MCP `alf_sync`
+/// tool so the two emit the identical structure.
+pub(crate) fn build_sync_result(outcome: SyncOutcome, selected: &SelectedAgent) -> SyncResult {
+    SyncResult {
+        ok: true,
+        sequence: outcome.sequence,
+        delta: outcome.delta,
+        changes: outcome.changes,
+        snapshot_path: outcome.snapshot_path.to_string_lossy().into(),
+        no_changes: outcome.no_changes,
+        recovered: outcome.recovered,
+        agent: SyncAgentRef {
+            runtime_agent: selected.alias.clone(),
+            alf_agent_id: selected.alf_agent_id,
+            source: selected.source,
+        },
+    }
 }
 
 /// `alf sync --all`: sync every enabled agent sequentially, collecting
@@ -362,6 +423,7 @@ fn run_all(
             recover,
             force_first_sync,
             /* human: */ false,
+            Progress::stderr(),
         ) {
             Ok(outcome) => results.push(SyncAllEntry {
                 runtime_agent: sel.alias.clone(),
@@ -433,9 +495,12 @@ fn run_all(
 }
 
 /// Sync one selected agent: export via the agent-aware seam, decide the mode,
-/// execute it. No stdout output — callers render the outcome.
+/// execute it. No stdout output — callers render the outcome. `progress`
+/// receives the interleaved status lines ([`Progress::stderr`] for the CLI, a
+/// callback for the MCP bridge); the human-mode `println!` path is CLI-only and
+/// never reached by the MCP server (which always passes `human: false`).
 #[allow(clippy::too_many_arguments)]
-fn sync_one(
+pub(crate) fn sync_one(
     client: &ApiClient,
     adapt: &dyn adapter::Adapter,
     runtime: &str,
@@ -444,6 +509,7 @@ fn sync_one(
     recover: bool,
     force_first_sync: bool,
     human: bool,
+    progress: Progress,
 ) -> Result<SyncOutcome> {
     // Fail closed on identity drift BEFORE any network traffic: the workspace
     // and the mapping must agree on who this agent is.
@@ -469,8 +535,8 @@ fn sync_one(
         println!("  Workspace: {}", workspace.display());
         println!();
     } else {
-        output::progress(&format!("Syncing {} workspace...", adapt.name()));
-        output::progress(&format!("  Workspace: {}", workspace.display()));
+        progress.emit(&format!("Syncing {} workspace...", adapt.name()));
+        progress.emit(&format!("  Workspace: {}", workspace.display()));
     }
 
     // WP3: prune tracked files (added via `alf add`) that the agent has since
@@ -480,7 +546,7 @@ fn sync_one(
     // this applies to every runtime whose adapter packs the tracked files.
     let removed = alf_core::prune_and_log_missing(&workspace)?;
     for rel in &removed {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Removed {rel} from sync (file no longer present; logged to {})",
             alf_core::SYNC_LOG_FILE
         ));
@@ -489,19 +555,19 @@ fn sync_one(
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("snapshot.alf");
 
-    output::progress("  Exporting workspace...");
+    progress.emit("  Exporting workspace...");
     // Export through the agent-aware seam: the mapping's id is written through
     // to the workspace, so manifest.agent.id == selected.alf_agent_id.
     let mut binding = selected.binding.clone();
     binding.workspace = workspace.clone();
     let report = adapt.export_agent(&binding, selected.alf_agent_id, &temp_alf)?;
-    output::progress(&format!(
+    progress.emit(&format!(
         "  Exported {} memory records",
         report.memory_records
     ));
     // Surface adapter advisories (e.g. Hermes's un-vaulted `.env` notice, D4).
     for w in &report.warnings {
-        output::progress(&format!("  ! {w}"));
+        progress.emit(&format!("  ! {w}"));
     }
 
     let alf_bytes = fs::read(&temp_alf).context("Failed to read temp .alf file")?;
@@ -541,6 +607,7 @@ fn sync_one(
             &temp_alf,
             &snapshot_path,
             force_first_sync,
+            progress,
         ),
         SyncMode::Delta { base_sequence } => execute_delta(
             client,
@@ -552,14 +619,15 @@ fn sync_one(
             &temp_alf,
             &snapshot_path,
             /* recovered: */ false,
+            progress,
         ),
         SyncMode::Recover { base_sequence } => {
-            output::progress(&format!(
+            progress.emit(&format!(
                 "  Local base missing — recovering from cloud (base sequence {base_sequence})..."
             ));
             // pull_cloud_base writes base.alf and state.toml under ~/.alf/state/.
-            let cloud = pull_cloud_base(client, agent_id)?;
-            output::progress(&format!(
+            let cloud = pull_cloud_base(client, agent_id, progress)?;
+            progress.emit(&format!(
                 "  Recovered local base at sequence {} ({})",
                 cloud.latest_sequence,
                 cloud.local_base.display()
@@ -574,6 +642,7 @@ fn sync_one(
                 &temp_alf,
                 &snapshot_path,
                 /* recovered: */ true,
+                progress,
             )
         }
         SyncMode::BailMissingBase {
@@ -711,8 +780,9 @@ fn execute_first_sync(
     temp_alf: &Path,
     snapshot_path: &Path,
     force_first_sync: bool,
+    progress: Progress,
 ) -> Result<SyncOutcome> {
-    output::progress("  First sync — registering agent and uploading snapshot...");
+    progress.emit("  First sync — registering agent and uploading snapshot...");
 
     // Lazy provisioning: the client-supplied id is the mapping id; a 409 feeds
     // the E3 guard below.
@@ -750,8 +820,9 @@ fn execute_delta(
     temp_alf: &Path,
     snapshot_path: &Path,
     recovered: bool,
+    progress: Progress,
 ) -> Result<SyncOutcome> {
-    output::progress(&format!(
+    progress.emit(&format!(
         "  Computing delta since sequence {base_sequence}..."
     ));
 
@@ -778,7 +849,7 @@ fn execute_delta(
     };
     let reconciled = alf_core::reconcile::reconcile(&prev_records, exported_records);
     let effective_bytes: std::borrow::Cow<'_, [u8]> = if reconciled.rewritten {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Reconciled memory identities: {} carried, {} updated in place, {} new, {} removed",
             reconciled.stats.carried,
             reconciled.stats.heading_matched + reconciled.stats.id_matched,
@@ -817,7 +888,7 @@ fn execute_delta(
     // delta. The service treats this as a clean, non-destructive rollover (new
     // base at the current sequence; prior deltas retained for point-in-time).
     if tracked_files_changed(runtime, &mut prev_reader, &mut curr_reader)? {
-        output::progress("  Tracked workspace files changed — uploading full snapshot...");
+        progress.emit("  Tracked workspace files changed — uploading full snapshot...");
         let upload = client
             .upload_snapshot(agent_id, effective_bytes.as_ref())
             .map_err(wrap_upload)?;
@@ -879,11 +950,11 @@ fn execute_delta(
         .filter(|e| e.operation == alf_core::manifest::DeltaOperation::Delete)
         .count();
 
-    output::progress(&format!(
+    progress.emit(&format!(
         "  Delta: {creates} creates, {updates} updates, {deletes} deletes"
     ));
     if !cred_diff.is_empty() {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Credentials: {} creates, {} updates, {} deletes",
             cred_diff.created.len(),
             cred_diff.updated.len(),
@@ -891,7 +962,7 @@ fn execute_delta(
         ));
     }
     if !princ_diff.is_empty() {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Principals: {} creates, {} updates, {} deletes",
             princ_diff.created.len(),
             princ_diff.updated.len(),
@@ -899,10 +970,10 @@ fn execute_delta(
         ));
     }
     if id_changed {
-        output::progress("  Identity changed");
+        progress.emit("  Identity changed");
     }
     if !raw_changed.is_empty() || !raw_deleted.is_empty() {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Raw sources: {} changed, {} removed",
             raw_changed.len(),
             raw_deleted.len()
@@ -1005,7 +1076,7 @@ fn execute_delta(
     let delta_buf = delta_writer.finish()?;
     let delta_bytes = delta_buf.into_inner();
 
-    output::progress(&format!(
+    progress.emit(&format!(
         "  Uploading delta ({} bytes)...",
         delta_bytes.len()
     ));
@@ -1145,6 +1216,51 @@ fn diff_raw_trees(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Schema conformance (offline): a populated `SyncResult` — whose partial
+    /// `SyncChanges` omits the zero credential/principal/identity layers —
+    /// validates against the same schemars schema the MCP `alf_sync` tool
+    /// declares as its `outputSchema`. This pins the `skip_serializing_if` +
+    /// `#[serde(default)]` reconciliation so a real (backend) sync result can
+    /// never drift from its declared schema. The MCP stdout harness only
+    /// exercises `alf_sync`'s error path offline, so this fills the success gap.
+    #[test]
+    fn sync_result_matches_declared_output_schema() {
+        let result = SyncResult {
+            ok: true,
+            sequence: 7,
+            delta: true,
+            changes: Some(SyncChanges {
+                creates: 1,
+                updates: 2,
+                deletes: 0,
+                credentials: LayerChanges::default(),
+                principals: LayerChanges::default(),
+                identity: false,
+            }),
+            snapshot_path: "/x/base.alf".into(),
+            no_changes: false,
+            recovered: false,
+            agent: SyncAgentRef {
+                runtime_agent: "main".into(),
+                alf_agent_id: Uuid::nil(),
+                source: SelectorSource::Flag,
+            },
+        };
+        let instance = serde_json::to_value(&result).unwrap();
+        // The zero layers must actually be omitted (the drift we're guarding).
+        let changes = &instance["changes"];
+        assert!(changes.get("credentials").is_none());
+        assert!(changes.get("principals").is_none());
+        assert!(changes.get("identity").is_none());
+
+        let schema = serde_json::to_value(schemars::schema_for!(SyncResult)).unwrap();
+        let validator = jsonschema::validator_for(&schema).unwrap();
+        assert!(
+            validator.is_valid(&instance),
+            "SyncResult must validate against its declared schema; instance = {instance}"
+        );
+    }
 
     /// A 409 sequence conflict must steer to restore, not a retry loop — a
     /// plain re-run pushes the same stale base and fails identically.

@@ -82,9 +82,12 @@ pub fn memory_record_id(
     )
 }
 
-/// Lowercase hex SHA-256 of `bytes`. Shared by the content-addressed id scheme
-/// and reconcile's collision re-mint.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`. Shared by the content-addressed id scheme,
+/// reconcile's collision re-mint, and test gates that fingerprint record content.
+///
+/// Note: [`memory_record_id`] hashes `content.trim_end()`, not raw content —
+/// callers fingerprinting raw bytes get a different digest than the id preimage.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);

@@ -19,6 +19,7 @@ pub mod memory;
 
 pub mod adapter;
 pub mod archive;
+pub mod chunk;
 pub mod credentials;
 pub mod crypto;
 pub mod delta;

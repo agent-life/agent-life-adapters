@@ -247,7 +247,7 @@ Inspect the effect with `alf export --dry-run` — the `excluded_by_alfignore` c
 | Error / Issue Code | Cause | Fix |
 | --- | --- | --- |
 | `no_api_key` | No API key configured | `alf login --key <key>` |
-| `workspace_not_found` | Workspace directory doesn't exist | Pass correct path: `alf check -r openclaw -w /correct/path` |
+| `workspace_not_found` | Workspace directory doesn't exist | Pass correct path: `alf check -r <runtime> -w /correct/path` |
 | `no_memory_content` | No MEMORY.md and no memory/ directory | Agent has no memories yet — nothing to sync |
 | `service_unreachable` | API endpoint not responding | Check network; verify `api_url` in `~/.alf/config.toml` |
 | HTTP 401 Unauthorized | Bad or revoked API key | `alf login --key <new-key>` |

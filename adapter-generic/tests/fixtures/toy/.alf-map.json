@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "framework": "toybox",
+  "framework_version": "0.1.0",
+  "identity_file": "IDENTITY.md",
+  "memory_sources": [
+    { "id": "journal",   "glob": "memories/*.md",     "memory_type": "episodic",
+      "namespace": "daily",      "chunking": "by_heading",
+      "timestamp": "filename_date",                    "tags": ["hashtags"] },
+    { "id": "knowledge", "glob": "knowledge/**/*.md",  "memory_type": "semantic",
+      "namespace": "curated",    "chunking": "per_file", "timestamp": "file_mtime",
+      "tags": ["static:kb"] },
+    { "id": "howto",     "glob": "procedures/*.md",    "memory_type": "procedural",
+      "namespace": "procedural", "chunking": "per_file", "timestamp": "file_mtime" }
+  ],
+  "watch": { "default_interval": "15m",
+             "per_source": { "journal": "5m" },
+             "tracked_files_interval": "1h" }
+}

@@ -19,6 +19,7 @@ use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
 use crate::output;
+use crate::output::Progress;
 use crate::selector;
 use crate::state::{local_base_path, AgentState};
 use crate::vault_key::{self, VaultKeyArgs};
@@ -114,13 +115,14 @@ fn fetch_restore_payload(
     client: &ApiClient,
     agent_id: Uuid,
     up_to_sequence: Option<u64>,
+    progress: Progress,
 ) -> Result<(Vec<u8>, u64)> {
-    output::progress("  Fetching restore manifest...");
+    progress.emit("  Fetching restore manifest...");
     let restore = client.restore(agent_id, up_to_sequence)?;
 
     let snapshot_bytes = match &restore.snapshot {
         Some(snap) => {
-            output::progress(&format!(
+            progress.emit(&format!(
                 "  Downloading snapshot (sequence {})...",
                 snap.sequence
             ));
@@ -138,16 +140,16 @@ fn fetch_restore_payload(
     let snapshot_sequence = restore.snapshot.as_ref().map(|s| s.sequence).unwrap_or(0);
 
     let delta_byte_vecs: Vec<Vec<u8>> = if restore.deltas.is_empty() {
-        output::progress("  No additional deltas to apply.");
+        progress.emit("  No additional deltas to apply.");
         Vec::new()
     } else {
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Downloading {} delta(s)...",
             restore.deltas.len()
         ));
         let mut out = Vec::with_capacity(restore.deltas.len());
         for (i, delta_info) in restore.deltas.iter().enumerate() {
-            output::progress(&format!(
+            progress.emit(&format!(
                 "  Downloading delta {} of {} (sequence {})...",
                 i + 1,
                 restore.deltas.len(),
@@ -155,7 +157,7 @@ fn fetch_restore_payload(
             ));
             out.push(client.download_presigned(&delta_info.url)?);
         }
-        output::progress(&format!(
+        progress.emit(&format!(
             "  Merging {} delta(s) into snapshot...",
             restore.deltas.len()
         ));
@@ -182,8 +184,12 @@ fn fetch_restore_payload(
 /// `base.alf` is written **before** `state.toml`. This guarantees that
 /// state.toml-present ⇒ base.alf-present at the moment of the last successful
 /// write. See [`docs/how_alf_syncs.md`].
-pub(crate) fn pull_cloud_base(client: &ApiClient, agent_id: Uuid) -> Result<CloudBase> {
-    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, None)?;
+pub(crate) fn pull_cloud_base(
+    client: &ApiClient,
+    agent_id: Uuid,
+    progress: Progress,
+) -> Result<CloudBase> {
+    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, None, progress)?;
 
     let local_base = local_base_path(agent_id)?;
     if let Some(parent) = local_base.parent() {
@@ -222,8 +228,9 @@ fn fetch_point_in_time(
     client: &ApiClient,
     agent_id: Uuid,
     up_to_sequence: u64,
+    progress: Progress,
 ) -> Result<(Vec<u8>, u64)> {
-    fetch_restore_payload(client, agent_id, Some(up_to_sequence))
+    fetch_restore_payload(client, agent_id, Some(up_to_sequence), progress)
 }
 
 pub fn run(
@@ -318,10 +325,10 @@ pub fn run(
     //   Some(n) → PIT preview: fetch only, leave ~/.alf/state untouched.
     let (final_bytes, latest_sequence) = match at_sequence {
         None => {
-            let base = pull_cloud_base(&client, agent_id)?;
+            let base = pull_cloud_base(&client, agent_id, Progress::stderr())?;
             (base.final_bytes, base.latest_sequence)
         }
-        Some(n) => fetch_point_in_time(&client, agent_id, n)?,
+        Some(n) => fetch_point_in_time(&client, agent_id, n, Progress::stderr())?,
     };
 
     // Import the merged archive into the workspace.
@@ -425,7 +432,8 @@ fn run_dry_run(
         ));
     }
 
-    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, at_sequence)?;
+    let (final_bytes, latest_sequence) =
+        fetch_restore_payload(client, agent_id, at_sequence, Progress::stderr())?;
 
     // Decode in a tempdir that is removed on exit — no workspace, no state.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;

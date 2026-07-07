@@ -199,7 +199,7 @@ Field notes:
       "resources": { ... },
       "alf": { "config_exists": false, "api_key_set": false, "agent_tracked": false, "last_synced_sequence": null, "service_reachable": false },
       "issues": [
-        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found", "suggestion": "Pass correct path: alf check -r openclaw -w /path/to/workspace" },
+        { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found at ...", "suggestion": "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace" },
         { "severity": "error", "code": "no_api_key", "message": "No API key configured", "suggestion": "Run: alf login --key <your-api-key>" }
       ],
       "suggestions": ["Get an API key at https://agent-life.ai/settings/api-keys"]

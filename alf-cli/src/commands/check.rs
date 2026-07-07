@@ -13,6 +13,7 @@ use crate::vault_migrate::{self, MigrationOutcome};
 use alf_core::CredentialsDocument;
 use anyhow::Result;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -22,8 +23,8 @@ use uuid::Uuid;
 // JSON output types
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
-struct CheckResult {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct CheckResult {
     version: String,
     ok: bool,
     runtime: String,
@@ -44,7 +45,7 @@ struct CheckResult {
 }
 
 /// Outcome of discovery + reconcile against the `[[agents]]` mapping.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct AgentsSection {
     first_run: bool,
     agents: Vec<AgentRow>,
@@ -55,7 +56,7 @@ struct AgentsSection {
     drift: Vec<crate::discovery::DriftWarning>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct AgentRow {
     runtime_agent: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -66,13 +67,13 @@ struct AgentRow {
     status: &'static str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct AlfignoreInfo {
     /// Whether a `.alfignore` file exists at the workspace root.
     present: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct WorkspaceInfo {
     path: String,
     source: String, // "flag", "alf_config", "openclaw.json", "default"
@@ -80,7 +81,7 @@ struct WorkspaceInfo {
     writable: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct ResourceInfo {
     soul_md: bool,
     identity_md: bool,
@@ -97,26 +98,26 @@ struct ResourceInfo {
     agent_id: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct DailyLogInfo {
     count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     latest: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct ProjectFileInfo {
     count: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct OpenClawInfo {
     config_found: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace_configured: Option<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct AlfInfo {
     config_exists: bool,
     api_key_set: bool,
@@ -130,7 +131,7 @@ struct AlfInfo {
 
 /// Snapshot of environment variables relevant to alf. Secret-bearing vars are
 /// reported as presence booleans only — their values are never serialized.
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct EnvInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     home: Option<String>,
@@ -145,7 +146,7 @@ struct EnvInfo {
 /// Location and state of the agent's credential vault
 /// (`~/.alf/vault/{alf_agent_id}/credentials.json`, or the legacy
 /// install-scoped path on mapping-less hosts).
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct VaultInfo {
     path: String,
     exists: bool,
@@ -155,7 +156,7 @@ struct VaultInfo {
     agent_id: Option<Uuid>,
     /// A pre-WP1 install-scoped vault still exists alongside the per-agent
     /// scope — migration is pending (see the issues list). Omitted when false.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     legacy_vault_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential_count: Option<usize>,
@@ -170,7 +171,7 @@ struct VaultInfo {
     parity_ok: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, JsonSchema)]
 struct Issue {
     severity: String, // "error", "warning", "info"
     code: String,
@@ -204,6 +205,10 @@ pub(crate) fn resolve_workspace(
     let configured = match runtime {
         "zeroclaw" => read_zeroclaw_workspace(),
         "hermes" => None,
+        // Generic runtimes have no runtime-side config to auto-discover: the
+        // workspace must be given explicitly. Placing this before the `_` arm
+        // keeps generic from ever reading `~/.openclaw/openclaw.json` (F12).
+        "generic" => None,
         _ => read_openclaw_workspace(),
     };
 
@@ -225,6 +230,20 @@ pub(crate) fn resolve_workspace(
                 runtime_configured_path: configured,
             };
         }
+    }
+
+    // Generic runtimes never auto-discover a workspace: with neither `-w` nor
+    // `[defaults].workspace` set there is nothing to resolve, so return an
+    // explicit "unresolved" sentinel rather than falling through to OpenClaw's
+    // `~/.openclaw/workspace` default (F12). The empty path fails the caller's
+    // `is_dir()` check, surfacing a clear "workspace required" error instead of
+    // silently pointing a generic agent at the OpenClaw workspace.
+    if runtime == "generic" {
+        return ResolvedWorkspace {
+            path: PathBuf::new(),
+            source: "unresolved".into(),
+            runtime_configured_path: None,
+        };
     }
 
     // Priority 3 + 4: runtime-specific discovery.
@@ -284,6 +303,26 @@ pub(crate) fn resolve_workspace(
         source: "default".into(),
         runtime_configured_path: configured,
     }
+}
+
+/// Resolve the install/workspace root, erroring if a runtime that requires an
+/// explicit workspace (generic) has none (R1). Without this an unresolved
+/// generic workspace flows into the default `export_agent`, which writes a stray
+/// `.alf-agent-id` into the CWD and then bails with a blank path. Non-generic
+/// runtimes always resolve to a concrete default, so this is a no-op for them.
+pub(crate) fn resolve_workspace_required(
+    flag: Option<&Path>,
+    config: &Config,
+    runtime: &str,
+) -> Result<PathBuf> {
+    let resolved = resolve_workspace(flag, config, runtime);
+    if resolved.source == "unresolved" || resolved.path.as_os_str().is_empty() {
+        anyhow::bail!(
+            "{runtime} runtime requires an explicit workspace. Pass `-w <path>` or set \
+             `[defaults].workspace` in ~/.alf/config.toml."
+        );
+    }
+    Ok(resolved.path)
 }
 
 /// Read `workspace_dir` from `~/.zeroclaw/config.toml`.
@@ -413,9 +452,9 @@ fn collect_issues(
             severity: "error".into(),
             code: "workspace_not_found".into(),
             message: format!("Workspace directory not found at {}", ws.path),
-            suggestion:
-                "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace"
-                    .into(),
+            suggestion: format!(
+                "Pass the correct workspace path: alf check -r {runtime} -w /path/to/workspace"
+            ),
         });
         return issues; // no point checking resources if workspace doesn't exist
     }
@@ -553,6 +592,25 @@ fn collect_issues(
     issues
 }
 
+/// Where each runtime keeps its workspace, for the `workspace_not_found` hint.
+/// Generic has no auto-discovery, so it points at the explicit-workspace knobs.
+fn workspace_config_hint(runtime: &str) -> &'static str {
+    match runtime {
+        "zeroclaw" => {
+            "The workspace path may be customized in ~/.zeroclaw/config.toml (workspace_dir)"
+        }
+        "hermes" => "The workspace is $HERMES_HOME (defaults to ~/.hermes)",
+        "generic" => {
+            "generic has no auto-discovery: pass -w <path> or set [defaults].workspace in \
+             ~/.alf/config.toml"
+        }
+        _ => {
+            "The workspace path may be customized in ~/.openclaw/openclaw.json under \
+              agents.defaults.workspace"
+        }
+    }
+}
+
 fn build_suggestions(result: &CheckResult) -> Vec<String> {
     let mut suggestions = Vec::new();
 
@@ -570,9 +628,7 @@ fn build_suggestions(result: &CheckResult) -> Vec<String> {
             .iter()
             .any(|i| i.code == "workspace_not_found")
         {
-            suggestions.push(
-                "The workspace path may be customized in ~/.openclaw/openclaw.json under agents.defaults.workspace".into()
-            );
+            suggestions.push(workspace_config_hint(&result.runtime).into());
         }
     }
 
@@ -584,7 +640,25 @@ fn build_suggestions(result: &CheckResult) -> Vec<String> {
 // ---------------------------------------------------------------------------
 
 pub fn run(runtime: &str, workspace_arg: Option<&Path>, agent: Option<&str>) -> Result<()> {
-    let human = output::human_mode();
+    let result = gather(runtime, workspace_arg, agent)?;
+    if output::human_mode() {
+        print_human(&result);
+    } else {
+        output::json(&result);
+    }
+    Ok(())
+}
+
+/// Run the full `alf check` diagnostic (discovery + reconcile + persist + vault
+/// migration + resource/service probing) and return the structured result
+/// **without** printing. Extracted as a seam so the MCP `alf_check` tool
+/// returns the byte-identical JSON. Progress lines still go to stderr via
+/// `output::progress` (never stdout — safe for the MCP protocol stream).
+pub(crate) fn gather(
+    runtime: &str,
+    workspace_arg: Option<&Path>,
+    agent: Option<&str>,
+) -> Result<CheckResult> {
     let mut config = Config::load()?;
 
     output::progress(&format!("Checking {} environment...", runtime));
@@ -841,13 +915,7 @@ pub fn run(runtime: &str, workspace_arg: Option<&Path>, agent: Option<&str>) -> 
     };
     result.suggestions = build_suggestions(&result);
 
-    if human {
-        print_human(&result);
-    } else {
-        output::json(&result);
-    }
-
-    Ok(())
+    Ok(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -1302,6 +1370,129 @@ mod tests {
 
         assert_eq!(resolved.source, "default");
         assert!(resolved.path.ends_with(".zeroclaw"));
+    }
+
+    // --- Generic runtime workspace resolution (WP-M1) ------------------------
+
+    /// Generic honors `-w` (priority 1) and `[defaults].workspace` (priority 2)
+    /// exactly like every other runtime.
+    #[test]
+    fn resolve_workspace_generic_honors_explicit_workspace() {
+        let flag = PathBuf::from("/gen/ws");
+        let resolved = resolve_workspace(Some(&flag), &Config::default(), "generic");
+        assert_eq!(resolved.path, PathBuf::from("/gen/ws"));
+        assert_eq!(resolved.source, "flag");
+
+        let mut config = Config::default();
+        config.defaults.workspace = Some("/alf/gen/ws".into());
+        let resolved = resolve_workspace(None, &config, "generic");
+        assert_eq!(resolved.path, PathBuf::from("/alf/gen/ws"));
+        assert_eq!(resolved.source, "alf_config");
+    }
+
+    /// Without an explicit workspace, generic must NOT fall through to OpenClaw
+    /// discovery — even when a `~/.openclaw/openclaw.json` is present. It
+    /// resolves to the "unresolved" sentinel (empty path) instead.
+    #[test]
+    fn resolve_workspace_generic_never_falls_through_to_openclaw() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        std::env::set_var("HOME", tmp.path());
+
+        let oc_dir = tmp.path().join(".openclaw");
+        fs::create_dir_all(&oc_dir).unwrap();
+        fs::write(
+            oc_dir.join("openclaw.json"),
+            r#"{"agents":{"defaults":{"workspace":"/from/openclaw"}}}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_workspace(None, &Config::default(), "generic");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(resolved.source, "unresolved");
+        assert_eq!(resolved.path, PathBuf::new());
+        assert!(resolved.runtime_configured_path.is_none());
+    }
+
+    /// Goal (c) guard: adding the generic arm must not perturb openclaw /
+    /// zeroclaw / hermes resolution. Pins each runtime's default-fallback
+    /// (path, source) byte-for-byte against a clean HOME.
+    #[test]
+    fn resolve_workspace_existing_runtimes_unchanged_by_generic_arm() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let prev = std::env::var_os("HOME");
+        let prev_alf = std::env::var_os("ALF_HOME");
+        let prev_hermes = std::env::var_os("HERMES_HOME");
+        std::env::set_var("HOME", tmp.path());
+        std::env::remove_var("ALF_HOME");
+        std::env::remove_var("HERMES_HOME");
+
+        let config = Config::default();
+        let openclaw = resolve_workspace(None, &config, "openclaw");
+        let zeroclaw = resolve_workspace(None, &config, "zeroclaw");
+        let hermes = resolve_workspace(None, &config, "hermes");
+
+        match prev {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match prev_alf {
+            Some(v) => std::env::set_var("ALF_HOME", v),
+            None => std::env::remove_var("ALF_HOME"),
+        }
+        match prev_hermes {
+            Some(v) => std::env::set_var("HERMES_HOME", v),
+            None => std::env::remove_var("HERMES_HOME"),
+        }
+
+        assert_eq!(openclaw.source, "default");
+        assert_eq!(
+            openclaw.path,
+            tmp.path().join(".openclaw").join("workspace")
+        );
+        assert_eq!(zeroclaw.source, "default");
+        assert_eq!(zeroclaw.path, tmp.path().join(".zeroclaw"));
+        assert_eq!(hermes.source, "default");
+        assert_eq!(hermes.path, tmp.path().join(".hermes"));
+    }
+
+    /// R1: an unresolved generic workspace errors (no stray CWD write path).
+    /// Non-generic runtimes always resolve, so the guard is a no-op for them.
+    #[test]
+    fn resolve_workspace_required_errors_for_unresolved_generic() {
+        let err = resolve_workspace_required(None, &Config::default(), "generic").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("generic"), "must name the runtime: {msg}");
+        assert!(msg.contains("-w"), "must suggest -w: {msg}");
+
+        // With an explicit -w it resolves fine.
+        let flag = PathBuf::from("/gen/ws");
+        assert_eq!(
+            resolve_workspace_required(Some(&flag), &Config::default(), "generic").unwrap(),
+            flag
+        );
+    }
+
+    /// C3: the workspace_not_found config hint names the correct config surface
+    /// per runtime (and never points a non-openclaw runtime at openclaw.json).
+    #[test]
+    fn workspace_config_hint_is_runtime_aware() {
+        assert!(workspace_config_hint("openclaw").contains("openclaw.json"));
+        assert!(workspace_config_hint("zeroclaw").contains("zeroclaw/config.toml"));
+        assert!(workspace_config_hint("hermes").contains("HERMES_HOME"));
+        let generic = workspace_config_hint("generic");
+        assert!(generic.contains("-w") && generic.contains("[defaults].workspace"));
+        assert!(
+            !generic.contains("openclaw"),
+            "generic hint must not mention openclaw"
+        );
     }
 
     #[test]

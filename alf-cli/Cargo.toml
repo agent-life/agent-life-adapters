@@ -15,6 +15,7 @@ alf-core = { path = "../alf-core" }
 adapter-openclaw = { path = "../adapter-openclaw" }
 adapter-zeroclaw = { path = "../adapter-zeroclaw" }
 adapter-hermes = { path = "../adapter-hermes" }
+adapter-generic = { path = "../adapter-generic" }
 anyhow = "1"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
@@ -26,6 +27,13 @@ serde_json = "1"
 tempfile = "3"
 toml = "0.8"
 uuid = { version = "1", features = ["v7"] }
+# MCP server (`alf mcp serve`). rmcp's `server` feature pulls schemars 1.x; we
+# depend on the SAME schemars so `#[derive(JsonSchema)]` on our output structs
+# interops with rmcp's outputSchema generation. tokio is already transitive via
+# blocking reqwest — the new weight is rmcp/schemars only (see WP-M2a handoff).
+rmcp = { version = "2.1", default-features = false, features = ["server", "macros", "transport-io"] }
+schemars = { version = "1", features = ["chrono04", "uuid1"] }
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "io-std", "macros", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -34,5 +42,8 @@ assert_cmd = "2"
 predicates = "3"
 serde_json = "1"
 shlex = "1"
+# MCP stdout-discipline harness: validate tool `structuredContent` against each
+# tool's declared `outputSchema`.
+jsonschema = "0.46"
 
 

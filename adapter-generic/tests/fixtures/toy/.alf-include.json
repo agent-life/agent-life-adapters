@@ -1,0 +1,7 @@
+{
+  "files": [
+    { "path": "config.toml" },
+    { "path": "data/brain.db" },
+    { "path": "notes.txt" }
+  ]
+}

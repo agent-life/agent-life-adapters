@@ -1,0 +1,75 @@
+[
+  {
+    "origin_file": "knowledge/rust.md",
+    "id": "9cac3069-196e-53de-8043-2bbd667ce1b8",
+    "memory_type": "semantic",
+    "namespace": "curated",
+    "content_sha256": "0e6e7525fef14de85df1a67e6beabe3a2eddc3310026fe19a25e4feb5b332d79",
+    "line_start": 1,
+    "line_end": 3,
+    "heading": null,
+    "tags": [
+      "curated",
+      "kb"
+    ],
+    "observed_at": null
+  },
+  {
+    "origin_file": "knowledge/systems/deploy.md",
+    "id": "703bdc02-7d1c-573e-877b-b1f3e2865a68",
+    "memory_type": "semantic",
+    "namespace": "curated",
+    "content_sha256": "5291d47b91a3daa3d1117e9b63fc0ac5766a3e3ef37248b9f1d474e8187f4fba",
+    "line_start": 1,
+    "line_end": 3,
+    "heading": null,
+    "tags": [
+      "curated",
+      "kb"
+    ],
+    "observed_at": null
+  },
+  {
+    "origin_file": "memories/2026-07-04.md",
+    "id": "ff094016-a567-5daa-a897-29cd69eab25d",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "052bb59588d706eea6df2552f72a05480613ac9b437da4b0cc018583627d5bcf",
+    "line_start": 3,
+    "line_end": 6,
+    "heading": "Fixed the deploy pipeline",
+    "tags": [
+      "daily"
+    ],
+    "observed_at": "2026-07-04T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memories/2026-07-04.md",
+    "id": "bc505608-2a7b-5565-bb1f-f05e643826a0",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "c5134ac2c2d883b9d230f2162c699da2546822c972cdf17e6f597a0d86202cb6",
+    "line_start": 8,
+    "line_end": 9,
+    "heading": "Standup notes",
+    "tags": [
+      "daily",
+      "planning"
+    ],
+    "observed_at": "2026-07-04T00:00:00+00:00"
+  },
+  {
+    "origin_file": "procedures/backup.md",
+    "id": "17de263c-9ce7-51fd-9291-2317d5f84f20",
+    "memory_type": "procedural",
+    "namespace": "procedural",
+    "content_sha256": "ca96551bca7f1ec395c9607c97f67a42c4bef2113bfc813174f3ef3eac5f41ba",
+    "line_start": 1,
+    "line_end": 5,
+    "heading": null,
+    "tags": [
+      "procedural"
+    ],
+    "observed_at": null
+  }
+]

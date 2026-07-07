@@ -11,6 +11,7 @@ mod discovery;
 mod errors;
 mod fs_private;
 pub mod output;
+mod schema;
 mod selector;
 mod state;
 mod vault_key;
@@ -64,7 +65,7 @@ enum Command {
         Example: alf export -r openclaw -w ./my-agent -o backup.alf"
     )]
     Export {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -95,7 +96,7 @@ enum Command {
         /// Path to the file to track (workspace-relative, or any path with --external)
         path: Option<String>,
 
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -130,7 +131,7 @@ enum Command {
         Example: alf import -r openclaw -w ./restored-agent archive.alf"
     )]
     Import {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -189,7 +190,7 @@ enum Command {
         by `alf vault add`; sync carries it as-is and never reads a vault key."
     )]
     Sync {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -229,7 +230,7 @@ enum Command {
         Example: alf restore --at-sequence 3 -r openclaw -w ./preview --agent <alias-or-id>"
     )]
     Restore {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -266,7 +267,7 @@ enum Command {
         Example: alf purge -r openclaw -w ./my-agent"
     )]
     Purge {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -299,7 +300,7 @@ enum Command {
         Example: alf check -r openclaw -w ~/custom-workspace"
     )]
     Check {
-        /// Agent framework runtime (openclaw, zeroclaw, hermes)
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -321,7 +322,7 @@ enum Command {
         Example: alf agents -r zeroclaw enable default"
     )]
     Agents {
-        /// Scope to one runtime (openclaw, zeroclaw, hermes); default: all
+        /// Scope to one runtime (openclaw, zeroclaw, hermes, generic); default: all
         #[arg(short, long)]
         runtime: Option<String>,
 
@@ -354,6 +355,35 @@ enum Command {
     Vault {
         #[command(subcommand)]
         command: VaultCommand,
+    },
+
+    /// Run an MCP (Model Context Protocol) server over stdio
+    #[command(
+        long_about = "Serve ALF tools to an MCP-capable agent host over stdio. The host \
+        spawns `alf mcp serve` as a subprocess and drives it with JSON-RPC on stdin/stdout; \
+        all diagnostics go to stderr. WP-M2a exposes alf_status, alf_check, and alf_sync, \
+        each with a declared outputSchema and structured results.\n\n\
+        The runtime and workspace pin which agent this server operates on, exactly like the \
+        other subcommands (global --agent selects among mapped agents).\n\n\
+        Example: alf mcp serve -r generic -w ./my-agent"
+    )]
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum McpCommand {
+    /// Serve ALF tools over stdio for an MCP-capable agent host
+    Serve {
+        /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)
+        #[arg(short, long)]
+        runtime: Option<String>,
+
+        /// Path to the agent workspace directory
+        #[arg(short, long)]
+        workspace: Option<PathBuf>,
     },
 }
 
@@ -438,7 +468,7 @@ enum VaultCommand {
         #[arg(short = 'a', long = "agent-id")]
         agent_id: Option<String>,
 
-        /// Runtime for default key path resolution (openclaw, zeroclaw, hermes).
+        /// Runtime for default key path resolution (openclaw, zeroclaw, hermes, generic).
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 
@@ -853,6 +883,28 @@ fn main() {
         Command::Help { topic, json } => commands::help::run(topic.as_deref(), json),
 
         Command::Vault { command } => dispatch_vault(command, agent),
+
+        Command::Mcp { command } => match command {
+            // The MCP host owns stdout for the JSON-RPC protocol stream, so this
+            // arm must NEVER yield into main's shared error path below: in
+            // non-human mode (an MCP host never sets ALF_HUMAN) that path prints
+            // a `{"ok":false,…}` JSON error to stdout, which would corrupt the
+            // stream — including a `Config::load()` failure on a malformed
+            // ~/.alf/config.toml, which would land as the first bytes the client
+            // reads during `initialize`. Handle failure on stderr and exit here.
+            McpCommand::Serve { runtime, workspace } => {
+                let outcome = (|| -> anyhow::Result<()> {
+                    let config = Config::load()?;
+                    let runtime = config.resolve_runtime(runtime);
+                    commands::mcp::serve(&runtime, workspace.as_deref(), agent)
+                })();
+                if let Err(err) = outcome {
+                    eprintln!("alf mcp serve: {err:#}");
+                    process::exit(1);
+                }
+                process::exit(0);
+            }
+        },
     };
 
     if let Err(err) = result {

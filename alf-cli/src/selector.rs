@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Which input won the selector precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectorSource {
     Flag,

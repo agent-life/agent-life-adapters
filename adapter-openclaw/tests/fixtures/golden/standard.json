@@ -1,0 +1,123 @@
+[
+  {
+    "origin_file": "MEMORY.md",
+    "id": "99517b28-8b89-5cdf-aab3-cb0efde32527",
+    "memory_type": "semantic",
+    "namespace": "curated",
+    "content_sha256": "37416203eccb3a1c670ee7f22be7330f349f1bd7e18111c0f22fae1315b95523",
+    "line_start": 3,
+    "line_end": 5,
+    "heading": "Fact 1",
+    "observed_at": null
+  },
+  {
+    "origin_file": "MEMORY.md",
+    "id": "5cca438c-d6cd-51e4-9e0c-db3ff4f1daf7",
+    "memory_type": "semantic",
+    "namespace": "curated",
+    "content_sha256": "611448539d4a6bebad7bb287c4f06c710521d95e30bcf7046bbbf5dabea5e0ec",
+    "line_start": 6,
+    "line_end": 7,
+    "heading": "Fact 2",
+    "observed_at": null
+  },
+  {
+    "origin_file": "memory/2026-01-15.md",
+    "id": "ca031378-0709-552c-b9be-1a48c4be5d94",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "1a6826eb1a69f5a8f6e96a1c78efb5f9642fc33f7404babb7f47aa9f6271b3df",
+    "line_start": 1,
+    "line_end": 3,
+    "heading": "Morning standup",
+    "observed_at": "2026-01-15T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memory/2026-01-15.md",
+    "id": "3c210c96-98d0-5ee9-8277-e719fbe277fe",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "6f2b173d970776b1eb7dad78c48799573e34c728152582ae213f117c71687b0e",
+    "line_start": 4,
+    "line_end": 6,
+    "heading": "Afternoon sync",
+    "observed_at": "2026-01-15T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memory/2026-01-15.md",
+    "id": "0de34db0-4cd9-5a9b-9a74-7e0c3a47b7fb",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "cfdc523561eb4fe82548b90a9b077fd18eede383c2c5b27cfc8f9e84d827ec09",
+    "line_start": 7,
+    "line_end": 8,
+    "heading": "EOD summary",
+    "observed_at": "2026-01-15T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memory/2026-01-16.md",
+    "id": "8f7f8218-24ed-5e56-aa22-4c71c10156c3",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "a38b820613bf10d66fc1d310cdf47e1e7f31761040696d35ac4b7cbb723349ef",
+    "line_start": 1,
+    "line_end": 2,
+    "heading": "Plan for today",
+    "observed_at": "2026-01-16T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memory/active-context.md",
+    "id": "d850e2ee-a1cb-59d2-8451-00fcc5c9de2e",
+    "memory_type": "summary",
+    "namespace": "active-context",
+    "content_sha256": "d0723d9a8a7ecaa72dfb61d871c5e0937ec0e37363db29896668d7646828b965",
+    "line_start": 1,
+    "line_end": 1,
+    "heading": null,
+    "observed_at": null
+  },
+  {
+    "origin_file": "memory/curated/postgres-rls.md",
+    "id": "d5cc12b9-9717-5492-9b9f-9173f828f996",
+    "memory_type": "semantic",
+    "namespace": "curated",
+    "content_sha256": "4245be580d114753bd797509159bd5f2f6581944876ddde8bd8630c73ad83d32",
+    "line_start": 1,
+    "line_end": 20,
+    "heading": null,
+    "observed_at": null
+  },
+  {
+    "origin_file": "memory/gating-policies.md",
+    "id": "3f42e4cd-618b-58d0-8a06-7d4c94766446",
+    "memory_type": "procedural",
+    "namespace": "procedural",
+    "content_sha256": "fc95b358b24cad74d521a483e9e45ffc22743cf10b5789b1ac82b635552029c1",
+    "line_start": 1,
+    "line_end": 2,
+    "heading": "Auth Policy",
+    "observed_at": null
+  },
+  {
+    "origin_file": "memory/procedures/morning-standup.md",
+    "id": "f41f64ab-be6c-5eef-a8a6-3b1e623c9500",
+    "memory_type": "procedural",
+    "namespace": "procedural",
+    "content_sha256": "f40010c1ee694dd83b382d1cd86cb64c5e604b3732ae653e7115a48ddbfaba92",
+    "line_start": 1,
+    "line_end": 35,
+    "heading": null,
+    "observed_at": null
+  },
+  {
+    "origin_file": "memory/project-clawsmith.md",
+    "id": "ee3e82b4-4bb2-5d26-8171-30bad596ae51",
+    "memory_type": "semantic",
+    "namespace": "project",
+    "content_sha256": "2168fee69a539e5114297bed64b8f3a3a5c18636dd9ee56e52de56b4857e412d",
+    "line_start": 1,
+    "line_end": 2,
+    "heading": "Overview",
+    "observed_at": null
+  }
+]

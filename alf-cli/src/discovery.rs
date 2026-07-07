@@ -59,7 +59,7 @@ pub struct ReconciledRow {
 }
 
 /// Warn-only identity-drift report (DoD 4).
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct DriftWarning {
     pub runtime_agent: String,
     pub message: String,

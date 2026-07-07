@@ -68,8 +68,11 @@ pub fn run(
                 true,
             )
         } else {
-            let install =
-                crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+            let install = crate::commands::check::resolve_workspace_required(
+                workspace_flag,
+                &config,
+                runtime,
+            )?;
             let selected = selector::select_current_agent(
                 &mut config,
                 adapter.as_ref(),
@@ -91,7 +94,8 @@ pub fn run(
     // Selection (lazy init applies): the mapping's id becomes the archive
     // identity. An explicit -w pointing elsewhere is an ad-hoc export and
     // keeps the legacy id-less path.
-    let install = crate::commands::check::resolve_workspace(workspace_flag, &config, runtime).path;
+    let install =
+        crate::commands::check::resolve_workspace_required(workspace_flag, &config, runtime)?;
     let selected =
         selector::select_current_agent(&mut config, adapter.as_ref(), runtime, &install, agent)?;
 

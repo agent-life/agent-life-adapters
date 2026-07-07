@@ -14,6 +14,9 @@ use regex::Regex;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
+use alf_core::chunk::{
+    dispatch, split_markdown_sections, ChunkingStrategy, MarkdownSection, SourceHandler,
+};
 use alf_core::{
     ExtractionMethod, MemoryRecord, MemoryStatus, MemoryType, SourceProvenance, TemporalMetadata,
 };
@@ -41,36 +44,6 @@ const RUNTIME: &str = "openclaw";
 // location declares how it maps: which `memory_type`/`namespace` to tag and how to
 // chunk it. Files that match no specific row fall to the `memory/*.md` catch-all.
 // This table is the pattern future adapters (ZeroClaw, …) copy and re-fill.
-
-/// How a matched source file is turned into records.
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum ChunkingStrategy {
-    /// The whole file is one record (procedures, curated knowledge, active-context).
-    OneRecordPerFile,
-    /// Split on Markdown ATX headings of `level` (2 == `## `). When `fence_aware`,
-    /// headings inside ``` fenced code blocks are ignored.
-    SplitByHeading { fence_aware: bool, level: u8 },
-    /// Layer 4 — iterate vault entries. Owned by the vault path (WP1); never
-    /// dispatched from the memory parser. Present so the strategy vocabulary
-    /// matches the architectural framing for future adapters.
-    #[allow(dead_code)]
-    VaultEntries,
-    /// Layer 5 — path listing only, no parse. Owned by `enumerate` (WP3); never
-    /// dispatched from the memory parser.
-    #[allow(dead_code)]
-    FileListingOnly,
-}
-
-/// Declarative description of how one on-disk location maps to ALF memory.
-pub(crate) struct SourceHandler {
-    /// Glob relative to the workspace root. See `path_matches` for the supported forms.
-    pub pattern: &'static str,
-    /// Cognitive category to tag records with.
-    pub memory_type: MemoryType,
-    /// Scoping namespace to tag records with.
-    pub namespace: &'static str,
-    pub chunking: ChunkingStrategy,
-}
 
 /// Ordered source-handler table. First match wins, so specific patterns come
 /// before the catch-all. Every memory file flows through exactly one row.
@@ -145,176 +118,6 @@ static SOURCE_HANDLERS: &[SourceHandler] = &[
         chunking: ChunkingStrategy::OneRecordPerFile,
     },
 ];
-
-/// Find the first handler whose pattern matches a workspace-relative path.
-fn dispatch(relative_path: &str) -> Option<&'static SourceHandler> {
-    let norm = relative_path.replace('\\', "/");
-    SOURCE_HANDLERS
-        .iter()
-        .find(|h| path_matches(h.pattern, &norm))
-}
-
-/// Minimal glob matcher for the `SOURCE_HANDLERS` patterns. Supports exactly:
-/// - literal bytes,
-/// - a single `*` matching a run of non-`/` characters (one path segment), and
-/// - `[0-9]` digit classes (used by the daily-date pattern).
-///
-/// Because `*` never crosses `/`, `memory/*.md` does not match a path under
-/// `memory/procedures/`. Matched against the full workspace-relative path.
-fn path_matches(pattern: &str, path: &str) -> bool {
-    glob_match(pattern.as_bytes(), path.as_bytes())
-}
-
-fn glob_match(pattern: &[u8], path: &[u8]) -> bool {
-    if pattern.is_empty() {
-        return path.is_empty();
-    }
-    match pattern[0] {
-        b'*' => {
-            let rest = &pattern[1..];
-            // `*` matches zero or more non-`/` characters.
-            if glob_match(rest, path) {
-                return true;
-            }
-            let mut i = 0;
-            while i < path.len() && path[i] != b'/' {
-                i += 1;
-                if glob_match(rest, &path[i..]) {
-                    return true;
-                }
-            }
-            false
-        }
-        b'[' if pattern.starts_with(b"[0-9]") => {
-            if path.first().is_some_and(u8::is_ascii_digit) {
-                glob_match(&pattern[5..], &path[1..])
-            } else {
-                false
-            }
-        }
-        c => path.first() == Some(&c) && glob_match(&pattern[1..], &path[1..]),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Section splitting
-// ---------------------------------------------------------------------------
-
-/// A section extracted from a Markdown file by splitting on H2 headings.
-#[derive(Debug, Clone)]
-pub(crate) struct MarkdownSection {
-    /// H2 heading text (without the `## ` prefix), or `None` for content
-    /// before the first heading.
-    pub heading: Option<String>,
-    /// Full section text including the heading line.
-    pub content: String,
-    /// 1-based start line in the original file.
-    pub line_start: usize,
-    /// 1-based end line (inclusive).
-    pub line_end: usize,
-}
-
-/// Split Markdown content on ATX headings of `level` (2 == `## `).
-///
-/// Content before the first heading becomes section 0 with `heading = None`.
-/// When `fence_aware`, heading-looking lines inside ``` fenced code blocks are
-/// treated as ordinary content, not split points. A section is emitted only if
-/// its *body* (content minus its leading heading line(s)) is non-empty — see
-/// `flush_section`.
-pub(crate) fn split_markdown_sections(
-    content: &str,
-    level: u8,
-    fence_aware: bool,
-) -> Vec<MarkdownSection> {
-    let marker = format!("{} ", "#".repeat(level as usize));
-    let lines: Vec<&str> = content.lines().collect();
-    let mut sections = Vec::new();
-    let mut current_heading: Option<String> = None;
-    let mut current_lines: Vec<&str> = Vec::new();
-    let mut section_start: usize = 1; // 1-based
-    let mut in_fence = false;
-
-    for (i, line) in lines.iter().enumerate() {
-        let lineno = i + 1; // 1-based
-
-        // A line opening or closing a fenced code block toggles fence state and
-        // is never itself a heading.
-        if fence_aware && line.starts_with("```") {
-            in_fence = !in_fence;
-            current_lines.push(line);
-            continue;
-        }
-
-        if !in_fence && line.starts_with(marker.as_str()) {
-            flush_section(
-                &mut sections,
-                current_heading.take(),
-                &current_lines,
-                section_start,
-                lineno - 1,
-            );
-            current_heading = Some(line[marker.len()..].trim().to_string());
-            current_lines = vec![line];
-            section_start = lineno;
-        } else {
-            current_lines.push(line);
-        }
-    }
-
-    flush_section(
-        &mut sections,
-        current_heading.take(),
-        &current_lines,
-        section_start,
-        lines.len(),
-    );
-
-    sections
-}
-
-/// Push a section onto `sections` only if its *body* is non-empty after trimming,
-/// where the body is the section's lines minus any leading heading line(s).
-///
-/// This single rule drops two kinds of noise: an empty `## ` section (heading
-/// with no content), and a preamble that is only an H1 date header — the source
-/// of the daily-journal over-chunking bug where `# Saturday, May 23rd, 2026`
-/// became its own record. A preamble that carries real intro text is kept.
-fn flush_section(
-    sections: &mut Vec<MarkdownSection>,
-    heading: Option<String>,
-    lines: &[&str],
-    line_start: usize,
-    line_end: usize,
-) {
-    if lines.is_empty() {
-        return;
-    }
-    // A `## ` section has exactly one leading heading line. A preamble has none,
-    // but may open with an H1/run of ATX headings we also strip before judging.
-    let body_start = if heading.is_some() {
-        1
-    } else {
-        lines
-            .iter()
-            .position(|l| !is_heading_or_blank(l))
-            .unwrap_or(lines.len())
-    };
-    if lines[body_start..].iter().all(|l| l.trim().is_empty()) {
-        return;
-    }
-    sections.push(MarkdownSection {
-        heading,
-        content: lines.join("\n"),
-        line_start,
-        line_end,
-    });
-}
-
-/// True for a blank line or any ATX heading line (`#`, `##`, …).
-fn is_heading_or_blank(line: &str) -> bool {
-    let trimmed = line.trim();
-    trimmed.is_empty() || trimmed.starts_with('#')
-}
 
 // ---------------------------------------------------------------------------
 // Classification helpers
@@ -435,7 +238,7 @@ pub(crate) fn parse_memory_file(
     file_mtime: DateTime<Utc>,
     agent_id: Uuid,
 ) -> Vec<MemoryRecord> {
-    let Some(handler) = dispatch(relative_path) else {
+    let Some(handler) = dispatch(SOURCE_HANDLERS, relative_path) else {
         // No handler matches this location → no structured record.
         return Vec::new();
     };
@@ -925,43 +728,32 @@ Build the memory parser.
     // -- Source-handler dispatch + matcher (WP2) -------------------------------
 
     #[test]
-    fn path_matches_supported_forms() {
-        assert!(path_matches("MEMORY.md", "MEMORY.md"));
-        assert!(!path_matches("MEMORY.md", "memory.md"));
-        assert!(path_matches("memory/*.md", "memory/notes.md"));
-        // `*` is segment-bounded: it must not cross `/`.
-        assert!(!path_matches("memory/*.md", "memory/procedures/x.md"));
-        assert!(path_matches(
-            "memory/procedures/*.md",
-            "memory/procedures/x.md"
-        ));
-        assert!(path_matches(
-            "memory/project-*.md",
-            "memory/project-clawsmith.md"
-        ));
-
-        let daily = "memory/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md";
-        assert!(path_matches(daily, "memory/2026-05-21.md"));
-        assert!(!path_matches(daily, "memory/2026-5-21.md")); // wrong digit count
-        assert!(!path_matches(daily, "memory/active-context.md"));
-    }
-
-    #[test]
     fn dispatch_routes_known_locations() {
         assert_eq!(
-            dispatch("memory/procedures/x.md").unwrap().namespace,
+            dispatch(SOURCE_HANDLERS, "memory/procedures/x.md")
+                .unwrap()
+                .namespace,
             "procedural"
         );
         assert_eq!(
-            dispatch("memory/curated/x.md").unwrap().namespace,
+            dispatch(SOURCE_HANDLERS, "memory/curated/x.md")
+                .unwrap()
+                .namespace,
             "curated"
         );
         assert_eq!(
-            dispatch("memory/2026-05-21.md").unwrap().memory_type,
+            dispatch(SOURCE_HANDLERS, "memory/2026-05-21.md")
+                .unwrap()
+                .memory_type,
             MemoryType::Episodic
         );
         // Anything else under memory/ falls to the catch-all.
-        assert_eq!(dispatch("memory/random.md").unwrap().namespace, "workspace");
+        assert_eq!(
+            dispatch(SOURCE_HANDLERS, "memory/random.md")
+                .unwrap()
+                .namespace,
+            "workspace"
+        );
     }
 
     // -- Chunking-strategy behavior (WP2 acceptance cases) ---------------------

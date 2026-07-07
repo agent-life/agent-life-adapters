@@ -23,6 +23,38 @@ pub fn human_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// A progress sink threaded through the long-running seams (`sync_one`, the
+/// restore path). CLI callers use [`Progress::stderr`] — identical to the
+/// historical `output::progress` (a line to stderr, invisible to JSON parsers).
+/// The MCP server uses [`Progress::callback`] to forward each message as an MCP
+/// progress notification instead (protocol owns stdout; nothing here writes to
+/// stdout). Cheap to copy — it only borrows the callback.
+#[derive(Clone, Copy)]
+pub struct Progress<'a> {
+    sink: Option<&'a (dyn Fn(&str) + Sync)>,
+}
+
+impl<'a> Progress<'a> {
+    /// CLI default: emit progress to stderr via [`progress`].
+    pub fn stderr() -> Self {
+        Self { sink: None }
+    }
+
+    /// MCP: forward each message to `cb` (which maps it to a progress
+    /// notification) instead of stderr.
+    pub fn callback(cb: &'a (dyn Fn(&str) + Sync)) -> Self {
+        Self { sink: Some(cb) }
+    }
+
+    /// Emit one progress message through whichever sink is configured.
+    pub fn emit(&self, msg: &str) {
+        match self.sink {
+            Some(cb) => cb(msg),
+            None => progress(msg),
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ErrorJson<'a> {
     ok: bool,
@@ -70,7 +102,7 @@ pub fn error_hint(err: &anyhow::Error) -> String {
         return "Run 'alf sync -r <runtime> -w <workspace>' first, or 'alf help status' to list agents.".into();
     }
     if msg.contains("Unknown runtime") {
-        return "Supported runtimes: openclaw, zeroclaw, hermes. Run 'alf help troubleshoot' for more."
+        return "Supported runtimes: openclaw, zeroclaw, hermes, generic. Run 'alf help troubleshoot' for more."
             .into();
     }
     if msg.contains("workspace") && (msg.contains("not found") || msg.contains("does not exist")) {
@@ -100,5 +132,24 @@ mod tests {
         std::env::set_var("ALF_HUMAN", "1");
         assert!(human_mode());
         std::env::remove_var("ALF_HUMAN");
+    }
+
+    /// Progress seam pin: a callback sink forwards every message verbatim; the
+    /// CLI's stderr sink emits without panicking (behavior unchanged — the CLI
+    /// always passes `Progress::stderr()`, so the None branch must stay inert to
+    /// stdout).
+    #[test]
+    fn progress_callback_forwards_and_stderr_is_inert() {
+        use std::sync::Mutex;
+
+        let seen: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        let capture = |m: &str| seen.lock().unwrap().push(m.to_string());
+        let sink = Progress::callback(&capture);
+        sink.emit("one");
+        sink.emit("two");
+        assert_eq!(&*seen.lock().unwrap(), &["one", "two"]);
+
+        // The CLI sink routes to stderr (via `progress`) — no panic, no stdout.
+        Progress::stderr().emit("to stderr, harmless");
     }
 }

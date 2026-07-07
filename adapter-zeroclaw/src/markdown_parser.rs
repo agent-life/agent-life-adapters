@@ -34,7 +34,14 @@ pub(crate) const ZEROCLAW_NS: Uuid = Uuid::from_bytes([
 const RUNTIME: &str = "zeroclaw";
 
 // ---------------------------------------------------------------------------
-// Section splitting (shared logic with OpenClaw adapter)
+// Section splitting (ZeroClaw-local copy — NOT `alf_core::chunk`)
+//
+// Diverges from the promoted contract: no fence-awareness and no empty-preamble
+// drop, so a daily file opening with a bare `# <date>` header emits that header
+// as its own record (the over-chunking shape `alf_core::chunk::flush_section`
+// fixed for OpenClaw). Do not unify mechanically: changing section boundaries
+// re-mints existing ZeroClaw markdown-backend birth ids — see the WP-M5 brief
+// note before touching this.
 // ---------------------------------------------------------------------------
 
 /// A section extracted from a Markdown file by splitting on H2 headings.

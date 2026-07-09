@@ -22,7 +22,7 @@ import threading
 import time
 import tomllib
 
-from . import archives, scenario, snapshots, verify
+from . import archives, events, scenario, snapshots, verify
 from .contract import SkipStage
 from .report import Check, StageResult
 
@@ -33,6 +33,34 @@ from .report import Check, StageResult
 
 def _passfail(cond: bool, name: str, detail: str = "") -> Check:
     return Check(name=name, status="PASS" if cond else "FAIL", detail=detail)
+
+
+def _workspace_entries_from_placement(rows, primary: bool = True) -> list:
+    """Build a small workspace tree from placement rows (+ hermes defaults)."""
+    seen: dict = {}
+    defaults = [
+        {"path": "config.yaml", "kind": "file"},
+        {"path": "SOUL.md", "kind": "file"},
+        {"path": "memories/MEMORY.md", "kind": "file"},
+        {"path": "state.db", "kind": "db"},
+        {"path": "skills/", "kind": "dir"},
+    ]
+    if not primary:
+        defaults = [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+            {"path": "profiles/agent_b/memories/MEMORY.md", "kind": "file"},
+            {"path": "profiles/agent_b/state.db", "kind": "db"},
+        ]
+    for d in defaults:
+        seen[d["path"]] = d
+    for r in rows or []:
+        key = r.key if hasattr(r, "key") else (r.get("key") if isinstance(r, dict) else None)
+        if not key:
+            continue
+        kind = "db" if str(key).endswith(".db") else "file"
+        seen[str(key)] = {"path": str(key), "kind": kind}
+    return list(seen.values())
 
 
 def _alf_home_config(run) -> dict:
@@ -59,6 +87,12 @@ def z01_install_probe(run, result: StageResult):
         install actually declares — the work definition's Z3-nuance evidence.
     """)
     nar.flow(f"official installer ──▶ {kit.home_mount} (bind-mounted under the run dir)")
+    events.state("agentA", {
+        "born": True,
+        "slot": kit.agent_slots[0],
+        "activity": f"probing {kit.name} install…",
+        "installing": True,
+    }, stage_id="z01")
 
     probe = kit.install_probe(run.container)
     result.add(_passfail(
@@ -87,8 +121,18 @@ def z01_install_probe(run, result: StageResult):
         name="declared [agents.*] set recorded (Z3-nuance evidence)",
         status="PASS",
         detail=f"declared: {declared or '(none — implicit sole agent)'}"))
+    events.state("agentA", {
+        "activity": f"{kit.name} {probe.get('version')} · {len(actual)} files",
+        "installing": False,
+        "version": probe.get("version"),
+        "files": len(actual),
+        "declared_agents": declared,
+    }, stage_id="z01")
 
     if run.llm == "proxy":
+        events.state("agentA", {
+            "activity": "wiring LLM proxy into framework config…",
+        }, stage_id="z01")
         kit.wire_llm(run.container, run.creds)
         wired, cfg_text = kit.llm_wired()
         result.add(_passfail(wired, "LLM proxy provider wired"))
@@ -99,9 +143,21 @@ def z01_install_probe(run, result: StageResult):
             run.creds.runtime_api_key not in rendered,
             "no key echoed — central redaction covers the wired config"))
         nar.show_diff("framework config (wired, redacted)", rendered)
+        events.state("agentA", {
+            "activity": "LLM proxy wired — ready for agent turns",
+            "llm_wired": True,
+        }, stage_id="z01")
+        events.state("service", {
+            "llm_proxy": True,
+            "activity": "LLM proxy ready",
+        }, stage_id="z01")
     else:
         result.add(Check(name="LLM wiring", status="SKIP",
                          detail="tier --llm none (CI tier has zero secrets)"))
+        events.state("agentA", {
+            "activity": "install probe done (no LLM tier)",
+            "llm_wired": False,
+        }, stage_id="z01")
 
     nar.show_data("install probe", {
         "version": probe.get("version"),
@@ -123,6 +179,14 @@ def z02_seed_markers(run, result: StageResult):
     kit, nar = run.kit, run.narrator
     slot = kit.agent_slots[0]
     turns = scenario.turns(slot, round=1)
+    events.state("agentA", {
+        "born": True,
+        "slot": slot,
+        "activity": "seeding marked memories…",
+        "markers": [],
+        "records": 0,
+        "turns": [],
+    }, stage_id="z02")
 
     if run.llm == "proxy":
         nar.explain("""
@@ -132,13 +196,81 @@ def z02_seed_markers(run, result: StageResult):
             irrelevant.
         """)
         nar.flow(f"prompts ──framework──▶ LLM proxy ──▶ real store ({kit.memory_store_label})")
-        for turn in turns:
-            log = kit.llm_turn(run.container, slot, turn)
+        markers_so_far: list = []
+        turns_log: list = []
+        for i, turn in enumerate(turns, start=1):
             from .redact import redact
+            prompt_head = redact(turn.prompt)[:220]
+            events.state("agentA", {
+                "activity": f"LLM turn {i}/{len(turns)} · {turn.turn_type} →",
+                "last_turn": {
+                    "n": i, "of": len(turns), "type": turn.turn_type,
+                    "marker": turn.marker, "phase": "prompt",
+                    "prompt": prompt_head,
+                },
+                "packet": "llm-prompt",
+            }, stage_id="z02")
+            events.emit("data", stage_id="z02", label="llm prompt", data={
+                "turn": i, "of": len(turns), "type": turn.turn_type,
+                "marker": turn.marker, "prompt": prompt_head,
+            })
+            events.state("service", {
+                "llm_proxy": True,
+                "activity": f"proxy · {turn.turn_type} turn",
+                "packet": "llm-prompt",
+                "llm": {
+                    "phase": "prompt",
+                    "turn": i, "of": len(turns),
+                    "type": turn.turn_type,
+                    "marker": turn.marker,
+                    "prompt": prompt_head,
+                    "response": None,
+                },
+            }, stage_id="z02")
+
+            log = kit.llm_turn(run.container, slot, turn)
             # Redact BEFORE truncation: a sliced key fragment no longer
             # matches the pattern shapes.
+            reply = redact(log.response_tail)[:240]
             result.add(_passfail(log.ok, f"turn {turn.turn_type} ({turn.marker})",
-                                 redact(log.response_tail)[:80]))
+                                 reply[:80]))
+            markers_so_far.append(turn.marker)
+            turn_rec = {
+                "n": i, "type": turn.turn_type, "marker": turn.marker,
+                "ok": log.ok, "prompt": prompt_head, "response": reply,
+            }
+            turns_log.append(turn_rec)
+            events.state("service", {
+                "llm_proxy": True,
+                "activity": f"proxy replied · {turn.turn_type}",
+                "packet": "llm-response",
+                "llm": {
+                    "phase": "response",
+                    "turn": i, "of": len(turns),
+                    "type": turn.turn_type,
+                    "marker": turn.marker,
+                    "prompt": prompt_head,
+                    "response": reply,
+                },
+            }, stage_id="z02")
+            events.state("agentA", {
+                "activity": f"stored {turn.turn_type} · {turn.marker}",
+                "markers": list(markers_so_far),
+                "records": len(markers_so_far),
+                "turns": list(turns_log),
+                "last_turn": {**turn_rec, "phase": "response"},
+                "packet": "llm-response",
+                "mutations": [
+                    {"path": "memories/MEMORY.md", "op": turn.turn_type[:4],
+                     "note": f"{turn.turn_type} · {turn.marker}"},
+                    {"path": "state.db", "op": "session",
+                     "note": f"session row · {turn.marker}"},
+                ],
+            }, stage_id="z02")
+            events.emit("data", stage_id="z02", label="llm response", data={
+                "turn": i, "of": len(turns), "type": turn.turn_type,
+                "marker": turn.marker, "ok": log.ok, "response": reply,
+            })
         stats = kit.native_memory_stats(run.container, slot)
         count = stats.get("count", 0)
         result.add(_passfail(count >= 4, "framework memory stats count >= 4",
@@ -146,6 +278,9 @@ def z02_seed_markers(run, result: StageResult):
     else:
         nar.explain(kit.seed_narrative())
         nar.flow(kit.seed_flow())
+        events.state("agentA", {
+            "activity": f"deterministic seed into {kit.memory_store_label}",
+        }, stage_id="z02")
         kit.seed_markers(run.container, slot, round=1)
         result.add(Check(name=f"{kit.memory_store_label} seeded with 4 round-1 markers",
                          status="PASS"))
@@ -165,6 +300,20 @@ def z02_seed_markers(run, result: StageResult):
                                     "key": row.key, "content": row.head})
     result.add(_passfail(len(rows) >= 4, "placement rows recorded (category/key per marker)",
                          f"{len(rows)} rows"))
+    markers = [m for m in scenario.markers(slot, 1)]
+    events.state("agentA", {
+        "born": True,
+        "slot": slot,
+        "markers": markers,
+        "records": max(4, len(rows)),
+        "placement": [{"category": r.category, "key": r.key} for r in rows[:8]],
+        "activity": f"coverage {verdict.coverage} · isolation {verdict.isolation}",
+        "mutations": [
+            {"path": r.key, "op": r.category, "note": r.head[:40]}
+            for r in rows[:6]
+        ],
+        "workspace": _workspace_entries_from_placement(rows, primary=True),
+    }, stage_id="z02")
 
 
 # ---------------------------------------------------------------------------
@@ -365,6 +514,27 @@ def z04_first_sync(run, result: StageResult):
         nar.show_data("export entries", names[:12])
     else:
         result.add(_passfail(False, "alf export copy-out readable on the host"))
+    events.state("agentA", {
+        "agent_id": agent_id,
+        "seq": run.state.get("sequence", 0),
+        "synced": True,
+        "activity": f"synced · seq {run.state.get('sequence', 0)}",
+        "mutations": [],
+    }, stage_id="z04")
+    events.state("service", {
+        "registered": True,
+        "agent_id": agent_id,
+        "latest_sequence": run.state.get("sequence", 0),
+        "snapshot": True,
+        "deltas": 0,
+        "packet": "snapshot",
+        "activity": f"agent A registered · seq {run.state.get('sequence', 0)}",
+        "agents": {
+            "A": {"registered": True, "id": agent_id,
+                  "seq": run.state.get("sequence", 0), "snapshot": True, "deltas": 0},
+        },
+    }, stage_id="z04")
+    events.state("mcp", {"role": "cli-sync", "last": "snapshot"}, stage_id="z04")
 
 
 # ---------------------------------------------------------------------------
@@ -446,6 +616,24 @@ def z06_vault(run, result: StageResult):
     body = (dec.stdout or "") + (dec.stderr or "")
     result.add(_passfail(secret in body, "alf vault decrypt returns the stored secret (get)",
                          "matched" if secret in body else "not found"))
+    events.state("agentA", {
+        "vault": ["vault-z6"],
+        "vault_key": key_path,
+        "activity": "vault-z6 encrypted under per-agent key",
+        "mutations": [
+            {"path": "state/<id>/.alf-vault-key", "op": "keygen", "note": "0600 local key"},
+            {"path": "credentials.json (vault)", "op": "add", "note": "vault-z6 ciphertext"},
+        ],
+        "workspace": [
+            {"path": "config.yaml", "kind": "file"},
+            {"path": "SOUL.md", "kind": "file"},
+            {"path": "memories/MEMORY.md", "kind": "file"},
+            {"path": "state.db", "kind": "db"},
+            {"path": "state/<id>/.alf-vault-key", "kind": "file"},
+            {"path": "credentials.json (vault)", "kind": "file"},
+            {"path": "skills/", "kind": "dir"},
+        ],
+    }, stage_id="z06")
 
 
 # ---------------------------------------------------------------------------
@@ -488,6 +676,24 @@ def z07_delta_sync(run, result: StageResult):
         result.add(_passfail("credentials.json" in names,
                              "vault ciphertext present in the agent's Layer 4",
                              f"{len(names)} entries"))
+    events.state("agentA", {
+        "seq": seq,
+        "vault_synced": True,
+        "activity": f"delta synced · seq {seq}",
+        "mutations": [
+            {"path": "state/<id>/.alf-vault-key", "op": "vault", "note": "Layer-4 ciphertext"},
+        ],
+    }, stage_id="z07")
+    events.state("service", {
+        "latest_sequence": seq,
+        "deltas": len(rbody.get("deltas") or []),
+        "packet": "delta",
+        "activity": f"agent A · seq {seq}",
+        "agents": {
+            "A": {"seq": seq, "deltas": len(rbody.get("deltas") or []), "snapshot": True},
+        },
+    }, stage_id="z07")
+    events.state("mcp", {"role": "cli-sync", "last": "delta"}, stage_id="z07")
 
 
 # ---------------------------------------------------------------------------
@@ -505,6 +711,24 @@ def z08_second_agent(run, result: StageResult):
     result.add(_passfail(kit.agent_declared(run.container, slot_b),
                          "framework config declares the second agent", slot_b))
     run.state["slot_b"] = slot_b
+    events.state("agentB", {
+        "born": True,
+        "slot": slot_b,
+        "records": 0,
+        "activity": "profile created — empty store",
+        "workspace": [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+        ],
+        "mutations": [
+            {"path": "profiles/agent_b/", "op": "create", "note": "framework profile"},
+            {"path": "profiles/agent_b/config.yaml", "op": "write", "note": "declared in config"},
+        ],
+    }, stage_id="z08")
+    events.state("service", {
+        "activity": "awaiting agent B first sync",
+        "agents": {"B": {"visible": True, "registered": False}},
+    }, stage_id="z08")
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +819,31 @@ def z10_agent_b_isolation(run, result: StageResult):
         result.add(_passfail(b_found == 4 and a_leak == 0,
                              "agent b's archive carries only b's markers",
                              f"b={b_found}/4 a_leak={a_leak}"))
+    events.state("agentB", {
+        "synced": True,
+        "markers": scenario.markers(slot_b, 1),
+        "records": 4,
+        "isolation": "clean",
+        "activity": "synced · isolation clean",
+        "workspace": [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+            {"path": "profiles/agent_b/memories/MEMORY.md", "kind": "file"},
+            {"path": "profiles/agent_b/state.db", "kind": "db"},
+        ],
+        "mutations": [
+            {"path": "profiles/agent_b/memories/MEMORY.md", "op": "seed", "note": "4 markers"},
+            {"path": "profiles/agent_b/state.db", "op": "seed", "note": "session rows"},
+        ],
+    }, stage_id="z10")
+    events.state("service", {
+        "agent_b_registered": True,
+        "packet": "snapshot",
+        "activity": "agent B registered",
+        "agents": {
+            "B": {"visible": True, "registered": True, "snapshot": True, "seq": 0, "deltas": 0},
+        },
+    }, stage_id="z10")
 
 
 # ---------------------------------------------------------------------------
@@ -916,7 +1165,30 @@ def z15_mcp_llm_gate(run, result: StageResult):
         marker (the harness itself issues zero `alf sync` calls this tier).
     """)
     nar.flow("agent turn ──▶ mcp_alf_alf_sync / mcp_alf_alf_vault_add ──▶ alf mcp serve ──▶ S3 + Neon ⊙")
+    events.state("mcp", {
+        "role": "stdio-server",
+        "tools": ["mcp_alf_alf_sync", "mcp_alf_alf_vault_add", "mcp_alf_alf_vault_list"],
+        "active": True,
+    }, stage_id="z15")
     kit.mcp_llm_gate(run, result)
+    events.state("mcp", {
+        "last": "tool-driven-sync",
+        "packet": "tool-call",
+        "activity": "mcp_alf_* tools invoked by agent",
+    }, stage_id="z15")
+    events.state("service", {
+        "packet": "mcp-sync",
+        "activity": "MCP tool-driven sync landed",
+        "agents": {"A": {"snapshot": True}},
+    }, stage_id="z15")
+    events.state("agentA", {
+        "activity": "synced via mcp_alf_* (no terminal alf sync)",
+        "synced": True,
+        "mutations": [
+            {"path": "memories/MEMORY.md", "op": "sync", "note": "tool-driven export"},
+            {"path": "state.db", "op": "sync", "note": "tool-driven export"},
+        ],
+    }, stage_id="z15")
 
 
 # ---------------------------------------------------------------------------
@@ -999,7 +1271,16 @@ def z16_watch_autosync(run, result: StageResult):
         # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
         ticks = 6
         for i in range(ticks):
-            markers.append(kit.mutate_watched(run.container, slot, i))
+            marker = kit.mutate_watched(run.container, slot, i)
+            markers.append(marker)
+            events.state("agentA", {
+                "activity": f"watch mutate {i + 1}/{ticks} · {marker}",
+                "mutations": [
+                    {"path": "memories/MEMORY.md", "op": "append", "note": marker},
+                    {"path": "state.db", "op": "insert", "note": f"z16_watch · {marker}"},
+                ],
+                "packet": "watch-delta",
+            }, stage_id="z16")
             time.sleep(3)
         time.sleep(3)  # let the final change quiesce (~1s) + upload
         # 4. The loop must have auto-uploaded multiple deltas carrying the content.
@@ -1013,6 +1294,34 @@ def z16_watch_autosync(run, result: StageResult):
             latest_seq() > base_seq,
             "⊙ backend sequence advanced under the watch loop (no tool/LLM calls)",
             f"seq {base_seq} → {latest_seq()}"))
+        end_seq = latest_seq()
+        events.state("mcp", {
+            "role": "watch-loop",
+            "active": True,
+            "watch_sources": 8,
+            "packet": "watch-delta",
+            "activity": f"watch-sync · {len(deltas)} deltas",
+        }, stage_id="z16")
+        events.state("service", {
+            "latest_sequence": end_seq,
+            "deltas_since": len(deltas),
+            "seq_from": base_seq,
+            "seq_to": end_seq,
+            "packet": "watch-delta",
+            "activity": f"agent A · seq {base_seq}→{end_seq}",
+            "agents": {
+                "A": {"seq": end_seq, "deltas": len(deltas), "snapshot": True},
+            },
+        }, stage_id="z16")
+        events.state("agentA", {
+            "seq": end_seq,
+            "watch_markers": len(markers),
+            "activity": f"watch done · seq {end_seq}",
+            "mutations": [
+                {"path": "memories/MEMORY.md", "op": "watch", "note": f"{len(markers)} entries"},
+                {"path": "state.db", "op": "watch", "note": f"{len(markers)} rows"},
+            ],
+        }, stage_id="z16")
         # content: the deltas carried the markers as memory RECORDS (MEMORY.md
         # §-entries). Memory indexing is ON-DEMAND (an async job), so trigger it
         # and poll the delta-correct browser until the delta-borne records land.

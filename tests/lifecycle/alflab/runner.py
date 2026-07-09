@@ -20,20 +20,51 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import models, provision, stages, ui
+from . import events, models, provision, stages, ui
 from .config import HarnessConfig
 from .contract import KitEnv, SkipStage
 from .dockerctl import (
     DockerContainer, DockerError, build_image, host_sha256, seed_home_from_image, ALF_DIST,
 )
+from .events import EventLog
 from .narrator import InteractiveAbort, NullNarrator, RichNarrator
 from .provision import Manifest, RuntimeCreds
 from .report import RunReport, StageResult
+from .viz_server import VizServer
 
 LIFECYCLE_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = LIFECYCLE_DIR.parents[1]
+VIZ_SRC = LIFECYCLE_DIR / "viz" / "index.html"
 SENTINEL_API_URL = "http://127.0.0.1:9"   # backend=none: refuses instantly
 DEFAULT_STAGES = "Z1-Z4,Z13"
+DEFAULT_VIZ_PORT = 8765
+
+
+def _install_viz(run_dir: Path) -> None:
+    """Copy the committed viz into the run dir so relative fetches work."""
+    if VIZ_SRC.is_file():
+        (run_dir / "visualization.html").write_text(
+            VIZ_SRC.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def _start_viz_server(run: "Run") -> None:
+    """Default-on local HTTP server for the live visualization."""
+    if getattr(run.args, "no_viz_server", False):
+        return
+    port = int(getattr(run.args, "viz_port", DEFAULT_VIZ_PORT) or DEFAULT_VIZ_PORT)
+    try:
+        srv = VizServer(run.paths.run_dir, port=port)
+        url = srv.start()
+        run.viz_server = srv
+        ui.section("OPS", "Lifecycle visualization (live)")
+        ui.ok(f"viz server listening on 127.0.0.1:{srv.port}")
+        ui.emit(f"  open:  {ui.c('cyan', url)}")
+        ui.emit(f"  (serves {run.paths.run_dir} — events.ndjson updates as stages run)")
+        ui.emit("")
+    except Exception as e:  # noqa: BLE001 — viz is best-effort; never block the run
+        from .redact import redact
+        ui.warn(f"viz server failed to start ({type(e).__name__}: {redact(str(e))[:120]}) "
+                "— continuing without it; open visualization.html manually later")
 
 
 @dataclass
@@ -76,6 +107,7 @@ class Run:
         self.expected_alf_version = ""
         self.sentinel_api_url = SENTINEL_API_URL
         self.state: dict = {}
+        self.viz_server = None                 # VizServer | None
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +211,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--alf-bin", default=None, help="path to the alf-under-test")
     p.add_argument("--keep", action="store_true", help="keep the container running")
     p.add_argument("--keep-agent", action="store_true", help="skip cloud teardown")
+    p.add_argument("--no-viz-server", action="store_true",
+                   help="do not start the local visualization HTTP server "
+                        f"(default: serve run dir on 127.0.0.1:{DEFAULT_VIZ_PORT})")
+    p.add_argument("--viz-port", type=int, default=DEFAULT_VIZ_PORT, metavar="PORT",
+                   help=f"port for the visualization server (default {DEFAULT_VIZ_PORT}; "
+                        "falls back to an ephemeral port if busy)")
     p.add_argument("--teardown", metavar="RUN_DIR", default=None,
                    help="recover: run the teardown ladder for a previous run dir")
     p.add_argument("--leak-scan", action="store_true",
@@ -241,6 +279,9 @@ def main(argv=None) -> int:
         driver_log=run_dir / "driver.log",
     )
     ui.set_log_file(run.paths.driver_log)
+    event_log = EventLog(run_dir / "events.ndjson")
+    events.set_event_log(event_log)
+    _install_viz(run_dir)
 
     stage_ids = stages.STAGE_IDS if args.full else parse_stage_selection(args.stages)
     run.report = RunReport(
@@ -260,6 +301,17 @@ def main(argv=None) -> int:
               f" · stages {','.join(s.upper() for s in stage_ids)}")
     ui.emit(f"  run dir: {run_dir}")
     ui.emit(f"  alf under test: {run.alf_binary} ({run.expected_alf_version})")
+    events.emit(
+        "run_start",
+        framework=args.framework,
+        tier=f"{run.llm}/{run.backend}",
+        stages_requested=stage_ids,
+        alf_version=run.expected_alf_version,
+        run_dir=str(run_dir),
+    )
+    # Viz server before any stage work so operators can open the page and watch
+    # events arrive live (mint / docker build / Z01…).
+    _start_viz_server(run)
 
     # Signals → exceptions so finally (teardown) always runs.
     def _sig(_n, _f):
@@ -420,6 +472,12 @@ def main(argv=None) -> int:
             result.duration_ms = (time.time() - t0) * 1000
             for chk in result.checks:
                 run.narrator.check(chk.status, chk.name, chk.detail)
+            events.emit(
+                "stage_end",
+                stage_id=sid,
+                status=result.status,
+                duration_ms=result.duration_ms,
+            )
             if result.status == "FAIL":
                 halted = True
             run.narrator.pause()
@@ -496,9 +554,33 @@ def finish(run: Run, aborted: bool) -> int:
             ui.warn(f"--keep: container {run.container.name} left running")
         if run.report is not None and run.paths is not None:
             run.report.write(run.paths.run_dir)
+            counts = run.report.counts()
+            events.emit(
+                "run_end",
+                passed=counts.get("PASS", 0),
+                failed=counts.get("FAIL", 0),
+                skipped=counts.get("SKIP", 0),
+                xfail=counts.get("XFAIL", 0),
+                coverage=run.report.coverage,
+                isolation=run.report.isolation,
+                teardown=run.report.teardown,
+                exit_code=run.report.exit_code,
+            )
+            events.set_event_log(None)
             ui.emit("")
             ui.emit(run.report.verdict_line())
             ui.emit(f"  report: {run.paths.run_dir}/report.md")
+            if (run.paths.run_dir / "visualization.html").is_file():
+                ui.emit(f"  viz:    {run.paths.run_dir}/visualization.html")
+                ui.emit(f"  replay: cd {run.paths.run_dir} && "
+                        f"python3 -m http.server {DEFAULT_VIZ_PORT}")
+        # Stop after run_end is on disk so a live tab can poll the final event.
+        if run.viz_server is not None:
+            try:
+                run.viz_server.stop()
+            except Exception:  # noqa: BLE001
+                pass
+            run.viz_server = None
     return run.report.exit_code if run.report else 2
 
 

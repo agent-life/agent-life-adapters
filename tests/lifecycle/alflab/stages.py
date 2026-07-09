@@ -18,6 +18,7 @@ archive.
 from __future__ import annotations
 
 import json
+import threading
 import time
 import tomllib
 
@@ -464,9 +465,10 @@ def z07_delta_sync(run, result: StageResult):
     """)
     nar.flow("alf sync ──▶ PUT delta (round-2 only) ──▶ S3 + Neon ⊙")
     proc, res = run.container.exec_json(["alf", "sync", "-r", kit.name], timeout=300)
-    result.add(_passfail(bool(res) and res.get("ok") is True and res.get("delta") is True,
-                         "alf sync ok + delta path (not a full snapshot)",
-                         f"sequence={res.get('sequence') if res else '?'}"))
+    ok = bool(res) and res.get("ok") is True and res.get("delta") is True
+    detail = (f"sequence={res.get('sequence')}" if ok else
+              f"sync failed: {(res or {}).get('error') or (proc.stderr or proc.stdout or '')[:240]!r}")
+    result.add(_passfail(ok, "alf sync ok + delta path (not a full snapshot)", detail))
     seq = res.get("sequence", 0) if res else 0
     result.add(_passfail(seq > run.state.get("sequence", 0),
                          "⊙ sequence advanced past the snapshot", f"seq={seq}"))
@@ -960,18 +962,40 @@ def z16_watch_autosync(run, result: StageResult):
 
     # 2. Start the persistent watch-loop server. stdin stays OPEN (the loop runs
     #    until EOF); the env overrides make the cadence ~1s (test-only, gated).
+    #    ALF_AGENT is PINNED: after Z8 the mapping has two enabled hermes agents,
+    #    so an unpinned loop cannot resolve one and never syncs (like the Z15
+    #    server, which pins it in config.yaml).
     serve_env = {
         "ALF_API_KEY": run.creds.runtime_api_key,
         "ALF_API_URL": run.creds.alf_api_url,
+        "ALF_AGENT": agent_id,
         "ALF_WATCH_DELTA_FLOOR_MS": "1000",
         "ALF_WATCH_QUIESCE_MS": "1000",
         "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+        "ALF_WATCH_TICK_MS": "1000",  # poll/rescan cadence (else 5s — too coarse)
     }
     argv = ["alf", "mcp", "serve", "-r", kit.name, "-w", kit._container_profile(slot)]
     sess = run.container.exec_stdio(argv, env=serve_env)
+    # Drain the server's stderr concurrently — both to diagnose (watch-loop
+    # active/not-started + sync events) and so a full stderr pipe never blocks the
+    # loop mid-run.
+    serve_err: list = []
+
+    def _drain():
+        try:
+            for line in iter(sess.proc.stderr.readline, b""):
+                serve_err.append(line.decode(errors="replace"))
+        except Exception:  # noqa: BLE001 — best-effort diagnostics
+            pass
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
     markers: list = []
     try:
         time.sleep(2)  # boot + the (no-op) catch-up-on-start
+        if not sess.alive():
+            result.add(_passfail(False, "Z16: watch server stayed up",
+                                 ("".join(serve_err)[-300:]) or "serve exited at startup"))
         # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
         ticks = 6
         for i in range(ticks):
@@ -989,16 +1013,41 @@ def z16_watch_autosync(run, result: StageResult):
             latest_seq() > base_seq,
             "⊙ backend sequence advanced under the watch loop (no tool/LLM calls)",
             f"seq {base_seq} → {latest_seq()}"))
-        # content: the head memory must carry the mutation markers the deltas moved.
-        rm = run.api.get(f"/agents/{agent_id}/memory")
-        mem_text = json.dumps(rm.json()) if rm.status_code == 200 else ""
-        present = sum(1 for m in markers if m in mem_text)
+        # content: the deltas carried the markers as memory RECORDS (MEMORY.md
+        # §-entries). Memory indexing is ON-DEMAND (an async job), so trigger it
+        # and poll the delta-correct browser until the delta-borne records land.
+        run.api.post_json(f"/agents/{agent_id}/index", {})
+        present = 0
+        for _ in range(15):
+            time.sleep(1)
+            rm = run.api.get(f"/agents/{agent_id}/memory?limit=100")
+            if rm.status_code == 200:
+                recs = json.dumps((rm.json() or {}).get("records") or [])
+                present = sum(1 for m in markers if m in recs)
+                if present >= len(markers):
+                    break
         result.add(_passfail(
             present >= 4,
-            "⊙ delta content: the mutation markers reached the head memory",
-            f"{present}/{len(markers)} markers present"))
+            "⊙ delta content: markers indexed into head memory (POST /index → GET /memory)",
+            f"{present}/{len(markers)} markers after on-demand indexing"))
     finally:
         sess.close()
+        drainer.join(timeout=3)
+        stderr_text = "".join(serve_err)
+        try:
+            (run.paths.run_dir / "z16-serve-stderr.log").write_text(stderr_text, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        loop_line = next((ln.strip() for ln in serve_err if "watch loop" in ln),
+                         "(no 'watch loop' line in the server stderr)")
+        syncs = sum(1 for ln in serve_err if "watch sync ok" in ln)
+        errs = next((ln.strip() for ln in serve_err if "watch sync error" in ln
+                     or "not started" in ln), "")
+        result.add(Check(
+            name="  Z16 serve: watch-loop diagnostics (informational)",
+            status="SKIP",
+            detail=f"{loop_line} | watch-sync-ok={syncs}"
+                   + (f" | {errs}" if errs else "")))
 
 
 # ---------------------------------------------------------------------------

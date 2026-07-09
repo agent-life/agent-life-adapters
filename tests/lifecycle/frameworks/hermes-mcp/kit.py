@@ -90,31 +90,29 @@ class HermesMcpKit(HermesKit):
     # -- Z16 watch auto-sync: mutate a watched file + the sqlite store ----------
 
     def mutate_watched(self, ctr, slot: str, i: int) -> str:
-        """One Z16 watch-cycle mutation: append a uniquely-marked `## ` section to
-        a watched memory file AND upsert a row in the watched `state.db`, host-side
-        on the mounted profile (the in-container `alf mcp serve` sees both via the
-        bind mount). Returns the marker so the stage can assert it synced. The
-        `z16_watch` table is additive — Hermes ignores it, and the `.db` change
-        still dirties adapter-hermes's `state.db` watch spec (a raw delta)."""
-        import sqlite3
+        """One Z16 watch-cycle mutation, written INSIDE the container (via `ctr`)
+        so the loop's inotify watch fires natively — a host-side write to the bind
+        mount does NOT generate a container inotify event, so the memory dir-watch
+        would miss it. Appends a `§`-separated entry to `memories/MEMORY.md` (a
+        REAL hermes semantic-memory source → one new memory RECORD, so the marker
+        reaches the /memory DTO) AND upserts a row in the watched `state.db` (the
+        additive `z16_watch` table Hermes ignores; the `.db` change is a raw
+        delta). Returns the marker so the stage can assert it synced."""
+        import shlex
 
-        ws = self._profile_dir(slot)
+        prof = self._container_profile(slot)
         marker = f"Z16-WATCH-{slot}-{i:02d}"
-        memdir = ws / "memories"
-        memdir.mkdir(parents=True, exist_ok=True)
-        mem = memdir / "z16-watch.md"
-        header = "" if mem.is_file() else "# Z16 watch journal\n\n"
-        with mem.open("a", encoding="utf-8") as f:
-            f.write(f"{header}## Tick {i}\n\nWatch marker: {marker}.\n\n")
-        conn = sqlite3.connect(ws / "state.db")
-        try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS z16_watch (id INTEGER PRIMARY KEY, marker TEXT)"
-            )
-            conn.execute("INSERT INTO z16_watch (id, marker) VALUES (?, ?)", (i, marker))
-            conn.commit()
-        finally:
-            conn.close()
+        # MEMORY.md entries are `\n§\n`-separated; append one (it exists from Z2).
+        entry = f"\n§\nWatch entry {marker}: auto-synced by the Z16 watch loop at tick {i}."
+        ctr.sh(
+            f"mkdir -p {prof}/memories; "
+            f"printf %s {shlex.quote(entry)} >> {prof}/memories/MEMORY.md",
+            user="agent")
+        ctr.exec(
+            ["sqlite3", f"{prof}/state.db",
+             "CREATE TABLE IF NOT EXISTS z16_watch (id INTEGER PRIMARY KEY, marker TEXT); "
+             f"INSERT INTO z16_watch (id, marker) VALUES ({i}, '{marker}');"],
+            user="agent")
         return marker
 
     # -- config wiring ---------------------------------------------------------

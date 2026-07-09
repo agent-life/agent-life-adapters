@@ -36,6 +36,19 @@ use engine::{Mono, SyncErrorClass, Tick, WatchConfig, WatchEngine, WatchSnapshot
 /// that minute-scale debounces resolve promptly; long enough to be cheap.
 const TICK_PERIOD: Duration = Duration::from_secs(5);
 
+/// TEST-ONLY: `ALF_WATCH_TICK_MS` (whole ms) lowers the 5 s poll/rescan cadence so
+/// the Z16 watch test can react to ~3 s-spaced mutations. Unset (production, every
+/// unit test) ⇒ [`TICK_PERIOD`]. Mirrors the engine's env-gated timing knobs.
+fn tick_period() -> Duration {
+    match std::env::var("ALF_WATCH_TICK_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        Some(ms) => Duration::from_millis(ms),
+        None => TICK_PERIOD,
+    }
+}
+
 /// A message from the `notify` watcher thread to the loop.
 enum WatchMsg {
     /// A path changed.
@@ -464,7 +477,7 @@ pub async fn run_loop(
         .map(|p| (p.clone(), file_mtime(p)))
         .collect();
 
-    let mut ticker = tokio::time::interval(TICK_PERIOD);
+    let mut ticker = tokio::time::interval(tick_period());
     loop {
         tokio::select! {
             Some(msg) = rx.recv() => {
@@ -654,7 +667,7 @@ async fn drive_rescan_only(
         .iter()
         .map(|p| (p.clone(), file_mtime(p)))
         .collect();
-    let mut ticker = tokio::time::interval(TICK_PERIOD);
+    let mut ticker = tokio::time::interval(tick_period());
     loop {
         ticker.tick().await;
         rescan(&handle, &index, &mut mtimes);

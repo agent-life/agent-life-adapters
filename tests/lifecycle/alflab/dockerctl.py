@@ -132,6 +132,24 @@ class DockerContainer:
            check: bool = False) -> subprocess.CompletedProcess:
         return self.exec(["sh", "-c", script], user=user, timeout=timeout, check=check)
 
+    def exec_stdio(self, argv: list[str], *, user: Optional[str] = None,
+                   env: Optional[dict] = None) -> "StdioSession":
+        """Start a PERSISTENT `docker exec -i` process and return a bidirectional
+        stdio handle to it — the primitive an MCP client needs (WP-M4 task 1b).
+
+        The plain `exec`/`exec_json` above are one-shot: they run to completion
+        and capture output. An MCP server is a long-lived subprocess the client
+        drives with request/response JSON-RPC over stdin/stdout, so it needs an
+        OPEN pipe, not `subprocess.run`. `-i` keeps stdin attached; stdout/stderr
+        are byte pipes. Secrets travel via `-e` here exactly as the one-shot
+        `exec` does (never argv) — for the MCP server that is `ALF_API_KEY` /
+        `ALF_AGENT`, which the container also already has via `--env-file`."""
+        cmd = ["docker", "exec", "-i", "-u", user or self.user]
+        for k, v in (env or {}).items():
+            cmd += ["-e", f"{k}={v}"]
+        cmd += [self.name] + argv
+        return StdioSession(cmd)
+
     # -- alf injection (D6) ---------------------------------------------------
 
     def inject_alf(self, host_binary: Path) -> str:
@@ -154,3 +172,55 @@ class DockerContainer:
         text = ((proc.stdout or "") + (proc.stderr or "")).strip()
         ok = proc.returncode == 0 and text.startswith("alf ")
         return ok, text
+
+
+class StdioSession:
+    """A live child process exposing byte-pipe stdin/stdout/stderr — the
+    transport an `McpClient` drives. Backs both a `docker exec -i` MCP server
+    (in-container) and a bare local `alf mcp serve` (unit tests), so the client
+    is identical in CI and in the lifecycle container."""
+
+    def __init__(self, argv: list[str], *, env: Optional[dict] = None,
+                 cwd: Optional[str] = None):
+        self.argv = argv
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0, env=env, cwd=cwd,
+        )
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def close(self, timeout: int = 10) -> Optional[int]:
+        """Close stdin (EOF → the server exits, MCP-style), then reap and close
+        the read pipes (the process is dead, so the reader threads have hit EOF)."""
+        code = None
+        try:
+            if self.proc.stdin is not None:
+                try:
+                    self.proc.stdin.close()
+                except (BrokenPipeError, ValueError):
+                    pass
+            try:
+                code = self.proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                code = self.proc.wait(timeout=timeout)
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            code = None
+        finally:
+            for pipe in (self.proc.stdout, self.proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+        return code
+
+
+def local_stdio_session(argv: list[str], *, env: Optional[dict] = None,
+                        cwd: Optional[str] = None) -> StdioSession:
+    """A local (no-docker) stdio session — `alf mcp serve` as a host subprocess.
+    Used by the harness self-tests so the MCP client + invoker mapping are
+    covered in the zero-secrets CI tier without a container."""
+    return StdioSession(argv, env=env, cwd=cwd)

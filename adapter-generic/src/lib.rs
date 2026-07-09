@@ -25,6 +25,8 @@ pub use alf_core::{Adapter, AgentBinding};
 pub mod export;
 pub mod import;
 pub mod map;
+pub mod sqlite;
+pub mod watch;
 
 pub use map::{MemoryMap, MemorySourceSpec, MAP_FILE};
 
@@ -63,6 +65,10 @@ impl Adapter for GenericAdapter {
 
     fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> {
         import::enumerate_archive(alf_file)
+    }
+
+    fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
+        watch::watch_paths(workspace)
     }
 
     // `discover_agents` (single-agent default), `export_agent`, and

@@ -86,10 +86,37 @@ pub struct MemorySourceSpec {
     /// Tag-extraction directives: `hashtags`, `static:<tag>`, `frontmatter:<key>`.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Row mapping for a `sqlite_rows` source. Required when `chunking` is
+    /// `sqlite_rows`, ignored otherwise. The source's `glob` names the `.db`
+    /// file(s); each matched file's rows become records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sqlite: Option<SqliteSpec>,
     /// Escape hatch: downgrade a non-canonical `memory_type` from error to
     /// warning (records will not match the dashboard filter chips).
     #[serde(default)]
     pub allow_noncanonical: bool,
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
+}
+
+/// How a SQLite database's rows become records (the `sqlite_rows` chunking mode).
+/// Each row → one record; the record **id is derived from the row's primary key**
+/// (`id_column`), never its content, so an in-place row edit keeps the id and
+/// reconciles to exactly one `Update` (P3), never a delete + create. The `.db`
+/// file itself is still preserved verbatim under `raw/generic/` for restore.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SqliteSpec {
+    /// Table to read rows from. Absent table ⇒ no records (a lazy/empty store
+    /// must not fail the export).
+    pub table: String,
+    /// Column holding each row's stable primary key → the ALF record id.
+    pub id_column: String,
+    /// Column holding the memory text → the record content.
+    pub content_column: String,
+    /// Optional column holding an RFC3339 timestamp for `created_at`/`observed_at`
+    /// (else the `.db` file's mtime is used, which reconcile carries forward).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp_column: Option<String>,
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -102,11 +129,17 @@ pub struct MemorySourceSpec {
 pub enum ChunkingMode {
     PerFile,
     ByHeading,
+    /// Rows of a SQLite database (see [`SqliteSpec`]). Handled by the sqlite
+    /// extractor, not the text chunker.
+    SqliteRows,
 }
 
 impl ChunkingMode {
     /// The `alf_core::chunk` strategy. `by_heading` is fixed to fence-aware ATX
     /// level-2 splitting — byte-compatible with OpenClaw's splitter (design §9).
+    /// `sqlite_rows` has no text strategy — the export branches to the sqlite
+    /// extractor before this is reached; `FileListingOnly` is a produces-nothing
+    /// fallback so a stray call can never mis-parse the `.db` as text.
     pub fn strategy(self) -> alf_core::chunk::ChunkingStrategy {
         use alf_core::chunk::ChunkingStrategy;
         match self {
@@ -115,7 +148,13 @@ impl ChunkingMode {
                 fence_aware: true,
                 level: 2,
             },
+            ChunkingMode::SqliteRows => ChunkingStrategy::FileListingOnly,
         }
+    }
+
+    /// Whether this source reads SQLite rows (export routes it to the extractor).
+    pub fn is_sqlite(self) -> bool {
+        matches!(self, ChunkingMode::SqliteRows)
     }
 }
 
@@ -196,6 +235,35 @@ impl MemoryMap {
             validate_timestamp(&src.timestamp).with_context(ctx)?;
             for tag in &src.tags {
                 validate_tag_directive(tag).with_context(ctx)?;
+            }
+
+            // `sqlite_rows` needs its `sqlite` block; a stray block on a text
+            // source is a no-op worth flagging. The table/column names are
+            // interpolated into the SELECT (rusqlite cannot bind an identifier),
+            // so they must be plain identifiers — enforced here, fail-closed.
+            if src.chunking == ChunkingMode::SqliteRows {
+                let Some(sq) = &src.sqlite else {
+                    bail!(
+                        "source `{}`: chunking `sqlite_rows` requires a `sqlite` block \
+                         with table, id_column, and content_column",
+                        src.id
+                    );
+                };
+                for (field, ident) in [
+                    ("table", &sq.table),
+                    ("id_column", &sq.id_column),
+                    ("content_column", &sq.content_column),
+                ] {
+                    validate_sqlite_ident(field, ident).with_context(ctx)?;
+                }
+                if let Some(ts) = &sq.timestamp_column {
+                    validate_sqlite_ident("timestamp_column", ts).with_context(ctx)?;
+                }
+            } else if src.sqlite.is_some() {
+                warnings.push(format!(
+                    "source `{}`: `sqlite` block ignored (chunking is not sqlite_rows)",
+                    src.id
+                ));
             }
 
             if !CANONICAL_TYPES.contains(&src.memory_type.as_str()) {
@@ -314,6 +382,23 @@ fn validate_glob(glob: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A sqlite table/column name must be a plain SQL identifier: it is interpolated
+/// into the SELECT (rusqlite cannot bind an identifier), so anything outside
+/// `[A-Za-z_][A-Za-z0-9_]*` is rejected to keep the query injection-free.
+fn validate_sqlite_ident(field: &str, ident: &str) -> Result<()> {
+    let mut chars = ident.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        bail!(
+            "sqlite {field} `{ident}` is not a plain identifier (letters, digits, \
+             and underscore only; must not start with a digit or be empty)"
+        );
+    }
 }
 
 /// Recognize a timestamp mode: `filename_date`, `file_mtime`, or
@@ -732,5 +817,68 @@ mod tests {
         });
         let map = MemoryMap::parse(&json.to_string()).unwrap();
         assert_eq!(map.runtime_version().as_deref(), Some("acme/2.3.1"));
+    }
+
+    fn sqlite_source(sqlite: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "brain", "glob": "brain.db", "memory_type": "semantic",
+            "namespace": "curated", "chunking": "sqlite_rows", "sqlite": sqlite
+        })
+    }
+
+    #[test]
+    fn valid_sqlite_source_validates_clean() {
+        let map = MemoryMap::parse(
+            &map_with(vec![sqlite_source(serde_json::json!({
+                "table": "memories", "id_column": "id",
+                "content_column": "content", "timestamp_column": "updated_at"
+            }))])
+            .to_string(),
+        )
+        .unwrap();
+        assert!(map.validate().unwrap().is_empty());
+        assert_eq!(map.memory_sources[0].chunking, ChunkingMode::SqliteRows);
+        assert!(map.memory_sources[0].chunking.is_sqlite());
+    }
+
+    #[test]
+    fn sqlite_rows_without_block_is_hard_error() {
+        let json = map_with(vec![serde_json::json!({
+            "id": "brain", "glob": "brain.db", "memory_type": "semantic",
+            "namespace": "curated", "chunking": "sqlite_rows"
+        })]);
+        let map = MemoryMap::parse(&json.to_string()).unwrap();
+        let err = map.validate().unwrap_err();
+        assert!(format!("{err:#}").contains("sqlite"));
+    }
+
+    #[test]
+    fn sqlite_non_identifier_names_are_rejected() {
+        for bad in ["memories; DROP TABLE x", "1bad", "a b", "col-name", ""] {
+            let map = MemoryMap::parse(
+                &map_with(vec![sqlite_source(serde_json::json!({
+                    "table": bad, "id_column": "id", "content_column": "content"
+                }))])
+                .to_string(),
+            )
+            .unwrap();
+            assert!(
+                map.validate().is_err(),
+                "sqlite table name `{bad}` should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_block_on_a_text_source_is_warning_only() {
+        let mut src = source("s", "a/*.md", "semantic", "curated");
+        src["sqlite"] = serde_json::json!({
+            "table": "memories", "id_column": "id", "content_column": "content"
+        });
+        let map = MemoryMap::parse(&map_with(vec![src]).to_string()).unwrap();
+        let warnings = map.validate().unwrap();
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("sqlite") && w.contains("ignored")));
     }
 }

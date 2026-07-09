@@ -5,8 +5,12 @@
 # dir is created by the container's `agent` user and isn't accessible to the CI
 # runner (uid mismatch across the bind mount), and we deliberately don't run
 # the Z-stage lifecycle in CI. CI keeps only the cheap, container-free guards —
-# the secret-pattern gate and the harness's own unit tests. Run the lifecycle
+# the secret-pattern gate and the harness's own unit tests. Those unit tests now
+# include the WP-M4 MCP coverage (test_mcp_client, test_invoker: the stdlib MCP
+# client + the CLI/MCP invoker seam, no alf binary or docker needed;
+# test_mcp_generic skips without a built alf). Run the container lifecycle
 # locally:  python3 tests/lifecycle/driver.py --framework <fw> --llm none --backend none
+# (the MCP-driven generic tier: --framework generic, or `./test.sh lifecycle-generic`).
 name: lifecycle-nollm
 
 on:

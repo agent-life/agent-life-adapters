@@ -82,6 +82,11 @@ class FrameworkKit(ABC):
     # curated stores; Z5's round-1 survival is informational on the LLM tier
     # for them (a real model may legitimately overwrite earlier memories).
     memory_shape: str = "append"                   # "append" | "curated"
+    # WP-M4 MCP LLM tier: when True, the framework is an MCP *host* — the LLM
+    # agent drives sync/vault by calling `mcp_alf_*` tools, and the Z15 gate runs
+    # instead of the harness driving alf itself. Only the hermes-mcp kit sets it;
+    # every other kit leaves it False, so Z15 SKIPs and no other stage changes.
+    mcp_llm_mode: bool = False
 
     def __init__(self, env: KitEnv):
         self.env = env
@@ -130,6 +135,26 @@ class FrameworkKit(ABC):
     @abstractmethod
     def placement(self, ctr, slot: str, markers: list) -> list:
         """[PlacementRow] — where each marker landed (category/key)."""
+
+    # -- alf transport (WP-M4) --------------------------------------------------
+    def make_invoker(self, run):
+        """How this framework drives `alf` in the Z-stages. Default is the
+        terminal path (`CliInvoker`, a transparent passthrough to
+        `container.exec*`); the generic kit overrides this to return an
+        `McpInvoker` that keeps one `alf mcp serve` stdio session open and maps
+        each tool-shaped command to a `tools/call`. Called once, after the
+        container is up. The three shipped frameworks keep the CLI path, so their
+        tiers are byte-for-byte unchanged."""
+        from .invoker import CliInvoker
+        return CliInvoker(run.container)
+
+    def config_defaults(self) -> dict:
+        """Extra `[defaults]` entries the harness writes into ~/.alf/config.toml
+        at Z3 (empty for the shipped frameworks → identical config). The generic
+        kit pins `workspace` here so its CLI-fallback ops (e.g. the Z13' export
+        copy-out) resolve without an explicit `-w` — a real generic user sets the
+        same key (the CLI's own `workspace_not_found` hint says so)."""
+        return {}
 
     # -- alf addressing ---------------------------------------------------------
     @abstractmethod
@@ -198,3 +223,12 @@ class FrameworkKit(ABC):
     def native_memory_stats(self, ctr, slot: str) -> dict:         # parity oracle
         raise SkipStage(f"{self.name}: native stats parity lands with the adapter fix",
                         wp="WP3")
+
+    def mcp_llm_gate(self, run, result) -> None:                   # Z15 (WP-M4)
+        """The MCP LLM-in-the-loop release gate: the LLM agent drives sync (and
+        vault) by calling the `mcp_alf_*` tools its host spawned, and this asserts
+        the effect through the ⊙ backend lanes plus an MCP-path marker (the
+        harness itself never calls `alf sync` in this tier). Only the hermes-mcp
+        kit implements it; every other framework SKIPs Z15."""
+        raise SkipStage(f"{self.name}: the MCP LLM gate is the hermes-mcp host tier",
+                        wp="WP-M4")

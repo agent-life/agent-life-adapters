@@ -1,0 +1,315 @@
+//! Generic `watch_paths` (design §11.1) — the watch surface the MCP loop
+//! monitors for a `.alf-map.json`-driven workspace.
+//!
+//! The whole-workspace default the trait provides would silently miss the two
+//! things generic can track outside a single recursive root: **external**
+//! include-list entries (absolute paths under a blessed root) and the exact set
+//! of files that matter (map globs + sentinels). So generic overrides it to
+//! yield, per design §11.1:
+//!
+//! - one spec per `memory_sources[]` entry (the glob's literal base dir, watched
+//!   recursively; a metachar-free glob is a single file),
+//! - the optional `identity_file`,
+//! - a single **tracked-files** spec (§6.1 rollover channel) carrying every
+//!   in-workspace include-list path **and** every external entry's absolute
+//!   source,
+//! - a **sentinels** spec for `.alf-map.json` / `.alf-include.json` themselves
+//!   (editing them changes the watch set / extraction).
+//!
+//! `watch_paths` returns a bare `Vec` (no `Result`), so every fallible read here
+//! degrades gracefully: a missing/broken map falls back to one recursive
+//! workspace spec plus whatever include-list/sentinel specs still resolve.
+
+use std::path::{Path, PathBuf};
+
+use alf_core::include::{IncludeList, INCLUDE_FILE};
+use alf_core::WatchSpec;
+
+use crate::map::{reject_unsafe_relpath, MemoryMap, MAP_FILE};
+
+/// Build the generic watch surface for `workspace`.
+///
+/// The map is **validated** before any root is derived (WP-M3 review F1): a
+/// hand-edited `.alf-map.json` with a `../`/absolute glob or identity path must
+/// not register an inotify watch outside the workspace. An invalid map (or an
+/// unsafe individual glob) is skipped, matching the export side's refusal.
+pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
+    let mut specs = Vec::new();
+
+    match MemoryMap::load(&workspace.join(MAP_FILE)).and_then(|map| {
+        map.validate()?; // rejects bad version / non-canonical types / mid-`**` globs / unsafe identity
+        Ok(map)
+    }) {
+        Ok(map) => {
+            for src in &map.memory_sources {
+                // `validate` does not reject a `..`/absolute glob (only mid-`**`),
+                // so guard each glob here before turning it into a watch root.
+                if reject_unsafe_relpath(&src.glob).is_ok() {
+                    specs.push(source_spec(
+                        workspace,
+                        &src.id,
+                        &src.glob,
+                        src.chunking.is_sqlite(),
+                    ));
+                }
+            }
+            if let Some(rel) = &map.identity_file {
+                // `validate` already rejected an unsafe identity, so this is safe;
+                // re-guard defensively.
+                if reject_unsafe_relpath(rel).is_ok() {
+                    specs.push(WatchSpec::file("identity", workspace.join(rel)));
+                }
+            }
+        }
+        Err(_) => {
+            // No usable map — fall back to the whole workspace so the loop still
+            // reacts to changes; sentinels below let a later `alf_configure` be
+            // noticed. Exclude `.git/` (its churn would spuriously dirty).
+            specs.push(
+                WatchSpec::dir("workspace", workspace.to_path_buf())
+                    .excluding([workspace.join(".git")]),
+            );
+        }
+    }
+
+    // Tracked-file channel: every in-workspace include-list path + every
+    // external entry's absolute source, as one §6.1 rollover unit.
+    if let Ok(list) = IncludeList::load(workspace) {
+        let mut roots: Vec<PathBuf> = list.paths().iter().map(|p| workspace.join(p)).collect();
+        for ext in list.externals() {
+            if let Some(source) = &ext.source {
+                roots.push(PathBuf::from(source));
+            }
+        }
+        if !roots.is_empty() {
+            specs.push(WatchSpec {
+                id: "tracked-files".into(),
+                roots,
+                recursive: false,
+                exclude: Vec::new(),
+                tracked: true,
+                sqlite: false,
+                rediscover: false,
+            });
+        }
+    }
+
+    // The control files themselves: editing them changes extraction / the watch
+    // set, so a change must re-sync (and re-derive the watch surface).
+    specs.push(WatchSpec {
+        id: "sentinels".into(),
+        roots: vec![workspace.join(MAP_FILE), workspace.join(INCLUDE_FILE)],
+        recursive: false,
+        exclude: Vec::new(),
+        tracked: false,
+        sqlite: false,
+        rediscover: false,
+    });
+
+    specs
+}
+
+/// A watch spec for one memory source: a metachar-free glob is a literal file;
+/// otherwise watch the glob's literal base directory recursively (with `.git/`
+/// excluded so its churn doesn't spuriously dirty a root-level glob — G3). A
+/// `sqlite_rows` source is flagged `as_sqlite` so the watch layer treats the
+/// `.db` + its `-wal`/`-shm` sidecars as one consistent-capture unit.
+fn source_spec(workspace: &Path, id: &str, glob: &str, sqlite: bool) -> WatchSpec {
+    let spec = if glob.contains(['*', '?', '[']) {
+        let base = glob_base_dir(workspace, glob);
+        let git = base.join(".git");
+        WatchSpec::dir(id, base).excluding([git])
+    } else {
+        WatchSpec::file(id, workspace.join(glob))
+    };
+    if sqlite {
+        spec.as_sqlite()
+    } else {
+        spec
+    }
+}
+
+/// The leading run of glob components with no metachar, joined under the
+/// workspace — the directory whose recursive watch covers the glob.
+fn glob_base_dir(workspace: &Path, glob: &str) -> PathBuf {
+    let mut base = workspace.to_path_buf();
+    for comp in glob.split('/') {
+        if comp.is_empty() {
+            continue;
+        }
+        if comp.contains(['*', '?', '[']) {
+            break;
+        }
+        base.push(comp);
+    }
+    base
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    fn write_map(ws: &Path, json: &str) {
+        fs::write(ws.join(MAP_FILE), json).unwrap();
+    }
+
+    #[test]
+    fn glob_base_dir_stops_at_first_metachar() {
+        let ws = Path::new("/ws");
+        assert_eq!(
+            glob_base_dir(ws, "memories/*.md"),
+            PathBuf::from("/ws/memories")
+        );
+        assert_eq!(
+            glob_base_dir(ws, "knowledge/**/*.md"),
+            PathBuf::from("/ws/knowledge")
+        );
+        assert_eq!(glob_base_dir(ws, "*.md"), PathBuf::from("/ws"));
+    }
+
+    #[test]
+    fn source_spec_literal_glob_is_a_file() {
+        let s = source_spec(Path::new("/ws"), "id", "IDENTITY.md", false);
+        assert!(!s.recursive);
+        assert!(!s.sqlite);
+        assert_eq!(s.roots, vec![PathBuf::from("/ws/IDENTITY.md")]);
+    }
+
+    #[test]
+    fn watch_paths_covers_sources_identity_tracked_and_sentinels() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_map(
+            ws,
+            r#"{
+                "version": 1,
+                "identity_file": "IDENTITY.md",
+                "memory_sources": [
+                    {"id":"journal","glob":"memories/*.md","memory_type":"episodic","namespace":"daily","chunking":"by_heading"},
+                    {"id":"kb","glob":"knowledge/**/*.md","memory_type":"semantic","namespace":"curated","chunking":"per_file"}
+                ]
+            }"#,
+        );
+        // Two in-workspace tracked files + one external.
+        fs::write(
+            ws.join(INCLUDE_FILE),
+            r#"{"files":[
+                {"path":"config.toml","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
+                {"path":"secret.txt","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/host/secret.txt","verified":true}
+            ]}"#,
+        )
+        .unwrap();
+
+        let specs = watch_paths(ws);
+        let by_id = |id: &str| specs.iter().find(|s| s.id == id).cloned();
+
+        let journal = by_id("journal").expect("journal source spec");
+        assert!(journal.recursive);
+        assert_eq!(journal.roots, vec![ws.join("memories")]);
+
+        let kb = by_id("kb").expect("kb source spec");
+        assert_eq!(kb.roots, vec![ws.join("knowledge")]);
+
+        let identity = by_id("identity").expect("identity spec");
+        assert_eq!(identity.roots, vec![ws.join("IDENTITY.md")]);
+
+        let tracked = by_id("tracked-files").expect("tracked spec");
+        assert!(tracked.tracked);
+        assert!(tracked.roots.contains(&ws.join("config.toml")));
+        assert!(tracked
+            .roots
+            .contains(&PathBuf::from("/etc/host/secret.txt")));
+
+        let sentinels = by_id("sentinels").expect("sentinels spec");
+        assert!(!sentinels.tracked);
+        assert!(sentinels.roots.contains(&ws.join(MAP_FILE)));
+        assert!(sentinels.roots.contains(&ws.join(INCLUDE_FILE)));
+    }
+
+    #[test]
+    fn watch_paths_without_map_falls_back_to_workspace() {
+        let tmp = TempDir::new().unwrap();
+        let specs = watch_paths(tmp.path());
+        let ws = tmp.path();
+        let workspace = specs
+            .iter()
+            .find(|s| s.id == "workspace" && s.recursive)
+            .expect("workspace fallback spec");
+        // G3: the fallback recursive spec excludes `.git/`.
+        assert!(workspace.exclude.contains(&ws.join(".git")));
+        // Sentinels are always present so a later configure is noticed.
+        assert!(specs.iter().any(|s| s.id == "sentinels"));
+    }
+
+    #[test]
+    fn root_level_glob_excludes_git() {
+        let s = source_spec(Path::new("/ws"), "root", "*.md", false);
+        assert!(s.recursive);
+        assert_eq!(s.roots, vec![PathBuf::from("/ws")]);
+        assert!(s.exclude.contains(&PathBuf::from("/ws/.git")));
+    }
+
+    #[test]
+    fn unsafe_glob_is_skipped_but_the_map_still_yields_safe_sources() {
+        // Review F1: `validate()` accepts `../` globs (it only rejects mid-`**`),
+        // so the per-glob guard in watch_paths must skip the escaping one while
+        // keeping the safe source — no watch registered outside the workspace.
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        write_map(
+            ws,
+            r#"{
+                "version": 1,
+                "memory_sources": [
+                    {"id":"escape","glob":"../secrets/*.md","memory_type":"episodic","namespace":"daily","chunking":"per_file"},
+                    {"id":"ok","glob":"memories/*.md","memory_type":"episodic","namespace":"daily","chunking":"per_file"}
+                ]
+            }"#,
+        );
+        let specs = watch_paths(ws);
+        assert!(
+            specs.iter().all(|s| s.id != "escape"),
+            "unsafe glob skipped"
+        );
+        assert!(specs.iter().any(|s| s.id == "ok"), "safe glob kept");
+        for spec in &specs {
+            for root in &spec.roots {
+                assert!(
+                    root.starts_with(ws),
+                    "root {root:?} escapes the workspace {ws:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unsafe_identity_makes_validate_fail_and_falls_back() {
+        // An absolute/`..` identity is a hard validate() failure → whole map
+        // skipped → workspace fallback (no out-of-workspace identity watch).
+        let tmp = TempDir::new().unwrap();
+        write_map(
+            tmp.path(),
+            r#"{"version":1,"identity_file":"../../etc/passwd","memory_sources":[]}"#,
+        );
+        let specs = watch_paths(tmp.path());
+        assert!(specs.iter().all(|s| s.id != "identity"));
+        assert!(specs.iter().any(|s| s.id == "workspace"));
+    }
+
+    #[test]
+    fn invalid_map_falls_back_to_workspace() {
+        // A non-canonical memory_type (no escape hatch) makes validate() fail →
+        // the whole map is skipped, and the loop still watches the workspace.
+        let tmp = TempDir::new().unwrap();
+        write_map(
+            tmp.path(),
+            r#"{"version":1,"memory_sources":[
+                {"id":"x","glob":"m/*.md","memory_type":"bogus","namespace":"daily","chunking":"per_file"}]}"#,
+        );
+        let specs = watch_paths(tmp.path());
+        assert!(specs.iter().any(|s| s.id == "workspace"));
+        assert!(specs.iter().all(|s| s.id != "x"));
+    }
+}

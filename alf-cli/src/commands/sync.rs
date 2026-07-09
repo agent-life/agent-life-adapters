@@ -209,9 +209,34 @@ fn persist_local(
     temp_alf: &Path,
     snapshot_path: &Path,
 ) -> Result<()> {
-    fs::copy(temp_alf, snapshot_path)
-        .with_context(|| format!("Failed to persist snapshot at {}", snapshot_path.display()))?;
+    // Atomic base write (WP-M3 review B1): copy into a sibling temp, fsync, then
+    // rename over the base. A SIGKILL mid-write (design §5.3 treats it as normal,
+    // and the watch loop makes autonomous syncs reachable) then leaves either the
+    // old base or the new base — never a truncated `base.alf` that the next start
+    // would read as a corrupt/short archive.
+    if let Some(parent) = snapshot_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+    }
+    let tmp = snapshot_path.with_extension("alf.tmp");
+    fs::copy(temp_alf, &tmp)
+        .with_context(|| format!("Failed to stage snapshot at {}", tmp.display()))?;
+    {
+        // fsync the staged file so its bytes are durable before the rename.
+        let f = fs::File::open(&tmp)
+            .with_context(|| format!("Failed to reopen staged snapshot {}", tmp.display()))?;
+        f.sync_all()
+            .with_context(|| format!("Failed to fsync staged snapshot {}", tmp.display()))?;
+    }
+    fs::rename(&tmp, snapshot_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        anyhow::anyhow!(
+            "Failed to persist snapshot at {}: {e}",
+            snapshot_path.display()
+        )
+    })?;
 
+    // State is written AFTER the base (invariant: state ⇒ base), atomically.
     let new_state = AgentState {
         agent_id,
         last_synced_sequence: Some(sequence),
@@ -770,6 +795,28 @@ fn wrap_upload(err: anyhow::Error) -> anyhow::Error {
     .into()
 }
 
+/// Crash seam for the WP-M4 live kill/restart gate (brief task 9): abort the
+/// process **before** any upload advances the cloud sequence — simulating a
+/// SIGKILL at the moment the design's crash-safety argument covers (§5.3). A
+/// restart's catch-up scan must then produce exactly one correct delta (base +
+/// state were never advanced, so the re-run derives the identical upload).
+///
+/// **Gated behind the `fault-injection` build feature (WP-M3 review D1).** The
+/// default/release binary compiles the no-op below and does not read any env, so
+/// a stray/leftover env var can never abort a real `alf sync`. The WP-M4 harness
+/// builds `alf` with `--features fault-injection` explicitly.
+#[cfg(feature = "fault-injection")]
+fn fault_before_upload() {
+    if std::env::var_os("ALF_WATCH_FAULT_BEFORE_UPLOAD").is_some() {
+        eprintln!("alf: ALF_WATCH_FAULT_BEFORE_UPLOAD set — aborting before upload (test seam)");
+        std::process::exit(137); // 128 + SIGKILL(9)
+    }
+}
+
+/// The default build: the fault seam does not exist — no env is read.
+#[cfg(not(feature = "fault-injection"))]
+fn fault_before_upload() {}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_first_sync(
     client: &ApiClient,
@@ -792,6 +839,7 @@ fn execute_first_sync(
 
     check_first_sync_safety(agent_id, runtime, &outcome, force_first_sync)?;
 
+    fault_before_upload();
     let upload = client
         .upload_snapshot(agent_id, alf_bytes)
         .map_err(wrap_upload)?;
@@ -889,6 +937,7 @@ fn execute_delta(
     // base at the current sequence; prior deltas retained for point-in-time).
     if tracked_files_changed(runtime, &mut prev_reader, &mut curr_reader)? {
         progress.emit("  Tracked workspace files changed — uploading full snapshot...");
+        fault_before_upload();
         let upload = client
             .upload_snapshot(agent_id, effective_bytes.as_ref())
             .map_err(wrap_upload)?;
@@ -1080,6 +1129,7 @@ fn execute_delta(
         "  Uploading delta ({} bytes)...",
         delta_bytes.len()
     ));
+    fault_before_upload();
     let upload = client
         .push_delta(agent_id, base_sequence, &delta_bytes)
         .map_err(wrap_upload)?;
@@ -1216,6 +1266,18 @@ fn diff_raw_trees(
 mod tests {
     use super::*;
     use uuid::Uuid;
+
+    /// Review D1: in the default build (no `fault-injection` feature) the upload
+    /// fault seam is a no-op — setting the env must NOT abort the process. If this
+    /// test's process survives the call, the seam is inert.
+    #[cfg(not(feature = "fault-injection"))]
+    #[test]
+    fn fault_before_upload_is_inert_without_the_feature() {
+        std::env::set_var("ALF_WATCH_FAULT_BEFORE_UPLOAD", "1");
+        fault_before_upload(); // would std::process::exit(137) if the seam were live
+        std::env::remove_var("ALF_WATCH_FAULT_BEFORE_UPLOAD");
+        // Reaching here proves the default build ignores the var.
+    }
 
     /// Schema conformance (offline): a populated `SyncResult` — whose partial
     /// `SyncChanges` omits the zero credential/principal/identity layers —
@@ -1462,6 +1524,19 @@ mod tests {
         let saved = AgentState::load_from(&state_path, agent_id).unwrap();
         assert_eq!(saved.last_synced_sequence, Some(42));
         assert!(saved.last_synced_at.is_some());
+
+        // Review B1: the base is written whole (atomic temp+rename), and no
+        // `.alf.tmp` staging file survives.
+        assert_eq!(fs::read(&snapshot_path).unwrap(), b"fake-alf-bytes");
+        let leftovers: Vec<_> = fs::read_dir(snapshot_path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no staging temp file may survive persist_local: {leftovers:?}"
+        );
     }
 
     /// WP3: tracked-file change detection drives the re-snapshot decision —

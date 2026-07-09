@@ -64,23 +64,57 @@ pub struct StatusResult {
     pub watch: WatchStatus,
 }
 
-/// Watch-loop status. WP-M2a ships the inactive stub; WP-M3 fills `sources`
-/// with per-source `{ last_tick, dirty_count, backoff }` rows.
+/// Watch-loop status (WP-M3). `active` is false when no loop is running (no API
+/// key, unresolved agent, or paused/parked); `sources` carries per-source cadence
+/// and dirty state; `parked`/`backoff_retry_in_secs` surface the recovery state
+/// machine so an agent can see why auto-sync stopped.
 #[derive(Serialize, JsonSchema, Default)]
 pub struct WatchStatus {
-    /// Whether an auto-sync watch loop is running. Always `false` in v1 M2a —
-    /// there is no loop yet (`alf mcp serve` syncs only on explicit `alf_sync`).
+    /// Whether the auto-sync watch loop is actively syncing (running, not paused,
+    /// not parked).
     pub active: bool,
-    /// Per-source watch state. Always empty until WP-M3.
+    /// Whether the loop is paused (`alf_watch_set {pause:true}` or mid-restore).
+    #[serde(default)]
+    pub paused: bool,
+    /// Present when auto-sync has parked on an unrecoverable error and is waiting
+    /// for operator intervention (design §7.W4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parked: Option<WatchParked>,
+    /// Seconds until the next retry while backing off after a transient error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backoff_retry_in_secs: Option<u64>,
+    /// Per-source watch state.
     pub sources: Vec<WatchSource>,
 }
 
-/// One watched source's loop state (WP-M3 shape; never emitted in M2a).
+/// A parked auto-sync error (coded, with a remediation hint).
+#[derive(Serialize, JsonSchema)]
+pub struct WatchParked {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+}
+
+/// One watched source's loop state.
 #[derive(Serialize, JsonSchema)]
 pub struct WatchSource {
     pub source: String,
-    pub last_tick: Option<String>,
+    /// The resolved sync cadence for this source (seconds).
+    pub interval_secs: u64,
+    /// True for the §6.1 tracked-file (full-snapshot rollover) channel.
+    pub tracked: bool,
+    /// Whether the source has unsynced changes pending.
+    pub dirty: bool,
+    /// Number of change events observed since the last sync.
     pub dirty_count: u64,
+    /// How long ago (seconds) this source last synced.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_fire_secs_ago: Option<u64>,
+    /// Set when a file has churned continuously for 24 h and can never be safely
+    /// captured (never sync torn bytes — surface it instead).
+    #[serde(default)]
+    pub never_quiesced_warning: bool,
 }
 
 /// Schema shim for [`alf_core::FileEntry`], which lives in `alf-core` and so

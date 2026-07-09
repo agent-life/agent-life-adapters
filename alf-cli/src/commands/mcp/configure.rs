@@ -32,6 +32,10 @@ pub(crate) struct ConfigureResult {
     // Skipped when empty on a non-Option ⇒ `#[serde(default)]` (M2a §2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
+    /// Operational note: the watch surface is computed at server start, so a
+    /// newly-added memory source is not auto-watched until the MCP server is
+    /// restarted (WP-M3 review G2; dynamic re-registration is WP-M5).
+    note: String,
 }
 
 /// Apply a `map` (full replacement) or `patch` (deep merge) to the workspace's
@@ -105,6 +109,9 @@ pub(crate) fn configure(
         map_path: map_path.to_string_lossy().into_owned(),
         map: map_value,
         warnings,
+        note: "Restart the MCP server to watch newly-added memory locations \
+               (the watch surface is registered at startup)."
+            .into(),
     })
 }
 
@@ -123,12 +130,21 @@ fn merge(base: &mut Value, patch: Value) {
 
 /// Write `contents` to `path` atomically (sibling temp + rename), so a crash
 /// mid-write leaves any pre-existing map untouched.
+///
+/// The temp name carries a **process-unique** suffix (pid + a monotonic counter)
+/// so two concurrent writers — rmcp fans a request batch out across threads
+/// (WP-M3 review E1) — never collide on the same temp path and stream into each
+/// other's file. Combined with the atomic rename, concurrent writes converge on a
+/// whole (last-writer-wins) map, never a torn one.
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(MAP_FILE);
-    let tmp = path.with_file_name(format!(".{name}.tmp.{}", std::process::id()));
+    let unique = SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{unique}", std::process::id()));
     std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
     std::fs::rename(&tmp, path).with_context(|| {
         let _ = std::fs::remove_file(&tmp);

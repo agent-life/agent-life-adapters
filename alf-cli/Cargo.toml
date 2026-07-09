@@ -1,6 +1,6 @@
 [package]
 name = "alf-cli"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "CLI for the Agent Life Format — export, import, validate, and sync agent data"
 license = "MIT"
@@ -9,6 +9,12 @@ repository = "https://github.com/agent-life/agent-life-adapters"
 [[bin]]
 name = "alf"
 path = "src/main.rs"
+
+[features]
+# Enables the WP-M3 upload fault-injection seam (a process-abort before the
+# sync upload) for the live-tier kill/restart gate (WP-M4). NEVER enabled in the
+# default/release build — the seam compiles to a no-op without it.
+fault-injection = []
 
 [dependencies]
 alf-core = { path = "../alf-core" }
@@ -31,9 +37,23 @@ uuid = { version = "1", features = ["v7"] }
 # depend on the SAME schemars so `#[derive(JsonSchema)]` on our output structs
 # interops with rmcp's outputSchema generation. tokio is already transitive via
 # blocking reqwest — the new weight is rmcp/schemars only (see WP-M2a handoff).
+# P4 re-check (WP-M6, 2026-07-08): 2.1.0 is the latest published rmcp and it
+# already lists 2026-07-28 in KNOWN_VERSIONS, so it echo-negotiates every
+# revision through the RC (design §4/F16). Locked to 2.1.0 in Cargo.lock. The
+# 2026-07-28 spec FINAL had not published as of the pin date; its choices (stderr
+# logging, no sampling/roots/tasks) match design §4, so no change is expected —
+# the human re-verifies the final text at/after 2026-07-28 before the release cut.
 rmcp = { version = "2.1", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = { version = "1", features = ["chrono04", "uuid1"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "io-std", "macros", "time"] }
+# WP-M3 watch loop: `notify` is the cross-platform FS watcher (inotify/FSEvents/
+# kqueue/Windows — audited for the 5 release triples in the handoff). `fs2` gives
+# the per-agent advisory lock (flock) — the first lock in alf-cli. `rusqlite`
+# (bundled, same version the zeroclaw/hermes adapters already link) backs the
+# SQLite-safe capture (`VACUUM INTO`); it adds no new native build.
+notify = "6"
+fs2 = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
 
 [dev-dependencies]
 tempfile = "3"

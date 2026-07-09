@@ -12,7 +12,7 @@
 //! is allowed to gate behaviour on it. A CI grep guard enforces this.
 
 use crate::config::Config;
-use crate::fs_private::write_private;
+use crate::fs_private::write_private_atomic;
 
 use anyhow::bail;
 use anyhow::{Context, Result};
@@ -93,7 +93,12 @@ impl AgentState {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize state")?;
-        write_private(path, &content)
+        // Atomic temp+rename (WP-M3 review B1): the watch loop makes autonomous
+        // syncs reachable, and the host may SIGKILL `alf mcp serve` at any moment
+        // (design §5.3 treats this as normal). A truncating write could leave a
+        // torn `state.toml`; the atomic rename guarantees the reader sees either
+        // the old or the new file, never a partial mix.
+        write_private_atomic(path, &content)
             .with_context(|| format!("Failed to write state to {}", path.display()))?;
         Ok(())
     }

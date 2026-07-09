@@ -1,6 +1,6 @@
 //! Configuration management for `~/.alf/config.toml`.
 
-use crate::fs_private::write_private;
+use crate::fs_private::write_private_atomic;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -241,7 +241,14 @@ impl Config {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        write_private(path, &content)
+        // Atomic temp+rename (WP-M5 review A1): the long-running MCP server is now
+        // a `config.toml` writer (`run_rediscovery`), and the tools read it on
+        // parallel threads with no shared lock. A non-atomic truncate+write would
+        // let a reader land on an empty file — and since every field is
+        // `#[serde(default)]`, that parses as an empty `[[agents]]` mapping, so
+        // `alf_agents_list` would momentarily report zero agents. Rename makes
+        // every reader see either the whole old or the whole new config.
+        write_private_atomic(path, &content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
         Ok(())
     }
@@ -407,6 +414,84 @@ mod tests {
         Config::default().save_to(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn save_to_is_atomic_and_leaves_no_temp() {
+        // WP-M5 review A1: an overwriting save must not leave a torn/partial file
+        // or a `.tmp` sibling — a concurrent reader (an MCP tool's `Config::load`)
+        // always sees a whole config.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut first = Config::default();
+        first.agents.push(AgentEntry {
+            runtime: Some("hermes".into()),
+            runtime_agent: "scout".into(),
+            runtime_agent_id: None,
+            alf_agent_id: uuid::Uuid::nil(),
+            workspace: "/ws".into(),
+            enabled: true,
+            extra: Default::default(),
+        });
+        first.save_to(&path).unwrap();
+        // Overwrite; the file must remain fully parseable throughout.
+        Config::default().save_to(&path).unwrap();
+
+        let reloaded = Config::load_from(&path).unwrap();
+        assert!(reloaded.agents.is_empty(), "second whole config won");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no torn .tmp sibling survives a save");
+    }
+
+    #[test]
+    fn concurrent_saves_never_expose_an_empty_agent_mapping() {
+        // WP-M5 review A1 DoD guard: with the MCP server (or a CLI) repeatedly
+        // saving config.toml, a concurrent reader (`alf_agents_list` →
+        // `Config::load`) must always see a whole file — never the truncate window
+        // that would parse as an empty `[[agents]]` mapping. Atomic temp+rename
+        // guarantees it; the pre-A1 in-place truncate+write did not.
+        use std::sync::Arc;
+        let dir = Arc::new(TempDir::new().unwrap());
+        let path = dir.path().join("config.toml");
+
+        let mut seeded = Config::default();
+        seeded.agents.push(AgentEntry {
+            runtime: Some("hermes".into()),
+            runtime_agent: "scout".into(),
+            runtime_agent_id: None,
+            alf_agent_id: uuid::Uuid::nil(),
+            workspace: "/ws".into(),
+            enabled: true,
+            extra: Default::default(),
+        });
+        seeded.save_to(&path).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (p, cfg) = (path.clone(), seeded.clone());
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    cfg.save_to(&p).unwrap();
+                }
+            }));
+        }
+        for _ in 0..3 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..80 {
+                    let c = Config::load_from(&p).expect("config always parseable");
+                    assert_eq!(c.agents.len(), 1, "reader never sees a torn/empty config");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]

@@ -1330,10 +1330,10 @@ impl Selector {
             .filter(|o| o.is_some())
             .count();
         if count == 0 {
-            bail!("Pass exactly one of --id, --label, --service to select a record");
+            bail!("Pass exactly one selector (id, label, or service) to choose a record");
         }
         if count > 1 {
-            bail!("Pass only one of --id, --label, --service");
+            bail!("Pass only one selector (id, label, or service), not several");
         }
         Ok(())
     }
@@ -1342,7 +1342,9 @@ impl Selector {
 fn find_record<'a>(doc: &'a CredentialsDocument, sel: &Selector) -> Result<&'a CredentialRecord> {
     sel.validate()?;
     if let Some(id_str) = &sel.id {
-        let id = Uuid::parse_str(id_str).context("--id is not a valid UUID")?;
+        let id = Uuid::parse_str(id_str).context(
+            "id is not a valid UUID (expected e.g. 123e4567-e89b-12d3-a456-426614174000)",
+        )?;
         return doc
             .credentials
             .iter()

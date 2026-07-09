@@ -185,23 +185,26 @@ def z03_alf_check(run, result: StageResult):
     result.add(_passfail(run.state["alf_sha_container"] == run.state["alf_sha_host"],
                          "injected alf sha256 == host binary sha256",
                          run.state["alf_sha_host"][:16] + "…"))
-    proc = run.container.exec(["alf", "--version"])
+    # `--version` has no MCP tool; the invoker runs it on the CLI either way.
+    proc = run.alf.exec(["--version"])
     got = (proc.stdout or "").strip()
     result.add(_passfail(got == run.expected_alf_version,
                          f"alf --version == {run.expected_alf_version!r} (workspace v1.0.0)",
                          f"got {got!r}"))
 
     # Belt-and-braces config pre-write; ALF_API_URL/ALF_API_KEY arrive via the
-    # container env-file as well (D10 removes the pre-write seam).
+    # container env-file as well (D10 removes the pre-write seam). A kit may pin
+    # extra `[defaults]` (generic pins `workspace` so its CLI-fallback ops resolve).
     api_url = run.creds.alf_api_url if run.creds else run.sentinel_api_url
+    defaults_extra = "".join(f'{k} = "{v}"\n' for k, v in kit.config_defaults().items())
     (run.paths.alf_home / "config.toml").write_text(
         "# Written by the lifecycle harness (belt-and-braces; the container env\n"
         "# carries ALF_API_URL/ALF_API_KEY — D10 makes this file optional).\n"
-        f'[service]\napi_url = "{api_url}"\n\n[defaults]\nruntime = "{kit.name}"\n',
+        f'[service]\napi_url = "{api_url}"\n\n[defaults]\nruntime = "{kit.name}"\n{defaults_extra}',
         encoding="utf-8")
 
     before = snapshots.snapshot(run.paths.home)
-    proc, check = run.container.exec_json(["alf", "check", "-r", kit.name])
+    proc, check = run.alf.json(["check", "-r", kit.name])
     after = snapshots.snapshot(run.paths.home)
 
     result.add(_passfail(check is not None, "alf check emits one JSON object on stdout"))
@@ -678,8 +681,8 @@ def z13_idle_resync(run, result: StageResult):
         r0 = run.api.get(f"/agents/{agent_id}")
         base_seq = ((r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0))
                     if r0.status_code == 200 else run.state.get("sequence", 0))
-        proc, res = run.container.exec_json(
-            ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+        proc, res = run.alf.json(
+            ["sync", "-r", kit.name, "--agent", slot], timeout=300)
         result.add(_passfail(bool(res) and res.get("no_changes") is True,
                              "idle re-sync: no_changes == true"))
         r = run.api.get(f"/agents/{agent_id}")
@@ -706,8 +709,11 @@ def z13_idle_resync(run, result: StageResult):
         paths = []
         for i in (1, 2):
             ctr_path = f"/home/agent/.alf/z13-export-{i}.alf"
-            run.container.exec(
-                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+            # `export` copy-out has no MCP tool (export is a CLI/human op, design
+            # §6); the invoker runs it on the CLI (generic pins `[defaults].
+            # workspace` so it resolves without -w).
+            run.alf.exec(
+                ["export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
                 timeout=300)
             host = run.paths.alf_home / f"z13-export-{i}.alf"
             if not host.is_file():
@@ -757,8 +763,11 @@ def z14_curated_memory(run, result: StageResult):
         agent_id = run.state.get("alf_agent_id", "")
 
         def sync_json():
-            _, res = run.container.exec_json(
-                ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+            # Through the invoker seam (WP-M4): CliInvoker → terminal `alf sync`
+            # (openclaw); McpInvoker → the `alf_sync` MCP tool (generic-mcp), so
+            # Z14's curation deltas are exercised over `alf mcp serve`.
+            _, res = run.alf.json(
+                ["sync", "-r", kit.name, "--agent", slot], timeout=300)
             return res or {}
 
         def mem_changes(res):
@@ -837,8 +846,10 @@ def z14_curated_memory(run, result: StageResult):
 
         def export_by_id(tag: str) -> dict:
             ctr_path = f"/home/agent/.alf/z14-export-{tag}.alf"
-            run.container.exec(
-                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+            # `export` has no MCP tool (copy-out is a CLI/human op, design §6), so
+            # the McpInvoker falls back to the terminal here; CliInvoker is direct.
+            run.alf.exec(
+                ["export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
                 timeout=300)
             host = run.paths.alf_home / f"z14-export-{tag}.alf"
             if not host.is_file():
@@ -877,6 +888,29 @@ def z14_curated_memory(run, result: StageResult):
 
 
 # ---------------------------------------------------------------------------
+# Z15 — MCP LLM-in-the-loop gate (WP-M4): the agent drives sync/vault via tools
+# ---------------------------------------------------------------------------
+
+def z15_mcp_llm_gate(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not kit.mcp_llm_mode:
+        raise SkipStage(
+            f"{kit.name}: the MCP LLM gate runs on the hermes-mcp host tier only",
+            wp="WP-M4")
+    if run.backend != "real":
+        raise SkipStage("Z15 needs --backend real (the ⊙ lanes prove the sync effect)")
+    nar.explain("""
+        The release gate: a REAL agent (Hermes host, LLM proxy) drives sync and
+        vault by calling the `mcp_alf_*` tools its host spawned from
+        `alf mcp serve` — the terminal is never used for these ops. The harness
+        asserts the sync/vault EFFECT through the ⊙ backend lanes and an MCP-path
+        marker (the harness itself issues zero `alf sync` calls this tier).
+    """)
+    nar.flow("agent turn ──▶ mcp_alf_alf_sync / mcp_alf_alf_vault_add ──▶ alf mcp serve ──▶ S3 + Neon ⊙")
+    kit.mcp_llm_gate(run, result)
+
+
+# ---------------------------------------------------------------------------
 # Registry — (stage_id, title, uses_alf, fn)
 # ---------------------------------------------------------------------------
 
@@ -896,6 +930,8 @@ REGISTRY = [
     ("z13", "Idle re-sync — no changes / Z13' determinism ⊙", True, z13_idle_resync),
     ("z14", "Curated in-place memory — reconcile delta shapes (WP4.1)", True,
      z14_curated_memory),
+    ("z15", "MCP LLM gate — agent drives sync/vault via mcp_alf_* (WP-M4)", True,
+     z15_mcp_llm_gate),
 ]
 
 STAGE_IDS = [sid for sid, *_ in REGISTRY]

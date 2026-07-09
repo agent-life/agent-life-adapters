@@ -17,11 +17,19 @@
 #   lifecycle    tests/lifecycle/driver.py, no-LLM/no-backend       (needs: docker, python3)
 #                  └ the CI tier: real zeroclaw install, seeded markers, alf check,
 #                    Z13' determinism (Z1-Z3,Z13). Zero secrets, stdlib-only Python.
+#   lifecycle-generic tests/lifecycle/driver.py --framework generic (needs: docker, python3)
+#                  └ the MCP-driven CI tier (WP-M4): the toy generic runtime, every
+#                    alf op over a `docker exec -i … alf mcp serve` stdio session.
 #   lifecycle-llm  tests/lifecycle/driver.py --llm proxy --backend real  (needs: docker,
 #                  python3 + requests, $ALF_SERVICE_REPO checkout with its .env)
 #                  └ mints a runtime key, drives real LLM turns, asserts the ⊙
 #                    API/S3/Neon lanes, ALWAYS runs the teardown ladder. Z1-Z4+Z13
 #                    with exactly one XFAIL (wp3-brain-db-extraction).
+#   lifecycle-mcp-llm tests/lifecycle/driver.py --framework hermes-mcp --llm proxy --backend real
+#                  └ the WP-M4 release gate: Hermes as an MCP HOST — a real agent
+#                    drives sync/vault by calling mcp_alf_* tools (Z15). Same prereqs
+#                    + teardown ladder. Prebuild the base: docker build -t
+#                    alf-lifecycle-hermes tests/lifecycle/frameworks/hermes.
 #   walkthroughs cloud e2e walkthroughs, every runtime branch, --no-pause  (needs: python3 + live .env)
 #                  └ main + workspace × {openclaw,zeroclaw,hermes}, plus the vault
 #                    walkthrough. Each combo is its own pass/fail row. SKIPPED
@@ -52,7 +60,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-ALL_TIERS=(fmt clippy unit integration installer lifecycle lifecycle-llm walkthroughs)
+ALL_TIERS=(fmt clippy unit integration installer lifecycle lifecycle-generic lifecycle-llm lifecycle-mcp-llm walkthroughs)
 
 # --- colours (only when stdout is a tty) ----------------------------------
 if [ -t 1 ]; then
@@ -76,7 +84,7 @@ while [ $# -gt 0 ]; do
         --installer-full)  INSTALLER_FULL=1 ;;
         --list)            printf '%s\n' "${ALL_TIERS[@]}"; exit 0 ;;
         -h|--help)         usage; exit 0 ;;
-        fmt|clippy|unit|integration|installer|lifecycle|lifecycle-llm|walkthroughs) SELECTED+=("$1") ;;
+        fmt|clippy|unit|integration|installer|lifecycle|lifecycle-generic|lifecycle-llm|lifecycle-mcp-llm|walkthroughs) SELECTED+=("$1") ;;
         *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -191,6 +199,15 @@ for tier in "${TIERS[@]}"; do
                 run_tier lifecycle python3 tests/lifecycle/driver.py \
                     --framework zeroclaw --llm none --backend none --ci --stages Z1-Z3,Z13
             fi ;;
+        lifecycle-generic)
+            if ! have python3; then
+                skip_tier lifecycle-generic "python3 not found"
+            elif ! docker_ready; then
+                skip_tier lifecycle-generic "docker not available (daemon running?)"
+            else
+                run_tier lifecycle-generic python3 tests/lifecycle/driver.py \
+                    --framework generic --llm none --backend none --ci --stages Z1-Z3,Z13
+            fi ;;
         lifecycle-llm)
             if ! have python3; then
                 skip_tier lifecycle-llm "python3 not found"
@@ -201,6 +218,18 @@ for tier in "${TIERS[@]}"; do
             else
                 run_tier lifecycle-llm python3 tests/lifecycle/driver.py \
                     --framework zeroclaw --llm proxy --backend real --no-pause
+            fi ;;
+        lifecycle-mcp-llm)
+            if ! have python3; then
+                skip_tier lifecycle-mcp-llm "python3 not found"
+            elif ! docker_ready; then
+                skip_tier lifecycle-mcp-llm "docker not available (daemon running?)"
+            elif ! lifecycle_llm_ready; then
+                skip_tier lifecycle-mcp-llm "needs \$ALF_SERVICE_REPO/.env + python3 with requests"
+            else
+                run_tier lifecycle-mcp-llm python3 tests/lifecycle/driver.py \
+                    --framework hermes-mcp --llm proxy --backend real --no-pause \
+                    --stages Z1-Z3,Z15
             fi ;;
         walkthroughs)
             if ! have python3; then

@@ -30,7 +30,7 @@ use alf_core::{
 use crate::map::{MemoryMap, MemorySourceSpec, MAP_FILE};
 use crate::{ExportReport, FileEntry, WorkspaceEnumeration};
 
-const RUNTIME: &str = "generic";
+pub(crate) const RUNTIME: &str = "generic";
 
 /// ALF's own control/metadata files. These never become memory records even
 /// when a broad glob (`**`) matches them (S3) — the `.alf-agent-id` pin, the map
@@ -185,7 +185,7 @@ fn safe_map_file(workspace: &Path, rel: &str) -> Result<Option<PathBuf>> {
 // File → records
 // ---------------------------------------------------------------------------
 
-fn parse_memory_type(s: &str) -> MemoryType {
+pub(crate) fn parse_memory_type(s: &str) -> MemoryType {
     // Every string deserializes: known variants map through, the rest become
     // `MemoryType::Unknown(s)` (validation already flagged non-canonical types).
     serde_json::from_value(serde_json::Value::String(s.to_string()))
@@ -313,7 +313,7 @@ fn parse_source_file(
 
 /// Assemble a record's tags: the namespace is always tag 0 (dashboard grouping),
 /// then each directive appends, deduplicated in directive order.
-fn build_tags(src: &MemorySourceSpec, content: &str) -> Vec<String> {
+pub(crate) fn build_tags(src: &MemorySourceSpec, content: &str) -> Vec<String> {
     let mut tags = vec![src.namespace.clone()];
     let push = |tags: &mut Vec<String>, t: String| {
         if !t.is_empty() && !tags.contains(&t) {
@@ -613,20 +613,45 @@ fn collect(workspace: &Path, map: &MemoryMap, agent_id: Uuid) -> Result<Collecte
             continue;
         }
         source_hit[idx] = true;
+        let src = &map.memory_sources[idx];
         let bytes = fs::read(&abs).with_context(|| format!("reading {rel}"))?;
-        // R2: a non-UTF-8 match (e.g. a binary caught by `knowledge/**`) is
-        // preserved raw but not parsed — a whole export must not fail on one file.
-        match std::str::from_utf8(&bytes) {
-            Ok(text) => records.extend(parse_source_file(
-                &map.memory_sources[idx],
+        if src.chunking.is_sqlite() {
+            // A `sqlite_rows` source: extract per-row records via the sqlite
+            // reader instead of parsing the `.db` as text. The `.db` (and any
+            // `-wal`/`-shm` sidecars) still travel raw for a lossless restore.
+            match crate::sqlite::extract_rows(
+                &abs,
                 &rel,
-                text,
-                file_mtime(&abs),
+                src,
+                &GENERIC_NS,
                 agent_id,
-            )),
-            Err(_) => warnings.push(format!(
-                "source file {rel} is not valid UTF-8; preserved raw but not parsed into records"
-            )),
+                file_mtime(&abs),
+            ) {
+                Ok(recs) => records.extend(recs),
+                Err(e) => warnings.push(format!(
+                    "sqlite source {rel}: {e:#}; preserved raw but no records extracted"
+                )),
+            }
+            if let Some(fname) = abs.file_name().and_then(|f| f.to_str()) {
+                for suffix in ["-wal", "-shm"] {
+                    let side = abs.with_file_name(format!("{fname}{suffix}"));
+                    if side.is_file() {
+                        raw.entry(format!("{rel}{suffix}"))
+                            .or_insert(RawSource::Path(side));
+                    }
+                }
+            }
+        } else {
+            // R2: a non-UTF-8 match (e.g. a binary caught by `knowledge/**`) is
+            // preserved raw but not parsed — a whole export must not fail on one file.
+            match std::str::from_utf8(&bytes) {
+                Ok(text) => {
+                    records.extend(parse_source_file(src, &rel, text, file_mtime(&abs), agent_id))
+                }
+                Err(_) => warnings.push(format!(
+                    "source file {rel} is not valid UTF-8; preserved raw but not parsed into records"
+                )),
+            }
         }
         raw.insert(rel, RawSource::Bytes(bytes));
     }
@@ -1033,6 +1058,7 @@ mod tests {
             chunking: crate::map::ChunkingMode::ByHeading,
             timestamp: "filename_date".into(),
             tags: vec!["hashtags".into()],
+            sqlite: None,
             allow_noncanonical: false,
             extra: HashMap::new(),
         };
@@ -1053,6 +1079,7 @@ mod tests {
             chunking: crate::map::ChunkingMode::PerFile,
             timestamp: "file_mtime".into(),
             tags: vec!["static:kb".into(), "frontmatter:topics".into()],
+            sqlite: None,
             allow_noncanonical: false,
             extra: HashMap::new(),
         };

@@ -156,8 +156,36 @@ test_scenario_drift.py      python3 -m unittest discover -s tests/lifecycle -p '
 
 Framework status: **zeroclaw** = the pilot (full Z1–Z4+Z13). **openclaw** =
 Z1/Z2 seeding only, alf stages SKIP→WP4. **hermes** = stubs→WP5 (SessionDB
-seeder skeleton). New frameworks: subclass `alflab.contract.FrameworkKit`,
-add `frameworks/<fw>/` with a pinned Dockerfile, expose `KIT_CLASS`.
+seeder skeleton). **generic** = the WP-M4 MCP-driven toy runtime (Z1–Z3,Z13,
+`--llm none --backend none`). **hermes-mcp** = the WP-M4 MCP LLM release gate —
+Hermes as an MCP *host*, the agent drives sync/vault via `mcp_alf_*` tools (the
+Z15 gate, `--llm proxy --backend real`, run once; see the handoff). New
+frameworks: subclass `alflab.contract.FrameworkKit`, add `frameworks/<fw>/` with
+a pinned Dockerfile, expose `KIT_CLASS`.
+
+## alf transport — CLI vs MCP (WP-M4)
+
+Stages drive alf through `run.alf` (an `AlfInvoker`), not `container.exec`
+directly, so a kit chooses the transport in `make_invoker`:
+
+* **CLI** (`CliInvoker`, default) — a transparent passthrough:
+  `run.alf.json(argv)` == `container.exec_json(["alf", *argv])`. zeroclaw/
+  openclaw/hermes keep this; their tiers are byte-for-byte unchanged.
+* **MCP** (`McpInvoker`, the generic kit) — one persistent
+  `docker exec -i … alf mcp serve -r <rt> -w <ws>` stdio session (an
+  `alflab.dockerctl.StdioSession` driven by the stdlib `alflab.mcp_client`),
+  with each tool-shaped command mapped to a `tools/call`. Commands the v1 tool
+  surface doesn't cover (`export` copy-out, `--version`, `vault keygen`/
+  `decrypt`, `sync --all`, agent-switching) fall back to a one-shot
+  `container.exec` — the explicit CLI/MCP boundary (design §6 / L10).
+
+The MCP client is **stdlib-only** (the WP-M4 spike decision: no `mcp` pip
+package in the zero-secrets tier). Its unit coverage — `test_mcp_client.py`
+(a fake JSON-RPC server), `test_invoker.py` (mapping + passthrough), and
+`test_mcp_generic.py` (a real `alf mcp serve`, skipped when unbuilt) — runs in
+the container-free CI self-test step. The **MCP LLM-in-the-loop** release gate
+uses Hermes as the *native* MCP host (its own client), not this invoker — see
+`frameworks/hermes-mcp/`.
 
 ## Canonical pre-release commands (see RELEASING.md)
 
@@ -165,3 +193,21 @@ add `frameworks/<fw>/` with a pinned Dockerfile, expose `KIT_CLASS`.
 python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --interactive
 python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --no-pause
 ```
+
+## Scheduled live gates (run once, keep the artifact — Neon test branch expires)
+
+These need a minted runtime key + the test backend, so they are scheduled, not
+CI gates (design/plan §6). Each is handed off with a runbook in its WP handoff.
+
+* **hermes-mcp MCP LLM tier** (Z15) — `./test.sh lifecycle-mcp-llm` (== `--framework
+  hermes-mcp --llm proxy --backend real --stages Z1-Z3,Z15`). The agent drives
+  sync/vault via `mcp_alf_*`; the marker check PASSes only on a positive MCP-path
+  log marker (WP-M6 task 0a). Finalize the log/session sink, then keep the run dir.
+* **kill-9 mid-sync catch-up** — `kill9_catchup_gate.py` (WP-M6 task 0b). Build the
+  fault binary, then run the gate; it proves the watch loop's crash-safety
+  (SIGKILL before upload → restart → exactly one catch-up delta, no dup):
+  ```
+  cargo build --release --features fault-injection --target-dir target/faultbuild
+  python3 tests/lifecycle/kill9_catchup_gate.py --service-repo ../agent-life-service
+  ```
+  (See the WP-M6 handoff §"kill-9 catch-up gate" for the finalize-at-live-run notes.)

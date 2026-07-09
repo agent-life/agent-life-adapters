@@ -8,10 +8,11 @@
 //! — design L10): a tool-error hint says "see `alf_docs("force-first-sync")`",
 //! and this returns the operator runbook for it.
 //!
-//! Two topics (`map-file`, `mcp`) are not yet covered by either embedded doc
-//! (their homes are the design doc / a future cli-reference section, per the
-//! WP-M6 docs task), so they carry a curated inline summary. Every advertised
-//! topic resolves to non-empty content — pinned by [`tests`].
+//! Every advertised topic — including `map-file` and `mcp`, whose homes are the
+//! dedicated cli-reference sections added in WP-M6 — resolves to a non-empty
+//! embedded section, pinned by [`tests`]. Because the sections ship inside the
+//! binary via `include_str!`, the topic tests are also the guard that a doc edit
+//! did not rename a heading a topic depends on (a stale embed is a silent bug).
 
 use anyhow::{anyhow, bail, Result};
 use schemars::JsonSchema;
@@ -29,8 +30,8 @@ pub(crate) struct DocResult {
     ok: bool,
     /// The canonical topic the query resolved to (aliases normalize to this).
     topic: String,
-    /// Where the content came from — the embedded doc path, or `builtin` for the
-    /// curated inline topics.
+    /// Where the content came from — the embedded doc path (e.g.
+    /// `docs/cli-reference.md`).
     source: String,
     /// The documentation section (Markdown).
     content: String,
@@ -61,12 +62,13 @@ impl Doc {
     }
 }
 
-/// How a topic's content is produced.
-enum Kind {
-    /// Extract the heading-delimited section whose heading contains this needle.
-    Section { doc: Doc, needle: &'static str },
-    /// A curated inline summary (topics not yet in the embedded docs).
-    Inline(&'static str),
+/// How a topic's content is produced: extract the heading-delimited section
+/// whose heading contains `needle` from the embedded `doc`. (Every v1 topic now
+/// has a home in an embedded reference; the earlier curated-inline fallback was
+/// retired in WP-M6 once `map-file`/`mcp` gained cli-reference sections.)
+struct Kind {
+    doc: Doc,
+    needle: &'static str,
 }
 
 /// One documentation topic: its canonical name, accepted aliases, and source.
@@ -83,7 +85,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "sync",
         aliases: &[],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf sync",
         },
@@ -91,7 +93,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "restore",
         aliases: &["point-in-time"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf restore",
         },
@@ -99,7 +101,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "recovery",
         aliases: &["recover", "e-cases", "e_cases", "ephemeral"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::HowAlfSyncs,
             needle: "Ephemeral-runtime",
         },
@@ -107,7 +109,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "vault",
         aliases: &["credentials"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf vault",
         },
@@ -115,7 +117,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "rotate-key",
         aliases: &["rotate", "rotatekey"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf vault rotate-key",
         },
@@ -123,7 +125,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "force-first-sync",
         aliases: &["force_first_sync", "forcefirstsync"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::HowAlfSyncs,
             needle: "E3 ",
         },
@@ -131,7 +133,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "purge",
         aliases: &["decommission"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf purge",
         },
@@ -139,7 +141,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "agents",
         aliases: &["agent"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf agents",
         },
@@ -147,7 +149,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "check",
         aliases: &[],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf check",
         },
@@ -155,7 +157,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "export",
         aliases: &[],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf export",
         },
@@ -163,7 +165,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "add",
         aliases: &["track"],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf add",
         },
@@ -171,7 +173,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "import",
         aliases: &[],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf import",
         },
@@ -179,7 +181,7 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "validate",
         aliases: &[],
-        kind: Kind::Section {
+        kind: Kind {
             doc: Doc::CliReference,
             needle: "alf validate",
         },
@@ -187,12 +189,18 @@ const TOPICS: &[Topic] = &[
     Topic {
         name: "map-file",
         aliases: &["map", "mapfile", "alf-map"],
-        kind: Kind::Inline(MAP_FILE_DOC),
+        kind: Kind {
+            doc: Doc::CliReference,
+            needle: "generic runtime map file",
+        },
     },
     Topic {
         name: "mcp",
         aliases: &["serve", "server"],
-        kind: Kind::Inline(MCP_DOC),
+        kind: Kind {
+            doc: Doc::CliReference,
+            needle: "alf mcp serve",
+        },
     },
 ];
 
@@ -216,20 +224,16 @@ pub(crate) fn resolve(topic: &str) -> Result<DocResult> {
         );
     };
 
-    let (source, content) = match &entry.kind {
-        Kind::Section { doc, needle } => {
-            let section = extract_section(doc.content(), needle).ok_or_else(|| {
-                anyhow!(
-                    "Documentation section for '{}' was not found in {} \
-                     (the embedded doc changed shape) — internal packaging error.",
-                    entry.name,
-                    doc.path()
-                )
-            })?;
-            (doc.path().to_string(), section)
-        }
-        Kind::Inline(text) => ("builtin".to_string(), (*text).to_string()),
-    };
+    let Kind { doc, needle } = &entry.kind;
+    let section = extract_section(doc.content(), needle).ok_or_else(|| {
+        anyhow!(
+            "Documentation section for '{}' was not found in {} \
+             (the embedded doc changed shape) — internal packaging error.",
+            entry.name,
+            doc.path()
+        )
+    })?;
+    let (source, content) = (doc.path().to_string(), section);
 
     Ok(DocResult {
         ok: true,
@@ -307,69 +311,6 @@ fn heading_level(line: &str) -> Option<usize> {
     (hashes > 0 && line.as_bytes().get(hashes) == Some(&b' ')).then_some(hashes)
 }
 
-const MAP_FILE_DOC: &str = "\
-# The generic runtime map file (`.alf-map.json`)
-
-The generic runtime has no hardcoded knowledge of a framework's layout: a
-`.alf-map.json` file in the workspace declares which files become memory records
-and how they are chunked, tagged, and dated. Configure it with `alf_configure`
-(a validated read-modify-write of this file).
-
-Shape:
-
-```jsonc
-{
-  \"version\": 1,
-  \"framework\": \"acme-agent\",            // informational: prefixes the runtime version
-  \"framework_version\": \"2.3.1\",
-  \"identity_file\": \"IDENTITY.md\",       // optional -> Layer 1 identity
-  \"memory_sources\": [
-    { \"id\": \"journal\", \"glob\": \"memories/*.md\", \"memory_type\": \"episodic\",
-      \"namespace\": \"daily\", \"chunking\": \"by_heading\",
-      \"timestamp\": \"filename_date\", \"tags\": [\"hashtags\"] }
-  ],
-  \"watch\": { \"default_interval\": \"15m\", \"tracked_files_interval\": \"1h\" }
-}
-```
-
-Rules that matter:
-- `memory_type` must be one of `episodic` / `semantic` / `procedural` for the
-  dashboard filter chips to recognize it (add `\"allow_noncanonical\": true` to a
-  source to override, at the cost of chip filtering).
-- `namespace` outside `daily` / `curated` / `procedural` still exports but loses
-  dashboard grouping — a warning, not an error.
-- `chunking` is `per_file` (whole file = one record) or `by_heading` (split on
-  ATX level-2 `## ` headings, fence-aware).
-- `timestamp` is `filename_date` (a `YYYY-MM-DD` filename), `file_mtime`, or
-  `frontmatter:<key>`.
-- Globs use single-segment `*` and whole-component `**`; a mid-segment `**`
-  (e.g. `dir/**.md`) is rejected because glob semantics are an id-stability
-  contract.
-
-Write your memories where your framework already writes them, and map that
-location — the map does not move files, it describes them.";
-
-const MCP_DOC: &str = "\
-# `alf mcp serve`
-
-`alf mcp serve` runs a stdio MCP (Model Context Protocol) server inside the `alf`
-binary so an MCP-capable agent host can drive ALF by tool call. The host spawns
-the process, speaks JSON-RPC on stdin/stdout, and terminates it when done; all
-diagnostics go to stderr.
-
-Pin the agent the same way as every other subcommand:
-`alf mcp serve -r <runtime> -w <workspace>` (the global `--agent` selects among
-mapped agents). For the generic runtime a workspace is required.
-
-Tools exposed (v1): `alf_status`, `alf_check`, `alf_sync`, `alf_restore`,
-`alf_export_dry_run`, `alf_track`, `alf_configure`, `alf_vault_add`,
-`alf_vault_list`, `alf_vault_delete`, `alf_agents_list`, and `alf_docs`.
-
-Deliberately NOT tools (CLI/human ceremonies — routed here via `alf_docs`):
-`purge`, `sync --force-first-sync`, vault `rotate-key` / `decrypt`, `login`, and
-external-root blessing (`alf add --allow-root`). Call `alf_status` first in every
-session to see whether ALF is configured.";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +384,47 @@ mod tests {
             "sync section leaked into the next command"
         );
         assert_eq!(doc.source, "docs/cli-reference.md");
+    }
+
+    /// The WP-M6 `mcp` and `map-file` sections must extract COMPLETE — not
+    /// truncated by an embedded code fence, not bleeding into the next `## `
+    /// section. This is the "the embed flows into the binary" guard the WP-M6
+    /// docs task names: a truncated section is still non-empty, so
+    /// `every_topic_resolves_nonempty` would miss it.
+    #[test]
+    fn mcp_and_map_file_sections_extract_complete() {
+        let mcp = resolve("mcp").unwrap();
+        // Reaches the end of the section (last `###` subheading content)…
+        assert!(
+            mcp.content.contains("Tool surface"),
+            "mcp: tool table missing"
+        );
+        assert!(
+            mcp.content.contains("Crash-safe by SIGKILL"),
+            "mcp: section truncated before the watch-loop subsection"
+        );
+        // …and stops at the next `## ` (client config is its own section). The
+        // in-section prose link to it is fine — assert on the HEADING form.
+        assert!(
+            !mcp.content.contains("## MCP client configuration"),
+            "mcp: section bled into the next `## `"
+        );
+
+        let map = resolve("map-file").unwrap();
+        // The schema fence and the worked-example tables must all be inside —
+        // a nested-fence bug would truncate at the schema or the example.
+        assert!(
+            map.content.contains("allow_noncanonical"),
+            "map: validation missing"
+        );
+        assert!(
+            map.content.contains("Standup notes"),
+            "map: section truncated before the end of the worked example"
+        );
+        assert!(
+            !map.content.contains("Decommissioning an agent"),
+            "map: section bled into the next `## `"
+        );
     }
 
     #[test]

@@ -149,15 +149,25 @@ Surgical changes per the plan. Tests for new behavior. Update `CHANGELOG.md`, `S
 In `agent-life-adapters`:
 
     cargo test --workspace
-    cargo clippy --workspace --all-targets -- -D warnings
+    cargo clippy --workspace --all-targets --all-features -- -D warnings   # --all-features lints the fault-injection seam
     cargo fmt --check
+    ./scripts/test_install.sh --quick                                       # install-script suite (mock GitHub Releases)
+
+Zero-secret lifecycle CI tiers (no backend; the MCP generic kit is here):
+
+    python3 tests/lifecycle/driver.py --framework zeroclaw --llm none --backend none --ci --stages Z1-Z3,Z13
+    python3 tests/lifecycle/driver.py --framework generic  --llm none --backend none --ci --stages Z1-Z3,Z13
 
 Canonical pre-release lifecycle runs (real install + real backend; see
-[tests/lifecycle/README.md](tests/lifecycle/README.md) — after WP4 extends the
-pilot to Z1–Z13 the interactive run is the M1 vehicle):
+[tests/lifecycle/README.md](tests/lifecycle/README.md)):
 
     python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --interactive
     python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --no-pause
+
+Scheduled live gates (run once per release, keep the artifact — see
+[tests/lifecycle/README.md](tests/lifecycle/README.md) §"Scheduled live gates"):
+the **hermes-mcp** MCP-LLM tier (`./test.sh lifecycle-mcp-llm`) and the **kill-9
+catch-up** gate (`kill9_catchup_gate.py`).
 
 If the JSON contract changed:
 

@@ -37,6 +37,7 @@ pub mod import;
 pub mod markdown_parser;
 pub mod principals_parser;
 pub mod sqlite_extractor;
+pub mod watch;
 
 // Dry-run enumeration entry points.
 pub use export::{enumerate, enumerate_workspace, EnumerationResult};
@@ -85,6 +86,13 @@ impl Adapter for ZeroClawAdapter {
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
         export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP-M5: the MCP watch surface — the `brain.db` sidecar trio, markdown
+    /// `memory/`, root files, `config.toml`, the AIEOS identity file, and the
+    /// include-list/sentinels.
+    fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
+        watch::watch_paths(workspace)
     }
 
     /// WP3: enumerate agents from the shared `brain.db` + `[agents.*]` config

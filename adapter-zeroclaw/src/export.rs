@@ -101,7 +101,7 @@ pub(crate) fn zeroclaw_home(workspace: &Path) -> std::path::PathBuf {
 /// Locate the shared `brain.db` under an install root (capture plan D9): the
 /// canonical `data/memory/brain.db`, then the older `memory/brain.db`, then the
 /// fictional flat `memory.db`, then a shallow search for any `brain.db`.
-fn resolve_brain_db(install: &Path) -> Option<PathBuf> {
+pub(crate) fn resolve_brain_db(install: &Path) -> Option<PathBuf> {
     let candidates = [
         brain_db_path(install),
         install.join("memory").join("brain.db"),
@@ -198,7 +198,7 @@ fn detect_config_schema_version(zc_home: &Path) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 /// Root-level workspace files to preserve.
-const ROOT_FILES: &[&str] = &[
+pub(crate) const ROOT_FILES: &[&str] = &[
     "SOUL.md",
     "IDENTITY.md",
     "AGENTS.md",

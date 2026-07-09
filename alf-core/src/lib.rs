@@ -36,7 +36,7 @@ pub mod validation;
 
 pub use adapter::{
     ensure_workspace_agent_id, verify_archive_agent, Adapter, AgentBinding, ArchiveEnumeration,
-    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode,
+    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode, WatchSpec,
     WorkspaceEnumeration, AGENT_ID_FILE,
 };
 pub use archive::{

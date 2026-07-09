@@ -85,7 +85,8 @@ fn initialized() -> Value {
     json!({"jsonrpc":"2.0","method":"notifications/initialized"})
 }
 
-/// The 12 tool names the v1 surface must advertise.
+/// The 13 tool names the v1 surface must advertise (12 from M2b + `alf_watch_set`
+/// added in WP-M3).
 const V1_TOOLS: &[&str] = &[
     "alf_status",
     "alf_check",
@@ -99,6 +100,7 @@ const V1_TOOLS: &[&str] = &[
     "alf_vault_delete",
     "alf_agents_list",
     "alf_docs",
+    "alf_watch_set",
 ];
 
 // ===========================================================================
@@ -169,7 +171,7 @@ fn response_with_id(msgs: &[Value], id: i64) -> &Value {
 }
 
 /// The whole-surface batch: initialize, initialized, tools/list, then a call for
-/// every one of the 12 v1 tools. Used to prove stdout stays pure even when the
+/// every one of the 13 v1 tools. Used to prove stdout stays pure even when the
 /// server fans the calls out concurrently.
 fn full_batch() -> Vec<Value> {
     let mut reqs = vec![
@@ -189,12 +191,12 @@ fn full_batch() -> Vec<Value> {
 fn stdout_is_pure_protocol_across_all_tools_and_error_paths() {
     let session = run_session(&full_batch());
     let msgs = parse_protocol_stdout(&session.stdout);
-    // 14 id'd requests (initialize + tools/list + 12 tool calls) → 14 responses;
+    // 15 id'd requests (initialize + tools/list + 13 tool calls) → 15 responses;
     // the initialized notification gets none.
     assert_eq!(
         msgs.len(),
-        14,
-        "expected 14 protocol responses, got {}\nstderr:\n{}\nstdout:\n{}",
+        15,
+        "expected 15 protocol responses, got {}\nstderr:\n{}\nstdout:\n{}",
         msgs.len(),
         session.stderr,
         session.stdout
@@ -235,7 +237,10 @@ fn tools_list_advertises_the_full_v1_surface() {
     names.sort_unstable();
     let mut expected: Vec<&str> = V1_TOOLS.to_vec();
     expected.sort_unstable();
-    assert_eq!(names, expected, "M2b ships exactly the 12 v1 tools");
+    assert_eq!(
+        names, expected,
+        "v1 ships exactly the 13 tools (M2b + alf_watch_set)"
+    );
 
     for tool in &tools {
         let schema = tool
@@ -246,6 +251,113 @@ fn tools_list_advertises_the_full_v1_surface() {
             Some("object"),
             "{}'s outputSchema must have root type object (MCP requirement)",
             tool["name"]
+        );
+    }
+}
+
+/// The input-schema clarity pass (2026-07): the two mutually-exclusive selector
+/// tools became discriminated (vault_delete by/value, configure operation/body),
+/// restore.mode + the watch cadences carry inline enums/patterns, and alf_docs
+/// lists every topic. A limited LLM reads these off the schema, so pin that they
+/// actually reach the wire (and stay INLINE, not hidden behind a $ref).
+#[test]
+fn input_schemas_carry_the_clarity_constraints() {
+    let session = run_session(&[
+        initialize(1, "2025-11-25"),
+        initialized(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    ]);
+    let msgs = parse_protocol_stdout(&session.stdout);
+    let tools = response_with_id(&msgs, 2)["result"]["tools"]
+        .as_array()
+        .expect("tools array")
+        .clone();
+    let input = |name: &str| -> Value {
+        tools
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap_or_else(|| panic!("{name} present"))["inputSchema"]
+            .clone()
+    };
+    let required = |schema: &Value| -> Vec<String> {
+        schema["required"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    // Every tool's inputSchema root is an object (rmcp guarantees it; catch a regression).
+    for t in &tools {
+        assert_eq!(
+            t["inputSchema"].get("type").and_then(Value::as_str),
+            Some("object"),
+            "{} inputSchema root must be type object",
+            t["name"]
+        );
+    }
+
+    // alf_vault_delete: discriminated by+value, both required, `by` an INLINE enum.
+    let vd = input("alf_vault_delete");
+    assert!(
+        required(&vd).contains(&"by".into()) && required(&vd).contains(&"value".into()),
+        "vault_delete must require by+value: {vd:#}"
+    );
+    assert_eq!(
+        vd["properties"]["by"]["enum"],
+        json!(["id", "label", "service"]),
+        "vault_delete.by must be an inline enum: {vd:#}"
+    );
+    assert!(
+        vd["properties"]["by"].get("$ref").is_none(),
+        "vault_delete.by must be inline, not a $ref: {vd:#}"
+    );
+
+    // alf_configure: discriminated operation+body, operation an inline enum.
+    let cfg = input("alf_configure");
+    assert!(
+        required(&cfg).contains(&"operation".into()) && required(&cfg).contains(&"body".into()),
+        "configure must require operation+body: {cfg:#}"
+    );
+    assert_eq!(
+        cfg["properties"]["operation"]["enum"],
+        json!(["replace", "merge"]),
+        "configure.operation must be an inline enum: {cfg:#}"
+    );
+
+    // alf_restore.mode: inline enum, not behind a $ref.
+    let rs = input("alf_restore");
+    assert_eq!(
+        rs["properties"]["mode"]["enum"],
+        json!(["total", "merge"]),
+        "restore.mode must be an inline enum: {rs:#}"
+    );
+    assert!(
+        rs["properties"]["mode"].get("$ref").is_none(),
+        "restore.mode must be inline, not a $ref: {rs:#}"
+    );
+
+    // alf_watch_set: the duration cadences carry the <n><unit> pattern.
+    let ws = input("alf_watch_set");
+    for field in ["default_interval", "tracked_files_interval"] {
+        assert_eq!(
+            ws["properties"][field]["pattern"], "^(\\d+[smhd])+$",
+            "watch_set.{field} must carry the duration pattern: {ws:#}"
+        );
+    }
+
+    // alf_docs.topic: the description now names the 5 topics the old text omitted.
+    let topic_desc = input("alf_docs")["properties"]["topic"]["description"]
+        .as_str()
+        .unwrap_or("")
+        .to_string();
+    for topic in ["check", "export", "add", "import", "validate"] {
+        assert!(
+            topic_desc.contains(topic),
+            "alf_docs.topic description must list '{topic}': {topic_desc}"
         );
     }
 }
@@ -464,7 +576,7 @@ fn every_tool_validates_against_its_schema_in_order() {
     let configure = conv.call(
         8,
         "alf_configure",
-        json!({"patch": {"framework": "harness"}}),
+        json!({"operation": "merge", "body": {"framework": "harness"}}),
     );
     assert_success(&configure, "alf_configure", &schema_for("alf_configure"));
     assert_eq!(
@@ -488,7 +600,11 @@ fn every_tool_validates_against_its_schema_in_order() {
         "vault_list should see the one record just added"
     );
 
-    let vault_delete = conv.call(11, "alf_vault_delete", json!({"label": "harness-cred"}));
+    let vault_delete = conv.call(
+        11,
+        "alf_vault_delete",
+        json!({"by": "label", "value": "harness-cred"}),
+    );
     assert_success(
         &vault_delete,
         "alf_vault_delete",
@@ -498,12 +614,74 @@ fn every_tool_validates_against_its_schema_in_order() {
     let docs = conv.call(12, "alf_docs", json!({"topic": "recovery"}));
     assert_success(&docs, "alf_docs", &schema_for("alf_docs"));
 
+    let watch = conv.call(13, "alf_watch_set", json!({"default_interval": "20m"}));
+    assert_success(&watch, "alf_watch_set", &schema_for("alf_watch_set"));
+
     // Backend-only tools tool-error with no API key configured.
-    let sync = conv.call(13, "alf_sync", json!({}));
+    let sync = conv.call(14, "alf_sync", json!({}));
     assert_tool_error(&sync, "alf_sync");
-    let restore = conv.call(14, "alf_restore", json!({}));
+    let restore = conv.call(15, "alf_restore", json!({}));
     assert_tool_error(&restore, "alf_restore");
 
+    conv.finish();
+}
+
+/// `alf_watch_set` clamps sub-floor intervals (with notes), toggles pause, and
+/// returns the effective cadence — the R3 control surface (design §11.3). Offline
+/// the loop is inactive (no API key), but the tool still validates and clamps.
+#[test]
+fn watch_set_clamps_and_reports_effective_config() {
+    let mut conv = Conversation::start();
+
+    // 30s is below the 1-min delta floor; 5m is below the 15-min tracked floor.
+    let r = conv.call(
+        3,
+        "alf_watch_set",
+        json!({"default_interval": "30s", "tracked_files_interval": "5m", "pause": true}),
+    );
+    let sc = &r["structuredContent"];
+    assert_eq!(
+        sc["default_interval_secs"], 60,
+        "delta clamped to 1-min floor"
+    );
+    assert_eq!(
+        sc["tracked_files_interval_secs"], 900,
+        "tracked clamped to 15-min floor"
+    );
+    assert_eq!(sc["paused"], true);
+    assert_eq!(sc["active"], false, "no API key → loop inactive");
+    assert!(
+        sc["notes"].as_array().unwrap().len() >= 2,
+        "both clamps should be noted: {sc}"
+    );
+
+    // A valid interval above the floors is accepted verbatim; resume clears pause.
+    let r2 = conv.call(
+        4,
+        "alf_watch_set",
+        json!({"default_interval": "10m", "pause": false}),
+    );
+    let sc2 = &r2["structuredContent"];
+    assert_eq!(sc2["default_interval_secs"], 600);
+    assert_eq!(sc2["paused"], false);
+
+    // A malformed interval is a tool error (production validation).
+    let bad = conv.call(5, "alf_watch_set", json!({"default_interval": "soon"}));
+    assert_tool_error(&bad, "alf_watch_set");
+
+    conv.finish();
+}
+
+/// `alf_status` carries the watch stanza. Offline (no API key) the loop is
+/// inactive, so `active` is false and `sources` is empty — the stanza is present
+/// and well-formed regardless.
+#[test]
+fn status_carries_watch_stanza() {
+    let mut conv = Conversation::start();
+    let status = conv.call(3, "alf_status", json!({}));
+    let watch = &status["structuredContent"]["watch"];
+    assert_eq!(watch["active"], false, "no API key → watch inactive");
+    assert!(watch["sources"].as_array().unwrap().is_empty());
     conv.finish();
 }
 
@@ -567,14 +745,101 @@ fn configure_writes_map_to_workspace() {
     let result = conv.call(
         3,
         "alf_configure",
-        json!({"patch": {"framework": "acme-x"}}),
+        json!({"operation": "merge", "body": {"framework": "acme-x"}}),
     );
     assert_eq!(result["isError"], false);
     let map = std::fs::read_to_string(conv.workspace.path().join(".alf-map.json")).unwrap();
     assert!(
         map.contains("acme-x"),
-        "alf_configure patch should have rewritten the map file: {map}"
+        "alf_configure merge should have rewritten the map file: {map}"
     );
+    conv.finish();
+}
+
+/// Read the responses for `ids` regardless of arrival order (rmcp may answer a
+/// concurrent batch in any order — `recv_id` would discard the wrong-order one).
+fn recv_ids(conv: &mut Conversation, ids: &[i64]) -> std::collections::HashMap<i64, Value> {
+    let mut got = std::collections::HashMap::new();
+    while got.len() < ids.len() {
+        let v = conv.recv();
+        if let Some(id) = v.get("id").and_then(Value::as_i64) {
+            if ids.contains(&id) {
+                got.insert(id, v);
+            }
+        }
+    }
+    got
+}
+
+/// Review E1: two concurrent first `alf_vault_add`s (both dispatched before either
+/// is read, so rmcp runs them on separate threads) must converge on **one** vault
+/// key (O_EXCL keygen) and keep **both** credentials (the in-process write lock
+/// serialized the vault RMW) — never a credential sealed under a discarded key.
+#[test]
+fn concurrent_first_vault_add_uses_one_key_and_keeps_both() {
+    let mut conv = Conversation::start();
+    conv.send(&call(
+        3,
+        "alf_vault_add",
+        json!({"service": "a", "secret": "sa", "label": "la"}),
+    ));
+    conv.send(&call(
+        4,
+        "alf_vault_add",
+        json!({"service": "b", "secret": "sb", "label": "lb"}),
+    ));
+    let got = recv_ids(&mut conv, &[3, 4]);
+    assert_eq!(got[&3]["result"]["isError"], false, "add a: {:?}", got[&3]);
+    assert_eq!(got[&4]["result"]["isError"], false, "add b: {:?}", got[&4]);
+
+    // Both records survive the concurrent RMW (list is sequential after both adds).
+    let list = conv.call(5, "alf_vault_list", json!({}));
+    assert_eq!(
+        list["structuredContent"]["count"], 2,
+        "both credentials must be kept (serialized RMW): {list}"
+    );
+
+    // Exactly one key file — O_EXCL keygen made the losing writer re-read the winner's key.
+    let keys_dir = conv.home.path().join(".alf").join("vault-keys");
+    let keys: Vec<_> = std::fs::read_dir(&keys_dir)
+        .expect("vault-keys dir created")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|x| x == "key"))
+        .collect();
+    assert_eq!(
+        keys.len(),
+        1,
+        "concurrent first-adds must converge on ONE key, found {}",
+        keys.len()
+    );
+    conv.finish();
+}
+
+/// Review E1: two concurrent `alf_configure` writes must never leave a torn map —
+/// the unique temp suffix + serialized RMW + atomic rename yield a whole, valid
+/// JSON file (last-writer-wins, never corrupt).
+#[test]
+fn concurrent_configure_never_corrupts_the_map() {
+    let mut conv = Conversation::start();
+    conv.send(&call(
+        3,
+        "alf_configure",
+        json!({"operation": "merge", "body": {"framework": "one"}}),
+    ));
+    conv.send(&call(
+        4,
+        "alf_configure",
+        json!({"operation": "merge", "body": {"framework_version": "9"}}),
+    ));
+    let got = recv_ids(&mut conv, &[3, 4]);
+    assert_eq!(got[&3]["result"]["isError"], false);
+    assert_eq!(got[&4]["result"]["isError"], false);
+
+    let raw = std::fs::read_to_string(conv.workspace.path().join(".alf-map.json"))
+        .expect("map file exists");
+    let parsed: Value = serde_json::from_str(&raw)
+        .unwrap_or_else(|e| panic!("map must be whole JSON, not torn: {e}\n{raw}"));
+    assert_eq!(parsed["version"], 1, "map stays a valid v1 map");
     conv.finish();
 }
 

@@ -789,6 +789,221 @@ The `--json` flag on `alf help status` is still accepted for backward compatibil
 
 ---
 
+## alf mcp serve
+
+Run a stdio [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server inside the `alf` binary so an MCP-capable agent host can drive ALF by tool call instead of shelling out. The host spawns the process, speaks JSON-RPC 2.0 on stdin/stdout, and terminates it (stdin close → SIGTERM → SIGKILL) when the session ends. **The protocol owns stdout** — every diagnostic goes to stderr. Once configured, a background [watch loop](#the-watch-loop) auto-syncs changes at zero token cost; the agent configures once and monitors by query.
+
+Protocol posture: built on rmcp, declares revision `2025-11-25`, and echo-negotiates any known revision (2024-11-05 through the 2026-07-28 RC), so one binary interoperates with clients on every revision. Every tool returns typed `structuredContent` **and** the same JSON as a text block, so both modern and pre-2025-06-18 clients get the identical payload the CLI prints.
+
+### Usage
+
+    alf mcp serve -r <runtime> [-w <workspace>] [--agent <alias-or-id>]
+
+`-r/--runtime` is `openclaw`, `zeroclaw`, `hermes`, or `generic` (falls back to `[defaults] runtime`). `-w/--workspace` is required for `generic` (the adapter has no discovery); the supported runtimes resolve it from the agent's `[[agents]]` mapping row or `[defaults] workspace`. `--agent` is the global selector — **a server should always pin one agent explicitly** (see [Environment contract](#environment-contract)).
+
+### Tool surface (v1)
+
+13 tools. Each maps to the same inner seam its CLI command uses — the server is a fourth *caller* of the sync machinery, never a second implementation.
+
+| Tool | CLI equivalent | What it does |
+|---|---|---|
+| `alf_status` | `alf help status` | Config, per-agent service status, **plus** the live watch-loop stanza (active flag, per-source last tick / dirty count / backoff) and last sync outcome. The agent's one monitoring query. |
+| `alf_check` | `alf check` | Full pre-flight diagnostics (also runs discovery for supported runtimes). |
+| `alf_sync` `{recover?}` | `alf sync [--recover]` | Incremental sync; registers on first call (sets the dashboard runtime chip). Emits progress. |
+| `alf_restore` `{at_sequence?, dry_run?, mode?}` | `alf restore` | Head restore, point-in-time preview (read-only w.r.t. the sync cursor), dry-run listing. Pauses the watch loop. |
+| `alf_export_dry_run` | `alf export --dry-run` | The what-would-sync preview; writes nothing. |
+| `alf_track` `{path, external?}` | `alf add` | Add a file to the include list; idempotent. `--allow-root` blessing stays CLI-only. |
+| `alf_configure` `{operation: "replace"\|"merge", body}` | *(none)* | Generic runtime only: validated read-modify-write of `.alf-map.json` (`replace` writes `body` whole; `merge` deep-merges it). |
+| `alf_vault_add` `{service, secret, …}` | `alf vault add` | Encrypt + upsert a credential (auto-keygens the vault key on first use; returns a fingerprint, never bytes). |
+| `alf_vault_list` | `alf vault list` | Plaintext descriptors only; no key touched. |
+| `alf_vault_delete` `{by: "id"\|"label"\|"service", value}` | `alf vault delete` | Descriptor-level delete via a discriminated selector; recoverable via point-in-time restore. |
+| `alf_agents_list` | `alf agents list` | Mapping rows + per-agent sync state. |
+| `alf_watch_set` `{default_interval?, per_source?, tracked_files_interval?, pause?}` | *(none)* | Steer the [watch loop](#the-watch-loop): cadence knobs (clamped) and pause/resume. |
+| `alf_docs` `{topic}` | `alf help <topic>` | Progressive-disclosure docs (this reference + `how_alf_syncs`), instead of 20 more tools. |
+
+**Deliberately not tools** — destructive or trust-boundary ceremonies an agent must not self-serve. The tool that would need them returns an error whose hint routes to `alf_docs` and the human CLI: `alf purge`, `alf sync --force-first-sync`, `alf vault rotate-key`, `alf vault decrypt`, `alf login`, and external-root blessing (`alf add --allow-root`). `alf_agents_set` (enable/disable from inside a session) is deferred to v1.2 — until then run one server per agent, or toggle with the CLI.
+
+### Environment contract
+
+Secrets and identity are set in the server's environment **before the model runs its first turn**, so they never transit model context.
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `ALF_API_KEY` | yes¹ | Service API key. `alf login` writes it to `~/.alf/config.toml`; the env var overrides. |
+| `ALF_API_URL` | yes¹ | Service base URL (or `[service] api_url` in the config). |
+| `ALF_AGENT` | **strongly** | Pins the agent (selector precedence `--agent` ≻ `ALF_AGENT` ≻ sole-enabled). A long-lived server **must** pin explicitly — "sole-enabled" silently breaks the moment a second agent is enabled. |
+| `ALF_HOME` | no | Overrides the `~/.alf` base (config, state, vault) and `~/.{runtime}` — a stable anchor when the host rewrites `$HOME`. |
+
+¹ or its config-file equivalent. The **workspace is pinned by `-w` in the server's `args`, not by an environment variable** (there is no `ALF_WORKSPACE`).
+
+### The watch loop
+
+The loop is what makes MCP mode token-free (design §11). It marks a source dirty on a filesystem event (plus a periodic rescan — editors and DB engines evade inotify), debounces to the interval, captures safely (SQLite by header → backup API / `VACUUM INTO`; everything else copy-on-quiesce), then calls the same sync seam a tool call would.
+
+- **Intervals.** Memory/raw changes ride the delta channel: floor **1 min**, ceiling **24 h**. A change to a tracked (`alf_track`) file triggers a **full-snapshot rollover** (§6.1) batched on its own knob — floor **15 min**, default **1 h**. Both are validation-clamped; steer them with `alf_watch_set` or the map's `watch` block.
+- **Catch-up on start.** On spawn the loop dirty-scans against the base snapshot, so anything changed while no server was alive syncs on the first tick. A crashed server, a rebooted machine, and a laptop closed for a week all resolve the same way: next session, first tick, one delta.
+- **Crash-safe by SIGKILL.** The spec sanctions SIGKILL as normal shutdown, so mid-sync death is safe by construction: state writes are temp+rename atomic and the upload is sequence-CAS'd server-side, so a killed sync leaves either "old base + old state" (retry = the same delta) or "new state fully committed".
+- **No daemon mode.** The loop lives only as long as the host keeps the session alive (the MCP convention: the client owns the process). Host-independent cadence stays with the CLI + OS cron on user machines and the boot/shutdown hooks on cloud runtimes.
+
+Per-host setup is in [MCP client configuration](#mcp-client-configuration); retiring an agent is in [Decommissioning an agent](#decommissioning-an-agent).
+
+---
+
+## MCP client configuration
+
+One small config fragment per MCP-client dialect. Install `alf` (unchanged installer), run `alf login --key …` once, then point the host at `alf mcp serve` with the env above. **Pin `ALF_AGENT`** in every fragment.
+
+### Claude Code (`.mcp.json`) — the reference host
+
+```json
+{
+  "mcpServers": {
+    "alf": {
+      "command": "alf",
+      "args": ["mcp", "serve", "-r", "generic", "-w", "/home/me/my-agent"],
+      "env": { "ALF_AGENT": "acme-a1b2", "ALF_API_KEY": "alf_..." }
+    }
+  }
+}
+```
+
+Tools surface under their plain names (`alf_sync`, `alf_status`, …). Claude Code respawns stdio servers per session automatically (catch-up-on-start covers the gap). Its **per-server timeout is a hard wall that progress notifications do not extend** — raise it for the first-sync / restore calls if your first snapshot is large.
+
+### Hermes (`~/.hermes/config.yaml`)
+
+```yaml
+mcp_servers:
+  alf:
+    command: alf
+    args: [mcp, serve, -r, hermes]
+    env:                       # Hermes STRIPS inherited env from stdio children,
+      ALF_AGENT: kleo-a1b2     # so declare every variable explicitly in the block
+      ALF_API_KEY: "alf_..."
+      ALF_API_URL: "https://api.agent-life.example/v1"
+      ALF_HOME: "/home/agent/.alf"
+```
+
+Tools surface as `mcp_alf_*` (`mcp_alf_alf_sync`). Because Hermes strips the environment, the variables above are **required in the block** — an inherited `ALF_API_KEY` will not reach the child.
+
+### ZeroClaw (`mcp_bundles` — one server entry per agent)
+
+```toml
+[mcp_servers.alf-kleo-a1b2]
+command = "alf"
+args = ["mcp", "serve", "-r", "zeroclaw"]
+deferred_loading = false          # eager, for unattended runs
+[mcp_servers.alf-kleo-a1b2.env]
+ALF_AGENT = "kleo-a1b2"
+ALF_API_KEY = "alf_..."
+
+[mcp_bundles.kleo-a1b2]            # grant it through that agent's single-server bundle
+servers = ["alf-kleo-a1b2"]
+```
+
+Env is **per-server, not per-agent**, so a multi-agent host declares one `[mcp_servers.alf-<agent>]` per agent (design §7.W7). Keep `deferred_loading = false` (the default) so the loop runs unattended.
+
+### Timeouts and respawn hygiene
+
+- **Timeouts.** Codex defaults `tool_timeout_sec` to **60 s** per tool call; Claude Code's per-server timeout is a **hard wall** progress does not extend. Routine calls (delta sync, status, vault ops) finish in seconds; the two potentially long calls — the first `alf_sync` and `alf_restore` — emit progress and want the raised timeout. The heavy lifting (watch-loop syncs) never happens inside a tool call at all.
+- **Respawn hygiene.** The MCP spec defines no auto-restart or reconnect for stdio servers. **Claude Code** respawns stdio servers per session automatically. **Claude Desktop** requires an **app restart after a server crash** — a known ecosystem limitation, not something the server can fix. Either way, catch-up-on-start means a respawn loses no data.
+
+---
+
+## The generic runtime map file (`.alf-map.json`)
+
+The `generic` runtime has no built-in knowledge of a framework's layout: a `.alf-map.json` at the workspace root declares which files become memory records and how they are chunked, tagged, and dated. It is packed under `raw/generic/` (so it syncs, restores, and is inspectable in the Workspace tab). Edit it by hand, or from an MCP session with `alf_configure` (a validated read-modify-write).
+
+### Schema
+
+```jsonc
+{
+  "version": 1,
+  "framework": "acme-agent",          // informational: prefixes source_runtime_version ("acme-agent/2.3.1"), may seed the display name; does NOT affect dispatch, paths, or ids
+  "framework_version": "2.3.1",
+  "identity_file": "IDENTITY.md",      // optional -> Layer 1 identity
+  "memory_sources": [
+    { "id": "journal",  "glob": "memories/*.md",    "memory_type": "episodic",
+      "namespace": "daily",      "chunking": "by_heading",
+      "timestamp": "filename_date",                  // filename_date | frontmatter:<key> | file_mtime
+      "tags": ["hashtags"] },                         // ["hashtags"] | a literal static tag
+    { "id": "knowledge","glob": "knowledge/**/*.md", "memory_type": "semantic",
+      "namespace": "curated",    "chunking": "per_file", "timestamp": "file_mtime" },
+    { "id": "howto",    "glob": "procedures/*.md",   "memory_type": "procedural",
+      "namespace": "procedural", "chunking": "per_file", "timestamp": "file_mtime" }
+  ],
+  "watch": { "default_interval": "15m",
+             "per_source": { "journal": "5m" },
+             "tracked_files_interval": "1h" }
+}
+```
+
+### Validation rules
+
+The map is the dashboard-parity enforcement point. An invalid map is rejected atomically — the write never lands.
+
+| Field | Rule |
+|---|---|
+| `memory_type` | Must be `episodic` / `semantic` / `procedural` for the dashboard filter chips. A non-canonical type is an **error** unless the source carries `"allow_noncanonical": true`, which downgrades it to a warning (and forfeits chip filtering). |
+| `namespace` | `daily` / `curated` / `procedural` get chip filtering + grouping; anything else still exports but loses them — a **warning**, not an error. |
+| `watch` intervals | Clamped: deltas to `[1 min, 24 h]`, `tracked_files_interval` to `[15 min, 24 h]`. Values above the floors are entirely yours. |
+| unknown fields | Preserved verbatim (forward-compatible). |
+
+Globs use single-segment `*` (never crosses `/`) and whole-component `**` (`knowledge/**/*.md`); a mid-segment `**` (`dir/**.md`) is rejected, because glob semantics are an id-stability contract.
+
+### Timestamp, tag, and chunking modes
+
+- **`timestamp`** — `filename_date` (a `YYYY-MM-DD` filename → midnight UTC → `created_at` + `observed_at`); `frontmatter:<key>` (a YAML front-matter key); or `file_mtime` (`created_at` = mtime, no `observed_at`). `updated_at` is always the file mtime.
+- **`tags`** — `["hashtags"]` extracts `#word` tokens from the content; a literal string adds that static tag to every record from the source. The namespace is always added as a tag.
+- **`chunking`** — `per_file` (the whole file is one record; `heading: null`, `line_start: 1`) or `by_heading` (split on ATX level-2 `## ` headings, fence-aware). Ids are content-addressed (UUIDv5 over `GENERIC_NS`), so an in-place body edit reconciles to the **same record id** (1 Update) while a heading rewrite is a delete+create.
+
+### Worked example
+
+`memories/2026-07-04.md`, mapped `{episodic, daily, by_heading, filename_date}`. Line-by-line (numbers are literal):
+
+| Line | Content | Effect |
+|---|---|---|
+| 1 | `# Friday, July 4th, 2026` | H1-only preamble → **dropped** (empty-body rule) |
+| 2 | *(blank)* | |
+| 3 | `## Fixed the deploy pipeline` | section **A** heading |
+| 4 | ` ```bash ` | opens a fence |
+| 5 | `## this is not a heading` | fence content — **not** a boundary |
+| 6 | ` ``` ` | fence close → A spans lines 3–6 |
+| 7 | `## Blocked` | heading with an empty body → **dropped** |
+| 8 | `## Standup notes` | section **B** heading |
+| 9 | `Agreed to ship Friday. #planning` | → B spans lines 8–9 |
+
+Three rules fire — the H1 preamble drops, the fenced `## this is not a heading` does not split, and the empty `## Blocked` drops — producing exactly **two** records:
+
+| | A | B |
+|---|---|---|
+| content | lines 3–6 (incl. the `## Fixed…` heading line and the fenced block) | lines 8–9 |
+| `raw_source_format` | `{line_start:3, line_end:6, heading:"Fixed the deploy pipeline"}` | `{line_start:8, line_end:9, heading:"Standup notes"}` |
+| tags | `["daily"]` | `["daily","planning"]` |
+| `created_at` / `observed_at` | `2026-07-04T00:00:00Z` | `2026-07-04T00:00:00Z` |
+
+Dashboard result: two Episodic cards titled by heading, `source: memories/2026-07-04.md`, dated "Jul 4". Later, an in-place edit of A's body reconciles to **1 Update, same id**; rewriting A's heading is delete+create.
+
+---
+
+## Decommissioning an agent
+
+Retiring an agent is a deliberate human CLI operation — it is **not** an MCP tool (an agent must not be able to delete its own cloud history). There are two levels:
+
+**Reversible — stop syncing, keep everything.** `alf agents disable <alias-or-id>` marks the agent ineligible for sync; the cloud archive and local state are untouched, and `alf agents enable` brings it back (registration stays lazy). A running MCP server pinned to a disabled agent parks at its next sync with `agent_disabled` in `alf_status`.
+
+**Irreversible — purge the cloud history.**
+
+    # optional: capture a final local copy first
+    alf export -r <runtime> -w <workspace> -o ./final-backup.alf
+
+    alf purge -r <runtime> -w <workspace> --agent <alias-or-id>
+
+> ⚠️ **`alf purge` executes immediately — there is no confirmation prompt.** It deletes every cloud snapshot/delta blob and the agent registration (`DELETE /v1/agents/:id`), then removes the local `~/.alf/state/{id}.toml` + `{id}-snapshot.alf`. It does **not** touch workspace files and **never deletes the local vault** (`~/.alf/vault/{id}/credentials.json`) — re-syncing after a purge re-uploads a full snapshot, credentials included. The action is not recoverable from the cloud; the optional export above is your only rollback.
+
+After a purge the mapping row remains (reported, not re-registered); the next `alf sync` for that agent is a fresh first sync.
+
+---
+
 ## Error JSON
 
 When any command fails, stdout contains a JSON error object:

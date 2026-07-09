@@ -66,6 +66,7 @@ class Run:
         self.db = None
         self.s3 = None
         self.container: Optional[DockerContainer] = None
+        self.alf = None                       # AlfInvoker (WP-M4): CLI or MCP
         self.manifest: Optional[Manifest] = None
         self.report: Optional[RunReport] = None
         self.llm = "none"
@@ -96,7 +97,7 @@ def parse_stage_selection(spec: str) -> list[str]:
     return [sid for sid in stages.STAGE_IDS if int(sid[1:]) in wanted]
 
 
-def load_kit(framework: str, env: KitEnv):
+def _load_kit_module(framework: str):
     import importlib.util
 
     kit_path = LIFECYCLE_DIR / "frameworks" / framework / "kit.py"
@@ -105,7 +106,20 @@ def load_kit(framework: str, env: KitEnv):
     spec = importlib.util.spec_from_file_location(f"kit_{framework}", kit_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.KIT_CLASS(env)
+    return module
+
+
+def load_kit(framework: str, env: KitEnv):
+    return _load_kit_module(framework).KIT_CLASS(env)
+
+
+def kit_runtime_name(framework: str) -> str:
+    """The alf RUNTIME a framework's kit drives — its `KIT_CLASS.name`. For the
+    three base frameworks this equals the framework dir name, but a host variant
+    like `hermes-mcp` drives the `hermes` runtime, so anything that keys on the
+    runtime (the mint variant, backend/service ops) must use THIS, not
+    `args.framework`. Read as a class attribute — no `KitEnv`, no instantiation."""
+    return _load_kit_module(framework).KIT_CLASS.name
 
 
 def expected_alf_version() -> str:
@@ -147,7 +161,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         prog="driver.py",
         description="agent-life lifecycle harness — real-install Z1–Z13 driver (WP2)")
     p.add_argument("--framework", default="zeroclaw",
-                   choices=["zeroclaw", "openclaw", "hermes"])
+                   choices=["zeroclaw", "openclaw", "hermes", "generic", "hermes-mcp",
+                            "generic-mcp"])
     p.add_argument("--llm", choices=["none", "proxy"], default="none")
     p.add_argument("--backend", choices=["none", "real"], default=None,
                    help="default: real locally, none under --ci/CI=true")
@@ -267,7 +282,10 @@ def main(argv=None) -> int:
             else:
                 run_model = models.default_for(args.framework)
             ui.emit(f"  model: {run_model} ({models.label_for(run_model)})")
-            run.creds = provision.mint(cfg.service_repo, args.framework, run_dir,
+            # Mint keys on the RUNTIME (`hermes`), not the harness framework dir
+            # (`hermes-mcp`) — the provisioner only knows openclaw|zeroclaw|hermes.
+            run.creds = provision.mint(cfg.service_repo,
+                                       kit_runtime_name(args.framework), run_dir,
                                        model=run_model)
             provision.write_run_env(run_dir, run.creds)
             run.manifest.tenant_id = run.creds.tenant_id
@@ -357,6 +375,13 @@ def main(argv=None) -> int:
                     "pointing at a musl build")
             raise SystemExit(2)
 
+        # -- alf transport (WP-M4) ---------------------------------------------
+        # How the stages drive alf: the terminal path for the shipped frameworks,
+        # a persistent `alf mcp serve` stdio session for the generic MCP kit. The
+        # invoker is created here (container up, alf injected) and drives every
+        # `run.alf.*` call in the stage loop; it is closed in finish().
+        run.alf = run.kit.make_invoker(run)
+
         # -- stage loop ---------------------------------------------------------
         registry = {sid: (title, uses_alf, fn) for sid, title, uses_alf, fn in stages.REGISTRY}
         halted = False
@@ -442,7 +467,8 @@ def finish(run: Run, aborted: bool) -> int:
                 try:
                     ok = provision.teardown_ladder(
                         run.manifest, run.paths.manifest, run.api, run.container,
-                        run.cfg.service_repo, run.kit.name if run.kit else run.args.framework)
+                        run.cfg.service_repo,
+                        run.kit.name if run.kit else kit_runtime_name(run.args.framework))
                 except Exception as e:  # noqa: BLE001 — an interrupted ladder must
                     # never skip container destroy / report / the recovery hint.
                     from .redact import redact
@@ -457,6 +483,13 @@ def finish(run: Run, aborted: bool) -> int:
                         run.report.exit_code = 1
             run.report.teardown = dict(run.manifest.teardown)
     finally:
+        # Shut any persistent MCP session (stdin EOF → server exits) before the
+        # container goes away. Best-effort: teardown must never crash here.
+        if run.alf is not None:
+            try:
+                run.alf.close()
+            except Exception:  # noqa: BLE001
+                pass
         if run.container is not None and not aborted and not run.args.keep:
             run.container.destroy()
         elif run.container is not None and run.args.keep:
@@ -512,8 +545,15 @@ def teardown_cli(run_dir: Path, cfg: HarnessConfig, framework: str) -> int:
                     ui.warn(f"runtime key already dead (probe HTTP {status}) — "
                             "falling back to targeted scavenge")
                 api = None
+    # Rung 1's `alf purge -r <runtime>` needs the alf RUNTIME, not the harness
+    # framework dir (hermes-mcp → hermes); derive it from the kit, tolerating a
+    # missing kit dir in a recovery context.
+    try:
+        teardown_runtime = kit_runtime_name(manifest.framework)
+    except Preflight:
+        teardown_runtime = manifest.framework
     ok = provision.teardown_ladder(manifest, manifest_path, api, container,
-                                   cfg.service_repo, manifest.framework)
+                                   cfg.service_repo, teardown_runtime)
     if container is not None:
         container.destroy()
     (ui.ok if ok else ui.fail)("teardown " + ("clean" if ok else "left residue — see ledger"))

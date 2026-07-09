@@ -1,0 +1,6 @@
+{
+  "files": [
+    { "path": "config.toml" },
+    { "path": "notes.txt" }
+  ]
+}

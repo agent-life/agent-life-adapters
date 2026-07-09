@@ -23,16 +23,55 @@ pub fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     }
 }
 
+/// Create `path` exclusively (`O_EXCL`) with owner-only permissions (Unix
+/// `0600`) and write `content`. Fails with [`std::io::ErrorKind::AlreadyExists`]
+/// if the file exists. Use for a **generate-once** secret (a vault key) so two
+/// concurrent first-writers converge on one file — the loser gets AlreadyExists
+/// and re-reads the winner's key rather than clobbering it (WP-M3 review E1).
+pub fn write_private_new(path: &Path, content: &str) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::fs::OpenOptions;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(content.as_bytes())
+    }
+    #[cfg(not(unix))]
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        f.write_all(content.as_bytes())
+    }
+}
+
 /// Write UTF-8 text atomically with owner-only permissions: a 0600 temp file
 /// in the same directory, `sync_all`, then rename over `path`. A crash leaves
 /// either the old file or the new one whole — never a truncated mix. Use for
-/// secrets whose loss is unrecoverable (the vault document, migration stamps).
+/// secrets whose loss is unrecoverable (the vault document, migration stamps),
+/// and for `config.toml` (WP-M5 review A1).
+///
+/// The temp file name is **process- and call-unique** (pid + an atomic counter),
+/// so two concurrent processes writing the *same* target — e.g. two `alf`
+/// invocations persisting discovery into one `~/.alf/config.toml`, or the M5
+/// rediscovery tick racing a CLI writer — never collide on the temp or rename a
+/// file the other already moved. This mirrors `configure::atomic_write`'s
+/// suffix (WP-M3 review E1).
 pub fn write_private_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
     let file_name = path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| std::io::Error::other("path has no file name"))?;
-    let tmp = path.with_file_name(format!("{file_name}.tmp"));
+    let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = path.with_file_name(format!("{file_name}.tmp.{}.{unique}", std::process::id()));
 
     {
         #[cfg(unix)]
@@ -81,7 +120,7 @@ mod tests {
         let leftovers: Vec<_> = std::fs::read_dir(dir.path())
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp file must not survive");
     }

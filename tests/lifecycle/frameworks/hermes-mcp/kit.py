@@ -85,6 +85,37 @@ class HermesMcpKit(HermesKit):
     name = "hermes"                              # the alf runtime is hermes
     image_tag = "alf-lifecycle-hermes-mcp"       # layered on alf-lifecycle-hermes
     mcp_llm_mode = True
+    watch_autosync_mode = True                   # the Z16 watch-auto-sync gate
+
+    # -- Z16 watch auto-sync: mutate a watched file + the sqlite store ----------
+
+    def mutate_watched(self, ctr, slot: str, i: int) -> str:
+        """One Z16 watch-cycle mutation: append a uniquely-marked `## ` section to
+        a watched memory file AND upsert a row in the watched `state.db`, host-side
+        on the mounted profile (the in-container `alf mcp serve` sees both via the
+        bind mount). Returns the marker so the stage can assert it synced. The
+        `z16_watch` table is additive — Hermes ignores it, and the `.db` change
+        still dirties adapter-hermes's `state.db` watch spec (a raw delta)."""
+        import sqlite3
+
+        ws = self._profile_dir(slot)
+        marker = f"Z16-WATCH-{slot}-{i:02d}"
+        memdir = ws / "memories"
+        memdir.mkdir(parents=True, exist_ok=True)
+        mem = memdir / "z16-watch.md"
+        header = "" if mem.is_file() else "# Z16 watch journal\n\n"
+        with mem.open("a", encoding="utf-8") as f:
+            f.write(f"{header}## Tick {i}\n\nWatch marker: {marker}.\n\n")
+        conn = sqlite3.connect(ws / "state.db")
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS z16_watch (id INTEGER PRIMARY KEY, marker TEXT)"
+            )
+            conn.execute("INSERT INTO z16_watch (id, marker) VALUES (?, ?)", (i, marker))
+            conn.commit()
+        finally:
+            conn.close()
+        return marker
 
     # -- config wiring ---------------------------------------------------------
 

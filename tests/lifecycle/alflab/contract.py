@@ -87,6 +87,12 @@ class FrameworkKit(ABC):
     # instead of the harness driving alf itself. Only the hermes-mcp kit sets it;
     # every other kit leaves it False, so Z15 SKIPs and no other stage changes.
     mcp_llm_mode: bool = False
+    # When True, the Z16 watch-auto-sync gate runs: the harness starts a
+    # persistent `alf mcp serve` with a ~1s watch cadence (test-only env
+    # overrides), mutates memory files + the sqlite store on a timer, and asserts
+    # the watch loop auto-uploaded the deltas. Only hermes-mcp sets it; every
+    # other kit leaves it False, so Z16 SKIPs.
+    watch_autosync_mode: bool = False
 
     def __init__(self, env: KitEnv):
         self.env = env

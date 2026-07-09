@@ -17,6 +17,7 @@ archive.
 
 from __future__ import annotations
 
+import json
 import time
 import tomllib
 
@@ -778,10 +779,16 @@ def z14_curated_memory(run, result: StageResult):
         # and sync it, so the measured ops below are independent of whatever a
         # real LLM left in the file. pre_seq is captured AFTER this baseline.
         kit.curate_memory(run.container, slot, "reset")
-        sync_json()
-        r0 = run.api.get(f"/agents/{agent_id}")
+        first = sync_json()
+        # A focused Z14 run (stages without the Z4 first-sync) learns its agent id
+        # from this reset sync's own registration; the full lifecycle set it in Z4.
+        if not agent_id:
+            agent_id = (first.get("agent") or {}).get("alf_agent_id") or ""
+            if agent_id:
+                run.state["alf_agent_id"] = agent_id
+        r0 = run.api.get(f"/agents/{agent_id}") if agent_id else None
         pre_seq = (r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0)) \
-            if r0.status_code == 200 else run.state.get("sequence", 0)
+            if (r0 is not None and r0.status_code == 200) else run.state.get("sequence", 0)
 
         kit.curate_memory(run.container, slot, "touch")
         res = sync_json()
@@ -911,6 +918,90 @@ def z15_mcp_llm_gate(run, result: StageResult):
 
 
 # ---------------------------------------------------------------------------
+# Z16 — watch loop auto-sync: mutate on a timer, assert the deltas landed
+# ---------------------------------------------------------------------------
+
+def z16_watch_autosync(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not getattr(kit, "watch_autosync_mode", False):
+        raise SkipStage(
+            f"{kit.name}: the watch auto-sync gate runs on the hermes-mcp tier only",
+            wp="Z16")
+    if run.backend != "real":
+        raise SkipStage("Z16 needs --backend real (it asserts backend deltas)")
+    slot = kit.agent_slots[0]
+    nar.explain("""
+        Z16: a PERSISTENT `alf mcp serve` runs the watch loop at a ~1s test cadence
+        (ALF_WATCH_* env overrides — production stays 60s/3s). The harness mutates
+        a watched memory FILE and the watched sqlite `state.db` every 3s for ~17s;
+        the loop must auto-upload each change as a delta with ZERO tool/LLM calls.
+    """)
+    nar.flow("mutate file+db every 3s ──▶ watch loop (1s) ──▶ N deltas ⊙")
+
+    # 1. Register (idempotent first sync) + learn the agent id + the base sequence.
+    _, first = run.container.exec_json(
+        ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+    agent_id = run.state.get("alf_agent_id") \
+        or ((first or {}).get("agent") or {}).get("alf_agent_id") or ""
+    if not agent_id:
+        result.add(_passfail(False, "Z16: agent registered before watch starts",
+                             "no alf_agent_id from the first sync"))
+        return
+    run.state["alf_agent_id"] = agent_id
+    if agent_id not in run.manifest.lifecycle_agents:
+        run.manifest.lifecycle_agents.append(agent_id)
+        run.manifest.save(run.paths.manifest)
+
+    def latest_seq() -> int:
+        r = run.api.get(f"/agents/{agent_id}")
+        return (r.json() or {}).get("latest_sequence", 0) if r.status_code == 200 else 0
+
+    base_seq = latest_seq()
+
+    # 2. Start the persistent watch-loop server. stdin stays OPEN (the loop runs
+    #    until EOF); the env overrides make the cadence ~1s (test-only, gated).
+    serve_env = {
+        "ALF_API_KEY": run.creds.runtime_api_key,
+        "ALF_API_URL": run.creds.alf_api_url,
+        "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+        "ALF_WATCH_QUIESCE_MS": "1000",
+        "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+    }
+    argv = ["alf", "mcp", "serve", "-r", kit.name, "-w", kit._container_profile(slot)]
+    sess = run.container.exec_stdio(argv, env=serve_env)
+    markers: list = []
+    try:
+        time.sleep(2)  # boot + the (no-op) catch-up-on-start
+        # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
+        ticks = 6
+        for i in range(ticks):
+            markers.append(kit.mutate_watched(run.container, slot, i))
+            time.sleep(3)
+        time.sleep(3)  # let the final change quiesce (~1s) + upload
+        # 4. The loop must have auto-uploaded multiple deltas carrying the content.
+        rd = run.api.get(f"/agents/{agent_id}/deltas?since={base_seq}")
+        deltas = (rd.json() or {}).get("deltas", []) if rd.status_code == 200 else []
+        result.add(_passfail(
+            len(deltas) >= 4,
+            f"⊙ watch loop auto-uploaded a delta per mutation (≈{ticks} over ~17s)",
+            f"{len(deltas)} deltas since seq {base_seq}"))
+        result.add(_passfail(
+            latest_seq() > base_seq,
+            "⊙ backend sequence advanced under the watch loop (no tool/LLM calls)",
+            f"seq {base_seq} → {latest_seq()}"))
+        # content: the head memory must carry the mutation markers the deltas moved.
+        rm = run.api.get(f"/agents/{agent_id}/memory")
+        mem_text = json.dumps(rm.json()) if rm.status_code == 200 else ""
+        present = sum(1 for m in markers if m in mem_text)
+        result.add(_passfail(
+            present >= 4,
+            "⊙ delta content: the mutation markers reached the head memory",
+            f"{present}/{len(markers)} markers present"))
+    finally:
+        sess.close()
+
+
+# ---------------------------------------------------------------------------
 # Registry — (stage_id, title, uses_alf, fn)
 # ---------------------------------------------------------------------------
 
@@ -932,6 +1023,8 @@ REGISTRY = [
      z14_curated_memory),
     ("z15", "MCP LLM gate — agent drives sync/vault via mcp_alf_* (WP-M4)", True,
      z15_mcp_llm_gate),
+    ("z16", "Watch loop auto-sync — timed file+db mutations → backend deltas ⊙", True,
+     z16_watch_autosync),
 ]
 
 STAGE_IDS = [sid for sid, *_ in REGISTRY]

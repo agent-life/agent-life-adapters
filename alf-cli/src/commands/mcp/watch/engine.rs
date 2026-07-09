@@ -44,9 +44,41 @@ pub const QUIESCE_WINDOW: Duration = Duration::from_secs(3);
 /// torn bytes; surface it instead — brief task 5).
 pub const NEVER_QUIESCE_WARN: Duration = Duration::from_secs(24 * 60 * 60);
 
-/// Clamp a delta-channel interval into `[DELTA_FLOOR, INTERVAL_CEILING]`.
+/// TEST-ONLY watch-cadence overrides (whole milliseconds). These lower the
+/// production timing constants *only when the env var is set* — the Z16 watch
+/// lifecycle test needs a ~1 s cadence that the 60 s floor / 3 s quiesce / 15 min
+/// default would otherwise make impossible. Unset (the normal case, including
+/// every unit test and production) ⇒ the constant below. Kept here, gated, rather
+/// than threaded through config so the CLI/map surface never exposes a sub-floor.
+fn env_ms(var: &str, default: Duration) -> Duration {
+    parse_ms(std::env::var(var).ok().as_deref(), default)
+}
+/// Pure: a whole-millisecond override string ⇒ that duration; unset/unparseable
+/// ⇒ `default`. Split out from the env read so it is testable without mutating
+/// the process env (which the timing getters below share).
+fn parse_ms(raw: Option<&str>, default: Duration) -> Duration {
+    match raw.and_then(|v| v.parse::<u64>().ok()) {
+        Some(ms) => Duration::from_millis(ms),
+        None => default,
+    }
+}
+/// Delta interval floor — 60 s, or `ALF_WATCH_DELTA_FLOOR_MS`.
+pub fn delta_floor() -> Duration {
+    env_ms("ALF_WATCH_DELTA_FLOOR_MS", DELTA_FLOOR)
+}
+/// Quiesce window — 3 s, or `ALF_WATCH_QUIESCE_MS`.
+pub fn quiesce_window() -> Duration {
+    env_ms("ALF_WATCH_QUIESCE_MS", QUIESCE_WINDOW)
+}
+/// Default delta interval when no map/CLI value is set — 15 min, or
+/// `ALF_WATCH_DEFAULT_INTERVAL_MS`.
+pub fn default_interval() -> Duration {
+    env_ms("ALF_WATCH_DEFAULT_INTERVAL_MS", DEFAULT_INTERVAL)
+}
+
+/// Clamp a delta-channel interval into `[delta_floor(), INTERVAL_CEILING]`.
 pub fn clamp_delta(d: Duration) -> Duration {
-    d.clamp(DELTA_FLOOR, INTERVAL_CEILING)
+    d.clamp(delta_floor(), INTERVAL_CEILING)
 }
 
 /// Clamp a tracked-file interval into `[TRACKED_FLOOR, INTERVAL_CEILING]`.
@@ -74,10 +106,12 @@ pub struct WatchConfig {
 impl Default for WatchConfig {
     fn default() -> Self {
         Self {
-            default_interval: DEFAULT_INTERVAL,
+            // The env-gated getters return the production const unless a test set
+            // the override — so a normal loop is 15 min / 3 s exactly as before.
+            default_interval: default_interval(),
             per_source: BTreeMap::new(),
             tracked_files_interval: DEFAULT_TRACKED_INTERVAL,
-            quiesce_window: QUIESCE_WINDOW,
+            quiesce_window: quiesce_window(),
             backoff_jitter: 0.0,
             paused: false,
         }
@@ -600,6 +634,20 @@ mod tests {
         assert_eq!(clamp_delta(secs(1)), DELTA_FLOOR);
         assert_eq!(clamp_delta(secs(999_999_999)), INTERVAL_CEILING);
         assert_eq!(clamp_tracked(secs(60)), TRACKED_FLOOR);
+    }
+
+    #[test]
+    fn timing_override_parsing_is_gated_on_a_valid_value() {
+        // The env-read is split from this pure parser so it can be tested without
+        // mutating the shared timing env vars (which `clamps` above depends on).
+        let d = DELTA_FLOOR;
+        assert_eq!(
+            super::parse_ms(Some("1000"), d),
+            Duration::from_millis(1000)
+        );
+        assert_eq!(super::parse_ms(None, d), d, "unset ⇒ production const");
+        assert_eq!(super::parse_ms(Some("nope"), d), d, "unparseable ⇒ const");
+        assert_eq!(super::parse_ms(Some(""), d), d);
     }
 
     #[test]

@@ -14,16 +14,20 @@ call). The named reference host is **Claude Code**; this script is the scripted
 spine of that transcript — the same call sequence a Claude Code agent issues from
 the `instructions` preamble.
 
+Credentials come from the repo `.env` (the harness contract: `API_KEY` +
+`API_BASE_URL`, mapped here to the CLI's `ALF_API_KEY` / `ALF_API_URL`), or from
+`ALF_API_KEY` / `ALF_API_URL` already set in the environment (those win).
+
 Two modes, one script:
-  * **offline** (no `ALF_API_KEY`): calls 1–4 run for real (they are local —
+  * **offline** (no key resolvable): calls 1–4 run for real (they are local —
     configure writes the map, track edits the include list, vault_add auto-keygens
     a 0600 key); `alf_sync` returns a clean tool error (no backend). The transcript
     still proves the CALL COUNT and that the surface onboards in ≤ 6 calls.
-  * **live** (`ALF_API_KEY` + `ALF_API_URL` set, or a `~/.alf/config.toml` with a
-    key): `alf_sync` registers the agent (`source_runtime="generic"` → dashboard
-    chip) and uploads the first snapshot — the full release artifact. Run this on a
-    fresh machine following only the published install docs, with Claude Code as
-    the host, to produce the attached transcript.
+  * **live** (`.env` API_KEY + API_BASE_URL, or `ALF_API_KEY` + `ALF_API_URL`
+    already set): `alf_sync` registers the agent (`source_runtime="generic"` →
+    dashboard chip) and uploads the first snapshot — the full release artifact. Run
+    this on a fresh machine following only the published install docs, with Claude
+    Code as the host, to produce the attached transcript.
 
 Run:  python3 tests/lifecycle/w1_walkthrough.py [--out transcript.md]
 """
@@ -34,14 +38,17 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
+import uuid
 from pathlib import Path
 
 LIFECYCLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = LIFECYCLE_DIR.parents[1]
 sys.path.insert(0, str(LIFECYCLE_DIR))
 
+from alflab.config import HarnessConfig  # noqa: E402
 from alflab.dockerctl import local_stdio_session  # noqa: E402
 from alflab.mcp_client import McpClient  # noqa: E402
 from alflab.redact import redact  # noqa: E402
@@ -72,9 +79,12 @@ def _find_alf() -> Path | None:
     return None
 
 
-def _seed_unconfigured_workspace(ws: Path) -> None:
+def _seed_unconfigured_workspace(ws: Path, agent_name: str) -> None:
     """A real, fresh generic workspace: memory files + identity + a config file to
-    track, and deliberately NO `.alf-map.json` (the agent writes it in step 2)."""
+    track, and deliberately NO `.alf-map.json` (the agent writes it in step 2).
+
+    `agent_name` is the IDENTITY.md h1 (→ `names.primary`), unique per run so live
+    re-runs don't collide on the tenant's unique-name constraint (HTTP 409)."""
     (ws / "memories").mkdir(parents=True)
     (ws / "knowledge").mkdir(parents=True)
     (ws / "memories" / "2026-07-08.md").write_text(
@@ -83,7 +93,8 @@ def _seed_unconfigured_workspace(ws: Path) -> None:
     (ws / "knowledge" / "stack.md").write_text(
         "The service runs on Neon Postgres + S3.\n", encoding="utf-8")
     (ws / "IDENTITY.md").write_text(
-        "# Atlas\n\nA generic MCP agent backed by ALF continuity.\n", encoding="utf-8")
+        f"# {agent_name}\n\nA generic MCP agent backed by ALF continuity.\n",
+        encoding="utf-8")
     (ws / "config.toml").write_text('name = "atlas"\n', encoding="utf-8")
 
 
@@ -141,6 +152,21 @@ def _summarize(tool: str, ok: bool, body: dict) -> str:
     return text[:220]
 
 
+def _purge_agent(alf: Path, ws: Path, env: dict) -> None:
+    """`alf purge -r generic -w <ws>` — DELETE /v1/agents/:id for the agent this
+    run registered. Same env (ALF_HOME/ALF_API_*) so it resolves the sole agent
+    from the state written during sync. Best-effort: failures print to stderr but
+    don't change the exit code (the walkthrough already succeeded)."""
+    proc = subprocess.run(
+        [str(alf), "purge", "-r", "generic", "-w", str(ws)],
+        env=env, capture_output=True, text=True)
+    if proc.returncode == 0:
+        print("cleanup: purged the registered agent", file=sys.stderr)
+    else:
+        print(f"cleanup: purge failed (rc={proc.returncode}): "
+              f"{proc.stderr.strip() or proc.stdout.strip()}", file=sys.stderr)
+
+
 def run(out_path: Path | None) -> int:
     alf = _find_alf()
     if not alf:
@@ -150,13 +176,24 @@ def run(out_path: Path | None) -> int:
     tmp = Path(tempfile.mkdtemp(prefix="alf-w1-"))
     ws = tmp / "my-agent"
     ws.mkdir(parents=True)
-    _seed_unconfigured_workspace(ws)
+    # Unique per run: the service enforces unique agent names per tenant, so a
+    # fixed "Atlas" collides (HTTP 409) on the second live run. The cleanup below
+    # deregisters it too, but the unique name is the belt to that suspenders.
+    agent_name = f"Atlas-w1-{uuid.uuid4().hex[:8]}"
+    _seed_unconfigured_workspace(ws, agent_name)
     home = tmp / "home"          # ALF_HOME is the base `~/.alf` resolves under
     home.mkdir()
 
+    # Resolve credentials: an already-set ALF_API_KEY/ALF_API_URL wins; otherwise
+    # fall back to the repo .env contract (API_KEY / API_BASE_URL).
+    cfg = HarnessConfig.from_env()
     env = dict(os.environ)
     env["ALF_HOME"] = str(home)
     env["HOME"] = str(home)
+    if not env.get("ALF_API_KEY") and cfg.api_key:
+        env["ALF_API_KEY"] = cfg.api_key
+    if not env.get("ALF_API_URL") and cfg.api_url:
+        env["ALF_API_URL"] = cfg.api_url
     live = bool(env.get("ALF_API_KEY") and env.get("ALF_API_URL"))
 
     t = Transcript()
@@ -167,6 +204,7 @@ def run(out_path: Path | None) -> int:
     argv = [str(alf), "mcp", "serve", "-r", "generic", "-w", str(ws)]
     sess = local_stdio_session(argv, env=env)
     client = McpClient(sess.proc, client_name="w1-walkthrough")
+    sync_res = None
     try:
         info = client.initialize()
         srv = info.get("serverInfo", {})
@@ -190,10 +228,15 @@ def run(out_path: Path | None) -> int:
                client.call_tool("alf_vault_add", vault_args, timeout=60))
         # 5. First sync — registers the agent + uploads the snapshot (live) or a
         #    clean tool error (offline: no backend).
-        t.step("alf_sync", {}, client.call_tool("alf_sync", {}, timeout=120))
+        sync_res = client.call_tool("alf_sync", {}, timeout=120)
+        t.step("alf_sync", {}, sync_res)
     finally:
         client.close()
         sess.close()
+        # Live cleanup: deregister the agent we just created so the tenant doesn't
+        # accumulate one Atlas per run. Best-effort — never masks the run's result.
+        if live and sync_res is not None and sync_res.ok:
+            _purge_agent(alf, ws, env)
         shutil.rmtree(tmp, ignore_errors=True)
 
     within = t.tool_calls <= 6

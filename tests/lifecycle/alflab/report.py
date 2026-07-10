@@ -80,9 +80,14 @@ class RunReport:
         c = self.counts()
         ran = [s for s in self.stages if s.status != "SKIP" or s.checks]
         passed = sum(1 for s in ran if s.status in ("PASS", "XFAIL", "XPASS"))
+        # Bare-skipped stages (SKIP with no checks) are invisible in passed/ran;
+        # always emit their count so a run that silently skipped work can't
+        # read as a full pass at a glance.
+        skipped = len(self.stages) - len(ran)
         stages = ",".join(s.stage_id.upper() for s in self.stages)
         line = (f"<!-- LIFECYCLE framework={self.framework} tier={self.tier} "
-                f"stages={stages} passed={passed}/{len(ran)} xfail={c['XFAIL']}")
+                f"stages={stages} passed={passed}/{len(ran)} skipped={skipped} "
+                f"xfail={c['XFAIL']}")
         if c["XPASS"]:
             line += f" xpass={c['XPASS']}"
         line += f" coverage={self.coverage} isolation={self.isolation} -->"

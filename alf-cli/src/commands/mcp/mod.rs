@@ -36,9 +36,10 @@
 
 mod configure;
 mod docs;
-mod watch;
+pub(crate) mod watch;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -75,8 +76,10 @@ configured (API key, tracked agents, per-agent cloud sync state). Then:
 - `alf_check` runs a full pre-flight diagnostic and returns actionable issues.
 - `alf_sync` performs an incremental sync (export → delta → upload); pass \
   `recover: true` to re-derive against cloud truth when a local base is missing.
-- `alf_restore` restores from the cloud (head, or a read-only `at_sequence` \
-  preview, or `dry_run` to list what would be written).
+- `alf_restore` restores from the cloud (head; `at_sequence: N` is a read-only \
+  point-in-time preview materialized into a separate preview directory — the \
+  live workspace and sync state are never touched; `dry_run` lists what would \
+  be written).
 - `alf_configure` (generic runtime) sets the `.alf-map.json` that describes \
   where your memories live; `alf_track` opts an extra file into sync.
 - `alf_vault_add`/`alf_vault_list`/`alf_vault_delete` manage the zero-knowledge \
@@ -107,11 +110,19 @@ pub struct AlfServer {
     /// (unit contexts); the tools degrade to the inactive stub when absent.
     watch: Option<std::sync::Arc<watch::WatchHandle>>,
     /// Serializes the per-agent read-modify-write tools (`alf_vault_add`,
-    /// `alf_vault_delete`, `alf_configure`, `alf_track`) in-process. rmcp fans a
-    /// request batch out across threads (WP-M3 review E1), so without this two
-    /// concurrent write-tool calls race their RMW — e.g. two first `alf_vault_add`s
-    /// generating different keys, or two `alf_configure`s corrupting the map.
+    /// `alf_vault_delete`, `alf_configure`, `alf_track`, `alf_check`) in-process.
+    /// rmcp fans a request batch out across threads (WP-M3 review E1), so without
+    /// this two concurrent write-tool calls race their RMW — e.g. two first
+    /// `alf_vault_add`s generating different keys, or two `alf_configure`s
+    /// corrupting the map. Lock hierarchy L1 (manual §6); never nested with
+    /// `sync_lock`.
     write_lock: std::sync::Arc<std::sync::Mutex<()>>,
+    /// Serializes whole-workspace operations in-process (manual §6, L2):
+    /// `alf_sync`, head `alf_restore`, and the watch loop's `run_due` all take
+    /// it, so a manual sync can never interleave with an in-flight watch sync.
+    /// tokio (not std) because the guard is legally held across `.await`s; the
+    /// watch loop only ever `try_lock`s so it never blocks the runtime.
+    sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     #[expect(dead_code, reason = "the tool_handler macro reads this router field")]
     tool_router: ToolRouter<Self>,
 }
@@ -122,6 +133,7 @@ impl AlfServer {
         workspace: Option<PathBuf>,
         agent: Option<String>,
         watch: Option<std::sync::Arc<watch::WatchHandle>>,
+        sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> Self {
         Self {
             runtime,
@@ -129,6 +141,7 @@ impl AlfServer {
             agent,
             watch,
             write_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+            sync_lock,
             tool_router: Self::tool_router(),
         }
     }
@@ -166,9 +179,11 @@ struct SyncParams {
 /// Parameters for `alf_restore`.
 #[derive(Deserialize, JsonSchema, Default)]
 struct RestoreParams {
-    /// Restore the workspace as it was after this sequence — a read-only
-    /// preview: `~/.alf/state` is not moved, so a later `alf_sync` is unaffected.
-    /// Omit for a head restore.
+    /// Preview the workspace as it was after this sequence. A true read-only
+    /// preview: nothing in the live workspace is written — files are
+    /// materialized into a separate preview directory (returned as
+    /// `preview_path` in the result) and `~/.alf/state` is untouched, so a
+    /// later `alf_sync` is unaffected. Omit for a head restore.
     #[serde(default)]
     at_sequence: Option<u64>,
     /// List what a restore would write and touch nothing. Defaults to false.
@@ -186,10 +201,10 @@ struct RestoreParams {
 /// Parameters for `alf_track`.
 #[derive(Deserialize, JsonSchema)]
 struct TrackParams {
-    /// Path to track. Must be an EXISTING regular file. Workspace-relative or
-    /// absolute, but (unless `external:true`) it must resolve INSIDE the
-    /// workspace or it is rejected. alf's own managed files (`.alf-include.json`,
-    /// the sync log) cannot be tracked.
+    /// Path to track. The file will sync as raw bytes. Must be an EXISTING
+    /// regular file. Workspace-relative or absolute, but (unless `external:true`)
+    /// it must resolve INSIDE the workspace or it is rejected. alf's own managed
+    /// files (`.alf-include.json`, the sync log) cannot be tracked.
     path: String,
     /// Track a file OUTSIDE the workspace. Only available on the hermes and
     /// generic runtimes, and only under a pre-blessed root (passing the
@@ -275,6 +290,8 @@ struct WatchSetParams {
     /// Per-source cadence overrides. Values use the same `<n><unit>` format as
     /// `default_interval`. Keys must be REAL source ids — do not invent them;
     /// call `alf_status` and read its watch stanza to get the valid ids.
+    /// Unknown ids are rejected with the list of valid ids; the tracked-files
+    /// channel is set via `tracked_files_interval`, not here.
     #[serde(default)]
     per_source: Option<std::collections::HashMap<String, String>>,
     /// Cadence for the §6.1 tracked-file rollover channel (a full snapshot is
@@ -289,7 +306,7 @@ struct WatchSetParams {
 }
 
 /// The `alf_watch_set` result: the effective cadence config after the change.
-#[derive(Serialize, JsonSchema)]
+#[derive(Debug, Serialize, JsonSchema)]
 struct WatchSetResult {
     ok: bool,
     /// Whether auto-sync is running (loop active and not paused).
@@ -360,7 +377,11 @@ cadence + dirty state, any backoff/parked recovery state).",
         // service query to the blocking pool.
         let watch = match &self.watch {
             Some(h) if h.is_active() => watch::to_status(h.snapshot()),
-            _ => WatchStatus::default(),
+            Some(h) => WatchStatus {
+                inactive_reason: h.inactive_reason(),
+                ..WatchStatus::default()
+            },
+            None => WatchStatus::default(),
         };
         call_blocking(move || {
             Ok(StatusResult {
@@ -386,7 +407,12 @@ Returns issues (error/warning/info) with suggestions. Also runs agent discovery 
         Parameters(_): Parameters<NoParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (runtime, workspace, agent) = self.owned();
-        call_blocking(move || check::gather(&runtime, workspace.as_deref(), agent.as_deref())).await
+        // Locked: `check::gather` persists discovered `[[agents]]` rows to
+        // config.toml — an RMW that must serialize with the other config writers.
+        call_blocking_locked(self.write_lock.clone(), move || {
+            check::gather(&runtime, workspace.as_deref(), agent.as_deref())
+        })
+        .await
     }
 
     /// Incremental sync (export → reconcile → delta → upload). Emits progress
@@ -408,7 +434,21 @@ missing or diverged. Safe and idempotent.",
         let (runtime, workspace, agent) = self.owned();
         let recover = params.recover.unwrap_or(false);
         let watch = self.watch.clone();
+        // L2: serialize against other manual syncs/restores and the watch loop's
+        // in-flight sync (manual §6). Bounded wait → `agent_busy`, never a hang.
+        let Ok(permit) = tokio::time::timeout(
+            Duration::from_secs(120),
+            self.sync_lock.clone().lock_owned(),
+        )
+        .await
+        else {
+            return Ok(tool_error(&agent_busy(
+                "another sync or restore is still running in this server",
+            )));
+        };
         call_streaming(ctx, move |sink| {
+            let _permit = permit; // L2 held for the whole blocking seam
+            let _agent_lock = acquire_agent_lock(&runtime, workspace.as_deref(), agent.as_deref())?;
             let (outcome, selected) = sync::run_one_agent(
                 &runtime,
                 workspace.as_deref(),
@@ -432,9 +472,10 @@ missing or diverged. Safe and idempotent.",
     #[tool(
         name = "alf_restore",
         description = "Restore this agent from the cloud. Default restores the head of history and \
-updates local sync state. Pass at_sequence:N for a read-only point-in-time preview (state is NOT \
-moved). Pass dry_run:true to list what would be written without touching anything. mode is total \
-(default) or merge for runtimes with a mutable per-agent store.",
+updates local sync state. Pass at_sequence:N for a read-only point-in-time preview: files are \
+written to a preview directory (preview_path in the result), never into the live workspace, and \
+sync state is not moved. Pass dry_run:true to list what would be written without touching \
+anything. mode is total (default) or merge for runtimes with a mutable per-agent store.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<restore::RestoreToolResult>()
             .expect("RestoreToolResult is a valid output schema")
     )]
@@ -459,12 +500,36 @@ moved). Pass dry_run:true to list what would be written without touching anythin
         // ALF_VAULT_KEY / the per-runtime default file (generic credential restore
         // needs the operator to provide the key — see the handoff note).
         let key_args = VaultKeyArgs::default();
-        // Pause the watch loop for the duration: it must never sync a workspace
-        // mid-restore (design §6/§11 — the pause hook, one call site). A dry-run
-        // or point-in-time preview writes nothing, but pausing is cheap and keeps
-        // the invariant simple. The guard resumes the loop on drop.
-        let _restore_guard = self.watch.as_ref().map(watch::restore_guard);
+        let head = !dry_run && at_sequence.is_none();
+        // L2 (manual §6): only a HEAD restore rewrites the live workspace + sync
+        // state, so only it serializes against syncs. Previews import into the
+        // preview dir and dry-runs write nothing — both stay lock-free.
+        let permit = if head {
+            match tokio::time::timeout(
+                Duration::from_secs(120),
+                self.sync_lock.clone().lock_owned(),
+            )
+            .await
+            {
+                Ok(g) => Some(g),
+                Err(_) => {
+                    return Ok(tool_error(&agent_busy(
+                        "another sync or restore is still running in this server",
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        // Pause the watch loop for the duration of a HEAD restore: it must never
+        // sync a workspace mid-restore (design §6/§11 — the pause hook). Previews
+        // never touch the workspace, so the loop has nothing to see and no guard
+        // is taken. The guard resumes the loop on drop.
+        let _restore_guard = head
+            .then(|| self.watch.as_ref().map(watch::restore_guard))
+            .flatten();
         call_streaming(ctx, move |sink| {
+            let _permit = permit; // L2 held for the whole blocking seam
             restore::run_for_mcp(
                 &runtime,
                 workspace.as_deref(),
@@ -503,9 +568,12 @@ to confirm the map/tracked files resolve as expected before syncing.",
     #[tool(
         name = "alf_track",
         description = "Opt a file into sync's include list (idempotent: added:false means it was \
-already tracked). Workspace-relative by default. With external:true a file outside the workspace \
-can be tracked, but only under a pre-blessed root and never on the sensitive denylist — blessing \
-a new root stays a CLI/human ceremony.",
+already tracked). Tracked files sync as RAW BYTES (no memory-record parsing), and any change to \
+one triggers a FULL-SNAPSHOT rollover on the tracked-files cadence (15 min floor, alf_watch_set \
+tracked_files_interval) — track sparingly; map memory sources instead where possible. \
+Workspace-relative by default. With external:true a file outside the workspace can be tracked, \
+but only under a pre-blessed root and never on the sensitive denylist — blessing a new root \
+stays a CLI/human ceremony.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<add::AddResult>()
             .expect("AddResult is a valid output schema")
     )]
@@ -515,14 +583,21 @@ a new root stays a CLI/human ceremony.",
     ) -> Result<CallToolResult, ErrorData> {
         let (runtime, workspace, agent) = self.owned();
         let external = params.external.unwrap_or(false);
+        let watch = self.watch.clone();
         call_blocking_locked(self.write_lock.clone(), move || {
-            add::track(
+            let result = add::track(
                 &runtime,
                 workspace.as_deref(),
                 agent.as_deref(),
                 &params.path,
                 external,
-            )
+            )?;
+            // The include list defines part of the watch surface — the loop
+            // re-derives it on the next tick, no restart needed (manual §4.3).
+            if let Some(h) = &watch {
+                h.request_resurface();
+            }
+            Ok(result)
         })
         .await
     }
@@ -543,6 +618,7 @@ before writing: an invalid configuration is rejected with nothing written.",
         Parameters(params): Parameters<ConfigureParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (runtime, workspace, _agent) = self.owned();
+        let watch = self.watch.clone();
         call_blocking_locked(self.write_lock.clone(), move || {
             let (map, patch) = match params.operation.as_str() {
                 "replace" => (Some(params.body), None),
@@ -551,7 +627,12 @@ before writing: an invalid configuration is rejected with nothing written.",
                     anyhow::bail!("operation must be \"replace\" or \"merge\" (got {other:?})")
                 }
             };
-            configure::configure(&runtime, workspace.as_deref(), map, patch)
+            let result = configure::configure(&runtime, workspace.as_deref(), map, patch)?;
+            // The map defines the watch surface — re-derive it (manual §4.3).
+            if let Some(h) = &watch {
+                h.request_resurface();
+            }
+            Ok(result)
         })
         .await
     }
@@ -562,7 +643,8 @@ before writing: an invalid configuration is rejected with nothing written.",
         description = "Encrypt a credential and append it to the agent's vault (Layer 4). The \
 ciphertext syncs; the plaintext descriptors (service, label, tags) stay visible. On the first add \
 with no key resolvable, a vault key is generated (0600) and its fingerprint + path returned — \
-never the key bytes; back up that file. Pass update:true to replace a same-label record.",
+never the key bytes; back up that file. An add whose service+label match an existing record is \
+rejected unless update:true.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<VaultAddResult>()
             .expect("VaultAddResult is a valid output schema")
     )]
@@ -657,7 +739,9 @@ ceremonies that are deliberately not tools.",
         description = "Control the auto-sync watch loop. Set the delta cadence (default_interval, \
 1 min–24 h), the tracked-file rollover cadence (tracked_files_interval, 15 min–24 h), per-source \
 overrides, and/or pause:true|false. Returns the effective cadence; intervals below a floor are \
-clamped (noted). Errors if no watch loop is running (no API key or unresolved agent).",
+clamped (noted). If the loop is not running the tool errors and the message says why (e.g. no \
+API key, unresolved agent); a paused or parked loop is still steerable — pause:false clears a \
+park.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<WatchSetResult>()
             .expect("WatchSetResult is a valid output schema")
     )]
@@ -671,6 +755,17 @@ clamped (noted). Errors if no watch loop is running (no API key or unresolved ag
                  configure and sync first, then re-launch the server"
             )));
         };
+        // The documented contract (manual §3.13): the tool errors when the loop
+        // is not running, and says WHY (paused/parked loops stay steerable —
+        // pause:false is what clears a park, so those still pass this gate).
+        if !handle.is_active() {
+            return Ok(tool_error(&anyhow::anyhow!(
+                "the watch loop is not running: {}",
+                handle
+                    .inactive_reason()
+                    .unwrap_or_else(|| "unknown startup failure".into())
+            )));
+        }
         // Serialized like the other config/FS writers so a concurrent
         // `alf_watch_set` can't lose an update mid read-modify-write (review G4).
         call_blocking_locked(self.write_lock.clone(), move || {
@@ -715,6 +810,32 @@ fn watch_set_impl(
         cfg.set_tracked(d);
     }
     if let Some(map) = &params.per_source {
+        // Validate EVERY id before mutating anything: unknown ids are typos a
+        // weak model would otherwise never notice (the old behavior echoed
+        // them back as ok:true), and the tracked channel has its own knob.
+        let snap = handle.snapshot();
+        for id in map.keys() {
+            match snap.sources.iter().find(|s| s.source == *id) {
+                None => {
+                    let mut valid: Vec<&str> =
+                        snap.sources.iter().map(|s| s.source.as_str()).collect();
+                    valid.sort_unstable();
+                    anyhow::bail!(
+                        "unknown per_source id '{id}' — valid ids: {}",
+                        if valid.is_empty() {
+                            "(none — the loop has no sources yet)".to_string()
+                        } else {
+                            valid.join(", ")
+                        }
+                    );
+                }
+                Some(s) if s.tracked => anyhow::bail!(
+                    "'{id}' is the tracked-files channel — set tracked_files_interval \
+                     instead of per_source"
+                ),
+                Some(_) => {}
+            }
+        }
         for (id, raw) in map {
             let d = watch::parse_interval(raw).ok_or_else(|| {
                 anyhow::anyhow!("invalid per_source['{id}'] interval '{raw}' (e.g. 5m)")
@@ -875,6 +996,34 @@ fn vault_add_impl(
     let config = Config::load()?;
     vault_migrate::require_migrated(&config, runtime)?;
     let scope = server_vault_scope(&config, runtime, agent, workspace)?;
+    // L3: two MCP servers pinned to the same agent must not interleave the
+    // vault read-modify-write (manual §6). write_lock (L1) is already held.
+    let _agent_lock = scope.map(vault_agent_lock).transpose()?;
+
+    // Duplicate guard (manual §3.8): without update:true, an add whose service +
+    // effective label match an existing record is rejected — a repeated
+    // identical call must never silently duplicate.
+    if !params.update.unwrap_or(false) {
+        if let Some(label) = params.label.as_deref().or(params.username.as_deref()) {
+            // A missing vault (first add) has no records — a list error there
+            // just means "nothing to collide with".
+            if let Ok(existing) = vault_list_impl(runtime, workspace, agent) {
+                if let Some(dup) = existing
+                    .credentials()
+                    .iter()
+                    .find(|c| c.label() == Some(label) && c.service() == params.service)
+                {
+                    anyhow::bail!(
+                        "a credential with label '{label}' for service '{}' already exists \
+                         (id {}); pass update:true to replace it, or use a different label",
+                        params.service,
+                        dup.id()
+                    );
+                }
+            }
+        }
+    }
+
     let (key_args, key_generated) = resolve_or_generate_vault_key(runtime, scope)?;
 
     let add = vault::add_core(
@@ -919,6 +1068,8 @@ fn vault_delete_impl(
     let config = Config::load()?;
     vault_migrate::require_migrated(&config, runtime)?;
     let scope = server_vault_scope(&config, runtime, agent, workspace)?;
+    // L3: cross-process vault RMW protection, same as vault_add_impl.
+    let _agent_lock = scope.map(vault_agent_lock).transpose()?;
     let selector = match params.by.as_str() {
         "id" => vault::Selector {
             id: Some(params.value),
@@ -938,6 +1089,57 @@ fn vault_delete_impl(
         other => anyhow::bail!("by must be one of id, label, or service (got {other:?})"),
     };
     vault::delete_core(None, &selector, None, scope)
+}
+
+// ---------------------------------------------------------------------------
+// Locking helpers (manual §6)
+// ---------------------------------------------------------------------------
+
+/// The coded `agent_busy` error: another sync/restore (this process or another)
+/// holds the lock past the bounded wait.
+pub(crate) fn agent_busy(cause: &str) -> anyhow::Error {
+    crate::errors::CliError {
+        code: crate::errors::codes::AGENT_BUSY,
+        cause: cause.to_string(),
+        remedy: "retry shortly; alf_status shows what auto-sync is doing".to_string(),
+    }
+    .into()
+}
+
+/// L3 for the vault tools: the per-agent advisory lock by known agent id.
+fn vault_agent_lock(agent_id: Uuid) -> anyhow::Result<watch::lock::AgentLock> {
+    let lock_file = watch::lock_path(agent_id)?;
+    if let Some(dir) = lock_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    watch::lock::acquire_timeout(
+        &lock_file,
+        Duration::from_secs(10),
+        Duration::from_millis(250),
+    )?
+    .ok_or_else(|| agent_busy("another ALF process is syncing or restoring this agent"))
+}
+
+/// L3: acquire the per-agent cross-process advisory lock with a bounded wait
+/// (10 s), resolving the pinned agent first. `agent_busy` if another ALF
+/// process holds it past the wait. Callers hold the returned guard across the
+/// whole-workspace operation.
+fn acquire_agent_lock(
+    runtime: &str,
+    workspace: Option<&Path>,
+    agent: Option<&str>,
+) -> anyhow::Result<watch::lock::AgentLock> {
+    let (_ws, agent_id) = watch::resolve_loop_context(runtime, workspace, agent)?;
+    let lock_file = watch::lock_path(agent_id)?;
+    if let Some(dir) = lock_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    watch::lock::acquire_timeout(
+        &lock_file,
+        Duration::from_secs(10),
+        Duration::from_millis(250),
+    )?
+    .ok_or_else(|| agent_busy("another ALF process is syncing or restoring this agent"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1054,6 +1256,44 @@ fn structured_ok<T: serde::Serialize>(value: &T) -> Result<CallToolResult, Error
     Ok(CallToolResult::structured(json))
 }
 
+/// CLI remedies name commands and flags an MCP agent cannot run; rewrite the
+/// known CLI phrasings into tool guidance before they reach the wire
+/// (manual §5). Ordered longest-match-first so `alf sync --recover` wins over
+/// `alf sync`. CLI stdout is untouched — this rewrite exists only on the MCP
+/// path.
+const MCP_REMEDY_REWRITES: &[(&str, &str)] = &[
+    (
+        "alf sync --force-first-sync",
+        "the CLI ceremony `alf sync --force-first-sync` (human terminal — see alf_docs          topic \"force-first-sync\")",
+    ),
+    ("alf sync --recover", "alf_sync with recover:true"),
+    (
+        "alf vault rotate-key",
+        "the CLI ceremony `alf vault rotate-key` (human terminal — see alf_docs topic          \"rotate-key\")",
+    ),
+    (
+        "alf vault migrate",
+        "the CLI ceremony `alf vault migrate` (human terminal — see alf_docs topic          \"vault\")",
+    ),
+    (
+        "alf agents enable",
+        "the CLI ceremony `alf agents enable` (human terminal — enable/disable are not tools)",
+    ),
+    ("alf login", "the CLI ceremony `alf login` (human terminal)"),
+    ("alf check", "the alf_check tool (CLI: `alf check`"),
+    ("alf restore", "the alf_restore tool (CLI: `alf restore`"),
+    ("alf sync", "the alf_sync tool (CLI: `alf sync`"),
+];
+
+/// Apply [`MCP_REMEDY_REWRITES`] to a remedy string.
+fn mcp_hint(remedy: &str) -> String {
+    let mut out = remedy.to_string();
+    for (cli, tool) in MCP_REMEDY_REWRITES {
+        out = out.replace(cli, tool);
+    }
+    out
+}
+
 /// Map a seam error to a **tool execution error** (isError, not a protocol
 /// error) carrying the CLI's `{ok:false, code?, error, hint}` shape as both
 /// structured content and text — so the agent can self-correct (spec 2025-11-25
@@ -1069,7 +1309,10 @@ fn tool_error(err: &anyhow::Error) -> CallToolResult {
             );
             obj.insert("error".into(), serde_json::Value::String(cli.cause.clone()));
             if !cli.remedy.is_empty() {
-                obj.insert("hint".into(), serde_json::Value::String(cli.remedy.clone()));
+                obj.insert(
+                    "hint".into(),
+                    serde_json::Value::String(mcp_hint(&cli.remedy)),
+                );
             }
         }
         None => {
@@ -1079,7 +1322,7 @@ fn tool_error(err: &anyhow::Error) -> CallToolResult {
             );
             let hint = crate::output::error_hint(err);
             if !hint.is_empty() {
-                obj.insert("hint".into(), serde_json::Value::String(hint));
+                obj.insert("hint".into(), serde_json::Value::String(mcp_hint(&hint)));
             }
         }
     }
@@ -1112,12 +1355,21 @@ pub fn serve(runtime: &str, workspace: Option<&Path>, agent: Option<&str>) -> an
     // storms across ALF processes on one machine — no rand dependency needed.
     cfg.backoff_jitter = (std::process::id() % 100) as f64 / 100.0 * 0.3;
     let handle = std::sync::Arc::new(watch::WatchHandle::new(cfg));
+    if !api_key_set {
+        handle.set_inactive_reason(
+            "no API key configured — the watch loop only runs when service.api_key is set \
+             (run `alf login` in a terminal, then restart the MCP server)",
+        );
+    }
+    // L2 (manual §6): shared by the manual sync/restore tools and the watch loop.
+    let sync_lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
 
     let server = AlfServer::new(
         runtime_s.clone(),
         workspace_buf.clone(),
         agent_s.clone(),
         Some(handle.clone()),
+        sync_lock.clone(),
     );
 
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -1132,8 +1384,15 @@ pub fn serve(runtime: &str, workspace: Option<&Path>, agent: Option<&str>) -> an
         // spawned only when an API key is configured — otherwise every catch-up
         // sync would fail and park, so the loop stays down and `alf_status` reports
         // it inactive.
-        let loop_task = api_key_set
-            .then(|| tokio::spawn(watch::run_loop(handle, runtime_s, workspace_buf, agent_s)));
+        let loop_task = api_key_set.then(|| {
+            tokio::spawn(watch::run_loop(
+                handle,
+                runtime_s,
+                workspace_buf,
+                agent_s,
+                sync_lock,
+            ))
+        });
         let running = server
             .serve(rmcp::transport::io::stdio())
             .await
@@ -1148,4 +1407,142 @@ pub fn serve(runtime: &str, workspace: Option<&Path>, agent: Option<&str>) -> an
         eprintln!("alf mcp serve: stopped ({reason:?})");
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handle_with_sources() -> std::sync::Arc<watch::WatchHandle> {
+        let handle = std::sync::Arc::new(watch::WatchHandle::new(Default::default()));
+        handle.set_sources_for_test(&[
+            alf_core::WatchSpec::file("journal", "/ws/memories"),
+            alf_core::WatchSpec::file("tracked-files", "/ws/x").as_tracked(),
+        ]);
+        handle
+    }
+
+    #[test]
+    fn mcp_hint_rewrites_recover_before_plain_sync() {
+        let hinted = mcp_hint("Run 'alf sync --recover' to re-derive against cloud truth");
+        assert!(hinted.contains("alf_sync with recover:true"), "{hinted}");
+        assert!(!hinted.contains("--recover'"), "{hinted}");
+    }
+
+    #[test]
+    fn mcp_hint_labels_cli_ceremonies() {
+        let hinted = mcp_hint("Run 'alf vault rotate-key' to rotate");
+        assert!(hinted.contains("human terminal"), "{hinted}");
+        assert!(hinted.contains("alf_docs"), "{hinted}");
+    }
+
+    #[test]
+    fn tool_error_carries_rewritten_hint() {
+        let err: anyhow::Error = crate::errors::CliError {
+            code: crate::errors::codes::SYNC_UPLOAD_FAILED,
+            cause: "x".into(),
+            remedy: "run alf sync --recover".into(),
+        }
+        .into();
+        let result = tool_error(&err);
+        let sc = serde_json::to_value(result.structured_content.as_ref().unwrap()).unwrap();
+        assert_eq!(sc["code"], "sync_upload_failed");
+        assert!(
+            sc["hint"].as_str().unwrap().contains("recover:true"),
+            "hint must speak tool language: {sc}"
+        );
+    }
+
+    #[test]
+    fn watch_set_rejects_unknown_per_source_id() {
+        let handle = handle_with_sources();
+        let params = WatchSetParams {
+            per_source: Some(
+                [("bogus".to_string(), "5m".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = watch_set_impl(&handle, params).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown per_source id 'bogus'"), "{msg}");
+        assert!(msg.contains("journal"), "must list the valid ids: {msg}");
+    }
+
+    #[test]
+    fn watch_set_rejects_tracked_channel_id_pointing_to_tracked_files_interval() {
+        let handle = handle_with_sources();
+        let params = WatchSetParams {
+            per_source: Some(
+                [("tracked-files".to_string(), "30m".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let err = watch_set_impl(&handle, params).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("tracked_files_interval"),
+            "must point at the right knob: {err:#}"
+        );
+    }
+
+    #[test]
+    fn watch_set_applies_a_valid_per_source_override() {
+        let handle = handle_with_sources();
+        let params = WatchSetParams {
+            per_source: Some(
+                [("journal".to_string(), "5m".to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
+            ..Default::default()
+        };
+        let result = watch_set_impl(&handle, params).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.per_source_secs.get("journal"), Some(&300));
+    }
+
+    #[test]
+    fn watch_set_clamps_sub_floor_intervals_with_notes() {
+        let handle = handle_with_sources();
+        // 30s < 1-min delta floor; 5m < 15-min tracked floor.
+        let params = WatchSetParams {
+            default_interval: Some("30s".into()),
+            tracked_files_interval: Some("5m".into()),
+            pause: Some(true),
+            ..Default::default()
+        };
+        let result = watch_set_impl(&handle, params).unwrap();
+        assert_eq!(result.default_interval_secs, 60, "delta clamped to floor");
+        assert_eq!(
+            result.tracked_files_interval_secs, 900,
+            "tracked clamped to floor"
+        );
+        assert!(result.paused);
+        assert!(
+            result.notes.len() >= 2,
+            "both clamps must be noted: {:?}",
+            result.notes
+        );
+
+        // A value above the floors passes through verbatim.
+        let params = WatchSetParams {
+            default_interval: Some("10m".into()),
+            ..Default::default()
+        };
+        let result = watch_set_impl(&handle, params).unwrap();
+        assert_eq!(result.default_interval_secs, 600);
+    }
+
+    #[test]
+    fn watch_set_rejects_a_malformed_interval() {
+        let handle = handle_with_sources();
+        let params = WatchSetParams {
+            default_interval: Some("soon".into()),
+            ..Default::default()
+        };
+        assert!(watch_set_impl(&handle, params).is_err());
+    }
 }

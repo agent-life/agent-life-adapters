@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -68,14 +71,20 @@ def seed_home_from_image(image: str, src_path: str, host_dest: Path,
 
 
 class DockerContainer:
-    """One `sleep infinity` container; every stage is a `docker exec`."""
+    """One `sleep infinity` container; every stage is a `docker exec`.
+
+    `env_dir`: where per-exec `--env-file` files are written (the runner sets
+    `{run_dir}/env-files` — ephemeral, chmod-700 parent, gitignored). Secrets
+    NEVER travel as `-e K=V` argv elements (argv is world-readable via
+    /proc/*/cmdline and `ps`); every exec env goes through a 0600 env file."""
 
     def __init__(self, name: str, image: str, *, user: str = "agent",
-                 home: str = "/home/agent"):
+                 home: str = "/home/agent", env_dir: Optional[Path] = None):
         self.name = name
         self.image = image
         self.user = user
         self.home = home
+        self.env_dir = env_dir
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -107,14 +116,44 @@ class DockerContainer:
 
     # -- exec ----------------------------------------------------------------
 
+    def _env_args(self, env: Optional[dict]) -> list[str]:
+        """Write `env` to a fresh 0600 env file and return `["--env-file", path]`
+        (`[]` when there is nothing to pass). Never `-e K=V` — a secret on argv
+        leaks via /proc/*/cmdline and `ps`. Files are uuid-named per exec and NOT
+        deleted at close: the run dir is ephemeral + gitignored, and a live
+        `exec_stdio` session may outlast the call that spawned it."""
+        if not env:
+            return []
+        env_dir = self.env_dir
+        if env_dir is None:  # no runner wiring (e.g. teardown CLI): private tmp
+            env_dir = Path(tempfile.mkdtemp(prefix=f"alf-envfiles-{self.name}-"))
+            self.env_dir = env_dir
+        env_dir.mkdir(parents=True, exist_ok=True)
+        path = env_dir / f"exec-{uuid.uuid4().hex}.env"
+        body = "".join(f"{k}={v}\n" for k, v in env.items())
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        return ["--env-file", str(path)]
+
+    def _exec_argv(self, argv: list[str], *, user: Optional[str] = None,
+                   env: Optional[dict] = None, stdio: bool = False) -> list[str]:
+        """The full `docker exec` argv for a one-shot (`exec`) or persistent
+        (`exec_stdio`, adds `-i`) invocation. Factored so tests can assert the
+        no-secrets-on-argv property without docker."""
+        cmd = ["docker", "exec"]
+        if stdio:
+            cmd.append("-i")
+        cmd += ["-u", user or self.user]
+        cmd += self._env_args(env)
+        cmd += [self.name] + argv
+        return cmd
+
     def exec(self, argv: list[str], *, user: Optional[str] = None,
              env: Optional[dict] = None, timeout: int = 300,
              check: bool = False) -> subprocess.CompletedProcess:
-        cmd = ["docker", "exec", "-u", user or self.user]
-        for k, v in (env or {}).items():
-            cmd += ["-e", f"{k}={v}"]
-        cmd += [self.name] + argv
-        return _run(cmd, timeout=timeout, check=check)
+        return _run(self._exec_argv(argv, user=user, env=env),
+                    timeout=timeout, check=check)
 
     def exec_json(self, argv: list[str], **kw) -> tuple[subprocess.CompletedProcess, Optional[dict]]:
         """Run a JSON-first CLI (ALF_HUMAN stays unset) and parse stdout."""
@@ -141,14 +180,10 @@ class DockerContainer:
         and capture output. An MCP server is a long-lived subprocess the client
         drives with request/response JSON-RPC over stdin/stdout, so it needs an
         OPEN pipe, not `subprocess.run`. `-i` keeps stdin attached; stdout/stderr
-        are byte pipes. Secrets travel via `-e` here exactly as the one-shot
-        `exec` does (never argv) — for the MCP server that is `ALF_API_KEY` /
-        `ALF_AGENT`, which the container also already has via `--env-file`."""
-        cmd = ["docker", "exec", "-i", "-u", user or self.user]
-        for k, v in (env or {}).items():
-            cmd += ["-e", f"{k}={v}"]
-        cmd += [self.name] + argv
-        return StdioSession(cmd)
+        are byte pipes. Secrets travel via a 0600 `--env-file` exactly as the
+        one-shot `exec` does (never `-e K=V` on argv) — for the MCP server that
+        is `ALF_API_KEY` / `ALF_AGENT`."""
+        return StdioSession(self._exec_argv(argv, user=user, env=env, stdio=True))
 
     # -- alf injection (D6) ---------------------------------------------------
 

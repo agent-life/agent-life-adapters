@@ -325,6 +325,44 @@ pub(crate) fn resolve_workspace_required(
     Ok(resolved.path)
 }
 
+/// Like [`resolve_workspace_required`], but falls back to the persisted
+/// `[[agents]]` mapping when the flag / defaults / runtime-default all fail: a
+/// generic agent whose row already carries a `workspace` should not need `-w`
+/// again (manual §3 / finding sync.rs:366). Never falls back to CWD (R1 — a
+/// stray `.alf-agent-id` must never be adopted). `agent` selects the row;
+/// without it, the sole enabled row for the runtime is used, and ambiguity
+/// keeps the original actionable error.
+pub(crate) fn resolve_workspace_or_mapped(
+    flag: Option<&Path>,
+    config: &Config,
+    runtime: &str,
+    agent: Option<&str>,
+) -> Result<PathBuf> {
+    match resolve_workspace_required(flag, config, runtime) {
+        Ok(p) => Ok(p),
+        Err(e) => {
+            let row = match agent {
+                Some(sel) => config.find_agent(runtime, sel),
+                None => {
+                    let enabled: Vec<_> = config
+                        .agents_for_runtime(runtime)
+                        .into_iter()
+                        .filter(|a| a.enabled)
+                        .collect();
+                    match enabled.as_slice() {
+                        [only] => Some(*only),
+                        _ => None, // zero or ambiguous → keep the original error
+                    }
+                }
+            };
+            match row.filter(|r| !r.workspace.is_empty()) {
+                Some(r) => Ok(PathBuf::from(&r.workspace)),
+                None => Err(e),
+            }
+        }
+    }
+}
+
 /// Read `workspace_dir` from `~/.zeroclaw/config.toml`.
 ///
 /// `workspace_dir` is a top-level key in ZeroClaw's V3 config, so a lightweight
@@ -1477,6 +1515,75 @@ mod tests {
         assert_eq!(
             resolve_workspace_required(Some(&flag), &Config::default(), "generic").unwrap(),
             flag
+        );
+    }
+
+    fn generic_row(alias: &str, workspace: &str, enabled: bool) -> crate::config::AgentEntry {
+        crate::config::AgentEntry {
+            runtime: Some("generic".into()),
+            runtime_agent: alias.into(),
+            runtime_agent_id: None,
+            alf_agent_id: uuid::Uuid::new_v4(),
+            workspace: workspace.into(),
+            enabled,
+            extra: Default::default(),
+        }
+    }
+
+    #[test]
+    fn mapped_generic_agent_resolves_without_w() {
+        let mut config = Config::default();
+        config.agents.push(generic_row("main", "/gen/mapped", true));
+        assert_eq!(
+            resolve_workspace_or_mapped(None, &config, "generic", None).unwrap(),
+            PathBuf::from("/gen/mapped")
+        );
+    }
+
+    #[test]
+    fn ambiguous_mapping_still_requires_w() {
+        let mut config = Config::default();
+        config.agents.push(generic_row("a", "/gen/a", true));
+        config.agents.push(generic_row("b", "/gen/b", true));
+        let err = resolve_workspace_or_mapped(None, &config, "generic", None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("-w"),
+            "ambiguity keeps the -w error"
+        );
+    }
+
+    #[test]
+    fn agent_flag_selects_the_mapped_row() {
+        let mut config = Config::default();
+        config.agents.push(generic_row("alpha", "/gen/a", true));
+        config.agents.push(generic_row("beta", "/gen/b", true));
+        assert_eq!(
+            resolve_workspace_or_mapped(None, &config, "generic", Some("beta")).unwrap(),
+            PathBuf::from("/gen/b")
+        );
+    }
+
+    #[test]
+    fn flag_still_wins_over_mapping() {
+        let mut config = Config::default();
+        config.agents.push(generic_row("main", "/gen/mapped", true));
+        let flag = PathBuf::from("/explicit");
+        assert_eq!(
+            resolve_workspace_or_mapped(Some(&flag), &config, "generic", None).unwrap(),
+            flag
+        );
+    }
+
+    #[test]
+    fn disabled_mapping_row_does_not_resolve() {
+        let mut config = Config::default();
+        config
+            .agents
+            .push(generic_row("main", "/gen/mapped", false));
+        let err = resolve_workspace_or_mapped(None, &config, "generic", None).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("-w"),
+            "a disabled row keeps the -w error"
         );
     }
 

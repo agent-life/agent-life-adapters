@@ -38,4 +38,12 @@ pub mod codes {
     pub const VAULT_ROTATE_FAILED: &str = "vault_rotate_failed";
     pub const VAULT_ROTATE_NO_DESTINATION: &str = "vault_rotate_no_destination";
     pub const VAULT_MIGRATION_BLOCKED: &str = "vault_migration_blocked";
+    // v1.1 MCP-train failure classes (manual §5): lock contention + the
+    // permanent-failure classes the watch loop must park on instead of
+    // retrying forever.
+    pub const AGENT_BUSY: &str = "agent_busy";
+    pub const AUTH_FAILED: &str = "auth_failed";
+    pub const SUBSCRIPTION_DENIED: &str = "subscription_denied";
+    pub const SYNC_BASE_UNREADABLE: &str = "sync_base_unreadable";
+    pub const WORKSPACE_MISSING: &str = "workspace_missing";
 }

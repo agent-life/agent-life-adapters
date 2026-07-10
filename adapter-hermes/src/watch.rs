@@ -52,6 +52,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         tracked: false,
         sqlite: false,
         rediscover: false,
+        resurface: false,
     });
 
     // Allowlisted content dirs, only when present (Hermes has no whole-home
@@ -78,10 +79,11 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         tracked: false,
         sqlite: true,
         rediscover: false,
+        resurface: false,
     });
 
     // config.yaml.
-    specs.push(WatchSpec::file("config", workspace.join("config.yaml")));
+    specs.push(WatchSpec::file("config", workspace.join("config.yaml")).resurfacing());
 
     // profiles/ — only for the default profile (the home itself). A named
     // profile's workspace is `<home>/profiles/<name>`, which has no `profiles/`
@@ -107,17 +109,23 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
                 tracked: true,
                 sqlite: false,
                 rediscover: false,
+                resurface: false,
             });
         }
     }
     specs.push(WatchSpec {
         id: "sentinels".into(),
-        roots: vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)],
+        roots: vec![
+            workspace.join(INCLUDE_FILE),
+            workspace.join(SYNC_LOG_FILE),
+            workspace.join(".alfignore"),
+        ],
         recursive: false,
         exclude: Vec::new(),
         tracked: false,
         sqlite: false,
         rediscover: false,
+        resurface: true, // surface-defining (manual §4.3)
     });
 
     specs
@@ -227,6 +235,8 @@ mod tests {
             .contains(&home.join("SOUL.md")));
         let sentinels = by_id(&specs, "sentinels").unwrap();
         assert!(sentinels.roots.contains(&home.join(INCLUDE_FILE)));
+        // WP-E.3: `.alfignore` edits change the export surface → watched.
+        assert!(sentinels.roots.contains(&home.join(".alfignore")));
     }
 
     #[test]

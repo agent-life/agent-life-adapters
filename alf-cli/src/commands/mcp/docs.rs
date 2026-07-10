@@ -438,4 +438,87 @@ mod tests {
         );
         assert!(msg.contains("vault"));
     }
+
+    // ---- Docs↔behavior drift guards (WP-M) ----------------------------------
+
+    #[test]
+    fn watch_loop_docs_do_not_claim_v2_capture() {
+        // M.1: v1 captures raw bytes after quiescence; the VACUUM/backup-API
+        // path is reserved for v2 and must not be advertised as current.
+        let mcp = resolve("mcp").unwrap().content;
+        assert!(
+            !mcp.contains("backup API"),
+            "docs must not claim a backup API"
+        );
+        assert!(
+            mcp.contains("reserved for v2"),
+            "docs must label VACUUM INTO as v2-only"
+        );
+    }
+
+    #[test]
+    fn map_file_docs_state_the_full_tag_grammar() {
+        // M.2: the real grammar is hashtags | static:<tag> | frontmatter:<key>.
+        let map = resolve("map-file").unwrap().content;
+        assert!(map.contains("static:"), "static:<tag> undocumented");
+        assert!(
+            map.contains("frontmatter:"),
+            "frontmatter:<key> undocumented"
+        );
+        assert!(map.contains("hashtags"));
+        assert!(
+            !map.contains("a literal static tag"),
+            "the old (wrong) 'bare literal' phrasing must be gone"
+        );
+    }
+
+    #[test]
+    fn park_codes_in_docs_match_the_engine() {
+        // M.3: the documented park-code list is pinned to the engine's single
+        // source of truth (engine::PARK_CODES) — neither can drift silently.
+        let line = CLI_REFERENCE
+            .lines()
+            .find(|l| l.contains("**Park codes.**"))
+            .expect("the Park codes line must exist in cli-reference.md");
+        // Backticked tokens on the line include tool names (`alf_sync`, …) in the
+        // "clears the park" sentence — park codes never start with `alf_`.
+        let mut documented: Vec<&str> = line
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|t| !t.starts_with("alf_"))
+            .collect();
+        documented.sort_unstable();
+        documented.dedup();
+        let mut actual = super::super::watch::engine::PARK_CODES.to_vec();
+        actual.sort_unstable();
+        assert_eq!(
+            documented, actual,
+            "docs park-code list must equal engine::PARK_CODES exactly"
+        );
+    }
+
+    #[test]
+    fn cli_reference_tool_table_matches_the_live_tool_router() {
+        // M.4: the hand-maintained tool table is pinned to the router's tools.
+        let section =
+            extract_section(CLI_REFERENCE, "Tool surface (v1)").expect("tool table section");
+        let mut documented: Vec<String> = section
+            .lines()
+            .filter(|l| l.trim_start().starts_with("| `alf_"))
+            .filter_map(|l| l.split('`').nth(1).map(str::to_string))
+            .collect();
+        documented.sort();
+        documented.dedup();
+        let mut live: Vec<String> = super::super::AlfServer::tool_router()
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        live.sort();
+        assert_eq!(
+            documented, live,
+            "the docs tool table must list exactly the live v1 tool surface"
+        );
+    }
 }

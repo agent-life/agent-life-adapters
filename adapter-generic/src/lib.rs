@@ -30,6 +30,14 @@ pub mod watch;
 
 pub use map::{MemoryMap, MemorySourceSpec, MAP_FILE};
 
+/// Error-message marker for a hard-failed SQLite extraction (WP-G.1).
+///
+/// Export prefixes every `sqlite_rows` extraction failure with this string so
+/// callers can classify it. **Warning:** `alf-cli`'s watch-loop `classify()`
+/// matches on this exact (lowercase) text to treat the failure as transient
+/// (bounded backoff, no mass delete) — do not reword one without the other.
+pub const SQLITE_EXTRACTION_FAILED: &str = "sqlite extraction failed";
+
 /// Generic map-driven adapter.
 pub struct GenericAdapter;
 

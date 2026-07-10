@@ -166,8 +166,10 @@ Canonical pre-release lifecycle runs (real install + real backend; see
 
 Scheduled live gates (run once per release, keep the artifact — see
 [tests/lifecycle/README.md](tests/lifecycle/README.md) §"Scheduled live gates"):
-the **hermes-mcp** MCP-LLM tier (`./test.sh lifecycle-mcp-llm`) and the **kill-9
-catch-up** gate (`kill9_catchup_gate.py`).
+the **hermes-mcp** MCP-LLM tier (`./test.sh lifecycle-mcp-llm`) and the
+**pre-upload abort catch-up** gate (`preupload_abort_catchup_gate.py`; formerly
+"kill-9" — it exercises a cooperative `exit(137)` at the pre-upload seam, not a
+kernel SIGKILL).
 
 If the JSON contract changed:
 

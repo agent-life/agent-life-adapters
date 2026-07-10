@@ -45,6 +45,7 @@ const CONTROL_FILES: &[&str] = &[
     SYNC_LOG_FILE,
     AGENT_ID_FILE,
     ".alfignore",
+    ".alf-include.lock",
 ];
 
 /// UUID v5 namespace for content-addressed generic record ids.
@@ -563,11 +564,41 @@ fn load_agent_vault(vault_path: Option<&Path>) -> Option<CredentialsDocument> {
 // ---------------------------------------------------------------------------
 
 /// Where a raw entry's bytes come from. Memory-source files are read once (for
-/// parsing) and their bytes reused here; everything else is read lazily at pack
-/// time so a large tracked DB is never held in memory twice.
+/// parsing) and their bytes reused here; a `sqlite_rows` source's `.db` and its
+/// `-wal`/`-shm` sidecars are captured eagerly and consecutively as bytes so the
+/// trio travels as one consistent unit (WP-G.3 — never `VACUUM INTO`, raw
+/// fidelity is the contract). Everything else is read lazily at pack time so a
+/// large tracked file is never held in memory twice. Every read — eager or
+/// lazy — goes through [`read_raw_capped`] (WP-I.1 size caps).
 enum RawSource {
     Bytes(Vec<u8>),
     Path(PathBuf),
+}
+
+/// Read a raw-tree file with the per-entry size cap enforced up front
+/// (WP-I.1): a file over [`alf_core::MAX_RAW_ENTRY_BYTES`] fails the export
+/// before its bytes are pulled into memory — a restore would reject the entry
+/// anyway. The underlying `io::Error` is preserved in the chain so callers can
+/// detect `NotFound` (the WAL-sidecar checkpoint race in [`collect`]).
+fn read_raw_capped(path: &Path, rel: &str) -> Result<Vec<u8>> {
+    let len = fs::metadata(path)
+        .with_context(|| format!("reading raw source {rel}"))?
+        .len();
+    if len > alf_core::MAX_RAW_ENTRY_BYTES {
+        bail!(
+            "raw source {rel} is {len} bytes, over the {} byte per-file cap \
+             (a restore would reject it)",
+            alf_core::MAX_RAW_ENTRY_BYTES
+        );
+    }
+    fs::read(path).with_context(|| format!("reading raw source {rel}"))
+}
+
+/// Whether an error chain bottoms out in `io::ErrorKind::NotFound`.
+fn is_not_found(err: &anyhow::Error) -> bool {
+    err.root_cause()
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
 /// Everything one workspace walk produces: parsed records + the deduplicated raw
@@ -614,11 +645,32 @@ fn collect(workspace: &Path, map: &MemoryMap, agent_id: Uuid) -> Result<Collecte
         }
         source_hit[idx] = true;
         let src = &map.memory_sources[idx];
-        let bytes = fs::read(&abs).with_context(|| format!("reading {rel}"))?;
+        let bytes = read_raw_capped(&abs, &rel)?;
         if src.chunking.is_sqlite() {
-            // A `sqlite_rows` source: extract per-row records via the sqlite
-            // reader instead of parsing the `.db` as text. The `.db` (and any
-            // `-wal`/`-shm` sidecars) still travel raw for a lossless restore.
+            // A `sqlite_rows` source: the `.db` bytes were just read; capture
+            // its `-wal`/`-shm` sidecars eagerly and CONSECUTIVELY (WP-G.3) so
+            // the trio travels as one near-consistent unit, BEFORE row
+            // extraction gets a chance to interleave. A sidecar that vanishes
+            // mid-capture (a checkpoint race) is skipped; any other read error
+            // fails the export. Never `VACUUM INTO` — raw fidelity.
+            if let Some(fname) = abs.file_name().and_then(|f| f.to_str()) {
+                for suffix in ["-wal", "-shm"] {
+                    let side = abs.with_file_name(format!("{fname}{suffix}"));
+                    let side_rel = format!("{rel}{suffix}");
+                    match read_raw_capped(&side, &side_rel) {
+                        Ok(data) => {
+                            raw.entry(side_rel).or_insert(RawSource::Bytes(data));
+                        }
+                        Err(e) if is_not_found(&e) => {} // checkpointed away mid-capture
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            // Extract per-row records via the sqlite reader instead of parsing
+            // the `.db` as text. Extraction failure hard-fails the export
+            // (decision 4): degrading to zero records would compute a delta
+            // that mass-deletes the agent's cloud history. The temp-then-rename
+            // archive write leaves any previous good archive untouched.
             match crate::sqlite::extract_rows(
                 &abs,
                 &rel,
@@ -627,18 +679,16 @@ fn collect(workspace: &Path, map: &MemoryMap, agent_id: Uuid) -> Result<Collecte
                 agent_id,
                 file_mtime(&abs),
             ) {
-                Ok(recs) => records.extend(recs),
-                Err(e) => warnings.push(format!(
-                    "sqlite source {rel}: {e:#}; preserved raw but no records extracted"
-                )),
-            }
-            if let Some(fname) = abs.file_name().and_then(|f| f.to_str()) {
-                for suffix in ["-wal", "-shm"] {
-                    let side = abs.with_file_name(format!("{fname}{suffix}"));
-                    if side.is_file() {
-                        raw.entry(format!("{rel}{suffix}"))
-                            .or_insert(RawSource::Path(side));
-                    }
+                Ok((recs, warns)) => {
+                    records.extend(recs);
+                    warnings.extend(warns);
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "{}: source `{}` ({rel})",
+                        crate::SQLITE_EXTRACTION_FAILED,
+                        src.id
+                    )))
                 }
             }
         } else {
@@ -980,15 +1030,24 @@ fn write_archive(
         writer.add_memory_partition(info.clone(), group)?;
     }
     let mut names = Vec::with_capacity(raw.len());
+    // WP-I.1: per-entry cap on every lazy read + a running whole-tree total,
+    // mirroring the restore side's zip-bomb guard — an archive we would refuse
+    // to restore must not be produced in the first place.
+    let mut total: u64 = 0;
     for (rel, source) in raw {
-        match source {
-            RawSource::Bytes(bytes) => writer.add_raw_source(RUNTIME, rel, bytes)?,
-            RawSource::Path(p) => {
-                let data =
-                    fs::read(p).with_context(|| format!("Failed to read raw source {rel}"))?;
-                writer.add_raw_source(RUNTIME, rel, &data)?;
-            }
+        let data: std::borrow::Cow<'_, [u8]> = match source {
+            RawSource::Bytes(bytes) => std::borrow::Cow::Borrowed(bytes.as_slice()),
+            RawSource::Path(p) => std::borrow::Cow::Owned(read_raw_capped(p, rel)?),
+        };
+        total = total.saturating_add(data.len() as u64);
+        if total > alf_core::MAX_RAW_TOTAL_BYTES {
+            bail!(
+                "raw tree exceeds the {} byte total cap at {rel} \
+                 (a restore would reject the archive)",
+                alf_core::MAX_RAW_TOTAL_BYTES
+            );
         }
+        writer.add_raw_source(RUNTIME, rel, &data)?;
         names.push(rel.clone());
     }
     writer.finish()?;

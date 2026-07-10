@@ -29,7 +29,7 @@ from .dockerctl import (
 from .events import EventLog
 from .narrator import InteractiveAbort, NullNarrator, RichNarrator
 from .provision import Manifest, RuntimeCreds
-from .report import RunReport, StageResult
+from .report import Check, RunReport, StageResult
 from .viz_server import VizServer
 
 LIFECYCLE_DIR = Path(__file__).resolve().parents[1]
@@ -397,7 +397,10 @@ def main(argv=None) -> int:
         else:
             build_image(run.kit.image_tag, run.framework_dir, stream=ui.ok)
 
-        run.container = DockerContainer(container_name, run.kit.image_tag)
+        # Per-exec env files live in the run dir (0700, gitignored): secrets
+        # travel to `docker exec` via --env-file, never as `-e K=V` argv.
+        run.container = DockerContainer(container_name, run.kit.image_tag,
+                                        env_dir=run.paths.run_dir / "env-files")
         run.container.destroy()  # stale name from a crashed run
         # Frameworks whose runtime lives inside the framework home (Hermes) need
         # the run's fresh home seeded from the image, or the bind-mount would
@@ -548,6 +551,22 @@ def finish(run: Run, aborted: bool) -> int:
                 run.alf.close()
             except Exception:  # noqa: BLE001
                 pass
+            # Stdout is the MCP transport: any non-JSON line the server wrote is
+            # a protocol violation. The client tolerated them mid-run so the
+            # tier could finish (diagnosability), but a run with violations must
+            # never exit green — surface them as a synthetic FAIL stage.
+            violations = getattr(run.alf, "last_protocol_violations", None) or []
+            if violations and run.report is not None:
+                synthetic = StageResult(stage_id="mcp-protocol",
+                                        title="MCP stdout protocol discipline")
+                synthetic.add(Check(
+                    name="MCP stdout protocol discipline",
+                    status="FAIL",
+                    detail=f"{len(violations)} non-JSON stdout line(s) from the MCP "
+                           f"server; first: {violations[0][:200]!r}"))
+                run.report.stages.append(synthetic)
+                if run.report.exit_code == 0:
+                    run.report.exit_code = 1
         if run.container is not None and not aborted and not run.args.keep:
             run.container.destroy()
         elif run.container is not None and run.args.keep:

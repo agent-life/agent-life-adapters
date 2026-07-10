@@ -4,10 +4,13 @@
 //! runtime.
 //!
 //! Two modes: `map` replaces the file wholesale; `patch` deep-merges into the
-//! existing map (objects merge recursively, scalars/arrays replace). Either way
-//! the result is parsed and validated **before** anything is written, so an
-//! invalid configuration is rejected with no partial application — the file on
-//! disk is never left half-written.
+//! existing map — objects merge recursively; `memory_sources` merges KEYED BY
+//! entry `id` (matching id → deep-merge that source, new id → append, missing
+//! id → error) so "add one source" can never clobber the others (manual §3.7);
+//! all other scalars/arrays replace. Either way the result is parsed and
+//! validated **before** anything is written, so an invalid configuration is
+//! rejected with no partial application — the file on disk is never left
+//! half-written.
 
 use std::path::Path;
 
@@ -32,9 +35,7 @@ pub(crate) struct ConfigureResult {
     // Skipped when empty on a non-Option ⇒ `#[serde(default)]` (M2a §2).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
-    /// Operational note: the watch surface is computed at server start, so a
-    /// newly-added memory source is not auto-watched until the MCP server is
-    /// restarted (WP-M3 review G2; dynamic re-registration is WP-M5).
+    /// Operational note about when the change takes effect.
     note: String,
 }
 
@@ -77,7 +78,7 @@ pub(crate) fn configure(
             } else {
                 Value::Object(serde_json::Map::new())
             };
-            merge(&mut base, p);
+            merge_top(&mut base, p)?;
             base
         }
     };
@@ -109,10 +110,70 @@ pub(crate) fn configure(
         map_path: map_path.to_string_lossy().into_owned(),
         map: map_value,
         warnings,
-        note: "Restart the MCP server to watch newly-added memory locations \
-               (the watch surface is registered at startup)."
+        note: "The watch surface refreshes automatically: newly-added memory \
+               locations are watched within one tick (manual §4.3)."
             .into(),
     })
+}
+
+/// Top-level merge: like [`merge`], but the `memory_sources` key routes through
+/// the keyed array merge (manual §3.7) and can therefore error (a patch entry
+/// without an `id`).
+fn merge_top(base: &mut Value, patch: Value) -> Result<()> {
+    match (base, patch) {
+        (Value::Object(b), Value::Object(p)) => {
+            for (k, v) in p {
+                let is_sources = k == "memory_sources";
+                let slot = b.entry(k).or_insert(Value::Null);
+                if is_sources {
+                    merge_memory_sources(slot, v)?;
+                } else {
+                    merge(slot, v);
+                }
+            }
+            Ok(())
+        }
+        (b, p) => {
+            *b = p;
+            Ok(())
+        }
+    }
+}
+
+/// Keyed array merge for `memory_sources`: patch entries pair with existing
+/// sources by their `id` (matching id → deep-merge that entry; new id →
+/// append; entry without an id → error, nothing written). Removal stays a
+/// `replace` operation. The natural weak-model call — "add this one source" —
+/// therefore never silently drops the others (the old wholesale-replace
+/// behavior deleted their records on the next sync).
+fn merge_memory_sources(base: &mut Value, patch: Value) -> Result<()> {
+    match (base, patch) {
+        (Value::Array(b), Value::Array(p)) => {
+            for (i, entry) in p.into_iter().enumerate() {
+                let Some(id) = entry.get("id").and_then(Value::as_str).map(str::to_owned) else {
+                    bail!(
+                        "patch memory_sources[{i}] has no \"id\" — patch entries merge by \
+                         id (include the id of the source to add or modify, or use \
+                         operation \"replace\" to rewrite the whole list)"
+                    );
+                };
+                match b
+                    .iter_mut()
+                    .find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()))
+                {
+                    Some(existing) => merge(existing, entry),
+                    None => b.push(entry),
+                }
+            }
+            Ok(())
+        }
+        // Not two arrays (first write, or a deliberate non-list) — replace;
+        // validation rejects a malformed result before anything is written.
+        (b, p) => {
+            *b = p;
+            Ok(())
+        }
+    }
 }
 
 /// Deep-merge `patch` into `base`: two objects merge key-by-key (recursively);
@@ -137,20 +198,11 @@ fn merge(base: &mut Value, patch: Value) {
 /// other's file. Combined with the atomic rename, concurrent writes converge on a
 /// whole (last-writer-wins) map, never a torn one.
 fn atomic_write(path: &Path, contents: &str) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(MAP_FILE);
-    let unique = SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = path.with_file_name(format!(".{name}.tmp.{}.{unique}", std::process::id()));
-    std::fs::write(&tmp, contents).with_context(|| format!("writing {}", tmp.display()))?;
-    std::fs::rename(&tmp, path).with_context(|| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("finalizing {}", path.display())
-    })?;
-    Ok(())
+    // alf-core's writer: pid+counter temp naming, write, fsync, rename — the
+    // fsync is what the old local implementation lacked (a power loss could
+    // rename an unflushed temp over a good map).
+    alf_core::write_atomic(path, contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -218,6 +270,87 @@ mod tests {
         let reloaded = MemoryMap::load(&ws.path().join(MAP_FILE)).unwrap();
         assert_eq!(reloaded.framework.as_deref(), Some("acme"));
         assert_eq!(reloaded.memory_sources.len(), 1);
+    }
+
+    #[test]
+    fn patch_adds_a_source_preserving_existing_ones() {
+        let ws = TempDir::new().unwrap();
+        configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+
+        // The natural "add one source" call must NOT clobber `journal`.
+        let patch = serde_json::json!({ "memory_sources": [
+            { "id": "kb", "glob": "knowledge/**/*.md", "memory_type": "semantic",
+              "namespace": "curated", "chunking": "per_file" }
+        ]});
+        let result = configure("generic", Some(ws.path()), None, Some(patch)).unwrap();
+        let sources = result.map["memory_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 2, "append, never replace: {sources:?}");
+        let ids: Vec<_> = sources.iter().map(|s| s["id"].as_str().unwrap()).collect();
+        assert!(ids.contains(&"journal") && ids.contains(&"kb"));
+    }
+
+    #[test]
+    fn patch_modifies_one_source_by_id() {
+        let ws = TempDir::new().unwrap();
+        configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+
+        let patch = serde_json::json!({ "memory_sources": [
+            { "id": "journal", "glob": "diary/*.md" }
+        ]});
+        let result = configure("generic", Some(ws.path()), None, Some(patch)).unwrap();
+        let sources = result.map["memory_sources"].as_array().unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0]["glob"], "diary/*.md", "patched field applied");
+        assert_eq!(
+            sources[0]["memory_type"], "episodic",
+            "unpatched fields survive the keyed deep-merge"
+        );
+    }
+
+    #[test]
+    fn patch_source_without_id_errors_without_writing() {
+        let ws = TempDir::new().unwrap();
+        configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+        let before = std::fs::read_to_string(ws.path().join(MAP_FILE)).unwrap();
+
+        let patch = serde_json::json!({ "memory_sources": [ { "glob": "x/*.md" } ]});
+        let err = configure("generic", Some(ws.path()), None, Some(patch)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("has no \"id\""),
+            "error must be actionable: {err:#}"
+        );
+        let after = std::fs::read_to_string(ws.path().join(MAP_FILE)).unwrap();
+        assert_eq!(before, after, "nothing written on a rejected patch");
+    }
+
+    #[test]
+    fn patch_arrays_inside_a_source_still_replace() {
+        let ws = TempDir::new().unwrap();
+        let mut map = valid_map();
+        map["memory_sources"][0]["tags"] = serde_json::json!(["static:old", "hashtags"]);
+        configure("generic", Some(ws.path()), Some(map), None).unwrap();
+
+        let patch = serde_json::json!({ "memory_sources": [
+            { "id": "journal", "tags": ["static:new"] }
+        ]});
+        let result = configure("generic", Some(ws.path()), None, Some(patch)).unwrap();
+        assert_eq!(
+            result.map["memory_sources"][0]["tags"],
+            serde_json::json!(["static:new"]),
+            "non-keyed arrays keep replace semantics"
+        );
+    }
+
+    #[test]
+    fn atomic_write_leaves_no_temp_sibling() {
+        let ws = TempDir::new().unwrap();
+        configure("generic", Some(ws.path()), Some(valid_map()), None).unwrap();
+        let leftovers: Vec<_> = std::fs::read_dir(ws.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp siblings: {leftovers:?}");
     }
 
     #[test]

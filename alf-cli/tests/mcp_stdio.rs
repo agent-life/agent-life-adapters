@@ -30,6 +30,11 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+mod common;
+
+/// The pinned agent id of the toy fixture (`.alf-agent-id`).
+const TOY_AGENT_ID: &str = "f47ac10b-58cc-4372-a567-0e02b2c3d479";
+
 fn toy_fixture() -> String {
     concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -54,21 +59,40 @@ fn copy_dir(src: &Path, dst: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Strip every ALF env var that could leak the developer's real configuration
+/// into the isolated child: a stray `ALF_API_KEY` would flip `api_key_set`,
+/// start a live watch loop, and sync the toy fixture into a REAL account
+/// (`Config::load` falls back to the env when the isolated home has no
+/// config.toml); `ALF_WATCH_*` overrides would warp loop timing.
+fn clean_alf_env(cmd: &mut Command) {
+    for var in [
+        "ALF_HUMAN",
+        "ALF_VAULT_KEY",
+        "ALF_AGENT",
+        "ALF_API_KEY",
+        "ALF_API_URL",
+        "ALF_WATCH_DELTA_FLOOR_MS",
+        "ALF_WATCH_QUIESCE_MS",
+        "ALF_WATCH_DEFAULT_INTERVAL_MS",
+        "ALF_WATCH_TICK_MS",
+        "ALF_WATCH_FAULT_BEFORE_UPLOAD",
+    ] {
+        cmd.env_remove(var);
+    }
+}
+
 /// Spawn `alf mcp serve -r generic -w <copy>` with an isolated `ALF_HOME` and the
 /// env cleaned so a stray var can't flip stdout or short-circuit auto-keygen.
 fn spawn(home: &Path, workspace: &Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_alf"))
-        .args(["mcp", "serve", "-r", "generic", "-w"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alf"));
+    cmd.args(["mcp", "serve", "-r", "generic", "-w"])
         .arg(workspace)
         .env("ALF_HOME", home)
-        .env_remove("ALF_HUMAN")
-        .env_remove("ALF_VAULT_KEY")
-        .env_remove("ALF_AGENT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn alf mcp serve")
+        .stderr(Stdio::piped());
+    clean_alf_env(&mut cmd);
+    cmd.spawn().expect("spawn alf mcp serve")
 }
 
 fn call(id: i64, name: &str, arguments: Value) -> Value {
@@ -427,9 +451,23 @@ struct Conversation {
 
 impl Conversation {
     fn start() -> Self {
+        Self::start_inner(None)
+    }
+
+    /// Like [`start`], but seeds `config.toml` pointing at a mock backend so the
+    /// api-key-gated tools (`alf_sync`, `alf_restore`) reach a live service
+    /// (and the watch loop starts). See `common::MockBackend`.
+    fn start_with_backend(api_url: &str) -> Self {
+        Self::start_inner(Some(api_url))
+    }
+
+    fn start_inner(api_url: Option<&str>) -> Self {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         copy_dir(Path::new(&toy_fixture()), workspace.path()).unwrap();
+        if let Some(url) = api_url {
+            common::seed_config(home.path(), url);
+        }
         let mut child = spawn(home.path(), workspace.path());
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
@@ -493,6 +531,15 @@ impl Conversation {
         self.recv_id(id)["result"].clone()
     }
 
+    /// The declared `outputSchema` for a tool (from `tools/list`).
+    fn schema_for(&mut self, name: &str) -> Value {
+        self.tools()
+            .into_iter()
+            .find(|t| t["name"] == name)
+            .and_then(|t| t.get("outputSchema").cloned())
+            .unwrap_or_else(|| panic!("{name} must declare an outputSchema"))
+    }
+
     fn finish(mut self) {
         self.stdin.take(); // close stdin → server exits on EOF
         let _ = self.child.wait();
@@ -523,6 +570,23 @@ fn assert_tool_error(result: &Value, name: &str) {
     assert_eq!(
         result["structuredContent"]["ok"], false,
         "{name} error payload carries ok:false"
+    );
+}
+
+/// Like [`assert_tool_error`], but pins the coded-error contract that the
+/// recovery automation depends on: `{ok:false, code, error, hint}` all reach
+/// the wire (the CliError downcast in `tool_error`).
+fn assert_tool_error_coded(result: &Value, name: &str, code: &str) {
+    assert_tool_error(result, name);
+    let sc = &result["structuredContent"];
+    assert_eq!(sc["code"], code, "{name} must carry code {code}: {sc}");
+    assert!(
+        sc["error"].as_str().is_some_and(|s| !s.is_empty()),
+        "{name} coded error must carry a non-empty error: {sc}"
+    );
+    assert!(
+        sc["hint"].as_str().is_some_and(|s| !s.is_empty()),
+        "{name} coded error must carry a hint: {sc}"
     );
 }
 
@@ -614,8 +678,10 @@ fn every_tool_validates_against_its_schema_in_order() {
     let docs = conv.call(12, "alf_docs", json!({"topic": "recovery"}));
     assert_success(&docs, "alf_docs", &schema_for("alf_docs"));
 
+    // alf_watch_set errors offline: with no API key the loop never started, and
+    // the tool's documented contract (manual §3.13) is to error and say why.
     let watch = conv.call(13, "alf_watch_set", json!({"default_interval": "20m"}));
-    assert_success(&watch, "alf_watch_set", &schema_for("alf_watch_set"));
+    assert_tool_error(&watch, "alf_watch_set");
 
     // Backend-only tools tool-error with no API key configured.
     let sync = conv.call(14, "alf_sync", json!({}));
@@ -626,48 +692,31 @@ fn every_tool_validates_against_its_schema_in_order() {
     conv.finish();
 }
 
-/// `alf_watch_set` clamps sub-floor intervals (with notes), toggles pause, and
-/// returns the effective cadence — the R3 control surface (design §11.3). Offline
-/// the loop is inactive (no API key), but the tool still validates and clamps.
+/// `alf_watch_set` errors when the loop is not running and says why (manual
+/// §3.13). Offline (no API key) the loop never started, so every steer call
+/// tool-errors with the reason — the clamp/note behavior is unit-tested where
+/// the handle has a live engine (see the mcp module's `watch_set_*` tests).
 #[test]
-fn watch_set_clamps_and_reports_effective_config() {
+fn watch_set_reports_why_loop_is_down() {
     let mut conv = Conversation::start();
 
-    // 30s is below the 1-min delta floor; 5m is below the 15-min tracked floor.
-    let r = conv.call(
-        3,
-        "alf_watch_set",
-        json!({"default_interval": "30s", "tracked_files_interval": "5m", "pause": true}),
-    );
-    let sc = &r["structuredContent"];
-    assert_eq!(
-        sc["default_interval_secs"], 60,
-        "delta clamped to 1-min floor"
-    );
-    assert_eq!(
-        sc["tracked_files_interval_secs"], 900,
-        "tracked clamped to 15-min floor"
-    );
-    assert_eq!(sc["paused"], true);
-    assert_eq!(sc["active"], false, "no API key → loop inactive");
+    let r = conv.call(3, "alf_watch_set", json!({"default_interval": "30s"}));
+    assert_tool_error(&r, "alf_watch_set");
+    let err = r["structuredContent"]["error"].as_str().unwrap();
     assert!(
-        sc["notes"].as_array().unwrap().len() >= 2,
-        "both clamps should be noted: {sc}"
+        err.contains("not running") && err.contains("API key"),
+        "the error must explain why the loop is down: {err}"
     );
 
-    // A valid interval above the floors is accepted verbatim; resume clears pause.
-    let r2 = conv.call(
-        4,
-        "alf_watch_set",
-        json!({"default_interval": "10m", "pause": false}),
+    // alf_status carries the same machine-readable reason.
+    let status = conv.call(4, "alf_status", json!({}));
+    let watch = &status["structuredContent"]["watch"];
+    assert!(
+        watch["inactive_reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("API key")),
+        "status watch stanza must carry inactive_reason: {watch}"
     );
-    let sc2 = &r2["structuredContent"];
-    assert_eq!(sc2["default_interval_secs"], 600);
-    assert_eq!(sc2["paused"], false);
-
-    // A malformed interval is a tool error (production validation).
-    let bad = conv.call(5, "alf_watch_set", json!({"default_interval": "soon"}));
-    assert_tool_error(&bad, "alf_watch_set");
 
     conv.finish();
 }
@@ -709,11 +758,12 @@ fn vault_add_auto_generates_key_0600_and_fingerprint_only() {
         keygen["path"].as_str().is_some(),
         "auto-keygen must report the key file path"
     );
-    // No key material leaks into the result.
-    let serialized = serde_json::to_string(structured).unwrap().to_lowercase();
-    assert!(
-        !serialized.contains("base64") && !serialized.contains("s3cr3t"),
-        "the result must never carry key bytes or the secret: {serialized}"
+    // Pin the shape: key_generated is EXACTLY {fingerprint, path} — a future
+    // convenience field carrying the key would break the zero-knowledge property.
+    assert_eq!(
+        keygen.as_object().expect("key_generated object").len(),
+        2,
+        "key_generated must be exactly {{fingerprint, path}}: {keygen}"
     );
 
     // The key file exists under the isolated home and is owner-only (0600).
@@ -725,15 +775,52 @@ fn vault_add_auto_generates_key_0600_and_fingerprint_only() {
         .find(|p| p.extension().is_some_and(|x| x == "key"))
         .expect("a generated .key file must exist");
 
+    // Non-vacuous leak guard: assert the ACTUAL generated key bytes are absent
+    // from the result (a base64 key string never contains the literal "base64",
+    // so the old needle could not catch a leak). Case-sensitive — base64 is.
+    let key_material = std::fs::read_to_string(&key_file)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert!(!key_material.is_empty(), "the key file must have contents");
+    let raw = serde_json::to_string(structured).unwrap();
+    assert!(
+        !raw.contains(&key_material),
+        "the vault key bytes leaked into the tool result"
+    );
+    assert!(
+        !raw.contains("s3cr3t"),
+        "the plaintext secret leaked into the tool result: {raw}"
+    );
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let mode = std::fs::metadata(&key_file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "vault key must be 0600, was {mode:o}");
     }
-    #[cfg(not(unix))]
-    let _ = key_file;
 
+    conv.finish();
+}
+
+/// The coded-error contract reaches the wire (manual §5): a legacy vault with
+/// an empty mapping blocks with `vault_migration_blocked`, and its hint speaks
+/// tool language (the A4 rewrite), not a bare CLI command.
+#[test]
+fn coded_seam_error_reaches_the_wire_with_code_and_hint() {
+    let mut conv = Conversation::start();
+    // Seed a legacy pre-multi-agent vault so require_migrated blocks.
+    let legacy = conv.home.path().join(".alf").join("vault");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("credentials.json"), r#"{"credentials":[]}"#).unwrap();
+
+    let r = conv.call(3, "alf_vault_list", json!({}));
+    assert_tool_error_coded(&r, "alf_vault_list", "vault_migration_blocked");
+    let hint = r["structuredContent"]["hint"].as_str().unwrap();
+    assert!(
+        hint.contains("alf_check") || hint.contains("alf_docs"),
+        "the MCP-context hint must name a tool, not a bare CLI command: {hint}"
+    );
     conv.finish();
 }
 
@@ -859,15 +946,14 @@ fn startup_failure_never_writes_to_stdout() {
     std::fs::create_dir_all(&alf_dir).unwrap();
     std::fs::write(alf_dir.join("config.toml"), "not valid toml = = =\n[").unwrap();
 
-    let out = Command::new(env!("CARGO_BIN_EXE_alf"))
-        .args(["mcp", "serve", "-r", "generic"])
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alf"));
+    cmd.args(["mcp", "serve", "-r", "generic"])
         .env("ALF_HOME", home.path())
-        .env_remove("ALF_HUMAN")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .expect("run alf mcp serve");
+        .stderr(Stdio::piped());
+    clean_alf_env(&mut cmd);
+    let out = cmd.output().expect("run alf mcp serve");
 
     assert!(
         out.stdout.is_empty(),
@@ -901,4 +987,214 @@ fn assert_structured_and_dual(result: &Value) {
         &parsed, structured,
         "dual result: the text block must equal structuredContent"
     );
+}
+
+// ===========================================================================
+// Backend success paths (via the mock service) — WP-A.1 / WP-N.3
+// ===========================================================================
+
+/// `alf_sync` against the mock backend: first sync uploads a snapshot, a
+/// mutation + second sync pushes a delta. Validates both against the schema and
+/// asserts the mock's recorded state advanced.
+#[test]
+fn alf_sync_success_roundtrip_uploads_snapshot_then_delta() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    let sync1 = conv.call(3, "alf_sync", json!({}));
+    assert_success(&sync1, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(
+        sync1["structuredContent"]["sequence"], 1,
+        "first sync is snapshot sequence 1: {}",
+        sync1["structuredContent"]
+    );
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(1));
+
+    // Mutate a tracked memory file so the second sync carries a real delta.
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-05.md"),
+        "## New entry\n\nA fresh memory to force a delta.\n",
+    )
+    .unwrap();
+
+    let sync2 = conv.call(4, "alf_sync", json!({}));
+    assert_success(&sync2, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(
+        sync2["structuredContent"]["sequence"], 2,
+        "second sync is delta sequence 2"
+    );
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 1, "one delta pushed");
+
+    conv.finish();
+}
+
+/// `alf_restore{at_sequence:N}` is a true read-only preview: it writes ONLY the
+/// preview directory, never the live workspace or `~/.alf/state` (manual §3.4).
+#[test]
+fn pit_restore_writes_preview_dir_not_workspace() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    // Establish cloud history: snapshot(seq 1), then a delta(seq 2).
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-06.md"),
+        "## Later\n\nSecond snapshot content.\n",
+    )
+    .unwrap();
+    assert_success(
+        &conv.call(4, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+
+    // Hash the live workspace + capture state mtimes BEFORE the preview.
+    let ws_before = hash_tree(conv.workspace.path());
+    let state_dir = conv.home.path().join(".alf").join("state");
+    let state_before = hash_tree(&state_dir);
+
+    let restore = conv.call(5, "alf_restore", json!({"at_sequence": 1}));
+    assert_success(&restore, "alf_restore", &conv.schema_for("alf_restore"));
+    let sc = &restore["structuredContent"];
+    assert_eq!(sc["preview"], true, "at_sequence is a preview");
+    let preview_path = sc["preview_path"]
+        .as_str()
+        .expect("preview_path must be present for a PIT preview");
+    let preview_dir = Path::new(preview_path);
+    assert!(
+        preview_dir.starts_with(conv.home.path().join(".alf").join("preview")),
+        "preview must land under ~/.alf/preview: {preview_path}"
+    );
+    assert!(
+        std::fs::read_dir(preview_dir).unwrap().next().is_some(),
+        "preview dir must be non-empty"
+    );
+
+    // The live workspace and sync state are byte-for-byte unchanged.
+    assert_eq!(
+        hash_tree(conv.workspace.path()),
+        ws_before,
+        "a preview must NOT touch the live workspace"
+    );
+    assert_eq!(
+        hash_tree(&state_dir),
+        state_before,
+        "a preview must NOT touch ~/.alf/state"
+    );
+
+    conv.finish();
+}
+
+/// Content hash of every file under `root` (path → sha256), for change
+/// detection. Missing dir → empty map.
+fn hash_tree(root: &Path) -> std::collections::BTreeMap<String, String> {
+    use std::collections::BTreeMap;
+    fn walk(dir: &Path, base: &Path, out: &mut BTreeMap<String, String>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, base, out);
+            } else if let Ok(bytes) = std::fs::read(&p) {
+                let rel = p.strip_prefix(base).unwrap().to_string_lossy().into_owned();
+                out.insert(rel, sha256_hex(&bytes));
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+/// Tiny dependency-free SHA-256 (FNV would collide too easily for a fidelity
+/// assertion; this is the reference SHA-256).
+fn sha256_hex(data: &[u8]) -> String {
+    // Reuse alf-core's hashing if exposed; else a compact local impl.
+    use std::fmt::Write;
+    let digest = sha256(data);
+    let mut s = String::with_capacity(64);
+    for b in digest {
+        write!(s, "{b:02x}").unwrap();
+    }
+    s
+}
+
+fn sha256(data: &[u8]) -> [u8; 32] {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+    let mut msg = data.to_vec();
+    let bitlen = (data.len() as u64) * 8;
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bitlen.to_be_bytes());
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (i, wi) in w.iter_mut().enumerate().take(16) {
+            *wi = u32::from_be_bytes([
+                chunk[i * 4],
+                chunk[i * 4 + 1],
+                chunk[i * 4 + 2],
+                chunk[i * 4 + 3],
+            ]);
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+        let mut v = h;
+        for i in 0..64 {
+            let s1 = v[4].rotate_right(6) ^ v[4].rotate_right(11) ^ v[4].rotate_right(25);
+            let ch = (v[4] & v[5]) ^ ((!v[4]) & v[6]);
+            let t1 = v[7]
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
+            let s0 = v[0].rotate_right(2) ^ v[0].rotate_right(13) ^ v[0].rotate_right(22);
+            let maj = (v[0] & v[1]) ^ (v[0] & v[2]) ^ (v[1] & v[2]);
+            let t2 = s0.wrapping_add(maj);
+            v[7] = v[6];
+            v[6] = v[5];
+            v[5] = v[4];
+            v[4] = v[3].wrapping_add(t1);
+            v[3] = v[2];
+            v[2] = v[1];
+            v[1] = v[0];
+            v[0] = t1.wrapping_add(t2);
+        }
+        for (hi, vi) in h.iter_mut().zip(v.iter()) {
+            *hi = hi.wrapping_add(*vi);
+        }
+    }
+    let mut out = [0u8; 32];
+    for (i, word) in h.iter().enumerate() {
+        out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
+    }
+    out
 }

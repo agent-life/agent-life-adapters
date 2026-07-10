@@ -7,11 +7,12 @@
 //!    write state.toml. Atomic-write order: base.alf BEFORE state.toml.
 //! 4. Resolve adapter, import the merged archive into the workspace
 //!
-//! Flow (point-in-time restore, `--at-sequence N`):
+//! Flow (point-in-time preview, `--at-sequence N`):
 //! 1-2. As above.
 //! 3. [`fetch_point_in_time`] — fetch snapshot + deltas bounded by `N`, merge in memory.
 //!    **Does not touch `~/.alf/state/`** — PIT restores are a read-only preview.
-//! 4. Import into the workspace as usual.
+//! 4. Import into `~/.alf/preview/{agent}/seq-{N}/` (manual §3.4) — the live
+//!    workspace is NEVER written, so the watch loop has nothing to pick up.
 //!
 //! `pull_cloud_base` is also reused by `alf sync --recover` (commands/sync.rs).
 
@@ -49,12 +50,17 @@ pub(crate) struct RestoreResult {
     runtime: String,
     memory_records: u64,
     workspace: String,
-    /// `true` when invoked with `--at-sequence N`. Indicates the local sync
-    /// state (`~/.alf/state/`) was deliberately not touched.
+    /// `true` when invoked with `--at-sequence N`: a true read-only preview —
+    /// files land in `preview_path`, and neither the live workspace nor
+    /// `~/.alf/state/` is touched (manual §3.4).
     preview: bool,
     /// Echoes the `--at-sequence N` flag; `None` for a head restore.
     #[serde(skip_serializing_if = "Option::is_none")]
     at_sequence: Option<u64>,
+    /// Where the preview was materialized (`~/.alf/preview/{agent}/seq-{N}/`);
+    /// only present for point-in-time previews. Pruned to the 3 newest per agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_path: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     warnings: Vec<String>,
 }
@@ -99,6 +105,10 @@ pub(crate) struct RestoreToolResult {
     memory_records: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     workspace: Option<String>,
+    /// Point-in-time previews only: the directory the preview was materialized
+    /// into (the live workspace is never written; manual §3.4).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preview_path: Option<String>,
     /// Dry-run only (the files a restore would write).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(with = "Option<Vec<crate::schema::FileEntrySchema>>")]
@@ -120,6 +130,7 @@ impl From<RestoreResult> for RestoreToolResult {
             runtime: Some(r.runtime),
             memory_records: Some(r.memory_records),
             workspace: Some(r.workspace),
+            preview_path: r.preview_path,
             would_write: None,
             warnings: r.warnings,
         }
@@ -139,6 +150,7 @@ impl From<RestoreDryRunResult> for RestoreToolResult {
             runtime: None,
             memory_records: None,
             workspace: None,
+            preview_path: None,
             would_write: Some(d.would_write),
             warnings: d.warnings,
         }
@@ -269,12 +281,16 @@ pub(crate) fn pull_cloud_base(
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
     }
-    fs::write(&local_base, &final_bytes).with_context(|| {
-        format!(
-            "Failed to write restored snapshot base at {}",
-            local_base.display()
-        )
-    })?;
+    // Atomic (temp+fsync+rename): a crash mid-write must never leave a torn
+    // base — every later delta derivation reads this file (manual §4.5).
+    crate::fs_private::write_private_atomic_bytes(&local_base, &final_bytes).with_context(
+        || {
+            format!(
+                "Failed to write restored snapshot base at {}",
+                local_base.display()
+            )
+        },
+    )?;
 
     let state = AgentState {
         agent_id,
@@ -368,6 +384,54 @@ fn resolve_target(
 /// `workspace`. Returns the raw import report plus the resolved cloud sequence.
 /// No printing — interstitial messages go to `progress` (stderr for the CLI, a
 /// progress notification for MCP).
+/// The preview directory for a point-in-time restore (manual §3.4):
+/// `~/.alf/preview/{agent_id}/seq-{N}/`. Honors `ALF_HOME`.
+fn preview_dir(agent_id: Uuid, seq: u64) -> Result<PathBuf> {
+    let home = alf_core::home_dir().context("Could not determine home directory")?;
+    Ok(home
+        .join(".alf")
+        .join("preview")
+        .join(agent_id.to_string())
+        .join(format!("seq-{seq}")))
+}
+
+/// Best-effort prune: keep only the `keep` newest `seq-*` previews (by mtime)
+/// for this agent. Errors are ignored — pruning must never fail a restore.
+fn prune_previews(agent_id: Uuid, keep: usize) {
+    let Ok(base) = preview_dir(agent_id, 0).map(|p| p.parent().map(Path::to_path_buf)) else {
+        return;
+    };
+    let Some(base) = base else { return };
+    prune_seq_dirs(&base, keep);
+}
+
+/// The mtime-ordered `seq-*` prune, factored for testing.
+fn prune_seq_dirs(base: &Path, keep: usize) {
+    let Ok(entries) = fs::read_dir(base) else {
+        return;
+    };
+    let mut dirs: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("seq-"))
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            meta.is_dir().then(|| {
+                (
+                    meta.modified().ok().unwrap_or(std::time::UNIX_EPOCH),
+                    e.path(),
+                )
+            })
+        })
+        .collect();
+    dirs.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
+    for (_, path) in dirs.into_iter().skip(keep) {
+        let _ = fs::remove_dir_all(path);
+    }
+}
+
+/// Perform a head restore into the live workspace, or a point-in-time preview
+/// into the preview directory. Returns the import report, the resolved cloud
+/// sequence, and the directory that was written.
 #[allow(clippy::too_many_arguments)]
 fn perform_restore(
     client: &ApiClient,
@@ -379,10 +443,14 @@ fn perform_restore(
     mode: RestoreMode,
     key_args: &VaultKeyArgs,
     progress: Progress,
-) -> Result<(ImportReport, u64)> {
+) -> Result<(ImportReport, u64, PathBuf)> {
     // Branch on at_sequence:
-    //   None    → head restore: pull_cloud_base writes base.alf + state.toml.
-    //   Some(n) → PIT preview: fetch only, leave ~/.alf/state untouched.
+    //   None    → head restore: pull_cloud_base writes base.alf + state.toml,
+    //             then the archive imports into the LIVE workspace.
+    //   Some(n) → PIT preview: fetch only; the archive imports into the
+    //             preview dir. The live workspace and ~/.alf/state are NEVER
+    //             touched, so the watch loop has nothing to pick up and a
+    //             later sync is unaffected (manual §3.4).
     let (final_bytes, latest_sequence) = match at_sequence {
         None => {
             let base = pull_cloud_base(client, agent_id, progress)?;
@@ -391,12 +459,37 @@ fn perform_restore(
         Some(n) => fetch_point_in_time(client, agent_id, n, progress)?,
     };
 
-    // Import the merged archive into the workspace.
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
     fs::write(&temp_alf, &final_bytes)?;
 
-    progress.emit("  Importing into workspace...");
+    let (target_dir, mode, merge_warning) = match at_sequence {
+        None => (workspace.to_path_buf(), mode, None),
+        Some(n) => {
+            let dir = preview_dir(agent_id, n)?;
+            if dir.exists() {
+                fs::remove_dir_all(&dir)
+                    .with_context(|| format!("clearing stale preview {}", dir.display()))?;
+            }
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("creating preview dir {}", dir.display()))?;
+            // Merge is meaningless against an empty preview dir: force Total.
+            let warning = matches!(mode, RestoreMode::Merge).then(|| {
+                "mode=merge ignored for point-in-time previews (imported as total into an                  empty preview directory)"
+                    .to_string()
+            });
+            (dir, RestoreMode::Total, warning)
+        }
+    };
+
+    progress.emit(&format!(
+        "  Importing into {}...",
+        if at_sequence.is_some() {
+            "preview directory"
+        } else {
+            "workspace"
+        }
+    ));
     let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
     if let Some((_, source)) = &resolved_key {
         progress.emit(&format!(
@@ -408,8 +501,14 @@ fn perform_restore(
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
         mode,
     };
-    let import_report = adapt.import_with_options(&temp_alf, workspace, import_options)?;
-    Ok((import_report, latest_sequence))
+    let mut import_report = adapt.import_with_options(&temp_alf, &target_dir, import_options)?;
+    if let Some(w) = merge_warning {
+        import_report.warnings.push(w);
+    }
+    if at_sequence.is_some() {
+        prune_previews(agent_id, 3);
+    }
+    Ok((import_report, latest_sequence, target_dir))
 }
 
 /// Assemble the JSON `RestoreResult` from a completed restore. Shared by the CLI
@@ -417,7 +516,7 @@ fn perform_restore(
 fn build_restore_result(
     agent_id: Uuid,
     runtime: &str,
-    workspace: &Path,
+    written_to: &Path,
     report: &ImportReport,
     latest_sequence: u64,
     at_sequence: Option<u64>,
@@ -429,9 +528,12 @@ fn build_restore_result(
         sequence: latest_sequence,
         runtime: runtime.to_string(),
         memory_records: report.memory_records,
-        workspace: workspace.to_string_lossy().into(),
+        workspace: written_to.to_string_lossy().into(),
         preview: at_sequence.is_some(),
         at_sequence,
+        preview_path: at_sequence
+            .is_some()
+            .then(|| written_to.to_string_lossy().into_owned()),
         warnings: report.warnings.clone(),
     }
 }
@@ -495,6 +597,30 @@ pub(crate) fn run_for_mcp(
 ) -> Result<RestoreToolResult> {
     let target = resolve_target(runtime, workspace_flag, agent)?;
 
+    // L3 (manual §6): a HEAD restore rewrites the live workspace and moves the
+    // sync state, so it takes the per-agent advisory lock. Previews and dry
+    // runs are read-only with respect to shared state — lock-free.
+    let _agent_lock = if !dry_run && at_sequence.is_none() {
+        let lock_file = crate::commands::mcp::watch::lock_path(target.agent_id)?;
+        if let Some(dir) = lock_file.parent() {
+            let _ = fs::create_dir_all(dir);
+        }
+        Some(
+            crate::commands::mcp::watch::lock::acquire_timeout(
+                &lock_file,
+                std::time::Duration::from_secs(10),
+                std::time::Duration::from_millis(250),
+            )?
+            .ok_or_else(|| {
+                crate::commands::mcp::agent_busy(
+                    "another ALF process is syncing or restoring this agent",
+                )
+            })?,
+        )
+    } else {
+        None
+    };
+
     if dry_run {
         let (enumeration, latest_sequence) = perform_dry_run(
             &target.client,
@@ -516,7 +642,7 @@ pub(crate) fn run_for_mcp(
     // writes Layer 4 (skipped for a dry-run, which writes nothing).
     vault_migrate::require_migrated(&target.config, runtime)?;
 
-    let (report, latest_sequence) = perform_restore(
+    let (report, latest_sequence, written_to) = perform_restore(
         &target.client,
         target.agent_id,
         &target.workspace,
@@ -530,7 +656,7 @@ pub(crate) fn run_for_mcp(
     Ok(build_restore_result(
         target.agent_id,
         runtime,
-        &target.workspace,
+        &written_to,
         &report,
         latest_sequence,
         at_sequence,
@@ -568,15 +694,15 @@ pub fn run(
     if human {
         if let Some(n) = at_sequence {
             println!(
-                "{} Preview: restoring agent {} at sequence {} into {} workspace...",
+                "{} Preview: materializing agent {} at sequence {} into a preview directory...",
                 "▸".blue().bold(),
                 &agent_id.to_string()[..8],
                 n,
-                adapt.name()
             );
             println!(
                 "  {}",
-                "Read-only preview — ~/.alf/state will not be touched.".yellow()
+                "Read-only preview — the live workspace and ~/.alf/state will not be touched."
+                    .yellow()
             );
         } else {
             println!(
@@ -597,7 +723,7 @@ pub fn run(
         ));
     }
 
-    let (import_report, latest_sequence) = perform_restore(
+    let (import_report, latest_sequence, written_to) = perform_restore(
         &target.client,
         agent_id,
         workspace,
@@ -613,8 +739,9 @@ pub fn run(
         println!();
         if preview {
             println!(
-                "{} Preview restore complete (state untouched)",
-                "✓".green().bold()
+                "{} Preview written to {} (workspace and ~/.alf/state untouched)",
+                "✓".green().bold(),
+                written_to.display()
             );
         } else {
             let state_path = crate::state::state_file_path(agent_id)?;
@@ -635,7 +762,11 @@ pub fn run(
         }
         println!("  Sequence:   {latest_sequence}");
         println!();
-        println!("  Workspace: {}", workspace.display());
+        if preview {
+            println!("  Preview dir: {}", written_to.display());
+        } else {
+            println!("  Workspace: {}", workspace.display());
+        }
 
         if !import_report.warnings.is_empty() {
             println!();
@@ -648,7 +779,7 @@ pub fn run(
         output::json(&build_restore_result(
             agent_id,
             runtime,
-            workspace,
+            &written_to,
             &import_report,
             latest_sequence,
             at_sequence,
@@ -723,6 +854,52 @@ fn run_dry_run(
 mod tests {
     use super::*;
 
+    #[test]
+    fn preview_dir_layout_and_prune_keeps_three() {
+        // Path shape (relative components — no env mutation, works on any HOME).
+        let id = Uuid::nil();
+        let dir = preview_dir(id, 7).unwrap();
+        let tail: Vec<_> = dir
+            .components()
+            .rev()
+            .take(4)
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            tail,
+            vec![
+                "seq-7".to_string(),
+                id.to_string(),
+                "preview".to_string(),
+                ".alf".to_string()
+            ],
+            "preview dir must be ~/.alf/preview/{{agent}}/seq-{{N}}"
+        );
+
+        // Prune keeps the 3 newest seq-* dirs (mtime order) and nothing else.
+        let base = tempfile::tempdir().unwrap();
+        for n in 1..=4u64 {
+            let d = base.path().join(format!("seq-{n}"));
+            std::fs::create_dir_all(&d).unwrap();
+            let t = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(n * 1000);
+            let f = std::fs::File::open(&d).unwrap();
+            f.set_modified(t).unwrap();
+        }
+        std::fs::create_dir_all(base.path().join("not-a-preview")).unwrap();
+        prune_seq_dirs(base.path(), 3);
+        assert!(!base.path().join("seq-1").exists(), "oldest pruned");
+        for n in 2..=4u64 {
+            assert!(
+                base.path().join(format!("seq-{n}")).exists(),
+                "seq-{n} kept"
+            );
+        }
+        assert!(
+            base.path().join("not-a-preview").exists(),
+            "non seq-* siblings are never touched"
+        );
+    }
+
     /// Offline pin for the backend-only `alf_restore` success shapes: the stdio
     /// harness only exercises restore's error path (no backend), so validate
     /// both `RestoreToolResult` variants against the declared schema here — this
@@ -743,6 +920,7 @@ mod tests {
             workspace: "/ws".into(),
             preview: false,
             at_sequence: None,
+            preview_path: None,
             warnings: vec![],
         }
         .into();

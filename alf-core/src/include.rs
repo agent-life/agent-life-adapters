@@ -85,11 +85,13 @@ impl IncludeList {
         serde_json::from_str(&content).with_context(|| format!("{INCLUDE_FILE} is not valid JSON"))
     }
 
-    /// Persist to `<workspace>/.alf-include.json` (pretty JSON).
+    /// Persist to `<workspace>/.alf-include.json` (pretty JSON, atomic — a
+    /// crash mid-save can never leave a torn include list).
     pub fn save(&self, workspace: &Path) -> Result<()> {
         let path = workspace.join(INCLUDE_FILE);
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        crate::fs_atomic::write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -215,6 +217,33 @@ fn append_sync_log(workspace: &Path, removed: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Flip restored external include entries to `verified = false` (inert). Returns
+/// the count changed.
+///
+/// Called by adapter imports right after the raw tree (which carries
+/// `.alf-include.json`) is restored: a hostile/compromised archive's external
+/// entries must do nothing on the next sync until the local user re-confirms
+/// them with `alf add --external` (D3 inert-on-restore). In-workspace entries
+/// are untouched; idempotent (already-inert entries stay inert).
+pub fn mark_external_inert(workspace: &Path) -> Result<usize> {
+    let path = workspace.join(INCLUDE_FILE);
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut list = IncludeList::load(workspace)?;
+    let mut changed = 0;
+    for e in list.files.iter_mut() {
+        if e.external && e.verified {
+            e.verified = false;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        list.save(workspace)?;
+    }
+    Ok(changed)
+}
+
 /// Resolve a user-supplied path to a workspace-relative, forward-slashed path
 /// for `alf add`. The path is interpreted relative to the workspace (absolute
 /// paths are accepted if they resolve inside it). Rejects paths that escape the
@@ -330,7 +359,8 @@ pub fn add_allowed_root(dir: &Path) -> Result<PathBuf> {
     if !roots.iter().any(|r| r == &canon) {
         roots.push(canon.clone());
         let body: String = roots.iter().map(|r| format!("{}\n", r.display())).collect();
-        fs::write(&path, body).with_context(|| format!("Failed to write {}", path.display()))?;
+        crate::fs_atomic::write_atomic(&path, body.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
     }
     Ok(canon)
 }
@@ -374,13 +404,29 @@ pub fn is_denylisted(canonical: &Path) -> bool {
 
 /// Validate an external source path for `alf add`/export: canonicalize (resolving
 /// symlinks — the TOCTOU guard), require it to be a file under an allowed root,
-/// and reject denylisted paths. Returns the canonical path on success.
+/// enforce the per-entry size cap, and reject denylisted paths. Returns the
+/// canonical path on success.
+///
+/// The size cap runs at add-time AND at export-time re-validation (via
+/// [`external_entries_for_export`]), so a file that grows past the cap after
+/// being added becomes an export-time skip + warning, never an oversized
+/// archive member.
 pub fn validate_external_source(source: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
     let canon = source
         .canonicalize()
         .with_context(|| format!("external file not found: {}", source.display()))?;
     if !canon.is_file() {
         bail!("external path is not a file: {}", canon.display());
+    }
+    let len = fs::metadata(&canon)
+        .with_context(|| format!("reading metadata for {}", canon.display()))?
+        .len();
+    if len > crate::MAX_RAW_ENTRY_BYTES {
+        bail!(
+            "{} is {len} bytes, over the {} byte per-file cap (a restore would reject it)",
+            canon.display(),
+            crate::MAX_RAW_ENTRY_BYTES
+        );
     }
     if is_denylisted(&canon) {
         bail!(
@@ -735,6 +781,98 @@ mod tests {
             list.files[0].verified,
             "missing verified must default to true"
         );
+    }
+
+    #[test]
+    fn save_leaves_no_temp_sibling() {
+        let dir = ws();
+        let mut list = IncludeList::default();
+        list.add("notes.txt");
+        list.save(dir.path()).unwrap();
+        // The atomic write must leave exactly the include file, no `.tmp.`.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![INCLUDE_FILE.to_string()]);
+        // And the saved list reloads.
+        assert_eq!(
+            IncludeList::load(dir.path()).unwrap().paths(),
+            vec!["notes.txt"]
+        );
+    }
+
+    #[test]
+    fn validate_external_rejects_oversize_file() {
+        let root = ws();
+        let big = root.path().join("huge.bin");
+        // Sparse file: instant to create, reports the oversize length.
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(crate::MAX_RAW_ENTRY_BYTES + 1).unwrap();
+        drop(f);
+        let roots = vec![root.path().canonicalize().unwrap()];
+        let err = validate_external_source(&big, &roots)
+            .expect_err("a file over MAX_RAW_ENTRY_BYTES must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("per-file cap"), "unexpected message: {msg}");
+        assert!(
+            msg.contains(&crate::MAX_RAW_ENTRY_BYTES.to_string()),
+            "message must name the cap: {msg}"
+        );
+        assert!(
+            msg.contains(&(crate::MAX_RAW_ENTRY_BYTES + 1).to_string()),
+            "message must name the size: {msg}"
+        );
+
+        // Exactly at the cap is still fine.
+        let ok = root.path().join("edge.bin");
+        let f = fs::File::create(&ok).unwrap();
+        f.set_len(crate::MAX_RAW_ENTRY_BYTES).unwrap();
+        drop(f);
+        assert!(validate_external_source(&ok, &roots).is_ok());
+    }
+
+    #[test]
+    fn mark_external_inert_flips_only_verified_externals() {
+        let dir = ws();
+        let mut list = IncludeList::default();
+        list.add("in-workspace.txt"); // in-workspace: untouched
+        list.files.push(IncludeEntry {
+            path: "aa-EXT.md".into(),
+            added_at: None,
+            external: true,
+            source: Some("/proj/EXT.md".into()),
+            verified: true, // verified external: flipped
+        });
+        list.files.push(IncludeEntry {
+            path: "bb-OLD.md".into(),
+            added_at: None,
+            external: true,
+            source: Some("/proj/OLD.md".into()),
+            verified: false, // already inert: stays
+        });
+        list.save(dir.path()).unwrap();
+
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 1);
+        let after = IncludeList::load(dir.path()).unwrap();
+        assert!(
+            after.files.iter().all(|e| !e.external || !e.verified),
+            "every external entry must be inert"
+        );
+        let in_ws = after
+            .files
+            .iter()
+            .find(|e| e.path == "in-workspace.txt")
+            .unwrap();
+        assert!(in_ws.verified, "in-workspace entries must be untouched");
+
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 0);
+
+        // Missing include file is a no-op, not an error.
+        let empty = ws();
+        assert_eq!(mark_external_inert(empty.path()).unwrap(), 0);
     }
 
     #[test]

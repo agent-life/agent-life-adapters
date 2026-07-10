@@ -203,11 +203,15 @@ CI gates (design/plan §6). Each is handed off with a runbook in its WP handoff.
   hermes-mcp --llm proxy --backend real --stages Z1-Z3,Z15`). The agent drives
   sync/vault via `mcp_alf_*`; the marker check PASSes only on a positive MCP-path
   log marker (WP-M6 task 0a). Finalize the log/session sink, then keep the run dir.
-* **kill-9 mid-sync catch-up** — `kill9_catchup_gate.py` (WP-M6 task 0b). Build the
-  fault binary, then run the gate; it proves the watch loop's crash-safety
-  (SIGKILL before upload → restart → exactly one catch-up delta, no dup):
+* **pre-upload abort catch-up** — `preupload_abort_catchup_gate.py` (WP-M6 task 0b;
+  formerly the "kill-9" gate). Build the fault binary, then run the gate; it proves
+  catch-up under worst-moment process death at the pre-upload seam (a COOPERATIVE
+  `exit(137)` via the fault-injection build — not a kernel SIGKILL; abort before
+  upload → restart → exactly one catch-up delta, no dup). A true-SIGKILL variant
+  is a specced follow-up:
   ```
   cargo build --release --features fault-injection --target-dir target/faultbuild
-  python3 tests/lifecycle/kill9_catchup_gate.py --service-repo ../agent-life-service
+  python3 tests/lifecycle/preupload_abort_catchup_gate.py --service-repo ../agent-life-service
   ```
-  (See the WP-M6 handoff §"kill-9 catch-up gate" for the finalize-at-live-run notes.)
+  (See the WP-M6 handoff §"pre-upload abort catch-up gate" for the
+  finalize-at-live-run notes.)

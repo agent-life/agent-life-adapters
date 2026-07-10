@@ -12,11 +12,12 @@
 //! The `.db` file itself is still preserved verbatim under `raw/generic/` by the
 //! caller, so a same-runtime restore rewrites the database, not the rows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
+use anyhow::{bail, Context, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
 use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags};
 use uuid::Uuid;
@@ -26,11 +27,16 @@ use alf_core::{ExtractionMethod, MemoryRecord, MemoryStatus, SourceProvenance, T
 use crate::export::{build_tags, parse_memory_type, RUNTIME};
 use crate::map::MemorySourceSpec;
 
-/// Read `db_path`'s rows for `src` (a `sqlite_rows` source) into records.
+/// Read `db_path`'s rows for `src` (a `sqlite_rows` source) into records, plus
+/// human-readable warnings (at most one per source, counting rows whose
+/// timestamp column was unparseable and fell back to the file mtime).
 ///
-/// Returns an empty vec when the configured table is absent (a lazy/empty store
-/// must never fail the export). `rel_path` is the workspace-relative `.db` path
-/// (the records' `origin_file`); `file_mtime` is the fallback timestamp.
+/// Returns empty vecs when the configured table is absent (a lazy/empty store
+/// must never fail the export). Any *other* failure — locked database, corrupt
+/// file, schema drift, NULL/duplicate primary keys — is a hard error: the
+/// caller fails the whole export rather than degrade to zero records (which
+/// would mass-delete cloud history). `rel_path` is the workspace-relative `.db`
+/// path (the records' `origin_file`); `file_mtime` is the fallback timestamp.
 pub fn extract_rows(
     db_path: &Path,
     rel_path: &str,
@@ -38,7 +44,7 @@ pub fn extract_rows(
     generic_ns: &Uuid,
     agent_id: Uuid,
     file_mtime: DateTime<Utc>,
-) -> Result<Vec<MemoryRecord>> {
+) -> Result<(Vec<MemoryRecord>, Vec<String>)> {
     let spec = src
         .sqlite
         .as_ref()
@@ -46,13 +52,23 @@ pub fn extract_rows(
 
     let conn = Connection::open_with_flags(db_path, OpenFlags::SQLITE_OPEN_READ_ONLY)
         .with_context(|| format!("opening sqlite db {}", db_path.display()))?;
+    // Wait out a short-lived writer lock instead of failing the export on the
+    // first SQLITE_BUSY (§3.7.1: the reader waits up to 5 s for a busy db).
+    conn.busy_timeout(Duration::from_secs(5))
+        .context("setting sqlite busy_timeout")?;
+    // Disable SQLite's double-quoted-string-literal misfeature: without this a
+    // misconfigured column name (e.g. a typo'd content_column) silently
+    // evaluates as a literal string for every row instead of erroring — the
+    // exact silent-garbage failure the hard-fail contract (§3.7.1) forbids.
+    conn.set_db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_DQS_DML, false)
+        .context("disabling sqlite double-quoted string literals")?;
 
     // Absent table → no records (do not fail the whole export on a lazy store).
     let table_exists: bool = conn
         .prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?
         .exists([spec.table.as_str()])?;
     if !table_exists {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
 
     // Identifiers were validated identifier-safe at map-validate time; quote them
@@ -73,8 +89,32 @@ pub fn extract_rows(
         .with_context(|| format!("preparing sqlite extraction query `{sql}`"))?;
     let mut query = stmt.query([])?;
     let mut records = Vec::new();
+    let mut seen_pks: HashSet<String> = HashSet::new();
+    let mut unparseable_timestamps: u64 = 0;
     while let Some(row) = query.next()? {
-        let pk = value_to_string(row.get::<_, Value>(0)?);
+        let pk_value = row.get::<_, Value>(0)?;
+        // NULL or duplicate primary keys are schema misconfigurations: the
+        // pk-derived record ids would collide (silent row loss), so hard-fail
+        // the extraction — the caller fails the export (decision 4).
+        if matches!(pk_value, Value::Null) {
+            bail!(
+                "table \"{}\" has a row with NULL \"{}\": sqlite_rows requires a \
+                 non-NULL primary key in id_column (point id_column at a NOT NULL \
+                 unique key or fix the row)",
+                spec.table,
+                spec.id_column
+            );
+        }
+        let pk = value_to_string(pk_value);
+        if !seen_pks.insert(pk.clone()) {
+            bail!(
+                "table \"{}\" has a duplicate \"{}\" value {pk:?}: sqlite_rows \
+                 requires unique id_column values (point id_column at a unique key \
+                 or fix the rows)",
+                spec.table,
+                spec.id_column
+            );
+        }
         let content = value_to_string(row.get::<_, Value>(1)?);
         let ts_raw = match ts_col {
             Some(_) => match row.get::<_, Value>(2)? {
@@ -93,10 +133,10 @@ pub fn extract_rows(
         // A parseable timestamp column → created_at + observed_at; else the file
         // mtime (reconcile carries a matched row's created_at forward, so a mtime
         // that moves on every edit never surfaces as a spurious update).
-        let parsed_ts = ts_raw
-            .as_deref()
-            .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&Utc));
+        let parsed_ts = ts_raw.as_deref().and_then(parse_row_timestamp);
+        if ts_raw.is_some() && parsed_ts.is_none() {
+            unparseable_timestamps += 1;
+        }
         let (created_at, observed_at) = match parsed_ts {
             Some(t) => (t, Some(t)),
             None => (file_mtime, None),
@@ -148,7 +188,34 @@ pub fn extract_rows(
             extra: HashMap::new(),
         });
     }
-    Ok(records)
+    let mut warnings = Vec::new();
+    if unparseable_timestamps > 0 {
+        warnings.push(format!(
+            "sqlite source {rel_path}: {unparseable_timestamps} row(s) have an \
+             unparseable \"{}\" value; fell back to the file mtime (accepted: \
+             RFC3339, \"YYYY-MM-DD HH:MM:SS\" as UTC, or integer epoch seconds)",
+            spec.timestamp_column.as_deref().unwrap_or("timestamp"),
+        ));
+    }
+    Ok((records, warnings))
+}
+
+/// Parse a row timestamp (§3.7.1): RFC3339, SQLite's default
+/// `YYYY-MM-DD HH:MM:SS[.fff]` (read as UTC), or integer epoch seconds —
+/// anything else is `None` (the caller falls back to the file mtime and counts
+/// it toward the per-source warning).
+fn parse_row_timestamp(s: &str) -> Option<DateTime<Utc>> {
+    let s = s.trim();
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.with_timezone(&Utc));
+    }
+    if let Ok(naive) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(naive.and_utc());
+    }
+    if let Ok(epoch) = s.parse::<i64>() {
+        return DateTime::from_timestamp(epoch, 0);
+    }
+    None
 }
 
 /// Canonical string for a sqlite cell: text as-is, integers/reals decimalised,
@@ -205,13 +272,21 @@ mod tests {
         }
     }
 
-    fn extract(path: &Path) -> Vec<MemoryRecord> {
+    /// Fixed fallback mtime, keeping tests deterministic.
+    fn fixed_mtime() -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-02-02T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+    }
+
+    fn extract_with_warnings(path: &Path) -> (Vec<MemoryRecord>, Vec<String>) {
         // A fixed mtime keeps the test deterministic; the timestamp column drives
         // created_at anyway.
-        let mtime = DateTime::parse_from_rfc3339("2026-02-02T00:00:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        extract_rows(path, "brain.db", &source(), &NS, agent(), mtime).unwrap()
+        extract_rows(path, "brain.db", &source(), &NS, agent(), fixed_mtime()).unwrap()
+    }
+
+    fn extract(path: &Path) -> Vec<MemoryRecord> {
+        extract_with_warnings(path).0
     }
 
     /// (creates, updates, deletes) for the current DB state vs `base`, run through
@@ -315,6 +390,164 @@ mod tests {
             .execute_batch("CREATE TABLE other (x TEXT);")
             .unwrap();
         assert!(extract(&db).is_empty());
+    }
+
+    #[test]
+    fn null_pk_is_a_hard_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        // No PRIMARY KEY constraint, so a NULL id row can exist.
+        conn.execute_batch("CREATE TABLE memories (id TEXT, content TEXT, updated_at TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO memories (id, content) VALUES (NULL, 'orphan')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        let err = extract_rows(&db, "brain.db", &source(), &NS, agent(), fixed_mtime())
+            .expect_err("a NULL primary key must hard-fail the extraction");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("NULL \"id\""), "unexpected message: {msg}");
+        assert!(msg.contains("\"memories\""), "must name the table: {msg}");
+    }
+
+    #[test]
+    fn duplicate_pk_is_a_hard_error_naming_the_pk() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT, content TEXT, updated_at TEXT);
+             INSERT INTO memories (id, content) VALUES ('dup', 'first');
+             INSERT INTO memories (id, content) VALUES ('dup', 'second');",
+        )
+        .unwrap();
+        drop(conn);
+        let err = extract_rows(&db, "brain.db", &source(), &NS, agent(), fixed_mtime())
+            .expect_err("a duplicate primary key must hard-fail the extraction");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("duplicate \"id\" value \"dup\""),
+            "must name the offending pk: {msg}"
+        );
+    }
+
+    #[test]
+    fn busy_timeout_waits_out_a_short_writer_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        build_db(&db, &[("a", "alpha")]);
+        // A writer holds an exclusive lock for 300 ms in another thread; the
+        // reader's 5 s busy_timeout must wait it out instead of erroring.
+        let writer = Connection::open(&db).unwrap();
+        writer.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            writer.execute_batch("COMMIT;").unwrap();
+        });
+        let recs = extract(&db);
+        handle.join().unwrap();
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].content, "alpha");
+    }
+
+    #[test]
+    fn sqlite_default_datetime_format_parses_as_utc() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+             INSERT INTO memories VALUES ('a', 'alpha', '2026-01-01 12:30:45');
+             INSERT INTO memories VALUES ('b', 'beta', '2026-01-01 12:30:45.500');",
+        )
+        .unwrap();
+        drop(conn);
+        let (recs, warnings) = extract_with_warnings(&db);
+        assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
+        assert_eq!(
+            recs[0].temporal.created_at.to_rfc3339(),
+            "2026-01-01T12:30:45+00:00",
+            "SQLite's default datetime format must be read as UTC"
+        );
+        assert_eq!(
+            recs[1].temporal.created_at.to_rfc3339(),
+            "2026-01-01T12:30:45.500+00:00",
+            "fractional seconds must parse too"
+        );
+        assert!(recs[0].temporal.observed_at.is_some());
+    }
+
+    #[test]
+    fn epoch_seconds_timestamp_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at INTEGER);
+             INSERT INTO memories VALUES ('a', 'alpha', 1767225600);",
+        )
+        .unwrap();
+        drop(conn);
+        let (recs, warnings) = extract_with_warnings(&db);
+        assert!(warnings.is_empty(), "no warning expected: {warnings:?}");
+        assert_eq!(
+            recs[0].temporal.created_at.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn unparseable_timestamps_warn_once_and_fall_back_to_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+             INSERT INTO memories VALUES ('a', 'alpha', 'yesterday-ish');
+             INSERT INTO memories VALUES ('b', 'beta', '01/02/2026');
+             INSERT INTO memories VALUES ('c', 'gamma', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+        let (recs, warnings) = extract_with_warnings(&db);
+        // ONE warning for the source, counting both unparseable rows.
+        assert_eq!(warnings.len(), 1, "exactly one warning: {warnings:?}");
+        assert!(
+            warnings[0].contains("2 row(s)"),
+            "warning must count the rows: {}",
+            warnings[0]
+        );
+        // Unparseable rows fell back to the file mtime, observed_at absent.
+        assert_eq!(recs[0].temporal.created_at, fixed_mtime());
+        assert!(recs[0].temporal.observed_at.is_none());
+        // The parseable row still uses its own timestamp.
+        assert_eq!(
+            recs[2].temporal.created_at.to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+    }
+
+    #[test]
+    fn wal_mode_rows_are_extracted() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+             INSERT INTO memories VALUES ('a', 'wal row', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        // The writing connection stays open: the row lives in the -wal file,
+        // not yet checkpointed into the main db. The reader must still see it.
+        assert!(db.with_file_name("brain.db-wal").exists());
+        let recs = extract(&db);
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].content, "wal row");
+        drop(conn);
     }
 
     #[test]

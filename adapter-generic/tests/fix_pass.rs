@@ -24,6 +24,14 @@ fn isolate_home() {
     });
 }
 
+/// Serializes tests that read-modify-write the shared `$HOME/.alf/external-roots`
+/// policy file (`add_allowed_root` is not designed for concurrent same-process
+/// writers; parallel test threads would lose each other's blessed roots).
+fn external_roots_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn write(ws: &Path, rel: &str, content: &str) {
     let p = ws.join(rel);
     if let Some(parent) = p.parent() {
@@ -172,6 +180,7 @@ fn s3_control_files_never_become_records_under_star_star() {
     write(&ws, ".alf-agent-id", "f47ac10b-58cc-4372-a567-0e02b2c3d479");
     write(&ws, ".alf-sync-log.md", "- 2026-01-01: removed x\n");
     write(&ws, ".alfignore", "# nothing\n");
+    write(&ws, ".alf-include.lock", "");
     write(
         &ws,
         ".alf-map.json",
@@ -191,6 +200,7 @@ fn s3_control_files_never_become_records_under_star_star() {
     for control in [
         ".alf-map.json",
         ".alf-include.json",
+        ".alf-include.lock",
         ".alf-sync-log.md",
         ".alf-agent-id",
         ".alfignore",
@@ -359,6 +369,7 @@ fn c1_alfignore_excludes_matched_files_and_is_counted() {
 #[test]
 fn c2_external_tracked_file_is_packed_under_external() {
     isolate_home();
+    let _roots_guard = external_roots_lock();
     let tmp = TempDir::new().unwrap();
     let ws = knowledge_ws(&tmp);
     write(&ws, "knowledge/a.md", "# A\n\nnote");
@@ -383,6 +394,175 @@ fn c2_external_tracked_file_is_packed_under_external() {
             .iter()
             .any(|n| n.starts_with("raw/generic/external/")),
         "external file was not packed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-G — SQLite extraction hard-fails the export; consistent WAL capture
+// ---------------------------------------------------------------------------
+
+/// A workspace whose only source is a `sqlite_rows` map over `brain.db`.
+fn sqlite_ws(tmp: &TempDir) -> std::path::PathBuf {
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    write(
+        &ws,
+        ".alf-map.json",
+        r#"{"version":1,"memory_sources":[
+            {"id":"brain","glob":"brain.db","memory_type":"semantic",
+             "namespace":"curated","chunking":"sqlite_rows",
+             "sqlite":{"table":"memories","id_column":"id",
+                       "content_column":"content","timestamp_column":"updated_at"}}]}"#,
+    );
+    ws
+}
+
+#[test]
+fn sqlite_schema_error_hard_fails_the_export_with_marker() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    // The map names a content_column that does not exist → schema drift.
+    write(
+        &ws,
+        ".alf-map.json",
+        r#"{"version":1,"memory_sources":[
+            {"id":"brain","glob":"brain.db","memory_type":"semantic",
+             "namespace":"curated","chunking":"sqlite_rows",
+             "sqlite":{"table":"memories","id_column":"id",
+                       "content_column":"no_such_column"}}]}"#,
+    );
+    let conn = rusqlite::Connection::open(ws.join("brain.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT);
+         INSERT INTO memories VALUES ('a', 'alpha');",
+    )
+    .unwrap();
+    drop(conn);
+
+    let out = tmp.path().join("out.alf");
+    let err = GenericAdapter
+        .export(&ws, &out)
+        .expect_err("a sqlite schema error must hard-fail the export (decision 4)");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains(adapter_generic::SQLITE_EXTRACTION_FAILED),
+        "error must carry the classify() marker: {msg}"
+    );
+    assert!(
+        msg.contains("`brain`"),
+        "error must name the source id: {msg}"
+    );
+    // Hard fail means no archive was produced (silent zero-record degrade would
+    // have mass-deleted the cloud history on the next delta).
+    assert!(!out.exists(), "a failed export must not write an archive");
+}
+
+#[test]
+fn wal_mode_db_packs_db_and_wal_sidecar() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = sqlite_ws(&tmp);
+    let conn = rusqlite::Connection::open(ws.join("brain.db")).unwrap();
+    conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+         INSERT INTO memories VALUES ('a', 'wal-borne row', '2026-01-01T00:00:00Z');",
+    )
+    .unwrap();
+    // The writing connection stays OPEN across the export: the row lives in the
+    // live `-wal` sidecar, not the main db file.
+    assert!(ws.join("brain.db-wal").exists());
+
+    let out = tmp.path().join("out.alf");
+    export(&ws, &out);
+    drop(conn);
+
+    let names = archive_names(&out);
+    assert!(
+        names.iter().any(|n| n == "raw/generic/brain.db"),
+        "brain.db must be packed: {names:?}"
+    );
+    assert!(
+        names.iter().any(|n| n == "raw/generic/brain.db-wal"),
+        "the live -wal sidecar must be packed with the db (WP-G.3): {names:?}"
+    );
+    // The WAL-borne row was still extracted into a memory record.
+    assert!(
+        memory(&out).iter().any(|r| r.content == "wal-borne row"),
+        "rows living only in the WAL must still extract"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WP-I.1 — size caps at export
+// ---------------------------------------------------------------------------
+
+#[test]
+fn oversize_tracked_include_hard_fails_export() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = knowledge_ws(&tmp);
+    write(&ws, "knowledge/a.md", "# A\n\nnote");
+    // A tracked include over the per-entry cap (sparse → instant).
+    let big = ws.join("big.bin");
+    let f = fs::File::create(&big).unwrap();
+    f.set_len(alf_core::MAX_RAW_ENTRY_BYTES + 1).unwrap();
+    drop(f);
+    let mut list = alf_core::include::IncludeList::default();
+    list.add("big.bin");
+    list.save(&ws).unwrap();
+
+    let out = tmp.path().join("out.alf");
+    let err = GenericAdapter
+        .export(&ws, &out)
+        .expect_err("an oversize tracked include must fail the export");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("per-file cap"), "unexpected message: {msg}");
+    assert!(!out.exists(), "a failed export must not write an archive");
+}
+
+#[test]
+fn oversize_external_is_skipped_with_warning_at_export() {
+    isolate_home();
+    let _roots_guard = external_roots_lock();
+    let tmp = TempDir::new().unwrap();
+    let ws = knowledge_ws(&tmp);
+    write(&ws, "knowledge/a.md", "# A\n\nnote");
+
+    // An external file that was small (and valid) when added...
+    let ext_root = tmp.path().join("shared-grow");
+    fs::create_dir_all(&ext_root).unwrap();
+    let ext_file = ext_root.join("GROWING.md");
+    fs::write(&ext_file, "small at add time").unwrap();
+    let canon = ext_file.canonicalize().unwrap();
+    alf_core::include::add_allowed_root(&ext_root).unwrap();
+    let mut list = alf_core::include::IncludeList::default();
+    let sanitized = alf_core::include::sanitized_external_name(&canon);
+    list.add_external(&sanitized, canon.to_str().unwrap());
+    list.save(&ws).unwrap();
+
+    // ...then grew past the cap before the next export.
+    let f = fs::OpenOptions::new().write(true).open(&ext_file).unwrap();
+    f.set_len(alf_core::MAX_RAW_ENTRY_BYTES + 1).unwrap();
+    drop(f);
+
+    let out = tmp.path().join("out.alf");
+    let report = export(&ws, &out); // succeeds — external re-validation skips it
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("rejected at export") && w.contains("per-file cap")),
+        "expected an export-time skip warning: {:?}",
+        report.warnings
+    );
+    assert!(
+        !archive_names(&out)
+            .iter()
+            .any(|n| n.starts_with("raw/generic/external/")),
+        "the oversize external must not be packed"
     );
 }
 

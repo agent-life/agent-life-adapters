@@ -76,6 +76,11 @@ pub struct WatchStatus {
     /// Whether the loop is paused (`alf_watch_set {pause:true}` or mid-restore).
     #[serde(default)]
     pub paused: bool,
+    /// Why the loop is NOT running (e.g. "no API key configured", "watch loop
+    /// not started: unknown runtime"). Present only when the loop never
+    /// started or bailed (manual §4.6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inactive_reason: Option<String>,
     /// Present when auto-sync has parked on an unrecoverable error and is waiting
     /// for operator intervention (design §7.W4).
     #[serde(skip_serializing_if = "Option::is_none")]

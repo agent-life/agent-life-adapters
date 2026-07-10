@@ -838,11 +838,12 @@ Secrets and identity are set in the server's environment **before the model runs
 
 ### The watch loop
 
-The loop is what makes MCP mode token-free (design §11). It marks a source dirty on a filesystem event (plus a periodic rescan — editors and DB engines evade inotify), debounces to the interval, captures safely (SQLite by header → backup API / `VACUUM INTO`; everything else copy-on-quiesce), then calls the same sync seam a tool call would.
+The loop is what makes MCP mode token-free (design §11). It marks a source dirty on a filesystem event (plus a periodic rescan — editors and DB engines evade inotify), debounces to the interval, captures safely (v1 captures raw bytes once the source has been quiet for the debounce window — a SQLite store gets NO exemption and waits out the same window; `VACUUM INTO`-based row extraction is reserved for v2), then calls the same sync seam a tool call would.
 
 - **Intervals.** Memory/raw changes ride the delta channel: floor **1 min**, ceiling **24 h**. A change to a tracked (`alf_track`) file triggers a **full-snapshot rollover** (§6.1) batched on its own knob — floor **15 min**, default **1 h**. Both are validation-clamped; steer them with `alf_watch_set` or the map's `watch` block.
 - **Catch-up on start.** On spawn the loop dirty-scans against the base snapshot, so anything changed while no server was alive syncs on the first tick. A crashed server, a rebooted machine, and a laptop closed for a week all resolve the same way: next session, first tick, one delta.
 - **Crash-safe by SIGKILL.** The spec sanctions SIGKILL as normal shutdown, so mid-sync death is safe by construction: state writes are temp+rename atomic and the upload is sequence-CAS'd server-side, so a killed sync leaves either "old base + old state" (retry = the same delta) or "new state fully committed".
+- **Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `lock_unavailable`. A successful manual `alf_sync` (or an `alf_watch_set` resume) clears the park.
 - **No daemon mode.** The loop lives only as long as the host keeps the session alive (the MCP convention: the client owns the process). Host-independent cadence stays with the CLI + OS cron on user machines and the boot/shutdown hooks on cloud runtimes.
 
 Per-host setup is in [MCP client configuration](#mcp-client-configuration); retiring an agent is in [Decommissioning an agent](#decommissioning-an-agent).
@@ -925,7 +926,7 @@ The `generic` runtime has no built-in knowledge of a framework's layout: a `.alf
     { "id": "journal",  "glob": "memories/*.md",    "memory_type": "episodic",
       "namespace": "daily",      "chunking": "by_heading",
       "timestamp": "filename_date",                  // filename_date | frontmatter:<key> | file_mtime
-      "tags": ["hashtags"] },                         // ["hashtags"] | a literal static tag
+      "tags": ["hashtags"] },                         // "hashtags" | "static:<tag>" | "frontmatter:<key>"
     { "id": "knowledge","glob": "knowledge/**/*.md", "memory_type": "semantic",
       "namespace": "curated",    "chunking": "per_file", "timestamp": "file_mtime" },
     { "id": "howto",    "glob": "procedures/*.md",   "memory_type": "procedural",
@@ -953,7 +954,7 @@ Globs use single-segment `*` (never crosses `/`) and whole-component `**` (`know
 ### Timestamp, tag, and chunking modes
 
 - **`timestamp`** — `filename_date` (a `YYYY-MM-DD` filename → midnight UTC → `created_at` + `observed_at`); `frontmatter:<key>` (a YAML front-matter key); or `file_mtime` (`created_at` = mtime, no `observed_at`). `updated_at` is always the file mtime.
-- **`tags`** — `["hashtags"]` extracts `#word` tokens from the content; a literal string adds that static tag to every record from the source. The namespace is always added as a tag.
+- **`tags`** — a list of directives: `hashtags` extracts `#word` tokens from the content; `static:<tag>` adds that literal tag to every record from the source; `frontmatter:<key>` reads tags from a YAML front-matter key. A bare literal string (e.g. `"kb"`) is rejected — write `static:kb`. The namespace is always added as a tag.
 - **`chunking`** — `per_file` (the whole file is one record; `heading: null`, `line_start: 1`) or `by_heading` (split on ATX level-2 `## ` headings, fence-aware). Ids are content-addressed (UUIDv5 over `GENERIC_NS`), so an in-place body edit reconciles to the **same record id** (1 Update) while a heading rewrite is a delete+create.
 
 ### Worked example
@@ -989,7 +990,7 @@ Dashboard result: two Episodic cards titled by heading, `source: memories/2026-0
 
 Retiring an agent is a deliberate human CLI operation — it is **not** an MCP tool (an agent must not be able to delete its own cloud history). There are two levels:
 
-**Reversible — stop syncing, keep everything.** `alf agents disable <alias-or-id>` marks the agent ineligible for sync; the cloud archive and local state are untouched, and `alf agents enable` brings it back (registration stays lazy). A running MCP server pinned to a disabled agent parks at its next sync with `agent_disabled` in `alf_status`.
+**Reversible — stop syncing, keep everything.** `alf agents disable <alias-or-id>` marks the agent ineligible for sync; the cloud archive and local state are untouched, and `alf agents enable` brings it back (registration stays lazy). A running MCP server pinned to a disabled agent parks at its next sync — `alf_status` shows park code `watch_parked` (the underlying sync error is coded `agent_disabled`).
 
 **Irreversible — purge the cloud history.**
 

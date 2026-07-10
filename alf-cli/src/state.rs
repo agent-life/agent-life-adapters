@@ -338,6 +338,9 @@ snapshot_path = "/tmp/legacy-snapshot.alf"
 
     #[test]
     fn local_base_path_format() {
+        // HOME_LOCK: the path derives from ALF_HOME/HOME, which other tests
+        // mutate under this lock — read-side must serialize too.
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
         let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let base = local_base_path(id).unwrap();
         assert!(base.ends_with(format!("{id}-snapshot.alf")));
@@ -368,6 +371,9 @@ snapshot_path = "/tmp/legacy-snapshot.alf"
 
     #[test]
     fn state_file_and_local_base_paths_share_state_dir() {
+        // HOME_LOCK: both calls re-read ALF_HOME/HOME; without the lock a
+        // concurrent env-mutating test can flip the home between them.
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
         let id = Uuid::new_v4();
         let s = state_file_path(id).unwrap();
         let b = local_base_path(id).unwrap();

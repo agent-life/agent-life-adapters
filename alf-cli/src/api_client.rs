@@ -182,6 +182,13 @@ impl ApiClient {
     ///
     /// Returns an error if the API key is not configured.
     pub fn from_config(config: &Config) -> Result<Self> {
+        Self::from_config_with_timeout(config, std::time::Duration::from_secs(120))
+    }
+
+    /// Build a client with an explicit request timeout. `alf_status` uses a
+    /// short timeout for its reachability probes (manual §3.1) so a blackholed
+    /// backend can't stall the tool for the default two minutes per agent.
+    pub fn from_config_with_timeout(config: &Config, timeout: std::time::Duration) -> Result<Self> {
         if config.service.api_key.is_empty() {
             bail!(
                 "No API key configured. Run `alf login` to authenticate, \
@@ -189,7 +196,7 @@ impl ApiClient {
             );
         }
         let http = Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(timeout)
             .build()
             .context("failed to build HTTP client")?;
 

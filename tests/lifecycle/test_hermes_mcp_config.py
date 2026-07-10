@@ -259,12 +259,29 @@ class HermesMcpServerLedgerTest(unittest.TestCase):
         k._add_server_checks(w, "PINNED", w, res)
         self.assertEqual(self._server_check(res.checks).status, "PASS")
 
-    def test_missing_stderr_log_skips_never_fails(self):
-        # An older Hermes that routes child stderr elsewhere must not FAIL the
-        # gate on an assertion it structurally cannot make.
+    def test_missing_mcp_stderr_log_fails_closed(self):
+        # FAIL-CLOSED (WP-O.4, replaces the old skips-never-fails behavior): the
+        # server ALWAYS writes its startup banner to stderr, so a missing/empty
+        # mcp-stderr.log means the capture plumbing is broken and the gate's
+        # server-side lane is blind — that must FAIL, not SKIP into a green run.
         k = self._kit()
         res = _FakeResult()
         k._add_server_checks([], "PINNED", [], res)
+        c = self._server_check(res.checks)
+        self.assertEqual(c.status, "FAIL")
+        self.assertIn("fails closed", c.detail)
+
+    def test_no_resolved_spawn_in_window_still_skips(self):
+        # The LATER legitimate SKIP branch survives: sessions were captured (the
+        # plumbing works) but no gate-window spawn recorded a watch/vault agent
+        # line — the tool may have errored before bind; that is a SKIP, not a
+        # fail-closed condition.
+        k = self._kit()
+        log = "===== [t] starting MCP server 'alf' =====\n" \
+              "alf mcp serve: stdio server ready (runtime=hermes)"
+        sessions = k._server_sessions(_FakeCtr(stderr_log=log), "default")
+        res = _FakeResult()
+        k._add_server_checks(sessions, "PINNED", sessions, res)
         self.assertEqual(self._server_check(res.checks).status, "SKIP")
 
     def test_since_idx_scopes_to_gate_window(self):

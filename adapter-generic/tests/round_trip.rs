@@ -221,6 +221,81 @@ fn heading_and_body_edit_is_create_plus_delete() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// WP-I.2 — inert-on-restore for external include entries
+// ---------------------------------------------------------------------------
+
+#[test]
+fn restored_external_entries_are_inert_and_not_repacked() {
+    isolate_home(); // must precede add_allowed_root (policy file lives in $HOME)
+    let tmp = tempfile::TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(ws.join("knowledge")).unwrap();
+    fs::write(
+        ws.join(".alf-map.json"),
+        r#"{"version":1,"memory_sources":[
+            {"id":"kb","glob":"knowledge/**/*.md","memory_type":"semantic",
+             "namespace":"curated","chunking":"per_file"}]}"#,
+    )
+    .unwrap();
+    fs::write(ws.join("knowledge/a.md"), "# A\n\nnote").unwrap();
+
+    // A VERIFIED external file under a blessed root.
+    let ext_root = tmp.path().join("proj");
+    fs::create_dir_all(&ext_root).unwrap();
+    let ext = ext_root.join("AGENTS.md");
+    fs::write(&ext, "# Ops\nshared doc").unwrap();
+    let canon = ext.canonicalize().unwrap();
+    alf_core::include::add_allowed_root(&ext_root).unwrap();
+    let mut list = alf_core::include::IncludeList::default();
+    let sanitized = alf_core::include::sanitized_external_name(&canon);
+    list.add_external(&sanitized, canon.to_str().unwrap());
+    list.save(&ws).unwrap();
+
+    // Export packs it under raw/generic/external/.
+    let alf = tmp.path().join("out.alf");
+    export(&ws, &alf);
+    let reader = AlfReader::new(fs::File::open(&alf).unwrap()).unwrap();
+    assert!(
+        reader
+            .file_names()
+            .iter()
+            .any(|n| n.starts_with("raw/generic/external/")),
+        "precondition: the verified external must be packed"
+    );
+
+    // Import → the restored entry is inert (external && !verified) + warned.
+    let dest = tmp.path().join("restored");
+    let report = GenericAdapter.import(&alf, &dest).expect("import failed");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("imported as inert")),
+        "import must warn about inert externals: {:?}",
+        report.warnings
+    );
+    let restored = alf_core::include::IncludeList::load(&dest).unwrap();
+    let entry = restored
+        .externals()
+        .next()
+        .expect("external entry restored");
+    assert!(entry.external);
+    assert!(!entry.verified, "restored external entry must be inert");
+
+    // Re-export from the restored workspace: the inert entry is NOT repacked.
+    let re = tmp.path().join("re.alf");
+    export(&dest, &re);
+    let re_reader = AlfReader::new(fs::File::open(&re).unwrap()).unwrap();
+    assert!(
+        !re_reader
+            .file_names()
+            .iter()
+            .any(|n| n.starts_with("raw/generic/external/")),
+        "an inert external entry must not repack until re-confirmed"
+    );
+}
+
 #[test]
 fn agent_id_derivation_matches_readonly_resolver() {
     // The pinned fixture id resolves back through the adapter (sanity: exports

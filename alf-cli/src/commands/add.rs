@@ -11,7 +11,7 @@ use crate::config::Config;
 use crate::output;
 use crate::selector;
 use alf_core::{normalize_include_path, Adapter, IncludeList};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context as _, Result};
 use colored::Colorize;
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -143,9 +143,21 @@ fn resolve_workspace(
     Ok(workspace)
 }
 
+/// Serialize `.alf-include.json` read-modify-writes against the watch loop's
+/// prune (sync.rs) and concurrent adds. INNERMOST lock (manual §6): never
+/// acquire the per-agent sync lock while holding it.
+pub(crate) fn lock_include_list(
+    workspace: &Path,
+) -> Result<crate::commands::mcp::watch::lock::AgentLock> {
+    let path = workspace.join(".alf-include.lock");
+    crate::commands::mcp::watch::lock::acquire_blocking(&path)
+        .with_context(|| format!("locking {}", path.display()))
+}
+
 fn add_in_workspace(workspace: &Path, path: &str) -> Result<AddResult> {
     // Rejects missing files, paths outside the workspace, and the sentinels.
     let rel = normalize_include_path(workspace, path)?;
+    let _include_lock = lock_include_list(workspace)?;
     let mut list = IncludeList::load(workspace)?;
     let added = list.add(&rel);
     if added {
@@ -194,6 +206,7 @@ fn add_external(
     }
 
     let sanitized = alf_core::include::sanitized_external_name(&canon);
+    let _include_lock = lock_include_list(workspace)?;
     let mut list = IncludeList::load(workspace)?;
     let added = list.add_external(&sanitized, &canon.to_string_lossy());
     if added {
@@ -274,5 +287,33 @@ mod tests {
                 "{wired} must pass the runtime gate, not bail on it: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn concurrent_adds_do_not_lose_entries() {
+        // Two threads doing the lock→load→(work)→add→save RMW: without the
+        // include lock the interleaving loses one side's entry (last writer
+        // wins on the whole file). The sleep forces the overlap.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::write(ws.path().join("a.txt"), "a").unwrap();
+        std::fs::write(ws.path().join("b.txt"), "b").unwrap();
+
+        let add_locked = |workspace: std::path::PathBuf, rel: &'static str| {
+            std::thread::spawn(move || {
+                let _lock = lock_include_list(&workspace).unwrap();
+                let mut list = IncludeList::load(&workspace).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(120));
+                list.add(rel);
+                list.save(&workspace).unwrap();
+            })
+        };
+        let t1 = add_locked(ws.path().to_path_buf(), "a.txt");
+        let t2 = add_locked(ws.path().to_path_buf(), "b.txt");
+        t1.join().unwrap();
+        t2.join().unwrap();
+
+        let final_list = IncludeList::load(ws.path()).unwrap();
+        assert!(final_list.contains("a.txt"), "a.txt survived the race");
+        assert!(final_list.contains("b.txt"), "b.txt survived the race");
     }
 }

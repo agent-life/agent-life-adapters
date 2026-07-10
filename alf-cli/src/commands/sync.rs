@@ -362,8 +362,12 @@ pub(crate) fn run_one_agent(
     // the runtime's own configured/default location (same order alf check uses).
     // Generic requires an explicit workspace — fail here rather than let an
     // empty path fall through to a stray CWD `.alf-agent-id` write (R1).
-    let install =
-        crate::commands::check::resolve_workspace_required(workspace_flag, &config, runtime)?;
+    let install = crate::commands::check::resolve_workspace_or_mapped(
+        workspace_flag,
+        &config,
+        runtime,
+        agent,
+    )?;
 
     // Selection (and its enabled gate) runs BEFORE ApiClient::from_config so
     // selection errors are observable without an API key.
@@ -543,12 +547,18 @@ pub(crate) fn sync_one(
     let (workspace, adhoc) = selector::effective_workspace(selected, workspace_flag);
 
     // A mapped per-agent workspace is adapter-owned and may not exist yet
-    // (`export_agent` creates it); only validate an explicit -w target.
+    // (`export_agent` creates it); only validate an explicit -w target. Coded
+    // (`workspace_missing`) so the watch loop parks instead of retrying forever.
     if adhoc && !workspace.exists() {
-        bail!(
-            "Workspace directory does not exist: {}",
-            workspace.display()
-        );
+        return Err(CliError {
+            code: codes::WORKSPACE_MISSING,
+            cause: format!(
+                "Workspace directory does not exist: {}",
+                workspace.display()
+            ),
+            remedy: "restore the workspace or fix the -w path, then re-run alf sync".to_string(),
+        }
+        .into());
     }
 
     if human {
@@ -569,7 +579,12 @@ pub(crate) fn sync_one(
     // the cleaned include list and the log are captured in this sync. The
     // include list is a runtime-agnostic workspace convention (alf_core), so
     // this applies to every runtime whose adapter packs the tracked files.
-    let removed = alf_core::prune_and_log_missing(&workspace)?;
+    // The RMW is serialized against alf_track/alf add (innermost lock, §6);
+    // the guard drops before export so nothing nests inside it.
+    let removed = {
+        let _include_lock = crate::commands::add::lock_include_list(&workspace)?;
+        alf_core::prune_and_log_missing(&workspace)?
+    };
     for rel in &removed {
         progress.emit(&format!(
             "  Removed {rel} from sync (file no longer present; logged to {})",
@@ -747,26 +762,47 @@ fn print_human_outcome(outcome: &SyncOutcome, agent_id: Uuid) -> Result<()> {
     Ok(())
 }
 
+/// True when an error string carries an HTTP auth rejection. Shared by the
+/// registration/upload wrappers so 401/403 classify as `auth_failed`
+/// (manual §4.2: the watch loop parks on auth instead of retrying forever).
+fn is_auth_rejection(cause: &str) -> bool {
+    let lc = cause.to_lowercase();
+    lc.contains("http 401") || lc.contains("http 403") || lc.contains("authentication failed")
+}
+
 /// Wrap a registration failure as a coded, machine-distinguishable error.
-/// HTTP 402 (subscription/agent limit) gets a dedicated remedy quoting the
-/// server detail carried in the cause.
+/// HTTP 402 (subscription/agent limit) and HTTP 401/403 (bad key) get dedicated
+/// codes — both are permanent classes the watch loop must park on, not retry.
 fn wrap_registration(err: anyhow::Error) -> anyhow::Error {
     let cause = format!("{err:#}");
-    let remedy = if cause.contains("HTTP 402") {
-        "The service refused registration (subscription/agent limit — see the server \
-         message in the error). Upgrade the subscription or `alf purge` an unused \
-         agent, then re-run alf sync."
-            .to_string()
-    } else {
-        "check your API key (alf login) and network, then re-run alf sync; \
-         registration is the one-time backend step before first upload — nothing \
-         was uploaded"
-            .to_string()
-    };
+    if cause.contains("HTTP 402") {
+        return CliError {
+            code: codes::SUBSCRIPTION_DENIED,
+            cause,
+            remedy: "The service refused registration (subscription/agent limit — see the \
+                 server message in the error). Upgrade the subscription or `alf purge` an \
+                 unused agent, then re-run alf sync."
+                .to_string(),
+        }
+        .into();
+    }
+    if is_auth_rejection(&cause) {
+        return CliError {
+            code: codes::AUTH_FAILED,
+            cause,
+            remedy: "the service rejected this API key; fix it (alf login, or \
+                 service.api_key in ~/.alf/config.toml), then re-run alf sync"
+                .to_string(),
+        }
+        .into();
+    }
     CliError {
         code: codes::REGISTRATION_FAILED,
         cause,
-        remedy,
+        remedy: "check your API key (alf login) and network, then re-run alf sync; \
+             registration is the one-time backend step before first upload — nothing \
+             was uploaded"
+            .to_string(),
     }
     .into()
 }
@@ -777,20 +813,48 @@ fn wrap_registration(err: anyhow::Error) -> anyhow::Error {
 /// must point at restore (how_alf_syncs.md E7), not a retry loop.
 fn wrap_upload(err: anyhow::Error) -> anyhow::Error {
     let cause = format!("{err:#}");
-    let remedy = if cause.contains("Sequence conflict") {
-        "another host advanced this agent's cloud state; run the 'alf restore' \
-         command shown in the error to pull the latest state, then re-run alf sync \
-         — a plain retry hits the same conflict"
-            .to_string()
-    } else {
-        "check network connectivity and re-run alf sync; the local delta base \
-         was not advanced, so the next sync retries this upload"
-            .to_string()
-    };
+    if cause.contains("Sequence conflict") {
+        return CliError {
+            code: codes::SYNC_UPLOAD_FAILED,
+            cause,
+            remedy: "another host advanced this agent's cloud state; run the 'alf restore' \
+                 command shown in the error to pull the latest state, then re-run alf sync \
+                 — a plain retry hits the same conflict"
+                .to_string(),
+        }
+        .into();
+    }
+    if is_auth_rejection(&cause) {
+        return CliError {
+            code: codes::AUTH_FAILED,
+            cause,
+            remedy: "the service rejected this API key; fix it (alf login, or \
+                 service.api_key in ~/.alf/config.toml), then re-run alf sync"
+                .to_string(),
+        }
+        .into();
+    }
     CliError {
         code: codes::SYNC_UPLOAD_FAILED,
         cause,
-        remedy,
+        remedy: "check network connectivity and re-run alf sync; the local delta base \
+             was not advanced, so the next sync retries this upload"
+            .to_string(),
+    }
+    .into()
+}
+
+/// Wrap a local-base read/parse failure as `sync_base_unreadable` — a corrupt
+/// or truncated `{id}-snapshot.alf`. Coded so the watch loop classifies it
+/// `MissingBase` (recover-once self-heals by re-pulling the base from cloud
+/// truth) instead of retrying the same broken read forever (manual §4.2).
+fn base_unreadable(err: anyhow::Error, path: &Path) -> anyhow::Error {
+    CliError {
+        code: codes::SYNC_BASE_UNREADABLE,
+        cause: format!("local delta base {} is unreadable: {err:#}", path.display()),
+        remedy: "re-run alf sync with --recover (MCP: alf_sync recover:true) to re-pull \
+             the base from cloud truth"
+            .to_string(),
     }
     .into()
 }
@@ -874,13 +938,10 @@ fn execute_delta(
         "  Computing delta since sequence {base_sequence}..."
     ));
 
-    let prev_bytes = fs::read(snapshot_path).with_context(|| {
-        format!(
-            "Failed to read previous snapshot at {}",
-            snapshot_path.display()
-        )
-    })?;
-    let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))?;
+    let prev_bytes =
+        fs::read(snapshot_path).map_err(|e| base_unreadable(e.into(), snapshot_path))?;
+    let mut prev_reader = AlfReader::new(Cursor::new(&prev_bytes))
+        .map_err(|e| base_unreadable(e.into(), snapshot_path))?;
     let prev_records = prev_reader.read_all_memory()?;
     let prev_creds = prev_reader.read_credentials()?;
     let prev_identity = prev_reader.read_identity()?;
@@ -1346,6 +1407,43 @@ mod tests {
         let err = wrap_upload(anyhow::anyhow!("connection reset by peer"));
         let cli = err.downcast_ref::<CliError>().unwrap();
         assert!(cli.remedy.contains("re-run alf sync"));
+    }
+
+    #[test]
+    fn wrap_registration_maps_402_and_401() {
+        let err = wrap_registration(anyhow::anyhow!(
+            "registration rejected (HTTP 402): agent limit reached"
+        ));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::SUBSCRIPTION_DENIED);
+
+        let err = wrap_registration(anyhow::anyhow!("HTTP 401: bad api key"));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::AUTH_FAILED);
+
+        let err = wrap_registration(anyhow::anyhow!("connection refused"));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::REGISTRATION_FAILED);
+    }
+
+    #[test]
+    fn wrap_upload_maps_401_to_auth_failed() {
+        let err = wrap_upload(anyhow::anyhow!("authentication failed (HTTP 403)"));
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::AUTH_FAILED);
+        assert!(cli.remedy.contains("alf login"), "remedy: {}", cli.remedy);
+    }
+
+    #[test]
+    fn base_unreadable_is_coded() {
+        let err = base_unreadable(
+            anyhow::anyhow!("invalid zip: unexpected EOF"),
+            Path::new("/home/x/.alf/state/abc-snapshot.alf"),
+        );
+        let cli = err.downcast_ref::<CliError>().unwrap();
+        assert_eq!(cli.code, codes::SYNC_BASE_UNREADABLE);
+        assert!(cli.cause.contains("abc-snapshot.alf"));
+        assert!(cli.remedy.contains("--recover"), "remedy: {}", cli.remedy);
     }
 
     fn state_with(seq: Option<u64>) -> AgentState {

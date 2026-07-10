@@ -361,8 +361,12 @@ enum Command {
     #[command(
         long_about = "Serve ALF tools to an MCP-capable agent host over stdio. The host \
         spawns `alf mcp serve` as a subprocess and drives it with JSON-RPC on stdin/stdout; \
-        all diagnostics go to stderr. WP-M2a exposes alf_status, alf_check, and alf_sync, \
-        each with a declared outputSchema and structured results.\n\n\
+        all diagnostics go to stderr. The v1 surface is 13 tools: alf_status, alf_check, \
+        alf_sync, alf_restore, alf_export_dry_run, alf_track, alf_configure, alf_vault_add, \
+        alf_vault_list, alf_vault_delete, alf_agents_list, alf_docs, and alf_watch_set — each \
+        with a declared outputSchema and structured results. A background watch loop auto-syncs \
+        while the session is alive. Full reference: docs/cli-reference.md, or the alf_docs tool \
+        with topic \"mcp\".\n\n\
         The runtime and workspace pin which agent this server operates on, exactly like the \
         other subcommands (global --agent selects among mapped agents).\n\n\
         Example: alf mcp serve -r generic -w ./my-agent"

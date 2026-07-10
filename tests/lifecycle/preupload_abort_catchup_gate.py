@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""Kill-9 mid-sync catch-up gate (WP-M6 task 0b / WP-M4 review Finding 2).
+"""Pre-upload abort catch-up gate (WP-M6 task 0b / WP-M4 review Finding 2).
 
-The WP-M3 review (D1) built a crash seam — `--features fault-injection` +
-`ALF_WATCH_FAULT_BEFORE_UPLOAD` — precisely so the watch loop's
-"crash-safe-by-SIGKILL" premise (design §5.3) could be verified end to end. No
-harness stage exercised it (it fell through the M3→M4→M6 seams). This gate
-closes that: it drives a real `alf mcp serve` watch loop into the fault at the
-pre-upload point, lets the process die (exit 137 == 128+SIGKILL), restarts a
-CLEAN server, and asserts the restart's catch-up scan produces EXACTLY ONE
-correct delta — no loss, no duplicate.
+WHAT THIS PROVES — stated honestly (WP-O.9): the fault build's
+`ALF_WATCH_FAULT_BEFORE_UPLOAD` seam makes the watch loop take a COOPERATIVE
+`exit(137)` at the pre-upload point. The exit CODE mimics 128+SIGKILL, but no
+kernel signal is delivered — so the gate proves catch-up + no-duplicate under
+worst-moment process death AT THAT SEAM (the process vanishes with base+state
+still at the old sequence, nothing uploaded), NOT kernel SIGKILL delivery
+semantics. A true-SIGKILL variant (`true_sigkill_catchup_gate`: MockBackend's
+blocking-upload knob holds the upload open + `os.kill(pid, SIGKILL)`
+mid-upload) is a SPECCED FOLLOW-UP — deliberately not implemented here.
+
+The WP-M3 review (D1) built the crash seam — `--features fault-injection` +
+`ALF_WATCH_FAULT_BEFORE_UPLOAD` — precisely so the watch loop's crash-safety
+premise (design §5.3) could be verified end to end. No harness stage exercised
+it (it fell through the M3→M4→M6 seams). This gate closes that: it drives a
+real `alf mcp serve` watch loop into the fault at the pre-upload point, lets
+the process die (cooperative exit 137), restarts a CLEAN server, and asserts
+the restart's catch-up scan produces EXACTLY ONE correct delta — no loss, no
+duplicate.
 
 TIER: live (`--backend real`). Like every prior live tier (M1 sync, M2b/M3
 backend gates, M4 hermes-mcp proxy/real, M5's three confirmations) it needs a
 minted runtime key + the test backend, so it is scheduled once and its artifact
 kept — it is NOT a CI gate (the Neon test branch auto-expires). Runbook: the
-WP-M6 handoff §"kill-9 catch-up gate".
+WP-M6 handoff §"pre-upload abort catch-up gate" (formerly "kill-9").
 
 Why host-side (no Docker): the generic toy runtime needs no framework install —
 just a workspace + `.alf-map.json`. The watch loop runs on the host FS via
@@ -70,7 +80,7 @@ from alflab.redact import redact  # noqa: E402
 # can never block a re-run.
 MAP = {
     "version": 1,
-    "framework": "kill9-gate",  # made unique per run in _seed_workspace()
+    "framework": "preupload-gate",  # made unique per run in _seed_workspace()
     "memory_sources": [
         {"id": "journal", "glob": "journal/*.md", "memory_type": "episodic",
          "namespace": "daily", "chunking": "by_heading", "timestamp": "file_mtime"}
@@ -87,7 +97,7 @@ def _log(msg: str) -> None:
 def _seed_workspace(ws: Path) -> None:
     (ws / "journal").mkdir(parents=True, exist_ok=True)
     # Unique agent name per run so a leaked orphan can never 409-block a re-run.
-    run_map = dict(MAP, framework=f"kill9-gate-{uuid.uuid4().hex[:8]}")
+    run_map = dict(MAP, framework=f"preupload-gate-{uuid.uuid4().hex[:8]}")
     (ws / ".alf-map.json").write_text(json.dumps(run_map, indent=2), encoding="utf-8")
     (ws / "journal" / "day.md").write_text(
         "## Section A\n\nfirst entry, present at the base snapshot.\n",
@@ -133,7 +143,7 @@ def _latest_sequence(api: ApiClient, agent_id: str) -> int | None:
 
 
 def run_gate(args) -> int:
-    run_dir = Path(tempfile.mkdtemp(prefix="alf-kill9-"))
+    run_dir = Path(tempfile.mkdtemp(prefix="alf-preupload-"))
     home = run_dir / "home"
     alf_home = home / ".alf"
     ws = home / "ws"
@@ -179,16 +189,20 @@ def run_gate(args) -> int:
             "## Section B\n\nadded after the base — the delta the loop must carry.\n",
             encoding="utf-8")
 
-        # (2) Fault build: the loop reaches the pre-upload seam and aborts (137).
+        # (2) Fault build: the loop reaches the pre-upload seam and takes a
+        #     COOPERATIVE exit(137) — the code mimics 128+SIGKILL, but no kernel
+        #     signal is delivered (see the module docstring).
         fault_env = _alf_env(alf_home, creds, {"ALF_WATCH_FAULT_BEFORE_UPLOAD": "1"})
-        _log("serving FAULT build (aborts before upload on the first due tick)…")
+        _log("serving FAULT build (cooperative exit(137) at the pre-upload seam "
+             "on the first due tick)…")
         p = _serve(args.alf_fault_bin, ws, fault_env)
         try:
             rc = p.wait(timeout=args.interval + args.settle)
         except subprocess.TimeoutExpired:
             p.kill()
             rc = p.wait(timeout=30)
-        check("watch loop aborted before upload (exit 137)", rc == 137, f"exit={rc}")
+        check("watch loop aborted at the pre-upload seam (cooperative exit 137, "
+              "not a kernel SIGKILL)", rc == 137, f"exit={rc}")
         check("⊙ backend sequence UNCHANGED after the crash (no partial upload)",
               _latest_sequence(api, agent_id) == s0, f"still S0={s0}")
 
@@ -232,7 +246,7 @@ def run_gate(args) -> int:
             shutil.rmtree(run_dir, ignore_errors=True)
 
     passed = sum(1 for _, ok, _ in checks if ok)
-    verdict = {"gate": "kill9-catchup", "passed": passed, "total": len(checks),
+    verdict = {"gate": "preupload-abort-catchup", "passed": passed, "total": len(checks),
                "ok": passed == len(checks) and len(checks) == 6}
     print(json.dumps(verdict))
     return 0 if verdict["ok"] else 1

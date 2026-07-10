@@ -128,8 +128,21 @@ pub fn import(
         );
     }
 
-    // Pin the agent id for future exports.
-    fs::write(&id_file, agent_id.to_string())?;
+    // Pin the agent id for future exports (atomic: a torn pin would break the
+    // S4 drift check above on the next import).
+    alf_core::fs_atomic::write_atomic(&id_file, agent_id.to_string().as_bytes())?;
+
+    // Inert-on-restore (D3): external include entries come back unverified, so a
+    // hostile/compromised archive's external entries are not packed on the next
+    // sync until the local user re-confirms them with `alf add --external`.
+    match alf_core::include::mark_external_inert(workspace) {
+        Ok(0) => {}
+        Ok(n) => warnings.push(format!(
+            "{n} external file entry(ies) imported as inert; re-add with \
+             `alf add --external` to include them in sync."
+        )),
+        Err(e) => warnings.push(format!("could not mark external entries inert: {e}")),
+    }
 
     // Credentials: Layer 4 is the agent's own vault (alf-vault records, still
     // AEAD-encrypted). Restore them verbatim to the per-agent vault path.

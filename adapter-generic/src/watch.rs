@@ -90,6 +90,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
                 tracked: true,
                 sqlite: false,
                 rediscover: false,
+                resurface: false,
             });
         }
     }
@@ -98,12 +99,17 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     // set, so a change must re-sync (and re-derive the watch surface).
     specs.push(WatchSpec {
         id: "sentinels".into(),
-        roots: vec![workspace.join(MAP_FILE), workspace.join(INCLUDE_FILE)],
+        roots: vec![
+            workspace.join(MAP_FILE),
+            workspace.join(INCLUDE_FILE),
+            workspace.join(".alfignore"),
+        ],
         recursive: false,
         exclude: Vec::new(),
         tracked: false,
         sqlite: false,
         rediscover: false,
+        resurface: true, // surface-defining (manual §4.3)
     });
 
     specs
@@ -112,13 +118,32 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
 /// A watch spec for one memory source: a metachar-free glob is a literal file;
 /// otherwise watch the glob's literal base directory recursively (with `.git/`
 /// excluded so its churn doesn't spuriously dirty a root-level glob — G3). A
-/// `sqlite_rows` source is flagged `as_sqlite` so the watch layer treats the
-/// `.db` + its `-wal`/`-shm` sidecars as one consistent-capture unit.
+/// `sqlite_rows` source is flagged `as_sqlite`, and a *literal-glob* sqlite
+/// source watches the `.db` **and** its `-wal`/`-shm` sidecars as one spec
+/// (WP-G.4): a WAL-mode write often touches only the sidecar, which would
+/// otherwise never dirty the source. A glob sqlite source is already covered
+/// by its recursive dir root.
 fn source_spec(workspace: &Path, id: &str, glob: &str, sqlite: bool) -> WatchSpec {
     let spec = if glob.contains(['*', '?', '[']) {
         let base = glob_base_dir(workspace, glob);
         let git = base.join(".git");
         WatchSpec::dir(id, base).excluding([git])
+    } else if sqlite {
+        let db = workspace.join(glob);
+        WatchSpec {
+            id: id.into(),
+            roots: vec![
+                db.clone(),
+                with_suffix(&db, "-wal"),
+                with_suffix(&db, "-shm"),
+            ],
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: false,
+            sqlite: false, // set by `.as_sqlite()` below
+            rediscover: false,
+            resurface: false,
+        }
     } else {
         WatchSpec::file(id, workspace.join(glob))
     };
@@ -127,6 +152,14 @@ fn source_spec(workspace: &Path, id: &str, glob: &str, sqlite: bool) -> WatchSpe
     } else {
         spec
     }
+}
+
+/// Append a sidecar suffix (`-wal`/`-shm`) to a `.db` path (the
+/// `adapter-zeroclaw` sidecar-trio precedent).
+fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+    let mut name: std::ffi::OsString = path.file_name().unwrap_or_default().to_os_string();
+    name.push(suffix);
+    path.with_file_name(name)
 }
 
 /// The leading run of glob components with no metachar, joined under the
@@ -178,6 +211,30 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_source_spec_includes_wal_and_shm_roots() {
+        // WP-G.4: a literal-glob sqlite source is the sidecar trio in ONE spec —
+        // a WAL-mode write that touches only `-wal` must dirty the source.
+        let s = source_spec(Path::new("/ws"), "brain", "data/brain.db", true);
+        assert!(s.sqlite);
+        assert!(!s.recursive);
+        assert_eq!(
+            s.roots,
+            vec![
+                PathBuf::from("/ws/data/brain.db"),
+                PathBuf::from("/ws/data/brain.db-wal"),
+                PathBuf::from("/ws/data/brain.db-shm"),
+            ]
+        );
+
+        // A *glob* sqlite source keeps its recursive dir root (already covers
+        // the sidecars).
+        let g = source_spec(Path::new("/ws"), "dbs", "data/*.db", true);
+        assert!(g.sqlite);
+        assert!(g.recursive);
+        assert_eq!(g.roots, vec![PathBuf::from("/ws/data")]);
+    }
+
+    #[test]
     fn watch_paths_covers_sources_identity_tracked_and_sentinels() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
@@ -223,9 +280,16 @@ mod tests {
             .contains(&PathBuf::from("/etc/host/secret.txt")));
 
         let sentinels = by_id("sentinels").expect("sentinels spec");
+        assert!(
+            sentinels.resurface,
+            "sentinels must be surface-defining (manual §4.3)"
+        );
         assert!(!sentinels.tracked);
         assert!(sentinels.roots.contains(&ws.join(MAP_FILE)));
         assert!(sentinels.roots.contains(&ws.join(INCLUDE_FILE)));
+        // WP-E.3: editing `.alfignore` changes the export surface, so it must
+        // dirty the watch loop too.
+        assert!(sentinels.roots.contains(&ws.join(".alfignore")));
     }
 
     #[test]

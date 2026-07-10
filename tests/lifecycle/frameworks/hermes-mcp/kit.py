@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import importlib.util
 import re
+import shlex
 import sys
 from pathlib import Path
 
@@ -97,9 +98,10 @@ class HermesMcpKit(HermesKit):
         REAL hermes semantic-memory source → one new memory RECORD, so the marker
         reaches the /memory DTO) AND upserts a row in the watched `state.db` (the
         additive `z16_watch` table Hermes ignores; the `.db` change is a raw
-        delta). Returns the marker so the stage can assert it synced."""
-        import shlex
-
+        delta). Both writes are rc-checked and raise on failure (fail-closed:
+        a silently failed mutation would make the later delta/row-count checks
+        assert against changes that never happened). Returns the marker so the
+        stage can assert it synced."""
         prof = self._container_profile(slot)
         marker = f"Z16-WATCH-{slot}-{i:02d}"
         # MEMORY.md entries are `\n§\n`-separated; append one (it exists from Z2).
@@ -107,12 +109,16 @@ class HermesMcpKit(HermesKit):
         ctr.sh(
             f"mkdir -p {prof}/memories; "
             f"printf %s {shlex.quote(entry)} >> {prof}/memories/MEMORY.md",
-            user="agent")
-        ctr.exec(
+            user="agent", check=True)
+        sql = ctr.exec(
             ["sqlite3", f"{prof}/state.db",
              "CREATE TABLE IF NOT EXISTS z16_watch (id INTEGER PRIMARY KEY, marker TEXT); "
              f"INSERT INTO z16_watch (id, marker) VALUES ({i}, '{marker}');"],
             user="agent")
+        if sql.returncode != 0:
+            raise RuntimeError(
+                f"Z16 sqlite mutation {marker} failed (rc={sql.returncode}): "
+                f"{(sql.stderr or sql.stdout or '').strip()[:300]}")
         return marker
 
     # -- config wiring ---------------------------------------------------------
@@ -335,11 +341,17 @@ class HermesMcpKit(HermesKit):
         is a first-class FAIL — the exact signal that was invisible when the ledger
         read only agent.log (creds silently written to a throwaway agent's vault)."""
         if not all_sessions:
+            # FAIL-CLOSED: the server ALWAYS writes its startup banner to stderr,
+            # so a missing/empty mcp-stderr.log means the capture plumbing is
+            # broken — the gate's server-side lane is blind and must not SKIP
+            # into a green run.
             result.add(Check(
                 name="server-resolved agent matches the pinned ALF_AGENT",
-                status="SKIP",
-                detail="mcp-stderr.log had no server-spawn sessions to parse — cannot "
-                       "confirm which agent ALF bound (check Hermes stderr routing)"))
+                status="FAIL",
+                detail="mcp-stderr.log had no server-spawn sessions to parse — the "
+                       "server always writes its startup banner to stderr, so an "
+                       "absent/empty log means the stderr capture plumbing is broken; "
+                       "the gate fails closed (fix Hermes stderr routing, then re-run)"))
             return
         problems: list[str] = []
         for s in window:
@@ -467,6 +479,24 @@ class HermesMcpKit(HermesKit):
         # lifecycle stages whose spawns ran before the pin.
         pre_sessions = len(self._server_sessions(run.container, slot))
 
+        # (1b) Make the gate non-vacuous: capture the backend sequence BEFORE the
+        # agent drives sync, and seed a fresh MEMORY.md marker entry so the
+        # MCP-driven sync cannot be a no-op — without it, an earlier stage's sync
+        # leaves nothing to carry and "the agent synced" would green on a stale
+        # head. -1 = not yet registered (the first sync's base at seq 0 counts
+        # as an advance).
+        r0 = run.api.get(f"/agents/{agent_id}")
+        seq_before = ((r0.json() or {}).get("latest_sequence")
+                      if r0.status_code == 200 else None)
+        prof = self._container_profile(slot)
+        z15_marker = f"Z15-MCP-SYNC-{slot}"
+        z15_entry = (f"\n§\nZ15 gate entry {z15_marker}: seeded before the "
+                     f"MCP-driven sync so it must carry a fresh delta.")
+        run.container.sh(
+            f"mkdir -p {prof}/memories; "
+            f"printf %s {shlex.quote(z15_entry)} >> {prof}/memories/MEMORY.md",
+            user="agent", check=True)
+
         # (2) The agent drives the FIRST sync by calling the tool.
         sync_tool = mcp_tool("alf_sync")
         turn = self.drive_tool_via_agent(
@@ -488,6 +518,20 @@ class HermesMcpKit(HermesKit):
         result.add(Check(name="⊙ API: snapshot uploaded (latest_snapshot_seq set)",
                          status="PASS" if body.get("latest_snapshot_seq") is not None else "FAIL",
                          detail=f"latest_sequence={body.get('latest_sequence')}"))
+        # Before/after: the seeded marker means a real sync MUST advance the
+        # sequence (registration+base from nothing counts: -1 → 0). Attribution
+        # caveat: the `alf mcp serve` child ALSO runs the watch loop, so in
+        # principle the advance could come from the loop auto-syncing the same
+        # seeded change rather than the tool call itself — this check proves the
+        # MCP SERVER CHILD synced the fresh delta; the tool_check above is what
+        # pins that the agent drove alf_sync.
+        seq_after = body.get("latest_sequence")
+        baseline = seq_before if seq_before is not None else -1
+        result.add(Check(
+            name="⊙ API: sequence advanced by the MCP-driven sync (fresh delta carried)",
+            status="PASS" if (seq_after is not None and seq_after > baseline) else "FAIL",
+            detail=f"latest_sequence {seq_before if seq_before is not None else '(unregistered)'}"
+                   f" → {seq_after}"))
         if agent_id and agent_id not in run.manifest.lifecycle_agents:
             run.manifest.lifecycle_agents.append(agent_id)
             run.manifest.save(run.paths.manifest)

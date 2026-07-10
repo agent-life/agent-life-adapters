@@ -85,6 +85,26 @@ class McpClientTest(unittest.TestCase):
         self.assertFalse(r.is_error)
         self.assertFalse(r.ok)          # honours the payload's own ok flag
 
+    def test_non_json_stdout_is_counted_as_protocol_violation(self):
+        # stdout is the MCP transport: a non-JSON line is a protocol violation.
+        # The pump must record it AND keep going — the request on the same pipe
+        # still succeeds (WP-O.5; the runner turns the record into a FAIL stage).
+        self.client.initialize()
+        r = self.client.call_tool("noise", {})
+        self.assertFalse(r.is_error)
+        self.assertEqual(r.parsed(), {"ok": True, "noise": True})
+        self.assertEqual(len(self.client.protocol_violations), 1)
+        self.assertIn("NOT-JSON", self.client.protocol_violations[0])
+
+    def test_call_tool_increments_sent_counter(self):
+        # The wire counter backs the W1 ≤6-call budget (WP-O.8): it counts
+        # tools/call requests SENT, and the handshake is not a tool call.
+        self.client.initialize()
+        self.assertEqual(self.client.tool_calls_sent, 0)
+        self.client.call_tool("echo", {"value": "a"})
+        self.client.call_tool("echo", {"value": "b"})
+        self.assertEqual(self.client.tool_calls_sent, 2)
+
 
 # ---------------------------------------------------------------------------
 # Fake MCP server (line-delimited JSON-RPC) — the transport under test.
@@ -131,6 +151,15 @@ def _fake_server() -> None:
                 send({"jsonrpc": "2.0", "id": rid, "result": {
                     "content": [{"type": "text", "text": json.dumps(payload)}],
                     "structuredContent": payload, "isError": True}})
+            elif name == "noise":
+                # A raw non-JSON line on stdout (a protocol violation) BEFORE
+                # the valid response — deliberately unlisted in tools/list.
+                stdout.write(b"NOT-JSON stray banner line\n")
+                stdout.flush()
+                payload = {"ok": True, "noise": True}
+                send({"jsonrpc": "2.0", "id": rid, "result": {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "structuredContent": payload, "isError": False}})
             elif name == "slow":
                 token = msg.get("params", {}).get("_meta", {}).get("progressToken")
                 for step in (1, 2):

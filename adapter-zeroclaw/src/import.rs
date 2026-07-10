@@ -73,6 +73,19 @@ pub fn import(
     let id_file = workspace.join(".alf-agent-id");
     let _ = fs::write(&id_file, agent_id.to_string());
 
+    // Inert-on-restore (D3): the raw tree carries `.alf-include.json`, so
+    // external include entries come back unverified — a hostile/compromised
+    // archive's external entries are not packed on the next sync until the
+    // local user re-confirms them with `alf add --external`.
+    match alf_core::include::mark_external_inert(workspace) {
+        Ok(0) => {}
+        Ok(n) => warnings.push(format!(
+            "{n} external file entry(ies) imported as inert; re-add with \
+             `alf add --external` to include them in sync."
+        )),
+        Err(e) => warnings.push(format!("could not mark external entries inert: {e}")),
+    }
+
     // Count what we imported
     let identity = alf.read_identity()?;
     let principals = alf.read_principals()?;

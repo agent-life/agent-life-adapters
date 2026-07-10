@@ -1209,6 +1209,9 @@ def z16_watch_autosync(run, result: StageResult):
         (ALF_WATCH_* env overrides — production stays 60s/3s). The harness mutates
         a watched memory FILE and the watched sqlite `state.db` every 3s for ~17s;
         the loop must auto-upload each change as a delta with ZERO tool/LLM calls.
+        In v1 `state.db` rides the RAW BYTE channel (no backend row extraction),
+        so the sqlite lane is verified locally — rc-checked mutations + a row
+        count — plus the combined delta count across the two watched channels.
     """)
     nar.flow("mutate file+db every 3s ──▶ watch loop (1s) ──▶ N deltas ⊙")
 
@@ -1269,7 +1272,10 @@ def z16_watch_autosync(run, result: StageResult):
             result.add(_passfail(False, "Z16: watch server stayed up",
                                  ("".join(serve_err)[-300:]) or "serve exited at startup"))
         # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
+        #    After each quiesce window, poll the backend so the viz can show
+        #    sequence climbing one delta at a time (not a single 1→N jump).
         ticks = 6
+        prev_seq = base_seq
         for i in range(ticks):
             marker = kit.mutate_watched(run.container, slot, i)
             markers.append(marker)
@@ -1282,14 +1288,56 @@ def z16_watch_autosync(run, result: StageResult):
                 "packet": "watch-delta",
             }, stage_id="z16")
             time.sleep(3)
+            tick_seq = latest_seq()
+            if tick_seq > prev_seq:
+                events.state("mcp", {
+                    "role": "watch-loop",
+                    "active": True,
+                    "watch_sources": 8,
+                    "packet": "watch-delta",
+                    "activity": f"watch sync · seq {prev_seq}→{tick_seq}",
+                    "last": "watch-delta",
+                }, stage_id="z16")
+                events.state("service", {
+                    "latest_sequence": tick_seq,
+                    "packet": "watch-delta",
+                    "activity": f"agent A · seq {tick_seq}",
+                    "agents": {
+                        "A": {
+                            "seq": tick_seq,
+                            "deltas": tick_seq - base_seq,
+                            "snapshot": True,
+                        },
+                    },
+                }, stage_id="z16")
+                events.state("agentA", {
+                    "seq": tick_seq,
+                    "activity": f"watch synced · seq {tick_seq}",
+                    "synced": True,
+                    "packet": "watch-delta",
+                }, stage_id="z16")
+                prev_seq = tick_seq
         time.sleep(3)  # let the final change quiesce (~1s) + upload
-        # 4. The loop must have auto-uploaded multiple deltas carrying the content.
+        # 4a. The sqlite lane, verified where it can be: state.db syncs as raw
+        #     bytes in v1 (no backend row extraction), so assert locally that
+        #     every rc-checked INSERT actually landed — one row per tick.
+        prof = kit._container_profile(slot)
+        cnt = run.container.exec(
+            ["sqlite3", f"{prof}/state.db", "SELECT COUNT(*) FROM z16_watch;"],
+            user="agent", timeout=60)
+        rows = (cnt.stdout or "").strip()
+        result.add(_passfail(
+            cnt.returncode == 0 and rows == str(ticks),
+            "sqlite lane: z16_watch row count == mutation ticks (local; raw-byte channel in v1)",
+            f"rows={rows or '(query failed: ' + (cnt.stderr or '').strip()[:80] + ')'}"
+            f" expected={ticks}"))
+        # 4b. The loop must have auto-uploaded multiple deltas carrying the content.
         rd = run.api.get(f"/agents/{agent_id}/deltas?since={base_seq}")
         deltas = (rd.json() or {}).get("deltas", []) if rd.status_code == 200 else []
         result.add(_passfail(
             len(deltas) >= 4,
-            f"⊙ watch loop auto-uploaded a delta per mutation (≈{ticks} over ~17s)",
-            f"{len(deltas)} deltas since seq {base_seq}"))
+            "⊙ ≥4 deltas across the two watched channels",
+            f"{len(deltas)} deltas since seq {base_seq} ({ticks} mutation ticks over ~17s)"))
         result.add(_passfail(
             latest_seq() > base_seq,
             "⊙ backend sequence advanced under the watch loop (no tool/LLM calls)",

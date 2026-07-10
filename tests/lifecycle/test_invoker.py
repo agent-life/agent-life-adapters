@@ -111,6 +111,35 @@ class McpMappingTest(unittest.TestCase):
         self.assertIsNone(self.inv._map(
             ["vault", "add", "--service", "x", "--secret-file", "/s"]))
 
+    def test_add_with_runtime_flag_maps_the_path_not_the_flag_value(self):
+        # `alf add -r generic notes.txt` must map path=notes.txt, never the
+        # runtime flag's VALUE ("generic") — the pre-WP-O.6 parser took the
+        # first non-dash token, which was the flag value.
+        self.assertMaps(["add", "-r", "generic", "notes.txt"],
+                        ("alf_track", {"path": "notes.txt"}))
+        self.assertMaps(["add", "--runtime", "generic", "-w", "/ws",
+                         "notes.txt", "--external"],
+                        ("alf_track", {"path": "notes.txt", "external": True}))
+        # A value-flag with no positional left has no path → CLI fallback.
+        self.assertIsNone(self.inv._map(["add", "-r", "generic"]))
+
+    def test_vault_add_default_type_maps(self):
+        # An explicit --type account is the tool's hardcoded type → still maps.
+        self.assertMaps(
+            ["vault", "add", "--type", "account", "--service", "email",
+             "--secret", "sk-FAKE"],
+            ("alf_vault_add", {"service": "email", "secret": "sk-FAKE"}))
+
+    def test_vault_add_nondefault_type_falls_back_to_cli(self):
+        # The v1 alf_vault_add tool hardcodes the `account` credential type; a
+        # non-account --type/-t must go to the CLI, not be silently coerced.
+        self.assertIsNone(self.inv._map(
+            ["vault", "add", "--type", "api_key", "--service", "email",
+             "--secret", "sk-FAKE"]))
+        self.assertIsNone(self.inv._map(
+            ["vault", "add", "-t", "token", "--service", "email",
+             "--secret", "sk-FAKE"]))
+
 
 if __name__ == "__main__":
     unittest.main()

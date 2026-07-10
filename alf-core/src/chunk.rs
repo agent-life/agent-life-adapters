@@ -76,21 +76,27 @@ pub fn dispatch<'a>(
 /// (e.g. the generic map's `knowledge/**/*.md`). Matched against the full
 /// workspace-relative path.
 ///
-/// **Backtracking is bounded (WP-M1).** Only the `**` arms can revisit a
-/// `(pattern_offset, path_offset)` state; naively, `k` `**` groups against an
+/// **Backtracking is bounded (WP-M1, gate widened in WP-K.3).** Any arm with a
+/// choice point (`**` *and* repeated single `*`s) can revisit a
+/// `(pattern_offset, path_offset)` state; naively, `k` such groups against an
 /// `n`-segment non-matching path cost Θ(C(n+k, k)) — measured at 1.25B calls /
-/// 5.25 s for k=12, n=24. When (and only when) the pattern contains `**`, a memo
-/// on `(pattern_offset, path_offset)` collapses that to the
+/// 5.25 s for `**` k=12, n=24, and the same blow-up exists for `a*a*a*…b`
+/// against a long run of `a`s. When (and only when) the pattern contains **two
+/// or more `*` bytes** — which subsumes every `**` pattern; a single `*` is
+/// segment-bounded and cannot blow up — a memo on
+/// `(pattern_offset, path_offset)` collapses that to the
 /// `(pattern.len()+1) * (path.len()+1)` state space with **identical match
-/// results** (each state is a pure function of its two offsets). A `**`-free
-/// pattern — every OpenClaw source-handler glob — takes the zero-allocation
-/// path M0 shipped. The golden corpus and every `chunk::` test pass unchanged.
+/// results** (each state is a pure function of its two offsets). A pattern
+/// with at most one `*` — every OpenClaw source-handler glob — takes the
+/// zero-allocation path M0 shipped. The golden corpus and every `chunk::` test
+/// pass unchanged.
 pub fn path_matches(pattern: &str, path: &str) -> bool {
     let (pattern, path) = (pattern.as_bytes(), path.as_bytes());
-    // Allocate the memo only for `**` patterns; otherwise `memo` is empty and
-    // `glob_match_at` runs as plain zero-alloc recursion (bounded already:
-    // single-`*` is segment-bounded, `[0-9]`/literals advance both offsets).
-    let mut memo: Vec<Option<bool>> = if contains_double_star(pattern) {
+    // Allocate the memo only for patterns with >= 2 `*`s; otherwise `memo` is
+    // empty and `glob_match_at` runs as plain zero-alloc recursion (bounded
+    // already: a lone `*` is segment-bounded, `[0-9]`/literals advance both
+    // offsets).
+    let mut memo: Vec<Option<bool>> = if needs_memo(pattern) {
         vec![None; (pattern.len() + 1) * (path.len() + 1)]
     } else {
         Vec::new()
@@ -98,8 +104,11 @@ pub fn path_matches(pattern: &str, path: &str) -> bool {
     glob_match_at(pattern, path, 0, 0, &mut memo)
 }
 
-fn contains_double_star(pattern: &[u8]) -> bool {
-    pattern.windows(2).any(|w| w == b"**")
+/// Two or more `*` bytes anywhere → memoize. Subsumes the old `**`-only gate
+/// (a `**` is itself two stars) and additionally catches multi-single-star
+/// patterns like `a*a*a*…b`, whose backtracking is just as exponential.
+fn needs_memo(pattern: &[u8]) -> bool {
+    pattern.iter().filter(|&&b| b == b'*').count() >= 2
 }
 
 /// Match `pattern[p..]` against `path[s..]`. When `memo` is non-empty it caches
@@ -457,5 +466,37 @@ Text.
         assert!(path_matches(&("**/".repeat(4) + "*.md"), "a/b/c/d/e.md"));
         assert!(path_matches("**/*.md", "deep/nested/tree/x.md"));
         assert!(!path_matches(&("**/".repeat(4) + "*.txt"), "a/b/c/d/e.md"));
+    }
+
+    #[test]
+    fn pathological_multi_star_pattern_is_time_bounded() {
+        // WP-K.3: repeated single `*`s backtrack exactly like `**` groups — the
+        // old `**`-only memo gate left `a*a*a*…b` vs a long `a` run exponential.
+        // With the >=2-stars gate the memo bounds it to the (pattern+1)*(path+1)
+        // state space, so this completes near-instantly.
+        let pattern = "a*".repeat(40) + "b";
+        let path = "a".repeat(80);
+        let start = std::time::Instant::now();
+        let matched = path_matches(&pattern, &path);
+        let elapsed = start.elapsed();
+        assert!(!matched, "the pathological pattern must not match");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "multi-star matching took {elapsed:?} — the memo gate is not \
+             covering repeated single `*`s"
+        );
+    }
+
+    #[test]
+    fn multi_star_semantics_unchanged_by_memo() {
+        // Semantic pins: memoizing multi-single-star patterns must not change
+        // what they match.
+        assert!(path_matches("a*b*c", "aXbYc"));
+        assert!(path_matches("a*b*c", "abc")); // each `*` can match empty
+        assert!(!path_matches("a*b*c", "aXbY"));
+        // `*` stays segment-bounded even when memoized.
+        assert!(!path_matches("a*b*c", "aX/bYc"));
+        assert!(path_matches("*-*.md", "2026-notes.md"));
+        assert!(!path_matches("*-*.md", "dir/2026-notes.md"));
     }
 }

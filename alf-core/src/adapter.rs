@@ -173,6 +173,11 @@ pub struct WatchSpec {
     /// surfaces in `alf_agents_list` (design §14, §11.1). Default `false`: an
     /// ordinary source change only dirties that source.
     pub rediscover: bool,
+    /// A change to this spec invalidates the watch SURFACE itself (manual §4.3):
+    /// the map / include list / runtime config define what to watch, so the loop
+    /// re-derives `watch_paths` and re-registers watches when one changes.
+    /// Default `false`: an ordinary source change only dirties that source.
+    pub resurface: bool,
 }
 
 impl WatchSpec {
@@ -187,6 +192,7 @@ impl WatchSpec {
             tracked: false,
             sqlite: false,
             rediscover: false,
+            resurface: false,
         }
     }
 
@@ -200,6 +206,7 @@ impl WatchSpec {
             tracked: false,
             sqlite: false,
             rediscover: false,
+            resurface: false,
         }
     }
 
@@ -219,6 +226,13 @@ impl WatchSpec {
     /// before the next sync (WP-M5 — Hermes `profiles/`).
     pub fn rediscovering(mut self) -> Self {
         self.rediscover = true;
+        self
+    }
+
+    /// Mark this spec as surface-defining: a change to it re-derives the watch
+    /// surface (manual §4.3 — map/include/config sentinels).
+    pub fn resurfacing(mut self) -> Self {
+        self.resurface = true;
         self
     }
 

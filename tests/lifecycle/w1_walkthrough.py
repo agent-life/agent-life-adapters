@@ -239,11 +239,23 @@ def run(out_path: Path | None) -> int:
             _purge_agent(alf, ws, env)
         shutil.rmtree(tmp, ignore_errors=True)
 
-    within = t.tool_calls <= 6
+    # The budget is judged on the WIRE count (tools/call requests the client
+    # actually sent), not the transcript's step count — a hidden retry would
+    # inflate the former without touching the latter.
+    wire_calls = client.tool_calls_sent
+    within = wire_calls <= 6
     t.lines += [
         "## Verdict", "",
-        f"* onboarding tool calls: **{t.tool_calls}** (criterion: ≤ 6) — "
-        f"{'✅ within budget' if within else '❌ over budget'}",
+        f"* onboarding tool calls (wire, tools/call sent): **{wire_calls}** "
+        f"(criterion: ≤ 6) — {'✅ within budget' if within else '❌ over budget'}",
+        f"* transcript steps rendered: {t.tool_calls}",
+    ]
+    if wire_calls != t.tool_calls:
+        t.lines.append(
+            f"* ⚠️ wire count ({wire_calls}) diverges from transcript steps "
+            f"({t.tool_calls}) — hidden retries or unrendered calls; the wire "
+            f"count is authoritative")
+    t.lines += [
         f"* mode: {'live — alf_sync registered + uploaded' if live else 'offline — alf_sync returned a tool error by design; run live for the full artifact'}",
         "",
     ]

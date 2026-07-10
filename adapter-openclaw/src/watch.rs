@@ -50,7 +50,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
 
     // Out-of-workspace: the OpenClaw config drives agent-set/workspace/version.
     if let Some(config) = openclaw_config_path(workspace) {
-        specs.push(WatchSpec::file("openclaw-config", config));
+        specs.push(WatchSpec::file("openclaw-config", config).resurfacing());
     }
 
     // External tracked files (the recursive workspace watch misses them). Their
@@ -69,6 +69,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
                 tracked: true,
                 sqlite: false,
                 rediscover: false,
+                resurface: false,
             });
         }
     }

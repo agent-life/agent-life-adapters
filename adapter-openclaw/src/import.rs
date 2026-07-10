@@ -67,6 +67,19 @@ pub fn import(
         reconstruct_from_structured(&mut alf, workspace, &mut warnings)?;
     }
 
+    // Inert-on-restore (security design §3.5, manual §7): external include
+    // entries arriving in an archive come back unverified — a hostile archive
+    // must never conscript this machine into packing files outside the
+    // workspace. In-workspace entries are untouched.
+    match alf_core::include::mark_external_inert(workspace) {
+        Ok(0) => {}
+        Ok(n) => warnings.push(format!(
+            "{n} external file entry(ies) imported as inert; re-add with \
+             `alf add --external` to include them in sync."
+        )),
+        Err(e) => warnings.push(format!("could not mark external entries inert: {e}")),
+    }
+
     // Write the agent ID for future exports
     let id_file = workspace.join(".alf-agent-id");
     fs::write(&id_file, agent_id.to_string())?;

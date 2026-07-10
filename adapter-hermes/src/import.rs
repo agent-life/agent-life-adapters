@@ -54,7 +54,7 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
     // Inert-on-restore (D3): external include entries come back unverified, so a
     // hostile/compromised archive's external entries are not packed on the next
     // sync until the local user re-confirms them with `alf add --external`.
-    match mark_external_inert(home) {
+    match alf_core::include::mark_external_inert(home) {
         Ok(0) => {}
         Ok(n) => warnings.push(format!(
             "{n} external file entry(ies) imported as inert; re-add with \
@@ -133,27 +133,6 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
         credentials_count,
         warnings,
     })
-}
-
-/// Flip restored external include entries to `verified = false` (inert). Returns
-/// the count changed.
-fn mark_external_inert(home: &Path) -> Result<usize> {
-    let path = home.join(alf_core::include::INCLUDE_FILE);
-    if !path.is_file() {
-        return Ok(0);
-    }
-    let mut list = alf_core::include::IncludeList::load(home)?;
-    let mut changed = 0;
-    for e in list.files.iter_mut() {
-        if e.external && e.verified {
-            e.verified = false;
-            changed += 1;
-        }
-    }
-    if changed > 0 {
-        list.save(home)?;
-    }
-    Ok(changed)
 }
 
 fn is_session_record(r: &MemoryRecord) -> bool {

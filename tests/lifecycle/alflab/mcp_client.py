@@ -105,6 +105,13 @@ class McpClient:
         self._stderr_ring = stderr_ring
         self.server_info: dict = {}
         self.instructions: str = ""
+        #: every non-JSON line the server emitted on stdout — stdout is the MCP
+        #: transport, so ANY such line is a protocol violation. The pump keeps
+        #: going (diagnosability), but the harness surfaces these as a FAIL.
+        self.protocol_violations: list[str] = []
+        #: tools/call requests actually SENT on the wire — the honest budget
+        #: counter (a transcript step count can drift under hidden retries).
+        self.tool_calls_sent: int = 0
 
         self._reader = threading.Thread(target=self._read_loop, daemon=True)
         self._reader.start()
@@ -123,8 +130,10 @@ class McpClient:
                 try:
                     msg = json.loads(line)
                 except json.JSONDecodeError:
-                    # A non-JSON line on stdout is a protocol violation; keep it
-                    # for diagnostics but don't crash the pump.
+                    # A non-JSON line on stdout is a protocol violation; record
+                    # it (the runner turns these into a synthetic FAIL stage)
+                    # and keep it for diagnostics, but don't crash the pump.
+                    self.protocol_violations.append(line[:500])
                     self._append_stderr(f"[stdout non-json] {line[:200]}")
                     continue
                 if isinstance(msg, dict) and "id" in msg and (
@@ -223,6 +232,9 @@ class McpClient:
 
     def call_tool(self, name: str, arguments: Optional[dict] = None,
                   *, timeout: float = 300.0) -> ToolResult:
+        # Count on SEND (before the response), so timeouts and hidden retries
+        # still show up in the wire count.
+        self.tool_calls_sent += 1
         result = self._request("tools/call", {
             "name": name, "arguments": arguments or {},
         }, timeout=timeout)

@@ -57,6 +57,10 @@ class AlfInvoker(ABC):
     def __init__(self):
         self.tool_calls: list[str] = []
         self.cli_fallbacks: list[str] = []
+        #: stdout protocol violations snapshotted from the MCP client at close()
+        #: (always empty for the CLI path). The runner reads this after the
+        #: session is gone and turns any entries into a synthetic FAIL stage.
+        self.last_protocol_violations: list[str] = []
 
     @abstractmethod
     def json(self, argv: list, **kw):
@@ -82,6 +86,11 @@ class CliInvoker(AlfInvoker):
 
     def exec(self, argv: list, **kw):
         return self.container.exec(["alf", *argv], **kw)
+
+
+# Flags whose NEXT argv token is a value, not a positional (used by the `add`
+# mapping so `alf add -r generic notes.txt` maps the path, never "generic").
+VALUE_FLAGS = {"-r", "--runtime", "-w", "--workspace", "--agent"}
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +139,9 @@ class McpInvoker(AlfInvoker):
             try:
                 self._client.close()
             finally:
+                # Snapshot BEFORE dropping the client: the runner asserts stdout
+                # protocol discipline after teardown, when the client is gone.
+                self.last_protocol_violations = list(self._client.protocol_violations)
                 self._client = None
         if self._session is not None:
             self._session.close()
@@ -209,6 +221,11 @@ class McpInvoker(AlfInvoker):
             if sub == "add":
                 if flags.value("--secret") is None:  # --secret-file/-json: CLI
                     return None
+                # The v1 tool hardcodes the `account` credential type — any other
+                # --type/-t must go through the CLI, not be silently coerced.
+                ctype = flags.value("--type") or flags.value("-t")
+                if ctype is not None and ctype != "account":
+                    return None
                 args = {
                     "service": flags.value("--service") or "",
                     "secret": flags.value("--secret"),
@@ -237,7 +254,23 @@ class McpInvoker(AlfInvoker):
                 return ("alf_vault_delete", args)
             return None  # keygen / decrypt / encrypt / rotate-key: CLI-only (L10)
         if head == "add":  # `alf add <path>` → alf_track
-            path = next((a for a in argv[1:] if not str(a).startswith("-")), None)
+            # Flag-value-aware: `alf add -r generic notes.txt` must map the PATH,
+            # not the flag's value ("generic"). Skip each value-taking flag's
+            # argument; the first remaining non-dash token is the path.
+            rest = [str(a) for a in argv[1:]]
+            path = None
+            skip_next = False
+            for a in rest:
+                if skip_next:
+                    skip_next = False
+                    continue
+                if a in VALUE_FLAGS:
+                    skip_next = True
+                    continue
+                if a.startswith("-"):
+                    continue
+                path = a
+                break
             if path is None:
                 return None
             args = {"path": path}

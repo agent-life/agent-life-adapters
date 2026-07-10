@@ -260,10 +260,15 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
             m2 = re.search(r"(\d+)\s+deltas since seq", d)
             if m2:
                 n_deltas = int(m2.group(1))
-        # Per-tick mutations so replay shows the watch loop lighting rows.
-        for i in range(min(n_deltas, 6)):
+        # Per-tick mutations + interpolated sequence so replay climbs 1→N.
+        n_ticks = min(n_deltas, 6) if n_deltas else 6
+        span = max(1, end - base)
+        for i in range(n_ticks):
+            tick_seq = base + max(1, round((i + 1) * span / n_ticks))
+            if i == n_ticks - 1:
+                tick_seq = end
             emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
-                 patch={"activity": f"watch mutate {i + 1}/{min(n_deltas, 6)}",
+                 patch={"activity": f"watch mutate {i + 1}/{n_ticks}",
                         "mutations": [
                             {"path": "memories/MEMORY.md", "op": "append",
                              "note": f"watch tick {i}"},
@@ -271,6 +276,22 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
                              "note": f"z16_watch · tick {i}"},
                         ],
                         "packet": "watch-delta"})
+            t = t + timedelta(milliseconds=20)
+            emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
+                 patch={"role": "watch-loop", "active": True, "watch_sources": 8,
+                        "packet": "watch-delta",
+                        "activity": f"watch sync · seq {tick_seq}",
+                        "last": "watch-delta"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+                 patch={"latest_sequence": tick_seq, "packet": "watch-delta",
+                        "activity": f"agent A · seq {tick_seq}",
+                        "agents": {"A": {"seq": tick_seq,
+                                        "deltas": tick_seq - base,
+                                        "snapshot": True}}})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+                 patch={"seq": tick_seq,
+                        "activity": f"watch synced · seq {tick_seq}",
+                        "synced": True, "packet": "watch-delta"})
             t = t + timedelta(milliseconds=40)
         emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
              patch={"role": "watch-loop", "active": True, "watch_sources": 8,

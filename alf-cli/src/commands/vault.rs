@@ -543,6 +543,24 @@ pub(crate) struct DescriptorView {
     created_at: chrono::DateTime<Utc>,
 }
 
+impl DescriptorView {
+    pub(crate) fn id(&self) -> Uuid {
+        self.id
+    }
+    pub(crate) fn service(&self) -> &str {
+        &self.service
+    }
+    pub(crate) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+impl ListResult {
+    pub(crate) fn credentials(&self) -> &[DescriptorView] {
+        &self.credentials
+    }
+}
+
 /// Build the plaintext-descriptor listing — no key touched, no stdout. Shared by
 /// the CLI [`list`] and the MCP `alf_vault_list` tool.
 pub(crate) fn list_core(input: Option<&Path>, scope: Option<Uuid>) -> Result<ListResult> {
@@ -738,7 +756,10 @@ fn delete_work(
         );
     }
 
-    fs::write(&output_path, serialized)
+    // Atomic + 0600 like every other vault write (add_core, rotate): a crash
+    // mid-delete must never truncate the whole credentials document — this is
+    // now agent-invokable via alf_vault_delete (manual §3.10).
+    write_private_atomic(&output_path, &serialized)
         .with_context(|| format!("Failed to write {}", output_path.display()))?;
 
     Ok((removed, doc.credentials.len(), output_path))
@@ -1579,6 +1600,21 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after.credentials.len(), 1);
         assert_eq!(after.credentials[0].id, other_id);
+
+        // The rewrite is atomic + owner-only (manual §3.10): a crash mid-delete
+        // can never truncate the vault, and delete normalizes perms to 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "delete must leave the vault owner-only");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp sibling: {leftovers:?}");
     }
 
     #[test]

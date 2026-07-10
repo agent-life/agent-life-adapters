@@ -41,10 +41,14 @@ fn fetch_service_status(
     if agents.is_empty() || config.service.api_key.is_empty() {
         return (false, Vec::new());
     }
-    let client = match ApiClient::from_config(config) {
-        Ok(c) => c,
-        Err(_) => return (false, Vec::new()),
-    };
+    // A short per-probe timeout (manual §3.1): status is a monitoring query, so
+    // a hung backend must yield `online:false` per agent, not block for minutes.
+    // Worst case is 5 s × tracked agents, which is acceptable for status.
+    let client =
+        match ApiClient::from_config_with_timeout(config, std::time::Duration::from_secs(5)) {
+            Ok(c) => c,
+            Err(_) => return (false, Vec::new()),
+        };
     let mut statuses = Vec::with_capacity(agents.len());
     for a in agents {
         match client.get_agent(a.agent_id) {

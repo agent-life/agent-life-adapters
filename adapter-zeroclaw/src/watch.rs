@@ -49,6 +49,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         tracked: false,
         sqlite: true,
         rediscover: false,
+        resurface: false,
     });
 
     // Markdown backend: memory/ (only when present — ZeroClaw has no
@@ -71,10 +72,11 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         tracked: false,
         sqlite: false,
         rediscover: false,
+        resurface: false,
     });
 
     // config.toml at the install root.
-    specs.push(WatchSpec::file("config", install.join("config.toml")));
+    specs.push(WatchSpec::file("config", install.join("config.toml")).resurfacing());
 
     // AIEOS identity.json — path declared in config.toml; may be outside the
     // install. Degrade gracefully if the config is missing/unparseable.
@@ -106,17 +108,23 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
                 tracked: true,
                 sqlite: false,
                 rediscover: false,
+                resurface: false,
             });
         }
     }
     specs.push(WatchSpec {
         id: "sentinels".into(),
-        roots: vec![install.join(INCLUDE_FILE), install.join(SYNC_LOG_FILE)],
+        roots: vec![
+            install.join(INCLUDE_FILE),
+            install.join(SYNC_LOG_FILE),
+            install.join(".alfignore"),
+        ],
         recursive: false,
         exclude: Vec::new(),
         tracked: false,
         sqlite: false,
         rediscover: false,
+        resurface: true, // surface-defining (manual §4.3)
     });
 
     specs
@@ -186,6 +194,8 @@ mod tests {
         let sentinels = by_id(&specs, "sentinels").expect("sentinels spec");
         assert!(sentinels.roots.contains(&install.join(INCLUDE_FILE)));
         assert!(sentinels.roots.contains(&install.join(SYNC_LOG_FILE)));
+        // WP-E.3: `.alfignore` edits change the export surface → watched.
+        assert!(sentinels.roots.contains(&install.join(".alfignore")));
     }
 
     #[test]

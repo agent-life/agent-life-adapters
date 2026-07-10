@@ -50,30 +50,77 @@ pub const NEVER_QUIESCE_WARN: Duration = Duration::from_secs(24 * 60 * 60);
 /// default would otherwise make impossible. Unset (the normal case, including
 /// every unit test and production) ⇒ the constant below. Kept here, gated, rather
 /// than threaded through config so the CLI/map surface never exposes a sub-floor.
-fn env_ms(var: &str, default: Duration) -> Duration {
-    parse_ms(std::env::var(var).ok().as_deref(), default)
+///
+/// The overrides ship in the release binary, so they are validated and clamped
+/// (manual §2.5): a malformed value warns once on stderr and is ignored; a valid
+/// value clamps into `[floor, INTERVAL_CEILING]`. A zero/absurd override can
+/// therefore never panic the loop (`tokio::time::interval` panics on ZERO).
+pub(crate) fn env_ms_clamped(var: &str, default: Duration, floor: Duration) -> Duration {
+    let raw = std::env::var(var).ok();
+    let (value, warning) = parse_ms_clamped(raw.as_deref(), default, floor);
+    if let Some(w) = warning {
+        eprintln!("alf mcp serve: {var}: {w}");
+    }
+    value
 }
-/// Pure: a whole-millisecond override string ⇒ that duration; unset/unparseable
-/// ⇒ `default`. Split out from the env read so it is testable without mutating
-/// the process env (which the timing getters below share).
-fn parse_ms(raw: Option<&str>, default: Duration) -> Duration {
-    match raw.and_then(|v| v.parse::<u64>().ok()) {
-        Some(ms) => Duration::from_millis(ms),
-        None => default,
+/// Pure core of [`env_ms_clamped`]: a whole-millisecond override string ⇒ that
+/// duration clamped into `[floor, INTERVAL_CEILING]`; unset ⇒ `default` silently;
+/// unparseable ⇒ `default` plus a warning. Split out from the env read so it is
+/// testable without mutating the process env (which the timing getters share).
+pub(crate) fn parse_ms_clamped(
+    raw: Option<&str>,
+    default: Duration,
+    floor: Duration,
+) -> (Duration, Option<String>) {
+    let Some(raw) = raw else {
+        return (default, None);
+    };
+    match raw.parse::<u64>() {
+        Ok(ms) => {
+            let requested = Duration::from_millis(ms);
+            let clamped = requested.clamp(floor, INTERVAL_CEILING);
+            let warning = (clamped != requested).then(|| {
+                format!(
+                    "override '{raw}' clamped to {}ms (valid range {}ms-{}ms)",
+                    clamped.as_millis(),
+                    floor.as_millis(),
+                    INTERVAL_CEILING.as_millis()
+                )
+            });
+            (clamped, warning)
+        }
+        Err(_) => (
+            default,
+            Some(format!(
+                "malformed override '{raw}' ignored (expected whole milliseconds)"
+            )),
+        ),
     }
 }
-/// Delta interval floor — 60 s, or `ALF_WATCH_DELTA_FLOOR_MS`.
+/// Delta interval floor — 60 s, or `ALF_WATCH_DELTA_FLOOR_MS` (min 1 s).
 pub fn delta_floor() -> Duration {
-    env_ms("ALF_WATCH_DELTA_FLOOR_MS", DELTA_FLOOR)
+    env_ms_clamped(
+        "ALF_WATCH_DELTA_FLOOR_MS",
+        DELTA_FLOOR,
+        Duration::from_secs(1),
+    )
 }
-/// Quiesce window — 3 s, or `ALF_WATCH_QUIESCE_MS`.
+/// Quiesce window — 3 s, or `ALF_WATCH_QUIESCE_MS` (min 100 ms).
 pub fn quiesce_window() -> Duration {
-    env_ms("ALF_WATCH_QUIESCE_MS", QUIESCE_WINDOW)
+    env_ms_clamped(
+        "ALF_WATCH_QUIESCE_MS",
+        QUIESCE_WINDOW,
+        Duration::from_millis(100),
+    )
 }
 /// Default delta interval when no map/CLI value is set — 15 min, or
-/// `ALF_WATCH_DEFAULT_INTERVAL_MS`.
+/// `ALF_WATCH_DEFAULT_INTERVAL_MS` (min 1 s).
 pub fn default_interval() -> Duration {
-    env_ms("ALF_WATCH_DEFAULT_INTERVAL_MS", DEFAULT_INTERVAL)
+    env_ms_clamped(
+        "ALF_WATCH_DEFAULT_INTERVAL_MS",
+        DEFAULT_INTERVAL,
+        Duration::from_secs(1),
+    )
 }
 
 /// Clamp a delta-channel interval into `[delta_floor(), INTERVAL_CEILING]`.
@@ -167,6 +214,10 @@ pub enum SyncErrorClass {
     Fork,
     /// Transient (network, 5xx, timeout). Exponential backoff + jitter, retry.
     Transient,
+    /// HTTP 401/403 — the service rejected the API key. Backoff for a small
+    /// retry budget (one blip shouldn't park), then park with `auth_failed`:
+    /// the key will not fix itself (manual §4.2).
+    Auth,
     /// Config/authorization (no API key, disabled agent, drift). Park with the
     /// coded error; a session change (`alf_watch_set`, re-config) is required.
     Fatal,
@@ -281,7 +332,33 @@ pub struct WatchEngine {
     /// its count is unchanged — so a change that lands mid-sync is not lost
     /// (WP-M3 review A5, defensive).
     in_flight: Vec<(String, u64)>,
+    /// Whether the in-flight sync is the recovery attempt — a Transient failure
+    /// of the recovery retries the RECOVERY after backoff instead of silently
+    /// downgrading it to a plain sync (which would burn `recover_attempted` and
+    /// park on the next genuine recoverable failure).
+    in_flight_recover: bool,
+    /// Consecutive `Auth` failures. 401/403 parks after a small budget
+    /// (manual §4.2): one blip retries, a dead key parks with `auth_failed`.
+    auth_attempts: u32,
 }
+
+/// Auth failures back off this many times before parking.
+const AUTH_ATTEMPT_BUDGET: u32 = 3;
+
+/// Every park code the engine can emit — the single source of truth the docs
+/// drift test pins `docs/cli-reference.md` (and the user manual) against.
+/// Consumed only by tests today (the docs-drift and park-coverage guards), but
+/// deliberately canonical so those pins have one authority.
+#[allow(dead_code)]
+pub const PARK_CODES: &[&str] = &[
+    "sync_first_sync_conflict",
+    "watch_parked",
+    "sync_conflict_unresolved",
+    "sync_missing_base_unresolved",
+    "sync_poisoned_base_unresolved",
+    "auth_failed",
+    "lock_unavailable",
+];
 
 impl WatchEngine {
     pub fn new(config: WatchConfig) -> Self {
@@ -294,6 +371,8 @@ impl WatchEngine {
             recover_attempted: false,
             recover_pending: false,
             in_flight: Vec::new(),
+            in_flight_recover: false,
+            auth_attempts: 0,
         }
     }
 
@@ -314,6 +393,7 @@ impl WatchEngine {
             self.parked = None;
             self.backoff = None;
             self.recover_attempted = false;
+            self.auth_attempts = 0;
         }
     }
 
@@ -387,8 +467,22 @@ impl WatchEngine {
             }
         }
         if self.recover_pending {
+            // A recovery sync exports the whole workspace exactly like a normal
+            // sync, so a mid-write file must not be captured torn: every DIRTY
+            // source must be quiesced (an empty dirty set passes — recovery must
+            // still run when nothing is dirty). The cooldown/tracked-floor gates
+            // deliberately do NOT apply: recovery is urgent repair, not cadence,
+            // and its re-snapshot IS the repair.
+            let unquiesced = self
+                .sources
+                .values()
+                .any(|s| s.dirty && !s.quiesced(now, self.config.quiesce_window));
+            if unquiesced {
+                return Tick::Idle;
+            }
             let reason = self.dirty_ids();
             self.begin_sync();
+            self.in_flight_recover = true;
             return Tick::Recover(reason);
         }
 
@@ -398,6 +492,13 @@ impl WatchEngine {
         // source is mid-write (WP-M3 review A1) — otherwise defer the whole tick,
         // so a co-dirty sibling is never captured torn. A never-quiescing source
         // blocks the tick indefinitely and surfaces the 24 h warning (unchanged).
+        //
+        // Tracked-floor gate (manual §4.1): a dirty TRACKED source that is still
+        // inside its floor defers the whole tick — the export would force a
+        // full-snapshot rollover by construction, bypassing the 15 min floor at
+        // delta cadence. Dirty-but-not-due DELTA sources still ride along
+        // deliberately: a delta ride-along is free (already in the export, no
+        // rollover), so blocking on them would delay capture for zero benefit.
         let dirty: Vec<&SourceState> = self.sources.values().filter(|s| s.dirty).collect();
         if dirty.is_empty() {
             return Tick::Idle;
@@ -406,7 +507,8 @@ impl WatchEngine {
             .iter()
             .all(|s| s.quiesced(now, self.config.quiesce_window));
         let any_due = dirty.iter().any(|s| s.cooled_down(now));
-        if !(all_quiesced && any_due) {
+        let tracked_blocked = dirty.iter().any(|s| s.tracked && !s.cooled_down(now));
+        if !(all_quiesced && any_due) || tracked_blocked {
             return Tick::Idle;
         }
         let reason = self.dirty_ids();
@@ -425,7 +527,7 @@ impl WatchEngine {
 
     /// Enter the single-flight state, snapshotting each dirty source's
     /// `dirty_count` so `record_result` can detect changes that land mid-sync
-    /// (review A5).
+    /// (review A5). The recover path flips `in_flight_recover` after this.
     fn begin_sync(&mut self) {
         self.in_flight = self
             .sources
@@ -434,6 +536,7 @@ impl WatchEngine {
             .map(|(id, s)| (id.clone(), s.dirty_count))
             .collect();
         self.syncing = true;
+        self.in_flight_recover = false;
     }
 
     /// Record the outcome of the sync the last poll authorized.
@@ -458,12 +561,41 @@ impl WatchEngine {
                 self.backoff = None;
                 self.recover_attempted = false;
                 self.recover_pending = false;
+                self.in_flight_recover = false;
+                self.auth_attempts = 0;
             }
             Err(class) => {
                 self.in_flight.clear();
+                let was_recover = self.in_flight_recover;
+                self.in_flight_recover = false;
                 self.recover_pending = false;
                 match class {
-                    SyncErrorClass::Transient => self.apply_backoff(now),
+                    SyncErrorClass::Transient => {
+                        // A network blip DURING the recovery attempt keeps the
+                        // recovery pending — retry the recovery after backoff
+                        // instead of downgrading to a plain sync (which would
+                        // burn `recover_attempted` and park on the re-failure).
+                        self.recover_pending = was_recover;
+                        self.apply_backoff(now);
+                    }
+                    SyncErrorClass::Auth => {
+                        self.auth_attempts = self.auth_attempts.saturating_add(1);
+                        if self.auth_attempts >= AUTH_ATTEMPT_BUDGET {
+                            self.parked = Some(ParkError {
+                                code: "auth_failed".into(),
+                                message: "Auto-sync parked: the service rejected this API \
+                                          key (HTTP 401/403)."
+                                    .into(),
+                                hint: Some(
+                                    "Fix the key (alf login / ~/.alf/config.toml); a \
+                                     successful manual alf_sync resumes auto-sync."
+                                        .into(),
+                                ),
+                            });
+                        } else {
+                            self.apply_backoff(now);
+                        }
+                    }
                     SyncErrorClass::Fork => {
                         self.parked = Some(ParkError {
                             code: "sync_first_sync_conflict".into(),
@@ -539,6 +671,13 @@ impl WatchEngine {
         self.backoff = None;
         self.recover_attempted = false;
         self.recover_pending = false;
+        self.auth_attempts = 0;
+    }
+
+    /// Park the loop from the driver side (e.g. `lock_unavailable` — the
+    /// advisory lock file cannot even be opened; manual §4.2).
+    pub fn park(&mut self, p: ParkError) {
+        self.parked = Some(p);
     }
 
     pub fn is_parked(&self) -> bool {
@@ -612,6 +751,7 @@ mod tests {
             tracked,
             sqlite: false,
             rediscover: false,
+            resurface: false,
         }
     }
 
@@ -637,17 +777,35 @@ mod tests {
     }
 
     #[test]
-    fn timing_override_parsing_is_gated_on_a_valid_value() {
+    fn env_override_clamps_floor_ceiling_and_ignores_malformed() {
         // The env-read is split from this pure parser so it can be tested without
         // mutating the shared timing env vars (which `clamps` above depends on).
         let d = DELTA_FLOOR;
-        assert_eq!(
-            super::parse_ms(Some("1000"), d),
-            Duration::from_millis(1000)
-        );
-        assert_eq!(super::parse_ms(None, d), d, "unset ⇒ production const");
-        assert_eq!(super::parse_ms(Some("nope"), d), d, "unparseable ⇒ const");
-        assert_eq!(super::parse_ms(Some(""), d), d);
+        let floor = Duration::from_millis(100);
+        // Sub-floor values are raised to the floor, with a warning.
+        let (v, w) = super::parse_ms_clamped(Some("0"), d, floor);
+        assert_eq!(v, floor, "zero can never reach tokio::time::interval");
+        assert!(w.is_some(), "a clamp must warn");
+        let (v, w) = super::parse_ms_clamped(Some("50"), d, floor);
+        assert_eq!(v, floor);
+        assert!(w.is_some());
+        // Malformed ⇒ default + warning; unset ⇒ default silently.
+        let (v, w) = super::parse_ms_clamped(Some("abc"), d, floor);
+        assert_eq!(v, d, "unparseable ⇒ production const");
+        assert!(w.is_some());
+        let (v, w) = super::parse_ms_clamped(Some(""), d, floor);
+        assert_eq!(v, d);
+        assert!(w.is_some());
+        let (v, w) = super::parse_ms_clamped(None, d, floor);
+        assert_eq!(v, d, "unset ⇒ production const");
+        assert!(w.is_none(), "unset must not warn");
+        // In-range values pass through untouched; absurd values hit the ceiling.
+        let (v, w) = super::parse_ms_clamped(Some("250"), d, floor);
+        assert_eq!(v, Duration::from_millis(250));
+        assert!(w.is_none());
+        let (v, w) = super::parse_ms_clamped(Some("999999999999"), d, floor);
+        assert_eq!(v, INTERVAL_CEILING);
+        assert!(w.is_some());
     }
 
     #[test]
@@ -958,5 +1116,221 @@ mod tests {
         assert_eq!(e.poll(secs(61)), Tick::Idle); // <120s
         e.mark_dirty("journal", secs(120));
         assert!(matches!(e.poll(secs(120)), Tick::Sync(_)));
+    }
+
+    #[test]
+    fn dirty_tracked_source_defers_the_whole_tick_until_its_floor() {
+        // Manual §4.1: a dirty TRACKED source inside its floor blocks the tick —
+        // the whole-workspace export would force a full-snapshot rollover at
+        // delta cadence otherwise.
+        let mut cfg = WatchConfig {
+            quiesce_window: Duration::ZERO,
+            ..Default::default()
+        };
+        cfg.set_default(DELTA_FLOOR);
+        cfg.set_tracked(TRACKED_FLOOR);
+        let mut e = WatchEngine::new(cfg);
+        e.set_sources(&[spec("journal", false), spec("tracked-files", true)]);
+        // Drain the catch-up tick (both sources never fired → both due).
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Ok(()));
+
+        e.mark_dirty("journal", secs(100));
+        e.mark_dirty("tracked-files", secs(100));
+        // journal is due at 160 (60 s floor) but the tracked source is inside
+        // its 900 s floor → the WHOLE tick defers.
+        assert_eq!(e.poll(secs(160)), Tick::Idle);
+        assert_eq!(e.poll(secs(899)), Tick::Idle);
+        // At the tracked floor, one Sync covers both.
+        match e.poll(secs(900)) {
+            Tick::Sync(ids) => {
+                assert!(ids.contains(&"journal".to_string()));
+                assert!(ids.contains(&"tracked-files".to_string()));
+            }
+            other => panic!("expected Sync at the tracked floor, got {other:?}"),
+        }
+        e.record_result(secs(900), Ok(()));
+        assert_eq!(e.poll(secs(901)), Tick::Idle);
+    }
+
+    #[test]
+    fn delta_ride_along_still_fires() {
+        // Documents the accepted ride-along: a dirty-but-not-due DELTA source
+        // rides on a due sibling for free (no rollover cost).
+        let mut cfg = WatchConfig {
+            quiesce_window: Duration::ZERO,
+            ..Default::default()
+        };
+        cfg.set_default(DELTA_FLOOR);
+        cfg.set_per_source("kb", secs(300));
+        let mut e = WatchEngine::new(cfg);
+        e.set_sources(&[spec("journal", false), spec("kb", false)]);
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Ok(()));
+
+        e.mark_dirty("journal", secs(61));
+        e.mark_dirty("kb", secs(61));
+        // journal is due (60 s); kb is not (300 s) but rides along.
+        match e.poll(secs(61)) {
+            Tick::Sync(ids) => {
+                assert!(ids.contains(&"journal".to_string()));
+                assert!(ids.contains(&"kb".to_string()));
+            }
+            other => panic!("expected Sync with the ride-along, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recovery_tick_waits_for_quiesce() {
+        // Manual §4.2: a recovery sync exports the whole workspace, so a
+        // mid-write file defers it exactly like a normal sync.
+        let mut e = engine_one_source(secs(3));
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Err(SyncErrorClass::Conflict));
+        e.mark_dirty("journal", secs(1));
+        assert_eq!(
+            e.poll(secs(2)),
+            Tick::Idle,
+            "mid-write file defers recovery"
+        );
+        assert!(matches!(e.poll(secs(4)), Tick::Recover(_)));
+    }
+
+    #[test]
+    fn recovery_runs_when_dirty_sources_are_quiesced() {
+        // The quiesce gate on recovery passes when nothing is mid-write —
+        // including the catch-up case where last_change was never stamped.
+        let mut e = engine_one_source(secs(3));
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Err(SyncErrorClass::MissingBase));
+        assert!(matches!(e.poll(secs(1)), Tick::Recover(_)));
+    }
+
+    #[test]
+    fn transient_failure_during_recovery_retries_recovery() {
+        let mut e = engine_one_source(Duration::ZERO);
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Err(SyncErrorClass::Conflict));
+        assert!(matches!(e.poll(secs(1)), Tick::Recover(_)));
+        // A network blip DURING the recovery: the recovery stays pending and
+        // retries after backoff — it is not downgraded to a plain Sync (which
+        // would burn recover_attempted and park on the re-failure).
+        e.record_result(secs(1), Err(SyncErrorClass::Transient));
+        assert_eq!(e.poll(secs(5)), Tick::Idle, "backing off");
+        assert!(
+            matches!(e.poll(secs(7)), Tick::Recover(_)),
+            "the RECOVERY retries, not a plain sync"
+        );
+        e.record_result(secs(7), Ok(()));
+        assert!(!e.is_parked());
+    }
+
+    #[test]
+    fn auth_failure_parks_after_three_attempts_with_backoff_between() {
+        let mut e = engine_one_source(Duration::ZERO);
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Err(SyncErrorClass::Auth));
+        assert!(!e.is_parked(), "one blip must not park");
+        assert_eq!(e.poll(secs(4)), Tick::Idle, "backing off 5s");
+        assert!(matches!(e.poll(secs(5)), Tick::Sync(_)));
+        e.record_result(secs(5), Err(SyncErrorClass::Auth));
+        assert!(!e.is_parked());
+        assert_eq!(e.poll(secs(14)), Tick::Idle, "backing off 10s");
+        assert!(matches!(e.poll(secs(15)), Tick::Sync(_)));
+        e.record_result(secs(15), Err(SyncErrorClass::Auth));
+        assert!(e.is_parked(), "third auth failure parks");
+        assert_eq!(e.snapshot(secs(16)).parked.unwrap().code, "auth_failed");
+        assert_eq!(e.poll(secs(16)), Tick::Idle);
+
+        // clear_park + a later success reset the budget: the next auth failure
+        // starts a fresh 3-attempt budget instead of instantly re-parking.
+        e.clear_park();
+        assert!(matches!(e.poll(secs(16)), Tick::Sync(_)));
+        e.record_result(secs(16), Ok(()));
+        e.mark_dirty("journal", secs(80));
+        assert!(matches!(e.poll(secs(80)), Tick::Sync(_)));
+        e.record_result(secs(80), Err(SyncErrorClass::Auth));
+        assert!(!e.is_parked(), "budget was reset by the clean sync");
+    }
+
+    #[test]
+    fn backoff_doubles_caps_at_300s_and_resets_on_success() {
+        let mut e = engine_one_source(Duration::ZERO);
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        let mut t = 0u64;
+        for gap in [5u64, 10, 20, 40, 80, 160, 300, 300] {
+            e.record_result(secs(t), Err(SyncErrorClass::Transient));
+            assert_eq!(
+                e.poll(secs(t + gap - 1)),
+                Tick::Idle,
+                "still backing off at +{}s",
+                gap - 1
+            );
+            t += gap;
+            assert!(
+                matches!(e.poll(secs(t)), Tick::Sync(_)),
+                "retry due at +{gap}s"
+            );
+        }
+        e.record_result(secs(t), Ok(()));
+        // Reset: after a success, the next transient failure starts back at 5s.
+        e.mark_dirty("journal", secs(t + 61)); // past the 60s interval
+        assert!(matches!(e.poll(secs(t + 61)), Tick::Sync(_)));
+        e.record_result(secs(t + 61), Err(SyncErrorClass::Transient));
+        assert_eq!(e.poll(secs(t + 65)), Tick::Idle);
+        assert!(
+            matches!(e.poll(secs(t + 66)), Tick::Sync(_)),
+            "backoff reset to 5s after a success"
+        );
+    }
+
+    #[test]
+    fn every_park_path_emits_a_code_listed_in_park_codes() {
+        // Drive every engine park path and pin the emitted set against
+        // PARK_CODES — the docs drift test pins the docs against the same
+        // const, closing the loop (manual §4.2).
+        let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        // Fork and Fatal park on the first failure.
+        for class in [SyncErrorClass::Fork, SyncErrorClass::Fatal] {
+            let mut e = engine_one_source(Duration::ZERO);
+            assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+            e.record_result(secs(0), Err(class));
+            emitted.insert(e.snapshot(secs(1)).parked.unwrap().code);
+        }
+        // Recoverables park when the recovery attempt re-fails.
+        for class in [
+            SyncErrorClass::Conflict,
+            SyncErrorClass::MissingBase,
+            SyncErrorClass::Poisoned,
+        ] {
+            let mut e = engine_one_source(Duration::ZERO);
+            assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+            e.record_result(secs(0), Err(class));
+            assert!(matches!(e.poll(secs(1)), Tick::Recover(_)));
+            e.record_result(secs(1), Err(class));
+            emitted.insert(e.snapshot(secs(2)).parked.unwrap().code);
+        }
+        // Auth parks on the third attempt.
+        {
+            let mut e = engine_one_source(Duration::ZERO);
+            let mut t = 0;
+            for gap in [5u64, 10, 0] {
+                assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+                e.record_result(secs(t), Err(SyncErrorClass::Auth));
+                t += gap;
+            }
+            emitted.insert(e.snapshot(secs(t)).parked.unwrap().code);
+        }
+        // `lock_unavailable` is driver-emitted (decide_lock in watch/mod.rs,
+        // pinned against PARK_CODES there) — the engine cannot produce it.
+        emitted.insert("lock_unavailable".to_string());
+
+        let expected: std::collections::BTreeSet<String> =
+            PARK_CODES.iter().map(|c| c.to_string()).collect();
+        assert_eq!(
+            emitted, expected,
+            "PARK_CODES and the emitted set must match exactly"
+        );
     }
 }

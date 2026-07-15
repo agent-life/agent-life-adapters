@@ -203,6 +203,19 @@ CI gates (design/plan §6). Each is handed off with a runbook in its WP handoff.
   hermes-mcp --llm proxy --backend real --stages Z1-Z3,Z15`). The agent drives
   sync/vault via `mcp_alf_*`; the marker check PASSes only on a positive MCP-path
   log marker (WP-M6 task 0a). Finalize the log/session sink, then keep the run dir.
+* **hermes-mcp watch auto-sync** (Z16) — a persistent harness-started `alf mcp
+  serve` runs the watch loop at a ~1s test cadence (`ALF_WATCH_*` env overrides;
+  production stays 60s/3s); the harness mutates a watched memory file + `state.db`
+  on a timer and asserts the loop auto-uploaded the deltas with zero tool/LLM
+  calls. `--framework hermes-mcp --llm none --backend real --stages Z1-Z3,Z16`.
+* **hermes-mcp multi-agent watch + vault** (Z17) — the real multi-agent posture:
+  TWO `alf mcp serve` loops (one per profile, each pinned to its own agent) watch
+  BOTH workspaces for ~20s while the harness makes 3 file edits (A, B, A) + a
+  vault add on A. Asserts each loop advanced only its own agent's backend
+  sequence, the file markers reached each head memory without cross-leak, and a
+  vault backend ROUND-TRIP (delete A's local ciphertext → `alf restore` →
+  `alf vault decrypt`). Needs both agents set up first:
+  `--framework hermes-mcp --llm none --backend real --stages Z1-Z12,Z17`.
 * **pre-upload abort catch-up** — `preupload_abort_catchup_gate.py` (WP-M6 task 0b;
   formerly the "kill-9" gate). Build the fault binary, then run the gate; it proves
   catch-up under worst-moment process death at the pre-upload seam (a COOPERATIVE

@@ -174,6 +174,9 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
                         {"path": "credentials.json (vault)", "kind": "file"},
                         {"path": "skills/", "kind": "dir"},
                     ]})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+             patch={"activity": "agent A vault · 1 key",
+                    "agents": {"A": {"vault_keys": 1, "vault_labels": ["vault-z6"]}}})
     elif sid == "z07" and status == "PASS":
         seq_n = 2
         for c in stage.get("checks") or []:
@@ -190,7 +193,8 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
         emit(events, seq, t, "state", stage_id=sid, subsystem="service",
              patch={"latest_sequence": seq_n, "deltas": 2, "packet": "delta",
                     "activity": f"agent A · seq {seq_n}",
-                    "agents": {"A": {"seq": seq_n, "deltas": 2, "snapshot": True}}})
+                    "agents": {"A": {"seq": seq_n, "deltas": 2, "snapshot": True,
+                                    "vault_keys": 1, "vault_labels": ["vault-z6"]}}})
         emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
              patch={"role": "cli-sync", "last": "delta"})
     elif sid == "z08" and status == "PASS":
@@ -213,6 +217,7 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
     elif sid == "z10" and status == "PASS":
         emit(events, seq, t, "state", stage_id=sid, subsystem="agentB",
              patch={"synced": True, "records": 4, "isolation": "clean",
+                    "seq": 0,
                     "activity": "synced · isolation clean",
                     "workspace": [
                         {"path": "profiles/agent_b/", "kind": "dir"},
@@ -231,6 +236,20 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
                     "activity": "agent B registered",
                     "agents": {"B": {"visible": True, "registered": True,
                                     "snapshot": True, "seq": 0, "deltas": 0}}})
+    elif sid == "z11" and status == "PASS":
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentB",
+             patch={"vault": ["vault-b"],
+                    "activity": "vault-b encrypted under b's key",
+                    "mutations": [
+                        {"path": "profiles/agent_b/…/.alf-vault-key", "op": "keygen",
+                         "note": "0600 local key"},
+                        {"path": "credentials.json (vault)", "op": "add",
+                         "note": "vault-b ciphertext"},
+                    ]})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+             patch={"activity": "agent B vault · 1 key (A cannot open)",
+                    "agents": {"B": {"visible": True, "registered": True,
+                                    "vault_keys": 1, "vault_labels": ["vault-b"]}}})
     elif sid == "z15" and status == "PASS":
         emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
              patch={"role": "stdio-server", "active": True,
@@ -240,15 +259,18 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
                     "activity": "mcp_alf_* tools invoked by agent"})
         emit(events, seq, t, "state", stage_id=sid, subsystem="service",
              patch={"packet": "mcp-sync", "activity": "MCP tool-driven sync landed",
-                    "agents": {"A": {"snapshot": True}}})
+                    "agents": {"A": {"snapshot": True, "vault_keys": 2,
+                                    "vault_labels": ["vault-z6", "z15"]}}})
         emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
              patch={"activity": "synced via mcp_alf_* (no terminal alf sync)",
-                    "synced": True,
+                    "synced": True, "vault": ["z15"],
                     "mutations": [
                         {"path": "memories/MEMORY.md", "op": "sync",
                          "note": "tool-driven export"},
                         {"path": "state.db", "op": "sync",
                          "note": "tool-driven export"},
+                        {"path": "credentials.json (vault)", "op": "add",
+                         "note": "z15 via mcp_alf_*"},
                     ]})
     elif sid == "z16" and status == "PASS":
         base, end, n_deltas = 4, 10, 6
@@ -310,6 +332,115 @@ def infer_state_for_stage(stage_id: str, stage: dict, events: list, seq: list, t
                         {"path": "state.db", "op": "watch",
                          "note": f"{n_deltas} rows"},
                     ]})
+    elif sid == "z17" and status == "PASS":
+        # Reconstruct A/B watch hops + per-agent sequence from check details.
+        base_a, end_a, base_b, end_b = 1, 3, 0, 2
+        n_a, n_b = 2, 1
+        for c in stage.get("checks") or []:
+            d = c.get("detail") or ""
+            name = c.get("name") or ""
+            m = re.search(r"seq\s+(\d+)\s*→\s*(\d+)", d)
+            if not m:
+                continue
+            if "agent A" in name or "agent A:" in name:
+                base_a, end_a = int(m.group(1)), int(m.group(2))
+                m2 = re.search(r"(\d+)\s+deltas", d)
+                if m2:
+                    n_a = int(m2.group(1))
+            elif "agent B" in name or "agent B:" in name:
+                base_b, end_b = int(m.group(1)), int(m.group(2))
+                m2 = re.search(r"(\d+)\s+deltas", d)
+                if m2:
+                    n_b = int(m2.group(1))
+        mid_a = base_a + max(1, (end_a - base_a) // 2) if end_a > base_a else end_a
+        # A edit 1 → sync
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+             patch={"activity": "watch edit 1/3",
+                    "mutations": [{"path": "memories/MEMORY.md", "op": "append",
+                                   "note": "z17 A#1"}],
+                    "packet": "watch-delta"})
+        t = t + timedelta(milliseconds=30)
+        if end_a > base_a:
+            emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
+                 patch={"role": "watch-loop", "active": True, "watch_sources": 8,
+                        "packet": "watch-delta", "last": "watch-delta",
+                        "activity": f"A watch sync · seq {mid_a}"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+                 patch={"seq": mid_a, "synced": True,
+                        "activity": f"watch synced · seq {mid_a}",
+                        "packet": "watch-delta"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+                 patch={"activity": f"agent A · seq {mid_a}",
+                        "agents": {"A": {"seq": mid_a,
+                                        "deltas": mid_a - base_a,
+                                        "snapshot": True}}})
+        t = t + timedelta(milliseconds=40)
+        # B edit → sync (packet on agentB → b-m edge)
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentB",
+             patch={"activity": "watch edit 2/3",
+                    "mutations": [
+                        {"path": "profiles/agent_b/memories/MEMORY.md",
+                         "op": "append", "note": "z17 B#2"}],
+                    "packet": "watch-delta"})
+        t = t + timedelta(milliseconds=30)
+        if end_b > base_b:
+            emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
+                 patch={"role": "watch-loop", "active": True, "watch_sources": 8,
+                        "packet": "watch-delta", "last": "watch-delta",
+                        "activity": f"B watch sync · seq {end_b}"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="agentB",
+                 patch={"seq": end_b, "synced": True,
+                        "activity": f"watch synced · seq {end_b}",
+                        "packet": "watch-delta"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+                 patch={"activity": f"agent B · seq {end_b}",
+                        "agents": {"B": {"seq": end_b,
+                                        "deltas": end_b - base_b,
+                                        "snapshot": True, "visible": True,
+                                        "registered": True}}})
+        t = t + timedelta(milliseconds=40)
+        # A vault + edit 3 → final sync
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+             patch={"vault": ["vault-z17"],
+                    "activity": "vault add vault-z17 (rides file #3)",
+                    "mutations": [{"path": "credentials.json (vault)", "op": "add",
+                                   "note": "vault-z17 ciphertext"}],
+                    "packet": "watch-delta"})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+             patch={"activity": "agent A vault · 3 keys",
+                    "agents": {"A": {"vault_keys": 3,
+                                    "vault_labels": ["vault-z6", "z15", "vault-z17"]}}})
+        t = t + timedelta(milliseconds=20)
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+             patch={"activity": "watch edit 3/3 (+ vault)",
+                    "mutations": [
+                        {"path": "memories/MEMORY.md", "op": "append",
+                         "note": "z17 A#3"},
+                        {"path": "credentials.json (vault)", "op": "watch",
+                         "note": "vault-z17 ↑ backend"}],
+                    "packet": "watch-delta"})
+        t = t + timedelta(milliseconds=30)
+        if end_a > mid_a:
+            emit(events, seq, t, "state", stage_id=sid, subsystem="mcp",
+                 patch={"role": "watch-loop", "active": True, "watch_sources": 8,
+                        "packet": "watch-delta", "last": "watch-delta",
+                        "activity": f"A watch sync · seq {end_a} (+ vault)"})
+            emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+                 patch={"seq": end_a, "synced": True,
+                        "activity": f"watch synced · seq {end_a}",
+                        "packet": "watch-delta"})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentA",
+             patch={"seq": end_a, "synced": True})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="agentB",
+             patch={"seq": end_b, "synced": True})
+        emit(events, seq, t, "state", stage_id=sid, subsystem="service",
+             patch={"latest_sequence": end_a,
+                    "activity": f"A seq {base_a}→{end_a} · B seq {base_b}→{end_b}",
+                    "agents": {
+                        "A": {"seq": end_a, "deltas": n_a, "snapshot": True},
+                        "B": {"seq": end_b, "deltas": n_b, "snapshot": True,
+                              "visible": True, "registered": True},
+                    }})
 
 
 def flows_from_log(driver_log: Path) -> dict[str, list]:

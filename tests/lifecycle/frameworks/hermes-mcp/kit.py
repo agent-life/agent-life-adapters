@@ -121,6 +121,59 @@ class HermesMcpKit(HermesKit):
                 f"{(sql.stderr or sql.stdout or '').strip()[:300]}")
         return marker
 
+    # -- Z17 multi-agent watch + vault: one watched FILE mutation ---------------
+
+    def mutate_watched_file(self, ctr, slot: str, i: int) -> str:
+        """One Z17 watched-FILE mutation (no `state.db`, unlike `mutate_watched`)
+        — append a `§`-separated entry to the profile's `memories/MEMORY.md`, a
+        REAL Hermes semantic-memory source, so the watch loop for `slot` picks it
+        up as one new memory RECORD (the marker then reaches the /memory DTO after
+        indexing). Written INSIDE the container (via `ctr`) so the loop's inotify
+        watch fires natively — a host-side write to the bind mount raises no
+        container inotify event. rc-checked and raises on failure (fail-closed: a
+        silently failed write would make the later delta/content checks assert
+        against a change that never happened). Returns the marker so the stage can
+        assert it synced to `slot`'s agent (and NOT the other agent's)."""
+        prof = self._container_profile(slot)
+        marker = f"Z17-WATCH-{slot}-{i:02d}"
+        entry = (f"\n§\nWatch entry {marker}: auto-synced by {slot}'s Z17 watch "
+                 f"loop (multi-agent tick {i}).")
+        ctr.sh(
+            f"mkdir -p {prof}/memories; "
+            f"printf %s {shlex.quote(entry)} >> {prof}/memories/MEMORY.md",
+            user="agent", check=True)
+        return marker
+
+    def parse_watch_stderr(self, lines: list) -> dict:
+        """Parse a harness-started `alf mcp serve`'s in-memory stderr capture (the
+        Z17 drain list) into the watch-loop facts a gate can ASSERT rather than
+        merely log: whether the loop went ACTIVE, which agent it BOUND (the loop
+        resolves + pins exactly one agent, server-side), and how many autonomous
+        syncs it completed. Reuses the same banner regexes as `_server_sessions`
+        (which parses the file Hermes captures for its own spawns). Returns
+        `{active, bound_agent, sync_ok, error}` — `active=None` means no banner was
+        seen at all (the stderr capture is broken), which a caller treats as a
+        first-class FAIL, not a silent pass."""
+        active = None
+        bound = None
+        error = None
+        sync_ok = 0
+        for line in lines:
+            m = self._RE_WATCH_OK.search(line)
+            if m:
+                active, bound = True, m.group(2).strip()
+                continue
+            m = self._RE_WATCH_NO.search(line)
+            if m:
+                active, error = False, m.group(1).strip()
+                continue
+            if "watch sync ok" in line:
+                sync_ok += 1
+            elif "watch sync error" in line and error is None:
+                error = line.strip()
+        return {"active": active, "bound_agent": bound, "sync_ok": sync_ok,
+                "error": error}
+
     # -- config wiring ---------------------------------------------------------
 
     def _config_yaml(self, creds, agent_id: str = "") -> str:

@@ -528,6 +528,7 @@
             <div class="metric"><span>Registered</span><span id="sAReg">no</span></div>
             <div class="metric"><span>Sequence</span><span id="sASeq">—</span></div>
             <div class="metric"><span>Snapshot / Δ</span><span id="sASnap">—</span></div>
+            <div class="metric"><span>Vault</span><span id="sAVault">0</span></div>
           </div>
         </div>
         <div class="agent-panel b hidden" id="svcPanelB">
@@ -536,6 +537,7 @@
             <div class="metric"><span>Registered</span><span id="sBReg">no</span></div>
             <div class="metric"><span>Sequence</span><span id="sBSeq">—</span></div>
             <div class="metric"><span>Snapshot / Δ</span><span id="sBSnap">—</span></div>
+            <div class="metric"><span>Vault</span><span id="sBVault">0</span></div>
           </div>
         </div>
       </div>
@@ -549,6 +551,7 @@
     <div class="activity" id="bActivity">not created yet</div>
     <div class="metrics">
       <div class="metric"><span>Records</span><span id="bRecords">0</span></div>
+      <div class="metric"><span>Sequence</span><span id="bSeq">—</span></div>
       <div class="metric"><span>Synced</span><span id="bSynced">no</span></div>
       <div class="metric"><span>Isolation</span><span id="bIso">—</span></div>
     </div>
@@ -628,6 +631,7 @@
     z14: "Z14 · Curated in-place memory delta shapes",
     z15: "Z15 · MCP LLM gate — agent drives sync/vault",
     z16: "Z16 · Watch loop auto-sync → backend deltas",
+    z17: "Z17 · Multi-agent watch — both loops + vault round-trip",
   };
 
   const WS_DEFAULT_A = [
@@ -650,8 +654,8 @@
               activity: "waiting…", turns: [], last_turn: null,
               workspace: WS_DEFAULT_A.map(x => ({ ...x })),
               mutations: [], root: "~/.hermes" },
-    agentB: { born: false, records: 0, synced: false, markers: [], isolation: "—",
-              activity: "not created yet",
+    agentB: { born: false, records: 0, seq: null, synced: false, markers: [], vault: [],
+              isolation: "—", activity: "not created yet",
               workspace: WS_DEFAULT_B.map(x => ({ ...x })),
               mutations: [], root: "profiles/agent_b" },
     mcp: { role: "idle", active: false, watch_sources: 0, last: "—", tools: [],
@@ -662,8 +666,10 @@
       llm: { phase: null, turn: null, of: null, type: null, marker: null,
              prompt: null, response: null },
       agents: {
-        A: { registered: false, seq: null, snapshot: false, deltas: 0, id: null },
-        B: { registered: false, seq: null, snapshot: false, deltas: 0, id: null, visible: false },
+        A: { registered: false, seq: null, snapshot: false, deltas: 0, id: null,
+             vault_keys: 0, vault_labels: [] },
+        B: { registered: false, seq: null, snapshot: false, deltas: 0, id: null,
+             visible: false, vault_keys: 0, vault_labels: [] },
       },
     },
   });
@@ -971,10 +977,13 @@
     const patch = ev.patch || {};
     const kind = patch.packet || "";
     const snip = llmSnippetFrom(ev);
+    const watchHop = (fromId) => ({
+      from: fromId, to: "mcp", label: "watch Δ", color: "var(--packet-watch)",
+      next: { from: "mcp", to: "service", label: "auto sync", color: "var(--packet-delta)" },
+    });
     const map = {
       snapshot: { from: "mcp", to: "service", label: "PUT snapshot", color: "var(--packet-snapshot)" },
       delta: { from: "mcp", to: "service", label: "PUT delta", color: "var(--packet-delta)" },
-      "watch-delta": { from: "agentA", to: "mcp", label: "watch Δ", color: "var(--packet-watch)", next: { from: "mcp", to: "service", label: "auto sync", color: "var(--packet-delta)" } },
       "tool-call": { from: "agentA", to: "mcp", label: "mcp_alf_*", color: "var(--packet-tool)", next: { from: "mcp", to: "service", label: "sync", color: "var(--packet-snapshot)" } },
       "mcp-sync": { from: "mcp", to: "service", label: "MCP sync", color: "var(--packet-tool)" },
       register: { from: "mcp", to: "service", label: "POST /agents", color: "var(--packet-register)" },
@@ -991,10 +1000,20 @@
         snippet: snip,
       },
     };
+    if (kind === "watch-delta") {
+      if (ev.subsystem === "agentB") return watchHop("agentB");
+      if (ev.subsystem === "agentA") return watchHop("agentA");
+      // mcp/service summaries: only the uplink, don't invent an Agent A source
+      return { from: "mcp", to: "service", label: "auto sync", color: "var(--packet-delta)" };
+    }
     if (kind && map[kind]) return map[kind];
     if (ev.kind === "flow") {
       const a = (ev.arrows || "").toLowerCase();
-      if (a.includes("watch")) return map["watch-delta"];
+      if (a.includes("2×") || a.includes("both") || (a.includes("a,b") && a.includes("watch"))) {
+        // Multi-agent watch intro — no single hop
+        return null;
+      }
+      if (a.includes("watch")) return watchHop("agentA");
       if (a.includes("mcp_alf") || a.includes("mcp serve")) return map["tool-call"];
       if (a.includes("llm proxy") || a.includes("prompts")) return map["llm-prompt"];
       if (a.includes("snapshot") || a.includes("post /v1/agents")) return map.snapshot;
@@ -1097,10 +1116,48 @@
           agents.B.registered = true;
           if (p.packet === "snapshot") agents.B.snapshot = true;
         }
-        if (p.agents) mergePatch(agents, p.agents);
+        if (p.agents) {
+          const prevVault = {
+            A: { labels: [...((agents.A && agents.A.vault_labels) || [])],
+                 keys: (agents.A && agents.A.vault_keys) || 0 },
+            B: { labels: [...((agents.B && agents.B.vault_labels) || [])],
+                 keys: (agents.B && agents.B.vault_keys) || 0 },
+          };
+          mergePatch(agents, p.agents);
+          // Keep Agent A/B cards' Sequence in sync when only the Service
+          // panel was patched (final Z17 summary, older event streams).
+          if (p.agents.A && p.agents.A.seq != null) S.subsystems.agentA.seq = p.agents.A.seq;
+          if (p.agents.B && p.agents.B.seq != null) S.subsystems.agentB.seq = p.agents.B.seq;
+          for (const k of ["A", "B"]) {
+            const ap = p.agents[k];
+            if (!ap || !agents[k]) continue;
+            const labels = [...new Set([
+              ...prevVault[k].labels,
+              ...(Array.isArray(ap.vault_labels) ? ap.vault_labels : []),
+              ...(Array.isArray(agents[k].vault_labels) ? agents[k].vault_labels : []),
+            ])];
+            if (labels.length) agents[k].vault_labels = labels;
+            agents[k].vault_keys = Math.max(
+              prevVault[k].keys,
+              ap.vault_keys != null ? ap.vault_keys : 0,
+              labels.length);
+          }
+        }
       }
       // Mirror Agent A turn text into the Service LLM proxy panel when the
       // service patch didn't carry an explicit llm blob (older / backfilled runs).
+      if (ev.subsystem === "agentA" || ev.subsystem === "agentB") {
+        const p = ev.patch || {};
+        if (Array.isArray(p.vault) && p.vault.length) {
+          const key = ev.subsystem === "agentB" ? "B" : "A";
+          const agents = S.subsystems.service.agents || (S.subsystems.service.agents = { A: {}, B: {} });
+          if (!agents[key]) agents[key] = {};
+          const labels = [...new Set([...(agents[key].vault_labels || []), ...p.vault])];
+          agents[key].vault_labels = labels;
+          agents[key].vault_keys = Math.max(agents[key].vault_keys || 0, labels.length);
+          if (key === "B") agents[key].visible = true;
+        }
+      }
       if (ev.subsystem === "agentA") {
         const lt = (ev.patch || {}).last_turn;
         if (lt && (lt.prompt || lt.response)) {
@@ -1226,6 +1283,7 @@
     renderWorkspace("aWs", A, doFlash);
     $("bActivity").textContent = B.activity || (B.born ? "ready" : "not created yet");
     $("bRecords").textContent = B.records ?? 0;
+    $("bSeq").textContent = B.seq == null ? "—" : B.seq;
     $("bSynced").textContent = B.synced ? "yes" : "no";
     $("bIso").textContent = B.isolation || "—";
     $("bChips").innerHTML = (B.markers || []).slice(0, 4).map(m => `<span class="chip">${m}</span>`).join("");
@@ -1245,11 +1303,13 @@
     const aSnap = aP.snapshot || Sv.snapshot;
     const aDeltas = aP.deltas != null ? aP.deltas : (Sv.deltas ?? 0);
     setMetric("sASnap", aSnap ? `snap + ${aDeltas}Δ` : (aDeltas ? `${aDeltas}Δ` : "—"), doFlash);
+    setMetric("sAVault", fmtVaultKeys(aP.vault_keys), doFlash);
     const showB = !!(bP.visible || Sv.agent_b_registered || B.born);
     $("svcPanelB").classList.toggle("hidden", !showB);
     setMetric("sBReg", (bP.registered || Sv.agent_b_registered) ? "yes" : "no", doFlash);
     setMetric("sBSeq", bP.seq != null ? bP.seq : "—", doFlash);
     setMetric("sBSnap", bP.snapshot ? `snap + ${bP.deltas || 0}Δ` : (bP.deltas ? `${bP.deltas}Δ` : "—"), doFlash);
+    setMetric("sBVault", fmtVaultKeys(bP.vault_keys), doFlash);
 
     // LLM proxy panel — conversation content lives here, not only on the edge.
     renderLlmProxyPanel();
@@ -1267,6 +1327,12 @@
     document.querySelectorAll(".agent-panel .metric.flash").forEach(row => {
       row.classList.remove("flash");
     });
+  }
+
+  function fmtVaultKeys(n) {
+    const c = n == null ? 0 : Number(n) || 0;
+    if (c <= 0) return "0";
+    return c === 1 ? "1 key" : `${c} keys`;
   }
 
   function setMetric(id, next, doFlash) {

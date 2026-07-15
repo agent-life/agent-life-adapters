@@ -634,6 +634,10 @@ def z06_vault(run, result: StageResult):
             {"path": "skills/", "kind": "dir"},
         ],
     }, stage_id="z06")
+    events.state("service", {
+        "activity": "agent A vault · 1 key",
+        "agents": {"A": {"vault_keys": 1, "vault_labels": ["vault-z6"]}},
+    }, stage_id="z06")
 
 
 # ---------------------------------------------------------------------------
@@ -690,7 +694,8 @@ def z07_delta_sync(run, result: StageResult):
         "packet": "delta",
         "activity": f"agent A · seq {seq}",
         "agents": {
-            "A": {"seq": seq, "deltas": len(rbody.get("deltas") or []), "snapshot": True},
+            "A": {"seq": seq, "deltas": len(rbody.get("deltas") or []), "snapshot": True,
+                  "vault_keys": 1, "vault_labels": ["vault-z6"]},
         },
     }, stage_id="z07")
     events.state("mcp", {"role": "cli-sync", "last": "delta"}, stage_id="z07")
@@ -819,8 +824,17 @@ def z10_agent_b_isolation(run, result: StageResult):
         result.add(_passfail(b_found == 4 and a_leak == 0,
                              "agent b's archive carries only b's markers",
                              f"b={b_found}/4 a_leak={a_leak}"))
+    rows = _mapping_rows(run)
+    b_id = next((str(r.get("alf_agent_id")) for r in rows
+                 if r.get("runtime_agent") == slot_b), "")
+    seq_b = 0
+    if b_id:
+        rb = run.api.get(f"/agents/{b_id}")
+        if rb.status_code == 200:
+            seq_b = int((rb.json() or {}).get("latest_sequence") or 0)
     events.state("agentB", {
         "synced": True,
+        "seq": seq_b,
         "markers": scenario.markers(slot_b, 1),
         "records": 4,
         "isolation": "clean",
@@ -841,7 +855,8 @@ def z10_agent_b_isolation(run, result: StageResult):
         "packet": "snapshot",
         "activity": "agent B registered",
         "agents": {
-            "B": {"visible": True, "registered": True, "snapshot": True, "seq": 0, "deltas": 0},
+            "B": {"visible": True, "registered": True, "snapshot": True,
+                  "seq": seq_b, "deltas": 0},
         },
     }, stage_id="z10")
 
@@ -888,6 +903,22 @@ def z11_vault_b_isolation(run, result: StageResult):
     result.add(_passfail(dec_x.returncode != 0 or secret not in body,
                          "a's key fails CLOSED on b's vault (AEAD)",
                          f"exit={dec_x.returncode}"))
+    events.state("agentB", {
+        "vault": ["vault-b"],
+        "activity": "vault-b encrypted under b's key",
+        "mutations": [
+            {"path": "profiles/agent_b/…/.alf-vault-key", "op": "keygen",
+             "note": "0600 local key"},
+            {"path": "credentials.json (vault)", "op": "add", "note": "vault-b ciphertext"},
+        ],
+    }, stage_id="z11")
+    events.state("service", {
+        "activity": "agent B vault · 1 key (A cannot open)",
+        "agents": {
+            "B": {"visible": True, "registered": True,
+                  "vault_keys": 1, "vault_labels": ["vault-b"]},
+        },
+    }, stage_id="z11")
 
 
 # ---------------------------------------------------------------------------
@@ -1176,17 +1207,25 @@ def z15_mcp_llm_gate(run, result: StageResult):
         "packet": "tool-call",
         "activity": "mcp_alf_* tools invoked by agent",
     }, stage_id="z15")
+    # (5) The agent drives a vault add by calling the tool — count from list.
+    _, lstj = run.container.exec_json(["alf", "vault", "list", "-r", kit.name])
+    labels = [c.get("label") for c in (lstj or {}).get("credentials", []) if c.get("label")]
+    if "z15" not in labels:
+        labels = list(dict.fromkeys([*labels, "z15"]))
     events.state("service", {
         "packet": "mcp-sync",
         "activity": "MCP tool-driven sync landed",
-        "agents": {"A": {"snapshot": True}},
+        "agents": {"A": {"snapshot": True, "vault_keys": len(labels),
+                         "vault_labels": labels}},
     }, stage_id="z15")
     events.state("agentA", {
         "activity": "synced via mcp_alf_* (no terminal alf sync)",
         "synced": True,
+        "vault": ["z15"],
         "mutations": [
             {"path": "memories/MEMORY.md", "op": "sync", "note": "tool-driven export"},
             {"path": "state.db", "op": "sync", "note": "tool-driven export"},
+            {"path": "credentials.json (vault)", "op": "add", "note": "z15 via mcp_alf_*"},
         ],
     }, stage_id="z15")
 
@@ -1408,6 +1447,336 @@ def z16_watch_autosync(run, result: StageResult):
 
 
 # ---------------------------------------------------------------------------
+# Z17 — multi-agent watch loop: TWO servers watch BOTH workspaces for ~20s,
+#        auto-syncing 3 file updates + a vault update (backend round-trip)
+# ---------------------------------------------------------------------------
+
+def z17_multiagent_watch_vault(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not getattr(kit, "watch_autosync_mode", False):
+        raise SkipStage(
+            f"{kit.name}: the multi-agent watch+vault gate runs on the "
+            "hermes-mcp tier only", wp="Z17")
+    if run.backend != "real":
+        raise SkipStage(
+            "Z17 needs --backend real (it asserts backend deltas on both agents "
+            "and a vault round-trip through the cloud)")
+    slot_a = kit.agent_slots[0]
+    slot_b = run.state.get("slot_b", "agent_b")
+    agent_id_a = run.state.get("alf_agent_id", "")
+    rows = _mapping_rows(run)
+    agent_id_b = next(
+        (str(r.get("alf_agent_id")) for r in rows
+         if r.get("runtime_agent") == slot_b), "")
+    if not agent_id_a or not agent_id_b:
+        raise SkipStage(
+            "Z17 needs BOTH agents registered in the backend — run the "
+            "multi-agent stages first (Z8 creates + Z9 enables + Z10 registers "
+            "agent b), e.g. --stages Z1-Z12,Z17", wp="Z17")
+
+    nar.explain("""
+        Z17: the REAL multi-agent watch posture — each Hermes profile runs its
+        OWN `alf mcp serve`, so TWO persistent watch loops (~1s test cadence)
+        watch BOTH agent workspaces at once, each pinned to its own agent (a loop
+        binds exactly one agent — resolve_loop_context). Over ~20s the harness
+        makes 3 watched-FILE edits (agent A, agent B, agent A) plus a vault add on
+        A; each loop must auto-upload its own changes as deltas with ZERO tool/LLM
+        calls, and NEITHER may cross into the other's archive. The vault lives at
+        ~/.alf/vault/<id>/ (NOT a watched path), so it rides A's next file-
+        triggered sync (the loop syncs a FULL export → the delta carries Layer 4).
+        The vault proof is a backend ROUND-TRIP: delete A's local ciphertext, then
+        `alf restore` (re-imports Layer 4 from the cloud) + `alf vault decrypt` —
+        which can only succeed if the watch loop truly pushed it to the backend.
+    """)
+    nar.flow("2× alf mcp serve (A,B) ──▶ 3 file edits + 1 vault ──▶ per-agent deltas ⊙ ──▶ restore+decrypt ⊙")
+
+    def latest_seq(aid: str) -> int:
+        r = run.api.get(f"/agents/{aid}")
+        return (r.json() or {}).get("latest_sequence", 0) if r.status_code == 200 else 0
+
+    base_a, base_b = latest_seq(agent_id_a), latest_seq(agent_id_b)
+    for aid in (agent_id_a, agent_id_b):
+        if aid not in run.manifest.lifecycle_agents:
+            run.manifest.lifecycle_agents.append(aid)
+    run.manifest.save(run.paths.manifest)
+
+    # Agent A carries the vault — ensure its per-agent key exists (Z6 makes it;
+    # this is defensive so a Z1-Z12,Z17 subset that somehow skipped it still runs).
+    a_key = f"{kit.home_mount}/state/{agent_id_a}/.alf-vault-key"
+    run.container.sh(
+        f"mkdir -p {kit.home_mount}/state/{agent_id_a}; "
+        f"test -f {a_key} || alf vault keygen --out {a_key} >/dev/null 2>&1",
+        user="agent")
+
+    # Start ONE persistent watch-loop server per agent. Each pins its own
+    # ALF_AGENT + watches its own profile (-w); the per-agent advisory lock
+    # (state/<id>.lock) means the two loops never contend. Test-cadence env
+    # overrides make each ~1s (gated; production stays 60s/3s — see Z16).
+    def _serve(slot: str, aid: str):
+        env = {
+            "ALF_API_KEY": run.creds.runtime_api_key,
+            "ALF_API_URL": run.creds.alf_api_url,
+            "ALF_AGENT": aid,
+            "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+            "ALF_WATCH_QUIESCE_MS": "1000",
+            "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+            "ALF_WATCH_TICK_MS": "1000",
+        }
+        argv = ["alf", "mcp", "serve", "-r", kit.name, "-w", kit._container_profile(slot)]
+        sess = run.container.exec_stdio(argv, env=env)
+        errs: list = []
+
+        def _drain():
+            try:
+                for line in iter(sess.proc.stderr.readline, b""):
+                    errs.append(line.decode(errors="replace"))
+            except Exception:  # noqa: BLE001 — best-effort diagnostics
+                pass
+
+        th = threading.Thread(target=_drain, daemon=True)
+        th.start()
+        return sess, errs, th
+
+    sess_a, err_a, dr_a = _serve(slot_a, agent_id_a)
+    sess_b, err_b, dr_b = _serve(slot_b, agent_id_b)
+    markers_a: list = []
+    markers_b: list = []
+    vault_label = "vault-z17"
+    vault_secret = scenario.marker_for(slot_a, "secret", 2)  # a fresh FAKE value
+    try:
+        time.sleep(2)  # boot both loops + the (no-op) catch-up-on-start
+        result.add(_passfail(
+            sess_a.alive() and sess_b.alive(),
+            "Z17: both watch servers stayed up (one per agent workspace)",
+            f"A={'up' if sess_a.alive() else 'DOWN: ' + ''.join(err_a)[-160:]} "
+            f"B={'up' if sess_b.alive() else 'DOWN: ' + ''.join(err_b)[-160:]}"))
+
+        # --- ~20s timeline: 3 file edits (A, B, A) + a vault add on A ----------
+        # t≈2s: file #1 → agent A
+        markers_a.append(kit.mutate_watched_file(run.container, slot_a, 1))
+        events.state("agentA", {
+            "activity": f"watch edit 1/3 · {markers_a[-1]}",
+            "mutations": [{"path": "memories/MEMORY.md", "op": "append", "note": markers_a[-1]}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(5)
+        seq_a = latest_seq(agent_id_a)
+        if seq_a > base_a:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"A watch sync · seq {seq_a}",
+            }, stage_id="z17")
+            events.state("agentA", {
+                "seq": seq_a, "synced": True,
+                "activity": f"watch synced · seq {seq_a}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+            events.state("service", {
+                "activity": f"agent A · seq {seq_a}",
+                "agents": {"A": {"seq": seq_a, "deltas": seq_a - base_a, "snapshot": True}},
+            }, stage_id="z17")
+        # t≈7s: file #2 → agent B (proves the OTHER loop syncs independently)
+        markers_b.append(kit.mutate_watched_file(run.container, slot_b, 2))
+        events.state("agentB", {
+            "activity": f"watch edit 2/3 · {markers_b[-1]}",
+            "mutations": [{"path": "profiles/agent_b/memories/MEMORY.md", "op": "append",
+                           "note": markers_b[-1]}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(4)
+        seq_b = latest_seq(agent_id_b)
+        if seq_b > base_b:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"B watch sync · seq {seq_b}",
+            }, stage_id="z17")
+            events.state("agentB", {
+                "seq": seq_b, "synced": True,
+                "activity": f"watch synced · seq {seq_b}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+            events.state("service", {
+                "activity": f"agent B · seq {seq_b}",
+                "agents": {"B": {"seq": seq_b, "deltas": seq_b - base_b,
+                                 "snapshot": True, "visible": True, "registered": True}},
+            }, stage_id="z17")
+        # t≈11s: vault add → agent A. Writes ~/.alf/vault/<id>/credentials.json,
+        # which is NOT a watched path, so on its own it does not fire the loop —
+        # it rides file #3 below (the next full-export sync carries Layer 4).
+        add, addj = run.container.exec_json(
+            ["alf", "vault", "add", "-r", kit.name, "--agent", slot_a,
+             "--service", "email", "--type", "account", "--label", vault_label,
+             "--secret", f"{vault_secret}-DO-NOT-USE"])
+        result.add(_passfail(
+            bool(addj) and addj.get("ok") is True,
+            "Z17: vault add on agent A ok (Layer-4 ciphertext, awaiting the next sync)",
+            (add.stderr or "")[:140] if add.returncode else vault_label))
+        events.state("agentA", {
+            "vault": [vault_label],
+            "activity": f"vault add {vault_label} (rides file #3)",
+            "mutations": [{"path": "credentials.json (vault)", "op": "add",
+                           "note": f"{vault_label} ciphertext"}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        _, lst_a = run.container.exec_json(
+            ["alf", "vault", "list", "-r", kit.name, "--agent", slot_a])
+        labels_a = [c.get("label") for c in (lst_a or {}).get("credentials", [])
+                    if c.get("label")]
+        events.state("service", {
+            "activity": f"agent A vault · {len(labels_a)} key"
+                        f"{'' if len(labels_a) == 1 else 's'}",
+            "agents": {"A": {"vault_keys": len(labels_a), "vault_labels": labels_a}},
+        }, stage_id="z17")
+        time.sleep(2)
+        # t≈13s: file #3 → agent A. This fires A's loop, whose FULL-export sync
+        # now carries BOTH file #3 and the fresh vault ciphertext in one delta.
+        markers_a.append(kit.mutate_watched_file(run.container, slot_a, 3))
+        events.state("agentA", {
+            "activity": f"watch edit 3/3 · {markers_a[-1]} (+ vault rides this sync)",
+            "mutations": [{"path": "memories/MEMORY.md", "op": "append", "note": markers_a[-1]},
+                          {"path": "credentials.json (vault)", "op": "watch",
+                           "note": f"{vault_label} ↑ backend"}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(7)  # settle to ~20s: let A's final change quiesce + upload
+        seq_a2 = latest_seq(agent_id_a)
+        if seq_a2 > seq_a:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"A watch sync · seq {seq_a2} (+ vault)",
+            }, stage_id="z17")
+            events.state("agentA", {
+                "seq": seq_a2, "synced": True,
+                "activity": f"watch synced · seq {seq_a2}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+
+        # --- backend deltas: each loop advanced ONLY its own agent ------------
+        end_a, end_b = latest_seq(agent_id_a), latest_seq(agent_id_b)
+        rda = run.api.get(f"/agents/{agent_id_a}/deltas?since={base_a}")
+        deltas_a = (rda.json() or {}).get("deltas", []) if rda.status_code == 200 else []
+        rdb = run.api.get(f"/agents/{agent_id_b}/deltas?since={base_b}")
+        deltas_b = (rdb.json() or {}).get("deltas", []) if rdb.status_code == 200 else []
+        result.add(_passfail(
+            end_a > base_a and len(deltas_a) >= 2,
+            "⊙ agent A: watch loop auto-synced ≥2 deltas (file #1; file #3 + vault)",
+            f"seq {base_a}→{end_a}, {len(deltas_a)} deltas (no tool/LLM calls)"))
+        result.add(_passfail(
+            end_b > base_b and len(deltas_b) >= 1,
+            "⊙ agent B: the OTHER watch loop auto-synced ≥1 delta (file #2)",
+            f"seq {base_b}→{end_b}, {len(deltas_b)} deltas"))
+        events.state("agentA", {"seq": end_a, "synced": True}, stage_id="z17")
+        events.state("agentB", {"seq": end_b, "synced": True}, stage_id="z17")
+        events.state("service", {
+            "latest_sequence": end_a,
+            "activity": f"A seq {base_a}→{end_a} · B seq {base_b}→{end_b}",
+            "agents": {
+                "A": {"seq": end_a, "deltas": len(deltas_a), "snapshot": True},
+                "B": {"seq": end_b, "deltas": len(deltas_b), "snapshot": True,
+                      "visible": True, "registered": True},
+            },
+        }, stage_id="z17")
+
+        # --- content: each agent's file markers reached ITS OWN head memory,
+        #     and NOT the other's (isolation). Memory indexing is on-demand.
+        run.api.post_json(f"/agents/{agent_id_a}/index", {})
+        run.api.post_json(f"/agents/{agent_id_b}/index", {})
+
+        def _present(aid: str, want: list, foreign: list) -> tuple:
+            got = 0
+            leaked = 0
+            for _ in range(15):
+                time.sleep(1)
+                rm = run.api.get(f"/agents/{aid}/memory?limit=100")
+                if rm.status_code != 200:
+                    continue
+                recs = json.dumps((rm.json() or {}).get("records") or [])
+                got = sum(1 for m in want if m in recs)
+                leaked = sum(1 for m in foreign if m in recs)
+                if got >= len(want):
+                    break
+            return got, leaked
+
+        got_a, leak_a = _present(agent_id_a, markers_a, markers_b)
+        got_b, leak_b = _present(agent_id_b, markers_b, markers_a)
+        result.add(_passfail(
+            got_a >= len(markers_a) and leak_a == 0,
+            "⊙ agent A: its 2 file markers indexed into head memory, none of B's leaked in",
+            f"{got_a}/{len(markers_a)} present, {leak_a} foreign"))
+        result.add(_passfail(
+            got_b >= len(markers_b) and leak_b == 0,
+            "⊙ agent B: its file marker indexed into head memory, none of A's leaked in",
+            f"{got_b}/{len(markers_b)} present, {leak_b} foreign"))
+    finally:
+        sess_a.close()
+        sess_b.close()
+        dr_a.join(timeout=3)
+        dr_b.join(timeout=3)
+        for name, errs in (("z17-serve-A", err_a), ("z17-serve-B", err_b)):
+            try:
+                (run.paths.run_dir / f"{name}-stderr.log").write_text(
+                    "".join(errs), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+        # Server-side proof — the loop's OWN voice, promoted from informational
+        # to a real gate. Per server: (1) the loop went active; (2) it bound the
+        # agent it was PINNED to — source-side isolation, complementary to the
+        # destination-side no-leak check above and the one signal that catches a
+        # loop happily syncing into the WRONG agent's archive; (3) it completed
+        # ≥1 autonomous sync. `expect` is that server's pinned ALF_AGENT.
+        for who, errs, expect in (("A", err_a, agent_id_a), ("B", err_b, agent_id_b)):
+            w = kit.parse_watch_stderr(errs)
+            result.add(_passfail(
+                w["active"] is True,
+                f"⊙ Z17 serve {who}: watch loop went active (autonomous, no tool/LLM calls)",
+                f"{w['sync_ok']} syncs" if w["active"] is True else
+                f"NOT active: {w['error'] or '(no watch-loop banner in stderr)'}"))
+            result.add(_passfail(
+                w["bound_agent"] == expect,
+                f"⊙ Z17 serve {who}: loop bound its OWN pinned agent (server-side isolation)",
+                f"bound {w['bound_agent']} == pinned {expect}"
+                if w["bound_agent"] == expect else
+                f"bound {w['bound_agent']} != pinned {expect}"))
+            result.add(_passfail(
+                w["sync_ok"] >= 1,
+                f"⊙ Z17 serve {who}: ≥1 successful autonomous watch-loop sync",
+                f"watch-sync-ok={w['sync_ok']}"
+                + (f" | last error: {w['error']}" if w["error"] else "")))
+
+    # --- vault backend round-trip (servers stopped → no lock contention) ------
+    # Delete EVERY local copy of A's vault ciphertext (per-agent + legacy
+    # install-scoped), then restore A from the cloud (re-imports Layer 4) and
+    # decrypt vault-z17. With no local copy left, a successful decrypt PROVES the
+    # ciphertext came BACK from the backend — i.e. the watch loop truly pushed it.
+    # (A's key at .hermes/state/<id>/ is allowlist-excluded, so it survives the
+    # restore and still opens the restored vault.)
+    run.container.sh(
+        f"rm -f /home/agent/.alf/vault/{agent_id_a}/credentials.json "
+        f"/home/agent/.alf/vault/credentials.json", user="agent")
+    rest = run.container.exec(
+        ["alf", "restore", "-r", kit.name, "--agent", slot_a], timeout=300)
+    dec = run.container.exec(
+        ["alf", "vault", "decrypt", "-r", kit.name, "--agent", slot_a,
+         "--label", vault_label, "--yes-insecure"])
+    body = (dec.stdout or "") + (dec.stderr or "")
+    result.add(_passfail(
+        vault_secret in body,
+        "⊙ vault round-trip: watch-synced vault-z17 restored from the BACKEND + decrypts",
+        "matched (local ciphertext was deleted first — it came from the cloud)"
+        if vault_secret in body else
+        f"not found (restore rc={rest.returncode}, decrypt rc={dec.returncode}): "
+        f"{(dec.stderr or rest.stderr or '').strip()[:160]}"))
+    events.state("agentA", {
+        "activity": f"vault {vault_label} round-tripped via restore",
+        "vault_synced": True,
+        "packet": "restore",
+    }, stage_id="z17")
+
+
+# ---------------------------------------------------------------------------
 # Registry — (stage_id, title, uses_alf, fn)
 # ---------------------------------------------------------------------------
 
@@ -1431,6 +1800,8 @@ REGISTRY = [
      z15_mcp_llm_gate),
     ("z16", "Watch loop auto-sync — timed file+db mutations → backend deltas ⊙", True,
      z16_watch_autosync),
+    ("z17", "Multi-agent watch — 2 loops, both workspaces, 3 file edits + vault ⊙", True,
+     z17_multiagent_watch_vault),
 ]
 
 STAGE_IDS = [sid for sid, *_ in REGISTRY]

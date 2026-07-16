@@ -1021,6 +1021,27 @@ def z13_idle_resync(run, result: StageResult):
             result.add(_passfail(m1.get("agent", {}).get("id") == mapped,
                                  "Z13': exported agent id == mapping id (stability)"))
 
+        # Identity integrity (the BLK-1 class). EXTERNAL oracles, deliberately:
+        # a deterministic id collision is self-consistent, so the byte-equality
+        # checks above pass right through it. (1) ids unique across the whole
+        # archive; (2) where the kit can enumerate exact store contents, each
+        # must live in exactly ONE structured record.
+        ident = archives.record_identity(paths[0])
+        result.add(_passfail(
+            not ident["duplicates"],
+            "Z13': record ids unique across the archive",
+            f"{ident['total']} records / {ident['unique']} ids"
+            if not ident["duplicates"]
+            else f"colliding: {sorted(ident['duplicates'].items())[:3]}"))
+        probes = getattr(kit, "identity_probe_contents", lambda: [])()
+        if probes:
+            off = {p: n for p, n in
+                   archives.marker_record_counts(paths[0], probes).items() if n != 1}
+            result.add(_passfail(
+                not off,
+                "Z13': each identity probe maps to exactly one record",
+                f"{len(probes)} probes 1:1" if not off else f"off: {off}"))
+
 
 # ---------------------------------------------------------------------------
 # Z14 — curated in-place memory → reconcile delta shapes (WP4.1)

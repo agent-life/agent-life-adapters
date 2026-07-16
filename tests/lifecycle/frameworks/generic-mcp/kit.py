@@ -57,6 +57,11 @@ finally:
 _CURATED = "memories/curated.md"
 # The synthetic SQLite memory store, mapped as a `sqlite_rows` source.
 _BRAIN = "brain.db"
+# A second store matched by the SAME source glob, with the SAME primary keys —
+# the multi-file shape (map.rs: "each matched file's rows become records") that
+# minted colliding record ids pre-release (BLK-1). Z13's identity oracle
+# asserts every row of both files survives as its own record id.
+_BRAIN_B = "brain-b.db"
 
 
 class GenericMcpKit(GenericKit):
@@ -75,6 +80,7 @@ class GenericMcpKit(GenericKit):
         (home / "memories").mkdir(parents=True, exist_ok=True)
         (home / ".alf-map.json").write_text(self._map_json(), encoding="utf-8")
         self._build_brain(home / _BRAIN, self._baseline_rows())
+        self._build_brain(home / _BRAIN_B, self._shard_b_rows())
 
     def _map_json(self) -> str:
         # A by_heading journal (curation target + seeder sink) plus the sqlite
@@ -100,7 +106,9 @@ class GenericMcpKit(GenericKit):
                     },
                     {
                         "id": "brain",
-                        "glob": _BRAIN,
+                        # Matches BOTH brain.db and brain-b.db — one source,
+                        # many db files, overlapping pks (the BLK-1 shape).
+                        "glob": "brain*.db",
                         "memory_type": "semantic",
                         "namespace": "curated",
                         "chunking": "sqlite_rows",
@@ -148,6 +156,24 @@ class GenericMcpKit(GenericKit):
             ("fact-2", "Prefers metric units and terse answers."),
             ("fact-3", "The tide-log automation runs on a Raspberry Pi."),
         ]
+
+    def _shard_b_rows(self) -> list[tuple[str, str]]:
+        # Same pks as `_baseline_rows` on purpose: equal pks in two files
+        # matched by one glob must still mint distinct record ids (BLK-1).
+        # Contents are distinct so the Z13 probe can pair each row 1:1 with
+        # its record.
+        return [
+            ("fact-1", "Shard B: the heron-nest camera streams at dawn."),
+            ("fact-2", "Shard B: tide tables are cached for seven days."),
+            ("fact-3", "Shard B: the buoy sensor reports every ten minutes."),
+        ]
+
+    def identity_probe_contents(self) -> list[str]:
+        """Z13' identity oracle: every sqlite row of BOTH stores must survive
+        as exactly one structured record (0 = shadowed by an id collision or
+        dropped in extraction; 2+ = multiply minted)."""
+        return [content for _, content in
+                self._baseline_rows() + self._shard_b_rows()]
 
     # -- Z2 seed: into the SINGLE curated journal (the store Z14 rewrites) ------
 

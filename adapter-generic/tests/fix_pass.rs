@@ -587,3 +587,56 @@ fn c2_malformed_include_list_warns_not_silent() {
     // Export still succeeded and the real memory is present.
     assert!(memory(&out).iter().any(|r| r.content.contains("note")));
 }
+
+// ---------------------------------------------------------------------------
+// BLK-1 — record ids are unique across every file a source's glob matches
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sqlite_multi_db_glob_mints_distinct_ids_per_file() {
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    // ONE sqlite source whose glob matches TWO databases with overlapping
+    // autoincrement pks — the documented multi-file shape (map.rs: "each
+    // matched file's rows become records").
+    write(
+        &ws,
+        ".alf-map.json",
+        r#"{"version":1,"memory_sources":[
+            {"id":"brains","glob":"agents/*/brain.db","memory_type":"semantic",
+             "namespace":"curated","chunking":"sqlite_rows",
+             "sqlite":{"table":"memories","id_column":"id",
+                       "content_column":"content"}}]}"#,
+    );
+    for (agent_dir, content) in [("a", "alpha"), ("b", "bravo")] {
+        let db_path = ws.join("agents").join(agent_dir).join("brain.db");
+        fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE memories (id INTEGER PRIMARY KEY, content TEXT);
+             INSERT INTO memories VALUES (1, '{content}-1'), (2, '{content}-2');"
+        ))
+        .unwrap();
+        drop(conn);
+    }
+
+    let out = tmp.path().join("out.alf");
+    export(&ws, &out);
+    let recs = memory(&out);
+    assert_eq!(recs.len(), 4, "both databases' rows must become records");
+    let ids: std::collections::HashSet<Uuid> = recs.iter().map(|r| r.id).collect();
+    assert_eq!(
+        ids.len(),
+        recs.len(),
+        "record ids must be unique across all glob-matched db files"
+    );
+    // Every row's content survived (no id-shadowed row loss downstream).
+    for want in ["alpha-1", "alpha-2", "bravo-1", "bravo-2"] {
+        assert!(
+            recs.iter().any(|r| r.content == want),
+            "row {want} lost to an id collision"
+        );
+    }
+}

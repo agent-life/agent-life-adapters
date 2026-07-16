@@ -1,9 +1,11 @@
 //! Extract memory records from a SQLite source (`chunking: sqlite_rows`).
 //!
 //! Each row of the configured table becomes one [`MemoryRecord`]. The record id
-//! is a deterministic v5 of the row's PRIMARY KEY (not its content), so an
-//! in-place row `UPDATE` keeps the id and `alf_core::reconcile` emits exactly one
-//! `Update` (pass P3), never a delete + create. The record carries **no**
+//! is a deterministic v5 of (db file rel_path, source id, table, row PRIMARY
+//! KEY) — not the row's content — so an in-place row `UPDATE` keeps the id and
+//! `alf_core::reconcile` emits exactly one `Update` (pass P3), never a
+//! delete + create; and rows with equal pks in *different* glob-matched `.db`
+//! files never collide. The record carries **no**
 //! `heading` slot in `raw_source_format`, so reconcile's markdown-heading pass
 //! (P2) skips it and it can only pair by id — the correct behaviour for a
 //! native-id store (a row whose content happens to start with `#` must never
@@ -125,10 +127,17 @@ pub fn extract_rows(
         };
 
         // Content-INDEPENDENT id keyed on the row's primary key: an edit keeps it,
-        // so reconcile P3 pairs it and emits exactly one Update.
+        // so reconcile P3 pairs it and emits exactly one Update. `rel_path` is a
+        // discriminator because one source's glob may match several `.db` files
+        // whose pks overlap — like text sources, the file path is identity-bearing
+        // (so moving/renaming a database re-mints its rows' ids).
         let id = Uuid::new_v5(
             generic_ns,
-            format!("sqlite-row:{agent_id}:{}:{}:{pk}", src.id, spec.table).as_bytes(),
+            format!(
+                "sqlite-row:{agent_id}:{rel_path}:{}:{}:{pk}",
+                src.id, spec.table
+            )
+            .as_bytes(),
         );
         // A parseable timestamp column → created_at + observed_at; else the file
         // mtime (reconcile carries a matched row's created_at forward, so a mtime
@@ -573,5 +582,103 @@ mod tests {
             .execute("UPDATE memories SET content='ONE' WHERE id=1", [])
             .unwrap();
         assert_eq!(delta_counts(&base, &db), (0, 1, 0));
+    }
+
+    // -- Id preimage discipline (injectivity twins) --------------------------
+    //
+    // Each twin varies exactly ONE discriminating dimension of the row-id
+    // preimage and asserts the minted ids change; the no-op twin asserts
+    // stability. A source's glob may match many `.db` files (map.rs: "each
+    // matched file's rows become records"), so the matched file's rel_path IS
+    // a dimension — omitting it collided same-pk rows across files (the
+    // v1.1.0 pre-release BLK-1 bug).
+
+    fn source_with(id: &str, table: &str) -> MemorySourceSpec {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "glob": "**/brain.db",
+            "memory_type": "semantic", "namespace": "curated",
+            "chunking": "sqlite_rows",
+            "sqlite": {
+                "table": table, "id_column": "id",
+                "content_column": "content", "timestamp_column": "updated_at"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn id_set(records: &[MemoryRecord]) -> HashSet<Uuid> {
+        records.iter().map(|r| r.id).collect()
+    }
+
+    fn extract_ids(db: &Path, rel: &str, src: &MemorySourceSpec, agent_id: Uuid) -> HashSet<Uuid> {
+        id_set(
+            &extract_rows(db, rel, src, &NS, agent_id, fixed_mtime())
+                .unwrap()
+                .0,
+        )
+    }
+
+    #[test]
+    fn twin_identical_inputs_mint_identical_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        build_db(&db, &[("1", "alpha"), ("2", "beta")]);
+        let a = extract_ids(&db, "agents/a/brain.db", &source(), agent());
+        let b = extract_ids(&db, "agents/a/brain.db", &source(), agent());
+        assert_eq!(a, b, "identical inputs must mint identical ids");
+    }
+
+    #[test]
+    fn twin_same_pk_different_db_file_mints_distinct_ids() {
+        // The BLK-1 regression: one source glob, two databases, overlapping
+        // pks. The same physical db read under two rel_paths is the sharpest
+        // form — every other preimage input is byte-identical.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        build_db(&db, &[("1", "alpha"), ("2", "beta")]);
+        let a = extract_ids(&db, "agents/a/brain.db", &source(), agent());
+        let b = extract_ids(&db, "agents/b/brain.db", &source(), agent());
+        assert!(
+            a.is_disjoint(&b),
+            "same pk in two glob-matched db files must never mint the same record id"
+        );
+    }
+
+    #[test]
+    fn twin_different_source_id_mints_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        build_db(&db, &[("1", "alpha")]);
+        let a = extract_ids(&db, "brain.db", &source_with("brain", "memories"), agent());
+        let b = extract_ids(&db, "brain.db", &source_with("brain2", "memories"), agent());
+        assert!(a.is_disjoint(&b), "source id must discriminate record ids");
+    }
+
+    #[test]
+    fn twin_different_table_mints_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        let conn = Connection::open(&db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+             CREATE TABLE notes    (id TEXT PRIMARY KEY, content TEXT, updated_at TEXT);
+             INSERT INTO memories VALUES ('1', 'alpha', '2026-01-01T00:00:00Z');
+             INSERT INTO notes    VALUES ('1', 'alpha', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        drop(conn);
+        let a = extract_ids(&db, "brain.db", &source_with("brain", "memories"), agent());
+        let b = extract_ids(&db, "brain.db", &source_with("brain", "notes"), agent());
+        assert!(a.is_disjoint(&b), "table must discriminate record ids");
+    }
+
+    #[test]
+    fn twin_different_agent_mints_distinct_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("brain.db");
+        build_db(&db, &[("1", "alpha")]);
+        let a = extract_ids(&db, "brain.db", &source(), agent());
+        let b = extract_ids(&db, "brain.db", &source(), Uuid::from_u128(0xfeed));
+        assert!(a.is_disjoint(&b), "agent id must discriminate record ids");
     }
 }

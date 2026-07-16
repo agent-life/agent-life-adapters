@@ -310,6 +310,24 @@ pub fn validate_memory_records(records: &[MemoryRecord]) -> ValidationReport {
     for (i, record) in records.iter().enumerate() {
         report.merge(validate_memory_record(record, &format!("records[{i}]")));
     }
+    // Duplicate record ids: a warning, never an error — foreign archives must
+    // stay readable (spec §8.2 posture) — but by-id consumers (reconcile,
+    // indexer) will silently keep only one of the duplicates, so surface it.
+    // (Our own writer refuses to produce such an archive: see
+    // `AlfWriter::add_memory_partition`.)
+    let mut first_seen = std::collections::HashMap::new();
+    for (i, record) in records.iter().enumerate() {
+        if let Some(first) = first_seen.insert(record.id, i) {
+            report.warning(
+                format!("records[{i}].id"),
+                format!(
+                    "Duplicate record id {} (first at records[{first}]): by-id \
+                     consumers keep only one of these records",
+                    record.id
+                ),
+            );
+        }
+    }
     report
 }
 
@@ -883,6 +901,36 @@ mod tests {
     fn valid_record_passes() {
         let report = validate_memory_record(&valid_record(), "test");
         assert!(report.is_valid(), "Findings: {:?}", report.findings);
+    }
+
+    #[test]
+    fn duplicate_record_ids_warn_but_do_not_fail() {
+        // Read-side posture (§8.2): a foreign archive with colliding ids must
+        // stay readable — but the collision is surfaced, since by-id consumers
+        // keep only one of the duplicates. (Our own writer refuses outright.)
+        let a = valid_record();
+        let mut b = valid_record();
+        b.id = a.id;
+        b.content = "different content, same id".into();
+        let report = validate_memory_records(&[a, b]);
+        assert!(report.is_valid(), "duplicates must warn, not fail");
+        assert!(
+            report
+                .warnings()
+                .iter()
+                .any(|f| f.message.contains("Duplicate record id") && f.path == "records[1].id"),
+            "Findings: {:?}",
+            report.findings
+        );
+    }
+
+    #[test]
+    fn distinct_record_ids_produce_no_duplicate_warning() {
+        let report = validate_memory_records(&[valid_record(), valid_record()]);
+        assert!(!report
+            .findings
+            .iter()
+            .any(|f| f.message.contains("Duplicate record id")));
     }
 
     #[test]

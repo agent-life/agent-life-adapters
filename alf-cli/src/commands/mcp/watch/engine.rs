@@ -381,8 +381,11 @@ impl WatchEngine {
     }
 
     /// Replace the cadence config (e.g. from `alf_watch_set`), re-resolving every
-    /// source's interval. Clears a park iff the caller un-pauses (an explicit
-    /// operator action is the intervention that ends a park).
+    /// source's interval. A paused→unpaused transition clears a park; the
+    /// explicit `pause:false` gesture on an unpaused-but-parked loop is handled
+    /// one layer up (`WatchHandle::note_explicit_unpause`) — this method only
+    /// sees the merged config and cannot tell "explicitly un-paused" from
+    /// "pause left untouched".
     pub fn set_config(&mut self, config: WatchConfig) {
         let was_paused = self.config.paused;
         self.config = config;

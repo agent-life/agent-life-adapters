@@ -853,6 +853,13 @@ fn watch_set_impl(
     }
 
     let effective = handle.set_config(cfg);
+    // An explicit pause:false is a documented un-park gesture (manual §4.2,
+    // like a clean manual alf_sync). It must not depend on the engine's
+    // paused→unpaused transition: parks don't set `paused`, so a parked loop
+    // is usually unpaused already.
+    if params.pause == Some(false) {
+        handle.note_explicit_unpause();
+    }
     // Derive `active` from the engine snapshot (review C2): the snapshot's `active`
     // already accounts for pause AND park, so a parked loop reports active:false
     // instead of the earlier pause-only recomputation.
@@ -1450,6 +1457,42 @@ mod tests {
         assert!(
             sc["hint"].as_str().unwrap().contains("recover:true"),
             "hint must speak tool language: {sc}"
+        );
+    }
+
+    #[test]
+    fn watch_set_pause_false_clears_a_park() {
+        // Parking never sets `paused`, so the documented un-park gesture
+        // (manual §4.2: alf_watch_set {pause:false}) must clear the park
+        // itself — it cannot ride on a paused→unpaused transition that
+        // never happened.
+        let handle = handle_with_sources();
+        handle.park_for_test("sync_first_sync_conflict");
+        assert!(handle.snapshot().parked.is_some());
+        let params = WatchSetParams {
+            pause: Some(false),
+            ..Default::default()
+        };
+        let result = watch_set_impl(&handle, params).unwrap();
+        assert!(result.ok);
+        assert!(
+            handle.snapshot().parked.is_none(),
+            "explicit pause:false must clear the park"
+        );
+    }
+
+    #[test]
+    fn watch_set_without_pause_leaves_a_park_alone() {
+        let handle = handle_with_sources();
+        handle.park_for_test("sync_conflict");
+        let params = WatchSetParams {
+            default_interval: Some("30m".into()),
+            ..Default::default()
+        };
+        watch_set_impl(&handle, params).unwrap();
+        assert!(
+            handle.snapshot().parked.is_some(),
+            "an interval-only change is not an un-park gesture"
         );
     }
 

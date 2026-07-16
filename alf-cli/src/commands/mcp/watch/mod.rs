@@ -184,10 +184,34 @@ impl WatchHandle {
             .set_sources(specs);
     }
 
+    /// Park the engine directly — unit-test seam for the un-park gestures.
+    #[cfg(test)]
+    pub(crate) fn park_for_test(&self, code: &str) {
+        self.engine
+            .lock()
+            .expect("watch engine mutex")
+            .park(engine::ParkError {
+                code: code.into(),
+                message: "test park".into(),
+                hint: None,
+            });
+    }
+
     /// A successful **manual** `alf_sync` is the operator intervention that ends a
     /// park (design §7.W4): if auto-sync had parked on a conflict/fork, a clean
     /// hand-run sync means the human resolved it, so resume the loop.
     pub fn note_manual_sync_ok(&self) {
+        let mut e = self.engine.lock().expect("watch engine mutex");
+        if e.is_parked() {
+            e.clear_park();
+        }
+    }
+
+    /// `alf_watch_set {pause:false}` is the other documented un-park gesture
+    /// (manual §4.2). Parking never sets `paused`, so the engine's
+    /// paused→unpaused transition in `set_config` cannot see the
+    /// parked-while-unpaused case — the caller signals the explicit intent here.
+    pub fn note_explicit_unpause(&self) {
         let mut e = self.engine.lock().expect("watch engine mutex");
         if e.is_parked() {
             e.clear_park();

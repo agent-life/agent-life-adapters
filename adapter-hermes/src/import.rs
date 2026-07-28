@@ -23,7 +23,12 @@ const RAW_PREFIX: &str = "raw/hermes/";
 const SCHEMA_SIDECAR: &str = ".alf-state-db-schema.json";
 
 /// Import an `.alf` archive into a Hermes home.
-pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Result<ImportReport> {
+pub fn import(
+    alf_file: &Path,
+    home: &Path,
+    vault_key: Option<&VaultKey>,
+    preview: bool,
+) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
     let mut alf = AlfReader::new(std::io::BufReader::new(file))?;
@@ -105,7 +110,7 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
             .credentials
             .into_iter()
             .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
-        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, home)?;
+        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, home, preview)?;
         if vaulted > 0 {
             warnings.push(format!(
                 "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -330,6 +335,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     home: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -339,14 +345,29 @@ fn restore_agent_vault(
         credentials: records,
         extra: doc_extra,
     };
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| home.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        home.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| home.join(".alf-restored-credentials.json"))
+    };
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&target, serde_json::to_string_pretty(&doc)?)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    // 0600 + atomic: the document carries ciphertext AND plaintext
+    // descriptors (service, username, label), and a crash must never
+    // truncate a just-restored vault.
+    alf_core::fs_atomic::write_private_atomic(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
     Ok(count)
 }
 
@@ -512,7 +533,7 @@ mod tests {
         fs::write(&vault, vault_doc(my_id, "stale-local", false)).unwrap();
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -568,7 +589,7 @@ mod tests {
         export::export(src.path(), &alf_file).unwrap();
 
         let target = TempDir::new().unwrap();
-        let report = import(&alf_file, target.path(), None).unwrap();
+        let report = import(&alf_file, target.path(), None, false).unwrap();
         assert_eq!(report.agent_name, "Atlas");
         assert!(report.identity_imported);
         assert_eq!(report.principals_count, 1);
@@ -622,7 +643,7 @@ mod tests {
         );
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
         assert!(target
             .path()
             .join("skills/custom/deploy/SKILL.md")
@@ -669,7 +690,7 @@ mod tests {
 
         // Import restores it and marks the entry inert (verified=false).
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
         let restored = alf_core::include::IncludeList::load(target.path()).unwrap();
         let ext = restored
             .externals()
@@ -686,7 +707,7 @@ mod tests {
         export::export(src.path(), &alf_file).unwrap();
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/.hermes");
-        let report = import(&alf_file, &deep, None).unwrap();
+        let report = import(&alf_file, &deep, None, false).unwrap();
         assert_eq!(report.agent_name, "Atlas");
         assert!(deep.is_dir());
     }
@@ -718,7 +739,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let home = root.path().join("a/.hermes");
         let escaped = root.path().join("PWNED.txt");
-        assert!(import(&alf_file, &home, None).is_err());
+        assert!(import(&alf_file, &home, None, false).is_err());
         assert!(!escaped.exists(), "Zip Slip escaped: {}", escaped.display());
     }
 }

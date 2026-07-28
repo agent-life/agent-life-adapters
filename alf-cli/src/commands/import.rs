@@ -131,6 +131,8 @@ pub fn run(
     let options = ImportOptions {
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
         mode,
+        // `alf import` is an explicit live import, never a sandboxed preview.
+        preview: false,
     };
     // Importing into the selected agent's own workspace fails closed on a
     // wrong-agent archive; an ad-hoc -w target keeps the legacy path.

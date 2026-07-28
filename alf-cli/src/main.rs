@@ -222,9 +222,13 @@ enum Command {
         kept; the JSON result carries `preview_path`). The live workspace, -w, and \
         ~/.alf/state/ are untouched — no follow-up restore is needed. See \
         docs/how_alf_syncs.md.\n\n\
-        Vault key: same behavior as `alf import` — with a resolved key, Layer 4 is decrypted into \
-        the runtime; without a key, restore still applies other layers and warnings explain that \
-        secrets were not restored.\n\n\
+        Vault key (head restore): same behavior as `alf import` — with a resolved key, Layer 4 is \
+        decrypted into the runtime; without a key, restore still applies other layers and warnings \
+        explain that secrets were not restored.\n\n\
+        Vault key (preview): a preview does NOT decrypt credentials unless --with-credentials is \
+        passed, and NEVER writes the live ~/.alf/vault — the restored Layer 4 stays inside the \
+        preview directory. Previews are pruned to the 3 newest per agent and expire after 24 h; \
+        `alf purge` removes them all.\n\n\
         The agent comes from the global --agent (an alias from the [[agents]] mapping, or a \
         UUID — an unmapped UUID restores by id onto a fresh host), then ALF_AGENT, then the \
         sole enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
@@ -253,6 +257,13 @@ enum Command {
         /// total (exact, default) or merge (keep local-only rows).
         #[arg(long, value_enum, default_value_t = RestoreModeArg::Total)]
         mode: RestoreModeArg,
+
+        /// Point-in-time previews only: also decrypt Layer 4 into the preview
+        /// directory. Off by default — a preview is for inspecting history, and
+        /// plaintext secrets should not outlive the inspection. The LIVE vault is
+        /// never written by a preview either way.
+        #[arg(long)]
+        with_credentials: bool,
 
         #[command(flatten)]
         key: VaultKeyCli,
@@ -847,6 +858,7 @@ fn main() {
             dry_run,
             mode,
             key,
+            with_credentials,
         } => (|| -> anyhow::Result<()> {
             let config = Config::load()?;
             let runtime = config.resolve_runtime(runtime);
@@ -858,6 +870,7 @@ fn main() {
                 dry_run,
                 mode.into(),
                 &key.to_args(),
+                with_credentials,
             )
         })(),
 

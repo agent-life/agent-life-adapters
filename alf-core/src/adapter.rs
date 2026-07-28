@@ -88,6 +88,19 @@ pub enum RestoreMode {
 pub struct ImportOptions<'a> {
     pub vault_key: Option<&'a VaultKey>,
     pub mode: RestoreMode,
+    /// **Sandboxed import**: nothing outside `workspace` may be written.
+    ///
+    /// Set by point-in-time previews (`alf restore --at-sequence N`), which
+    /// materialize a historical archive into `~/.alf/preview/…` and promise
+    /// the live agent is untouched. Layer 4 is the trap: the vault lives at
+    /// `~/.alf/vault/{agent_id}/` — *outside* the workspace — so an ordinary
+    /// import overwrites the LIVE vault with the historical document (full
+    /// overwrite, D6), silently dropping credentials added since that
+    /// sequence and reinstating pre-rotation ciphertext. Under `preview` the
+    /// adapter must keep the restored vault inside `workspace` instead.
+    ///
+    /// Default `false` — a head restore/import intends the live write.
+    pub preview: bool,
 }
 
 // ---------------------------------------------------------------------------

@@ -2,6 +2,24 @@
 
 First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additive throughout — no wire-format, backend, or web changes. The openclaw/zeroclaw/hermes export/import/sync happy paths and the archive bytes they produce are unchanged (goal c); a handful of CLI behaviors changed deliberately alongside the train — see **Changed** below. See `docs/alf-mcp-server-design.md`.
 
+> ### ⚠️ Read this first if you have ever run `alf restore --at-sequence N`
+>
+> **A point-in-time preview used to overwrite your live credentials vault.** The
+> preview is documented as read-only, but the Layer 4 restore wrote
+> `~/.alf/vault/{agent_id}/credentials.json` with full-overwrite semantics on every
+> runtime — so previewing an old sequence silently **deleted every credential added
+> since that sequence** from the local vault, and could reinstate a secret you had
+> rotated away. No key was needed for this to happen, and nothing warned you.
+>
+> **Fixed in 1.1.0**: a preview never writes the live vault (the historical Layer 4
+> stays inside the preview directory), and previews no longer decrypt at all unless
+> you pass the new `--with-credentials`.
+>
+> **If you ran a preview on 1.0.x**, your cloud history is intact — the bug was
+> local-only. Recover the current vault with a head restore (`alf restore -r
+> <runtime>`), which re-materializes Layer 4 from cloud truth, and re-check
+> `alf vault list` against what you expect.
+
 ### Added
 
 - **`alf mcp serve` — a stdio MCP (Model Context Protocol) server inside the `alf` binary.** Any MCP-capable host (Claude Code, Hermes, ZeroClaw, Codex, …) can drive ALF by tool call instead of shelling out: **13 tools** (`alf_status`, `alf_check`, `alf_sync`, `alf_restore`, `alf_export_dry_run`, `alf_track`, `alf_configure`, `alf_vault_add`/`_list`/`_delete`, `alf_agents_list`, `alf_watch_set`, `alf_docs`) with typed `structuredContent` plus the identical JSON the CLI prints as a text block (structured-output floor 2025-06-18). Built on rmcp 2.1; declares revision 2025-11-25 and echo-negotiates every known revision (2024-11-05 → the 2026-07-28 RC), so one binary interoperates with clients on any revision. Diagnostics go to stderr (the protocol owns stdout). Destructive/trust-boundary ceremonies (`purge`, `--force-first-sync`, vault `rotate-key`/`decrypt`, `login`, external-root blessing) are deliberately **not** tools — a tool error routes the agent to `alf_docs` and the human CLI. `alf_agents_set` (in-session enable/disable) is deferred to v1.2; run one server per agent meanwhile.

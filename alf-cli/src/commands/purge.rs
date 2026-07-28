@@ -95,6 +95,9 @@ pub fn run(runtime: &str, workspace_flag: Option<&Path>, agent_arg: Option<&str>
     let del = client.delete_agent(agent_id)?;
 
     AgentState::delete(agent_id)?;
+    // Previews are derived copies of this agent's history — decommissioning it
+    // must not leave them (with any decrypted credentials) behind (MIN-12).
+    crate::commands::restore::purge_previews(agent_id);
     let snapshot_path = local_base_path(agent_id)?;
     if snapshot_path.exists() {
         fs::remove_file(&snapshot_path).map_err(|e| {
@@ -114,6 +117,7 @@ pub fn run(runtime: &str, workspace_flag: Option<&Path>, agent_arg: Option<&str>
         );
         println!();
         println!("  Local sync state under ~/.alf/state/ was reset for this agent.");
+        println!("  Point-in-time previews under ~/.alf/preview/ were removed.");
         println!("  The workspace on disk was not modified. Run `alf sync` to upload again.");
         // D7: purge never touches the vault — deleting the last ciphertext
         // copy right after deleting the cloud copy would be the worst moment.

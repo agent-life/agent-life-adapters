@@ -38,6 +38,7 @@ pub fn import(
     workspace: &Path,
     vault_key: Option<&VaultKey>,
     mode: RestoreMode,
+    preview: bool,
 ) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -108,7 +109,7 @@ pub fn import(
             .into_iter()
             .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
 
-        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
+        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace, preview)?;
         if vaulted > 0 {
             warnings.push(format!(
                 "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -390,6 +391,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     workspace: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -403,16 +405,30 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        workspace.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
+    };
 
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let serialized = serde_json::to_string_pretty(&doc)?;
-    fs::write(&target, serialized)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    // 0600 + atomic: the document carries ciphertext AND plaintext
+    // descriptors (service, username, label), and a crash must never
+    // truncate a just-restored vault.
+    alf_core::fs_atomic::write_private_atomic(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(count)
 }
@@ -755,7 +771,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target_ws = target_dir.path().join("workspace");
         fs::create_dir_all(&target_ws).unwrap();
-        import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
+        import(&alf_file, &target_ws, None, RestoreMode::Total, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -837,7 +853,7 @@ mod tests {
         let target_ws = target_dir.path().join("install");
         fs::create_dir_all(&target_ws).unwrap();
 
-        let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
+        let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total, false).unwrap();
         // Agent name round-trips as the per-agent alias (WP6 unique-name fix),
         // not the shared-install SOUL.md H1 "ZCBot".
         assert_eq!(import_report.agent_name, "agent_a");
@@ -882,7 +898,7 @@ mod tests {
 
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep, None, RestoreMode::Total).unwrap();
+        let report = import(&alf_file, &deep, None, RestoreMode::Total, false).unwrap();
         assert_eq!(report.agent_name, "DirTest");
         assert!(deep.is_dir());
     }
@@ -923,7 +939,7 @@ mod tests {
         // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
         let escaped = root.path().join("PWNED.txt");
 
-        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total, false);
         assert!(
             result.is_err(),
             "import must reject a path-traversal archive"
@@ -948,7 +964,7 @@ mod tests {
         // Workspace nested so its parent (the ZeroClaw `config.toml` target)
         // also stays inside the sandbox.
         let workspace = root.path().join("home/ws");
-        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total, false);
         assert!(
             result.is_err(),
             "import must reject an absolute-path archive entry"

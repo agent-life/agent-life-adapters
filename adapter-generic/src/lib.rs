@@ -60,7 +60,13 @@ impl Adapter for GenericAdapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
-        import::import(alf_file, workspace, options.vault_key, options.mode)
+        import::import(
+            alf_file,
+            workspace,
+            options.vault_key,
+            options.mode,
+            options.preview,
+        )
     }
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {

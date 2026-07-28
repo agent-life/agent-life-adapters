@@ -73,7 +73,13 @@ impl Adapter for ZeroClawAdapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
-        import::import(alf_file, workspace, options.vault_key, options.mode)
+        import::import(
+            alf_file,
+            workspace,
+            options.vault_key,
+            options.mode,
+            options.preview,
+        )
     }
 
     fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {

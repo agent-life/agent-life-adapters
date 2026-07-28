@@ -34,6 +34,7 @@ pub fn import(
     alf_file: &Path,
     workspace: &Path,
     vault_key: Option<&VaultKey>,
+    preview: bool,
 ) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -104,7 +105,8 @@ pub fn import(
                 .into_iter()
                 .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
 
-            let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
+            let vaulted =
+                restore_agent_vault(vault_records, doc_extra, agent_id, workspace, preview)?;
             if vaulted > 0 {
                 warnings.push(format!(
                     "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -354,6 +356,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     workspace: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -367,16 +370,30 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        workspace.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
+    };
 
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    let serialized = serde_json::to_string_pretty(&doc)?;
-    fs::write(&target, serialized)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    // 0600 + atomic: the document carries ciphertext AND plaintext
+    // descriptors (service, username, label), and a crash must never
+    // truncate a just-restored vault.
+    alf_core::fs_atomic::write_private_atomic(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(count)
 }
@@ -662,6 +679,57 @@ mod tests {
         assert_eq!(doc.credentials[0].label.as_deref(), Some("mine"));
     }
 
+    /// MIN-12 regression: a PREVIEW import must not touch the live vault.
+    /// Restore is a full overwrite (D6), so writing a historical Layer 4 to
+    /// `~/.alf/vault/{id}/` would silently drop every credential added since
+    /// that sequence — from `alf restore --at-sequence N`, which is documented
+    /// as a read-only preview. The restored document belongs in the preview
+    /// tree instead.
+    #[test]
+    fn preview_import_never_writes_the_live_vault() {
+        isolate_home();
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nhi"),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
+        let my_id = "cfef1150-aaaa-4aaa-8aaa-0000000000a7";
+        fs::write(ws.path().join(".alf-agent-id"), my_id).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let vault = alf_core::agent_vault_path(&home, my_id.parse().unwrap());
+        fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        // The archive carries the OLD credential…
+        fs::write(&vault, vault_doc(my_id, "historical", true)).unwrap();
+        let alf_file = ws.path().join("export.alf");
+        export::export(ws.path(), &alf_file).unwrap();
+        // …while the live vault has moved on (a credential added since, or a
+        // rotation). This is what a preview must not destroy.
+        fs::write(&vault, vault_doc(my_id, "current-live", false)).unwrap();
+
+        let preview = TempDir::new().unwrap();
+        import(&alf_file, preview.path(), None, /* preview: */ true).unwrap();
+
+        let live: alf_core::CredentialsDocument =
+            serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
+        assert_eq!(
+            live.credentials[0].label.as_deref(),
+            Some("current-live"),
+            "a preview must leave the live vault exactly as it was"
+        );
+        // The historical document is materialized inside the preview instead.
+        let sandboxed = preview.path().join(".alf-restored-credentials.json");
+        assert!(sandboxed.is_file(), "preview vault copy missing");
+        let copy: alf_core::CredentialsDocument =
+            serde_json::from_str(&fs::read_to_string(&sandboxed).unwrap()).unwrap();
+        assert_eq!(copy.credentials[0].label.as_deref(), Some("historical"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&sandboxed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "restored vault must be owner-only (MIN-14)");
+        }
+    }
+
     /// A-2 (WP1): import restores alf-vault records to the archive agent's
     /// own per-agent vault path, fully overwriting a stale local vault (D6)
     /// while preserving the archive doc's unknown extra fields.
@@ -687,7 +755,7 @@ mod tests {
         fs::write(&vault, vault_doc(my_id, "stale-local", false)).unwrap();
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -719,7 +787,7 @@ mod tests {
 
         // Import into fresh workspace
         let target = TempDir::new().unwrap();
-        let import_report = import(&alf_file, target.path(), None).unwrap();
+        let import_report = import(&alf_file, target.path(), None, false).unwrap();
 
         assert_eq!(import_report.agent_name, "Clawd");
         assert!(import_report.identity_imported);
@@ -756,7 +824,7 @@ mod tests {
 
         let target = TempDir::new().unwrap();
         let deep_path = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep_path, None).unwrap();
+        let report = import(&alf_file, &deep_path, None, false).unwrap();
         assert_eq!(report.agent_name, "Bot");
         assert!(deep_path.is_dir());
     }
@@ -798,7 +866,7 @@ mod tests {
         // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
         let escaped = root.path().join("PWNED.txt");
 
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, false);
         assert!(
             result.is_err(),
             "import must reject a path-traversal archive"
@@ -821,7 +889,7 @@ mod tests {
         let (_keep, alf_file) = archive_with_malicious_entry(&entry);
 
         let workspace = root.path().join("ws");
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, false);
         assert!(
             result.is_err(),
             "import must reject an absolute-path archive entry"

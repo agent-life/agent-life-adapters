@@ -58,6 +58,76 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// [`write_atomic`] with owner-only (`0600`) permissions, applied to the temp
+/// **before** any bytes land so the content is never briefly world-readable.
+///
+/// For files that hold credential material: the restored per-agent vault
+/// (`~/.alf/vault/{id}/credentials.json`) carries AEAD ciphertext *and*
+/// plaintext descriptors — service names, usernames, labels — so it must not
+/// be readable by other local users. On non-unix this is exactly
+/// [`write_atomic`] (permissions are the platform's business).
+pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("write_private_atomic: {} has no file name", path.display()),
+                )
+            })?
+            .to_string();
+        let tmp = path.with_file_name(format!(
+            "{name}.tmp.{}.{}",
+            std::process::id(),
+            TEMP_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            io::Write::write_all(&mut file, bytes)?;
+            file.sync_all()?;
+        }
+        // A pre-existing target may already be 0644 (written by an older alf):
+        // the rename carries the temp's mode, so the result is 0600 either way.
+        if let Err(e) = fs::rename(&tmp, path) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Some(dir) = path.parent() {
+            cleanup_stale_temps(dir, &name, STALE_TEMP_AGE);
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        write_atomic(path, bytes)
+    }
+}
+
+/// Create `path` (and parents) as an owner-only (`0700`) directory.
+///
+/// Used for directories whose *listing* is sensitive — the point-in-time
+/// preview tree (`~/.alf/preview/{agent}/`) materializes historical agent
+/// content, and the vault/key directories leak agent ids by name. Existing
+/// directories are tightened too. No-op beyond `create_dir_all` on non-unix.
+pub fn create_dir_private(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 /// Best-effort sweep of abandoned temp files for `target_name` in `dir`
 /// (WP-H.3). Removes ONLY siblings named exactly `{target_name}.tmp.{digits}.
 /// {digits}` whose mtime is older than `older_than`; anything else — other

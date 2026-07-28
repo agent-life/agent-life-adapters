@@ -72,6 +72,7 @@ pub fn import(
     workspace: &Path,
     _vault_key: Option<&VaultKey>,
     mode: RestoreMode,
+    preview: bool,
 ) -> Result<ImportReport> {
     let file = fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -159,7 +160,8 @@ pub fn import(
                 .credentials
                 .into_iter()
                 .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
-            let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
+            let vaulted =
+                restore_agent_vault(vault_records, doc_extra, agent_id, workspace, preview)?;
             if vaulted > 0 {
                 warnings.push(format!(
                     "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -234,6 +236,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: Uuid,
     workspace: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -243,13 +246,28 @@ fn restore_agent_vault(
         credentials: records,
         extra: doc_extra,
     };
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        workspace.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
+    };
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&target, serde_json::to_string_pretty(&doc)?)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    // 0600 + atomic: the document carries ciphertext AND plaintext
+    // descriptors (service, username, label), and a crash must never
+    // truncate a just-restored vault.
+    alf_core::fs_atomic::write_private_atomic(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
     Ok(count)
 }

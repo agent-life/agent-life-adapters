@@ -405,8 +405,26 @@ fn prune_previews(agent_id: Uuid, keep: usize) {
     prune_seq_dirs(&base, keep);
 }
 
-/// The mtime-ordered `seq-*` prune, factored for testing.
+/// How long a materialized preview may linger. A preview is inspection
+/// scratch: keeping it past a day serves nobody and (with
+/// `--with-credentials`) leaves decrypted secrets on disk — including
+/// pre-rotation ones a later `alf vault rotate-key` cannot reach (MIN-12).
+const PREVIEW_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// The `seq-*` prune, factored for testing: drop anything older than
+/// [`PREVIEW_TTL`], then keep only the `keep` newest of what remains.
 fn prune_seq_dirs(base: &Path, keep: usize) {
+    prune_seq_dirs_at(base, keep, std::time::SystemTime::now(), PREVIEW_TTL)
+}
+
+/// [`prune_seq_dirs`] with the clock injected (pure enough to unit-test both
+/// the TTL sweep and the keep-N cap without sleeping).
+fn prune_seq_dirs_at(
+    base: &Path,
+    keep: usize,
+    now: std::time::SystemTime,
+    ttl: std::time::Duration,
+) {
     let Ok(entries) = fs::read_dir(base) else {
         return;
     };
@@ -423,9 +441,29 @@ fn prune_seq_dirs(base: &Path, keep: usize) {
             })
         })
         .collect();
+    // Expired first — a stale preview goes regardless of how few there are.
+    dirs.retain(|(mtime, path)| {
+        let expired = now
+            .duration_since(*mtime)
+            .map(|age| age > ttl)
+            .unwrap_or(false);
+        if expired {
+            let _ = fs::remove_dir_all(path);
+        }
+        !expired
+    });
     dirs.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime)); // newest first
     for (_, path) in dirs.into_iter().skip(keep) {
         let _ = fs::remove_dir_all(path);
+    }
+}
+
+/// Remove every preview for `agent_id` (the whole `~/.alf/preview/{id}/` tree).
+/// Called by `alf purge`, and available as the "forget everything I previewed"
+/// operation.
+pub(crate) fn purge_previews(agent_id: Uuid) {
+    if let Ok(Some(base)) = preview_dir(agent_id, 0).map(|p| p.parent().map(Path::to_path_buf)) {
+        let _ = fs::remove_dir_all(base);
     }
 }
 
@@ -442,6 +480,7 @@ fn perform_restore(
     at_sequence: Option<u64>,
     mode: RestoreMode,
     key_args: &VaultKeyArgs,
+    with_credentials: bool,
     progress: Progress,
 ) -> Result<(ImportReport, u64, PathBuf)> {
     // Branch on at_sequence:
@@ -471,7 +510,10 @@ fn perform_restore(
                 fs::remove_dir_all(&dir)
                     .with_context(|| format!("clearing stale preview {}", dir.display()))?;
             }
-            fs::create_dir_all(&dir)
+            // 0700: a preview materializes historical agent content — memory,
+            // identity, and (with --with-credentials) decrypted secrets — so
+            // neither the tree nor its listing may be world-readable.
+            alf_core::fs_atomic::create_dir_private(&dir)
                 .with_context(|| format!("creating preview dir {}", dir.display()))?;
             // Merge is meaningless against an empty preview dir: force Total.
             let warning = matches!(mode, RestoreMode::Merge).then(|| {
@@ -491,7 +533,15 @@ fn perform_restore(
             "workspace"
         }
     ));
-    let resolved_key = vault_key::resolve(key_args, runtime, Some(agent_id))?;
+    // Previews do NOT decrypt by default (MIN-12): materializing plaintext
+    // secrets is not what "inspect history" needs, and the copy would outlive
+    // the inspection. `--with-credentials` opts in explicitly.
+    let decrypt = at_sequence.is_none() || with_credentials;
+    let resolved_key = if decrypt {
+        vault_key::resolve(key_args, runtime, Some(agent_id))?
+    } else {
+        None
+    };
     if let Some((_, source)) = &resolved_key {
         progress.emit(&format!(
             "Using vault key from {} — credentials will be decrypted and restored",
@@ -501,14 +551,24 @@ fn perform_restore(
     let import_options = ImportOptions {
         vault_key: resolved_key.as_ref().map(|(k, _)| k),
         mode,
+        // Sandboxed: keep Layer 4 inside the preview tree, never the live vault.
+        preview: at_sequence.is_some(),
     };
     let mut import_report = adapt.import_with_options(&temp_alf, &target_dir, import_options)?;
     if let Some(w) = merge_warning {
         import_report.warnings.push(w);
     }
-    if at_sequence.is_some() {
-        prune_previews(agent_id, 3);
+    if at_sequence.is_some() && !with_credentials {
+        import_report.warnings.push(
+            "credentials were not decrypted into this preview (pass --with-credentials \
+             to include them); the live vault is untouched either way"
+                .to_string(),
+        );
     }
+    // Cleanup runs on EVERY restore, not just previews: keep the 3 newest and
+    // drop anything older than the TTL, so an inspected preview does not sit
+    // on disk indefinitely waiting for two more previews to push it out.
+    prune_previews(agent_id, 3);
     Ok((import_report, latest_sequence, target_dir))
 }
 
@@ -596,6 +656,10 @@ pub(crate) fn run_for_mcp(
     key_args: &VaultKeyArgs,
     progress: Progress,
 ) -> Result<RestoreToolResult> {
+    // Over MCP a preview NEVER decrypts (MIN-12): materializing plaintext
+    // secrets is a human ceremony (`alf restore --at-sequence N
+    // --with-credentials`), so the tool surface deliberately has no opt-in.
+    let with_credentials = false;
     let target = resolve_target(runtime, workspace_flag, agent)?;
 
     // L3 (manual §6): a HEAD restore rewrites the live workspace and moves the
@@ -640,6 +704,7 @@ pub(crate) fn run_for_mcp(
         at_sequence,
         mode,
         key_args,
+        with_credentials,
         progress,
     )?;
     Ok(build_restore_result(
@@ -653,6 +718,7 @@ pub(crate) fn run_for_mcp(
     .into())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     runtime: &str,
     workspace_flag: Option<&Path>,
@@ -661,6 +727,7 @@ pub fn run(
     dry_run: bool,
     mode: RestoreMode,
     key_args: &VaultKeyArgs,
+    with_credentials: bool,
 ) -> Result<()> {
     let human = output::human_mode();
     let preview = at_sequence.is_some();
@@ -735,6 +802,7 @@ pub fn run(
         at_sequence,
         mode,
         key_args,
+        with_credentials,
         Progress::stderr(),
     )?;
 
@@ -857,6 +925,44 @@ fn run_dry_run(
 mod tests {
     use super::*;
 
+    /// MIN-12: a preview is inspection scratch — it expires, regardless of how
+    /// few previews exist. (The keep-N cap alone let one sit forever until two
+    /// more previews pushed it out.)
+    #[test]
+    fn prune_sweeps_previews_older_than_the_ttl() {
+        let base = tempfile::tempdir().unwrap();
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let ttl = std::time::Duration::from_secs(3600);
+        for (n, age) in [(1u64, 7200u64), (2, 600)] {
+            let d = base.path().join(format!("seq-{n}"));
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::File::open(&d)
+                .unwrap()
+                .set_modified(now - std::time::Duration::from_secs(age))
+                .unwrap();
+        }
+        // keep = 3, so nothing is dropped by the cap: only the TTL can act.
+        prune_seq_dirs_at(base.path(), 3, now, ttl);
+        assert!(
+            !base.path().join("seq-1").exists(),
+            "a preview older than the TTL is swept even when under the keep cap"
+        );
+        assert!(base.path().join("seq-2").exists(), "a fresh preview stays");
+    }
+
+    /// MIN-12: the preview tree is created 0700 — its contents are historical
+    /// agent memory/identity (and, opted in, decrypted secrets).
+    #[test]
+    #[cfg(unix)]
+    fn preview_dirs_are_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("preview").join("seq-3");
+        alf_core::fs_atomic::create_dir_private(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "preview dir must be owner-only, got {mode:o}");
+    }
+
     #[test]
     fn preview_dir_layout_and_prune_keeps_three() {
         // Path shape (relative components — no env mutation, works on any HOME).
@@ -889,7 +995,16 @@ mod tests {
             f.set_modified(t).unwrap();
         }
         std::fs::create_dir_all(base.path().join("not-a-preview")).unwrap();
-        prune_seq_dirs(base.path(), 3);
+        // Clock injected: `now` sits just after the fixture mtimes and the TTL
+        // is effectively infinite, so this asserts the keep-N cap alone (the
+        // TTL sweep has its own test below).
+        let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(4001);
+        prune_seq_dirs_at(
+            base.path(),
+            3,
+            now,
+            std::time::Duration::from_secs(u32::MAX as u64),
+        );
         assert!(!base.path().join("seq-1").exists(), "oldest pruned");
         for n in 2..=4u64 {
             assert!(

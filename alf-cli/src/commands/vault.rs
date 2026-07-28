@@ -416,15 +416,26 @@ pub(crate) fn add_core(
 
     let mut updated = false;
     if update {
-        if let Some(new_label) = &record_label {
-            if let Some(pos) = doc
+        // Upsert by label (the documented CLI contract). A LABEL-LESS record —
+        // the shape a minimal `{service, secret}` add produces, since the
+        // effective label is `label ?? username` — has no label to match on,
+        // so it upserts against the same service's other label-less record
+        // instead (MIN-1). Without this, `update: true` appended a second copy
+        // and the duplicate guard's "pass update:true to replace it" advice
+        // was untrue for the commonest call shape.
+        let pos = match &record_label {
+            Some(new_label) => doc
                 .credentials
                 .iter()
-                .position(|c| c.label.as_deref() == Some(new_label.as_str()))
-            {
-                doc.credentials[pos] = record.clone();
-                updated = true;
-            }
+                .position(|c| c.label.as_deref() == Some(new_label.as_str())),
+            None => doc
+                .credentials
+                .iter()
+                .position(|c| c.label.is_none() && c.service == record.service),
+        };
+        if let Some(pos) = pos {
+            doc.credentials[pos] = record.clone();
+            updated = true;
         }
     }
     if !updated {
@@ -1482,6 +1493,92 @@ mod tests {
         };
         std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap()).unwrap();
         path
+    }
+
+    /// `add_core` against a scratch vault file with an explicit key.
+    /// (Named `add_scratch`, not `add`: the parent module already has an `add`
+    /// that other tests in here call.)
+    #[allow(clippy::too_many_arguments)]
+    fn add_scratch(
+        vault: &Path,
+        key_path: &Path,
+        service: &str,
+        username: Option<&str>,
+        label: Option<&str>,
+        secret: &str,
+        update: bool,
+    ) -> Result<AddResult> {
+        add_core(
+            Some(vault),
+            service,
+            "account",
+            username,
+            Some(secret),
+            None,
+            None,
+            label,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            update,
+            &VaultKeyArgs {
+                key_file: Some(key_path.to_path_buf()),
+                key_env: None,
+            },
+            "generic",
+        )
+    }
+
+    /// MIN-1: `update: true` must upsert a LABEL-LESS record too. The effective
+    /// label is `label` ?? `username`, so a minimal `{service, secret}` add
+    /// produces `label: None`; the replace pass used to require `Some`, so
+    /// re-adding appended a second record and the "pass update:true to replace
+    /// it" advice was untrue for the commonest call shape.
+    #[test]
+    fn update_upserts_a_label_less_record_by_service() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let vault = dir.path().join("credentials.json");
+
+        let first = add_scratch(&vault, &key_path, "openai", None, None, "sk-one", false).unwrap();
+        assert_eq!(first.total, 1);
+        assert!(!first.updated);
+
+        let second = add_scratch(&vault, &key_path, "openai", None, None, "sk-two", true).unwrap();
+        assert!(
+            second.updated,
+            "a label-less re-add must replace, not append"
+        );
+        assert_eq!(second.total, 1, "still one record for the service");
+
+        // A DIFFERENT service is untouched by the label-less upsert.
+        let other =
+            add_scratch(&vault, &key_path, "anthropic", None, None, "sk-three", true).unwrap();
+        assert!(!other.updated, "a different service is a new record");
+        assert_eq!(other.total, 2);
+    }
+
+    /// Labeled upsert keeps its documented "upserts by label" behavior.
+    #[test]
+    fn update_still_upserts_by_label() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let vault = dir.path().join("credentials.json");
+
+        add_scratch(&vault, &key_path, "openai", None, Some("work"), "a", false).unwrap();
+        let again =
+            add_scratch(&vault, &key_path, "openai", None, Some("work"), "b", true).unwrap();
+        assert!(again.updated);
+        assert_eq!(again.total, 1);
+        // A label-less record does not collide with a labeled one.
+        let bare = add_scratch(&vault, &key_path, "openai", None, None, "c", true).unwrap();
+        assert!(
+            !bare.updated,
+            "label-less must not replace a labeled record"
+        );
+        assert_eq!(bare.total, 2);
     }
 
     #[test]

@@ -1432,3 +1432,69 @@ fn watch_loop_backs_off_on_auth_rejection_then_recovers() {
     });
     conv.finish();
 }
+
+/// MIN-1: the minimal `{service, secret}` call shape carries no label, and a
+/// retried identical call (a timed-out client re-sending) must NOT silently
+/// duplicate the credential — the guard rejects it, `update:true` replaces it,
+/// and the vault holds exactly one record throughout.
+#[test]
+fn vault_add_retry_without_a_label_does_not_duplicate() {
+    let mut conv = Conversation::start();
+    let schema = conv.schema_for("alf_vault_add");
+
+    let first = conv.call(
+        3,
+        "alf_vault_add",
+        json!({"service": "openai", "secret": "sk-one"}),
+    );
+    assert_success(&first, "alf_vault_add", &schema);
+
+    // The retry: byte-identical arguments, as an agent re-sending after a
+    // client timeout would.
+    let retry = conv.call(
+        4,
+        "alf_vault_add",
+        json!({"service": "openai", "secret": "sk-one"}),
+    );
+    assert_tool_error(&retry, "alf_vault_add");
+    let text = retry["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("already exists") && text.contains("update:true"),
+        "the refusal must name the remedy: {text}"
+    );
+
+    // The documented remedy actually works — and replaces rather than appends.
+    let updated = conv.call(
+        5,
+        "alf_vault_add",
+        json!({"service": "openai", "secret": "sk-two", "update": true}),
+    );
+    assert_success(&updated, "alf_vault_add", &schema);
+    assert_eq!(
+        updated["structuredContent"]["updated"], true,
+        "update:true must replace the label-less record: {}",
+        updated["structuredContent"]
+    );
+    assert_eq!(
+        updated["structuredContent"]["total"], 1,
+        "replacing must not grow the vault"
+    );
+
+    let list = conv.call(6, "alf_vault_list", json!({}));
+    assert_eq!(
+        list["structuredContent"]["count"], 1,
+        "exactly one record survives the retry + update: {}",
+        list["structuredContent"]
+    );
+
+    // A different service is still a distinct record, not a collision.
+    let other = conv.call(
+        7,
+        "alf_vault_add",
+        json!({"service": "anthropic", "secret": "sk-three"}),
+    );
+    assert_success(&other, "alf_vault_add", &schema);
+    let list2 = conv.call(8, "alf_vault_list", json!({}));
+    assert_eq!(list2["structuredContent"]["count"], 2);
+    conv.finish();
+}

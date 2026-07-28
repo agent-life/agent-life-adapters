@@ -1026,24 +1026,30 @@ fn vault_add_impl(
 
     // Duplicate guard (manual §3.8): without update:true, an add whose service +
     // effective label match an existing record is rejected — a repeated
-    // identical call must never silently duplicate.
+    // identical call must never silently duplicate. The effective label is
+    // `label ?? username`, and it is matched INCLUDING the None case (MIN-1):
+    // a minimal `{service, secret}` retry — the shape a timed-out client sends
+    // — carries no label, and used to skip this guard entirely.
     if !params.update.unwrap_or(false) {
-        if let Some(label) = params.label.as_deref().or(params.username.as_deref()) {
-            // A missing vault (first add) has no records — a list error there
-            // just means "nothing to collide with".
-            if let Ok(existing) = vault_list_impl(runtime, workspace, agent) {
-                if let Some(dup) = existing
-                    .credentials()
-                    .iter()
-                    .find(|c| c.label() == Some(label) && c.service() == params.service)
-                {
-                    anyhow::bail!(
-                        "a credential with label '{label}' for service '{}' already exists \
-                         (id {}); pass update:true to replace it, or use a different label",
-                        params.service,
-                        dup.id()
-                    );
-                }
+        let effective = params.label.as_deref().or(params.username.as_deref());
+        // A missing vault (first add) has no records — a list error there
+        // just means "nothing to collide with".
+        if let Ok(existing) = vault_list_impl(runtime, workspace, agent) {
+            if let Some(dup) = existing
+                .credentials()
+                .iter()
+                .find(|c| c.label() == effective && c.service() == params.service)
+            {
+                let which = match effective {
+                    Some(label) => format!("with label '{label}'"),
+                    None => "with no label".to_string(),
+                };
+                anyhow::bail!(
+                    "a credential {which} for service '{}' already exists (id {}); \
+                     pass update:true to replace it, or add a distinguishing label",
+                    params.service,
+                    dup.id()
+                );
             }
         }
     }

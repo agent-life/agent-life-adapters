@@ -202,9 +202,9 @@ Tracked files sync as **RAW BYTES** — no memory-record parsing — and any cha
 - `username`, `label`, `description` (strings, optional) — plaintext descriptors. `label` defaults to `username` and is the selector for list/delete.
 - `tags` (string list) — an `alf-vault` tag is always added.
 - `fields` (string list) — extra encrypted fields, each a single `key=value` string; an entry without `=` is rejected.
-- `update` (bool, default `false`) — replace the same-label record.
+- `update` (bool, default `false`) — replace the matching record: the same-label one, or — when this add carries no effective label — the same service's other label-less record.
 
-**Duplicate guard *(v1.1)*.** Without `update: true`, an add whose service + effective label match an existing record is **rejected** with a hint naming `update: true`. Repeating an identical call never silently duplicates.
+**Duplicate guard *(v1.1)*.** Without `update: true`, an add whose service + effective label match an existing record is **rejected** with a hint naming `update: true`. The match includes the **no-label** case, so the minimal `{service, secret}` shape is guarded too: repeating an identical call (a client retry after a timeout) never silently duplicates.
 
 **Key handling.** On the first add with no key resolvable, a vault key is generated (file mode 0600) and the result carries `key_generated: {fingerprint, path}` — **never the key bytes**. Back up that file; the service can never decrypt without it. Generation is race-safe: two concurrent first-adds converge on one key.
 

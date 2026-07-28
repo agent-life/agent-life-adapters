@@ -464,7 +464,9 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 - **Head restore (default)**: pulls the latest snapshot and all subsequent deltas, merges them, writes the merged base to `~/.alf/state/{agent-id}-snapshot.alf`, updates `~/.alf/state/{agent-id}.toml`, and imports into the workspace. After this, `alf sync` resumes against the freshly restored base.
 
-- **Point-in-time preview** (`--at-sequence N`): rebuilds the workspace as it looked after sequence `N` was applied. **Does not touch `~/.alf/state/`** — the local sync cursor remains pointed at head. This is a read-only inspection mode; running `alf sync` afterwards still works against head as if the preview never happened. To return the workspace to head, run plain `alf restore` again. See [`docs/how_alf_syncs.md`](how_alf_syncs.md) for the rationale.
+- **Point-in-time preview** (`--at-sequence N`): materializes the agent as it looked after sequence `N` into `~/.alf/preview/{agent-id}/seq-{N}/`. **Neither the live workspace nor `~/.alf/state/` is touched** — the sync cursor stays at head, so `alf sync` afterwards works as if the preview never happened, and no follow-up restore is needed. *(Before v1.1.0 the preview overwrote the workspace.)* The preview directory is created `0700`, pruned to the 3 newest per agent, and expires after 24 h; `alf purge` removes an agent's previews outright. See [`docs/how_alf_syncs.md`](how_alf_syncs.md) for the rationale.
+
+  **Credentials in a preview:** the live vault (`~/.alf/vault/{agent-id}/credentials.json`) is **never** written — the historical Layer 4 lands inside the preview directory as `.alf-restored-credentials.json` (mode `0600`), so inspecting an old sequence cannot drop credentials added since it or reinstate a pre-rotation secret. A preview also does **not** decrypt unless `--with-credentials` is passed.
 
 ### Flags
 
@@ -473,6 +475,7 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 | `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
 | `--workspace` | `-w` | No | Path to the target workspace directory (default: the selected agent's mapped workspace) |
 | `--agent` | | No | Alias-or-id (global flag; the `-a` short form was removed). An unmapped UUID is used verbatim; see [Agent selection](#agent-selection). |
+| `--with-credentials` | | No | Point-in-time previews only: also decrypt Layer 4 into the preview directory. Off by default. The live vault is never written by a preview either way. |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags); needed only to decrypt legacy archives into the runtime |
 | `--vault-key-env` | | No | |
@@ -843,7 +846,7 @@ The loop is what makes MCP mode token-free (design §11). It marks a source dirt
 - **Intervals.** Memory/raw changes ride the delta channel: floor **1 min**, ceiling **24 h**. A change to a tracked (`alf_track`) file triggers a **full-snapshot rollover** (§6.1) batched on its own knob — floor **15 min**, default **1 h**. Both are validation-clamped; steer them with `alf_watch_set` or the map's `watch` block.
 - **Catch-up on start.** On spawn the loop dirty-scans against the base snapshot, so anything changed while no server was alive syncs on the first tick. A crashed server, a rebooted machine, and a laptop closed for a week all resolve the same way: next session, first tick, one delta.
 - **Crash-safe by SIGKILL.** The spec sanctions SIGKILL as normal shutdown, so mid-sync death is safe by construction: state writes are temp+rename atomic and the upload is sequence-CAS'd server-side, so a killed sync leaves either "old base + old state" (retry = the same delta) or "new state fully committed".
-- **Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `lock_unavailable`. A successful manual `alf_sync` (or an `alf_watch_set` resume) clears the park.
+- **Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`. A successful manual `alf_sync` (or an `alf_watch_set` resume) clears the park.
 - **No daemon mode.** The loop lives only as long as the host keeps the session alive (the MCP convention: the client owns the process). Host-independent cadence stays with the CLI + OS cron on user machines and the boot/shutdown hooks on cloud runtimes.
 
 Per-host setup is in [MCP client configuration](#mcp-client-configuration); retiring an agent is in [Decommissioning an agent](#decommissioning-an-agent).

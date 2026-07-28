@@ -143,6 +143,14 @@ Call `alf_status` first in every session. Once configured, the watch loop syncs 
 
 **Concurrency.** Head restores take the sync lock + advisory lock and wait for an in-flight watch sync to finish *(v1.1)*. Previews and dry runs take no locks (they are read-only with respect to shared state).
 
+**Credentials in a preview *(v1.1)*.** A preview never writes the live vault
+(`~/.alf/vault/{agent_id}/`) — the historical Layer 4 is materialized inside the
+preview directory instead, so previewing an old sequence can never drop
+credentials added since it or reinstate a pre-rotation secret. Over MCP a
+preview also never *decrypts*; the human CLI can opt in with
+`alf restore --at-sequence N --with-credentials`. Previews are pruned to the 3
+newest per agent, expire after 24 h, and `alf purge` removes them all.
+
 **Failures (coded).** `agent_busy` (head only); `auth_failed`; `invalid mode` (uncoded, self-describing); backend/network errors with hints. Vault-encrypted credentials restore only when a vault key resolves (`ALF_VAULT_KEY` or the runtime's default key file); otherwise credentials are skipped with a warning.
 
 ### 3.5 `alf_export_dry_run`
@@ -290,7 +298,7 @@ A sync tick fires when: at least one source is dirty AND every dirty source is q
 - **Auth errors** (HTTP 401/403) park after 3 attempts with backoff between *(v1.1)*.
 - **Lock-file I/O errors** (not contention — an unopenable lock file) park after 3 consecutive failures *(v1.1)*.
 
-**Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `lock_unavailable`.
+**Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`.
 
 | Code | Meaning | Operator remedy |
 |---|---|---|
@@ -300,6 +308,7 @@ A sync tick fires when: at least one source is dirty AND every dirty source is q
 | `sync_poisoned_base_unresolved` | E9 base parity failure; auto-recovery failed | Same |
 | `watch_parked` | Fatal configuration/authorization error (e.g. underlying code `agent_disabled`, `workspace_missing`, `subscription_denied`) | Fix the named cause; the park message carries the underlying error |
 | `auth_failed` | Service rejected the API key (401/403) | Fix the key (`alf login` / config), then one manual `alf_sync` |
+| `watch_panicked` | The sync task panicked repeatedly (a bug; the panic is on the server's stderr) *(v1.1)* | Fix or remove the offending workspace file, then `alf_sync` |
 | `lock_unavailable` | The advisory lock file cannot be opened (permissions/state dir) | Fix `~/.alf/state/` permissions, then `alf_sync` |
 
 **What clears a park:** a successful manual `alf_sync`, or `alf_watch_set {pause:false}`.

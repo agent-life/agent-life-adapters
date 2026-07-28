@@ -11,6 +11,7 @@
 //! It lives in `alf-core` so every adapter (and the CLI) can share one
 //! implementation — see the OpenClaw and ZeroClaw adapters' `export`.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,10 +26,22 @@ pub const INCLUDE_FILE: &str = ".alf-include.json";
 pub const SYNC_LOG_FILE: &str = ".alf-sync-log.md";
 
 /// The agent-managed whitelist of extra files to sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// **Forward compatible (MIN-7).** This file is rewritten in place by routine
+/// operations — `mark_external_inert` on every restore/import,
+/// `prune_and_log_missing` on every sync — and it travels inside the archive,
+/// so an older binary's rewrite propagates to the cloud and to every other
+/// machine. Mixed versions are routine (a runtime image bakes `alf` at build
+/// time and lags the user's laptop), so unknown fields written by a newer alf
+/// are preserved verbatim rather than silently dropped, matching the
+/// `Manifest`/`AgentMetadata` discipline (spec §8.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct IncludeList {
     #[serde(default)]
     pub files: Vec<IncludeEntry>,
+    /// Unknown document-level fields preserved for forward compatibility.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// One tracked file in the include list.
@@ -39,7 +52,7 @@ pub struct IncludeList {
 /// provenance + re-validation, and use `verified` for inert-on-restore: a
 /// `false` value means "restored from an archive, do not pack until the local
 /// user re-confirms" (so a hostile archive's external entries do nothing).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IncludeEntry {
     /// For in-workspace entries: the workspace-relative, forward-slashed path.
     /// For external entries: the sanitized archive name under `external/`.
@@ -59,6 +72,9 @@ pub struct IncludeEntry {
     /// archive is imported `false` (inert) until the local user re-confirms.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verified: bool,
+    /// Unknown entry-level fields preserved for forward compatibility (MIN-7).
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -111,6 +127,7 @@ impl IncludeList {
             external: false,
             source: None,
             verified: true,
+            extra: HashMap::new(),
         });
         true
     }
@@ -129,6 +146,7 @@ impl IncludeList {
             external: true,
             source: Some(source_abs.to_string()),
             verified: true,
+            extra: HashMap::new(),
         });
         true
     }
@@ -797,6 +815,7 @@ mod tests {
             external: true,
             source: Some("/some/old/OLD.md".into()),
             verified: false,
+            extra: HashMap::new(),
         });
 
         let (packable, skipped) = external_entries_for_export(&list, &roots);
@@ -873,6 +892,64 @@ mod tests {
         assert!(validate_external_source(&ok, &roots).is_ok());
     }
 
+    /// MIN-7: forward compatibility for the include list. `.alf-include.json`
+    /// is rewritten in place by routine operations — `mark_external_inert` on
+    /// EVERY restore/import (all four adapters) and `prune_and_log_missing` on
+    /// every sync — and it travels inside the archive, so a strip propagates to
+    /// the cloud and every other machine. Mixed versions are routine here (a
+    /// runtime image bakes `alf` at build time and lags the user's laptop), so
+    /// an older binary must round-trip fields it does not know: without this,
+    /// the older binary silently deletes a newer version's data on a plain
+    /// restore. This must ship BEFORE the first version that adds a field —
+    /// a deployed binary cannot be taught to preserve what it never knew.
+    #[test]
+    fn unknown_fields_survive_every_rewrite_path() {
+        let dir = ws();
+        fs::write(dir.path().join("kept.txt"), "k").unwrap();
+        // A list as a FUTURE alf would write it: unknown keys at both the entry
+        // and document level.
+        fs::write(
+            dir.path().join(INCLUDE_FILE),
+            r#"{"files":[
+                {"path":"kept.txt","added_at":"2026-01-01T00:00:00Z","pinned":true,
+                 "future_entry_field":{"nested":1}},
+                {"path":"aa-EXT.md","external":true,"source":"/proj/EXT.md",
+                 "verified":true,"pinned":false}
+            ],"future_doc_field":"kept"}"#,
+        )
+        .unwrap();
+
+        // Rewrite path 1: every restore/import.
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 1);
+        // Rewrite path 2: every sync.
+        prune_and_log_missing(dir.path()).unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(INCLUDE_FILE)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc["future_doc_field"], "kept",
+            "document-level unknown field stripped: {raw}"
+        );
+        let kept = &doc["files"][0];
+        assert_eq!(kept["pinned"], true, "entry unknown field stripped: {raw}");
+        assert_eq!(
+            kept["future_entry_field"]["nested"], 1,
+            "nested unknown value mangled: {raw}"
+        );
+        // The known fields still work — the external really was flipped inert.
+        let ext = doc["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == "aa-EXT.md")
+            .expect("external entry survived");
+        assert_eq!(ext["verified"], false, "known-field behavior regressed");
+        assert_eq!(
+            ext["pinned"], false,
+            "unknown field lost on the flipped entry"
+        );
+    }
+
     #[test]
     fn mark_external_inert_flips_only_verified_externals() {
         let dir = ws();
@@ -884,6 +961,7 @@ mod tests {
             external: true,
             source: Some("/proj/EXT.md".into()),
             verified: true, // verified external: flipped
+            extra: HashMap::new(),
         });
         list.files.push(IncludeEntry {
             path: "bb-OLD.md".into(),
@@ -891,6 +969,7 @@ mod tests {
             external: true,
             source: Some("/proj/OLD.md".into()),
             verified: false, // already inert: stays
+            extra: HashMap::new(),
         });
         list.save(dir.path()).unwrap();
 

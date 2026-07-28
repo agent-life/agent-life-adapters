@@ -258,9 +258,11 @@ def main(argv=None) -> int:
     run.alf_binary = find_alf_binary(args.alf_bin)
     run.expected_alf_version = expected_alf_version()
     if run.backend == "real":
-        prov = cfg.service_repo / "scripts" / "provision-test-runtime.sh"
-        if not prov.is_file():
-            raise Preflight(f"service checkout not found: {prov} (set ALF_SERVICE_REPO)")
+        # We mint via the `e2e` cargo bin directly (adapters/.env is the sole
+        # config source), so require the crate, not the service shell wrapper.
+        crate = cfg.service_repo / "tests" / "e2e" / "Cargo.toml"
+        if not crate.is_file():
+            raise Preflight(f"service e2e crate not found: {crate} (set ALF_SERVICE_REPO)")
 
     # -- run dir (fresh-HOME invariant is structural: E3's 409 guard) ----------
     ts = provision.utc_ts()
@@ -338,7 +340,7 @@ def main(argv=None) -> int:
             # (`hermes-mcp`) — the provisioner only knows openclaw|zeroclaw|hermes.
             run.creds = provision.mint(cfg.service_repo,
                                        kit_runtime_name(args.framework), run_dir,
-                                       model=run_model)
+                                       model=run_model, env=cfg.subprocess_env())
             provision.write_run_env(run_dir, run.creds)
             run.manifest.tenant_id = run.creds.tenant_id
             run.manifest.seed_agent_id = run.creds.seed_agent_id
@@ -529,7 +531,8 @@ def finish(run: Run, aborted: bool) -> int:
                     ok = provision.teardown_ladder(
                         run.manifest, run.paths.manifest, run.api, run.container,
                         run.cfg.service_repo,
-                        run.kit.name if run.kit else kit_runtime_name(run.args.framework))
+                        run.kit.name if run.kit else kit_runtime_name(run.args.framework),
+                        env=run.cfg.subprocess_env())
                 except Exception as e:  # noqa: BLE001 — an interrupted ladder must
                     # never skip container destroy / report / the recovery hint.
                     from .redact import redact
@@ -654,7 +657,8 @@ def teardown_cli(run_dir: Path, cfg: HarnessConfig, framework: str) -> int:
     except Preflight:
         teardown_runtime = manifest.framework
     ok = provision.teardown_ladder(manifest, manifest_path, api, container,
-                                   cfg.service_repo, teardown_runtime)
+                                   cfg.service_repo, teardown_runtime,
+                                   env=cfg.subprocess_env())
     if container is not None:
         container.destroy()
     (ui.ok if ok else ui.fail)("teardown " + ("clean" if ok else "left residue — see ledger"))

@@ -217,6 +217,18 @@ impl WatchHandle {
             e.clear_park();
         }
     }
+
+    /// A vault mutation through the MCP tools (`alf_vault_add`/`_delete`) must
+    /// auto-sync (manual §3.8: "the ciphertext syncs"): dirty the vault watch
+    /// source directly — belt and braces over the filesystem watch, which can
+    /// miss a write into a dir that appeared after registration. No-op when
+    /// the loop has no vault source (loop not running, or the reserved id was
+    /// claimed by a map source).
+    pub fn note_vault_mutation(&self) {
+        let now = self.now();
+        let mut e = self.engine.lock().expect("watch engine mutex");
+        e.mark_dirty(VAULT_SOURCE_ID, now);
+    }
 }
 
 /// Pause the loop for the lifetime of the returned guard (held across a HEAD
@@ -456,12 +468,44 @@ struct Surface {
     resurface_ids: std::collections::HashSet<String>,
 }
 
+/// The reserved watch-source id for the per-agent vault directory.
+pub(crate) const VAULT_SOURCE_ID: &str = "agent-vault";
+
+/// The per-agent vault DIRECTORY (`~/.alf/vault/{agent_id}/`). The credentials
+/// file inside is replaced by temp+rename, so the dir — not the file — is the
+/// stable watch root (a file watch would follow the dead pre-rename inode),
+/// and the dir's mtime joins the §4.3 dir-rescan backstop.
+fn vault_dir(home: &Path, agent_id: uuid::Uuid) -> PathBuf {
+    alf_core::agent_vault_path(home, agent_id)
+        .parent()
+        .expect("agent_vault_path always has a parent dir")
+        .to_path_buf()
+}
+
+/// Append the vault watch source. Skipped if an adapter/map spec already
+/// claims the reserved id — the engine keys sources by id, so a collision
+/// would conflate their dirty state.
+fn append_vault_spec(specs: &mut Vec<WatchSpec>, home: &Path, agent_id: uuid::Uuid) {
+    if specs.iter().any(|s| s.id == VAULT_SOURCE_ID) {
+        return;
+    }
+    specs.push(WatchSpec::dir(VAULT_SOURCE_ID, vault_dir(home, agent_id)));
+}
+
 /// Derive the watch surface for `runtime`/`workspace`. The adapter is created
 /// and dropped synchronously (`Box<dyn Adapter>` is not `Send` — it must never
 /// cross an await). `None` when the runtime is unknown.
-fn compute_surface(runtime: &str, workspace: &Path) -> Option<Surface> {
+fn compute_surface(runtime: &str, workspace: &Path, agent_id: uuid::Uuid) -> Option<Surface> {
     let adapt = crate::adapter::get_adapter(runtime)?;
-    let specs = adapt.watch_paths(workspace);
+    let mut specs = adapt.watch_paths(workspace);
+    // The per-agent vault (Layer 4) is an export input on EVERY runtime but is
+    // workspace-external (~/.alf), so no adapter surface owns it — without a
+    // root here a vault-only change would never auto-sync, though manual §3.8
+    // promises the ciphertext syncs. Central root, all runtimes (MAJ-3); the
+    // MCP vault tools additionally dirty it directly (`note_vault_mutation`).
+    if let Some(home) = alf_core::home_dir() {
+        append_vault_spec(&mut specs, &home, agent_id);
+    }
     let (sync_specs, rediscover_roots) = split_specs(&specs);
     let index = RootIndex::build(&sync_specs);
     let resurface_ids = sync_specs
@@ -527,19 +571,57 @@ pub(crate) fn lock_path(agent_id: uuid::Uuid) -> anyhow::Result<PathBuf> {
     Ok(crate::state::AgentState::state_dir()?.join(format!("{agent_id}.lock")))
 }
 
+/// Acquire the per-agent advisory lock (L3) at `lock_file` with a bounded
+/// wait. `agent_busy` when another ALF process holds it past `timeout`; a
+/// filesystem that cannot take the lock at all errors immediately with
+/// "advisory lock unusable" (never a phantom `agent_busy` — see
+/// `lock::try_acquire`).
+pub(crate) fn acquire_lock_file_timeout(
+    lock_file: &Path,
+    timeout: Duration,
+) -> anyhow::Result<lock::AgentLock> {
+    use anyhow::Context as _;
+    lock::acquire_timeout(lock_file, timeout, Duration::from_millis(250))
+        .with_context(|| format!("advisory lock unusable at {}", lock_file.display()))?
+        .ok_or_else(|| {
+            crate::commands::mcp::agent_busy(
+                "another ALF process is syncing or restoring this agent",
+            )
+        })
+}
+
+/// [`acquire_lock_file_timeout`] for `agent_id`'s lock file (creating the
+/// state dir if needed). Shared by the MCP tools AND the plain-CLI
+/// whole-workspace ops (`alf sync`, head `alf restore`) — a CLI mutation must
+/// not interleave with a watch-loop export on the same agent (MAJ-6).
+/// Callers that already hold the lock (the watch loop's tick, the MCP tools
+/// around their seams) must NOT re-acquire: flock does not nest across file
+/// descriptions.
+pub(crate) fn acquire_agent_lock_timeout(
+    agent_id: uuid::Uuid,
+    timeout: Duration,
+) -> anyhow::Result<lock::AgentLock> {
+    let lock_file = lock_path(agent_id)?;
+    if let Some(dir) = lock_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    acquire_lock_file_timeout(&lock_file, timeout)
+}
+
 /// What `run_due` should do with an advisory-lock acquisition outcome.
 enum LockDecision {
     Acquired(lock::AgentLock),
-    /// Contention (or a not-yet-persistent open error): skip this tick.
+    /// Contention (or a not-yet-persistent open/lock error): skip this tick.
     SkipTick,
-    /// Three consecutive open errors: park with `lock_unavailable`.
+    /// Three consecutive open/lock errors: park with `lock_unavailable`.
     Park(engine::ParkError),
 }
 
 /// Classify a `lock::try_acquire` outcome. Contention (`Ok(None)`) is normal —
-/// skip the tick and reset the failure streak. An OPEN error (`Err`: missing
-/// state dir, permissions — the only Err source, see `lock.rs`) increments the
-/// streak; the third consecutive one parks. Extracted for unit testing.
+/// skip the tick and reset the failure streak. An OPEN or LOCK error (`Err`:
+/// missing state dir, permissions, a filesystem without flock support — NFS
+/// and some FUSE/SMB homes) increments the streak; the third consecutive one
+/// parks. Extracted for unit testing.
 fn decide_lock(
     failures: &AtomicU32,
     result: std::io::Result<Option<lock::AgentLock>>,
@@ -558,13 +640,19 @@ fn decide_lock(
             if strikes >= 3 {
                 LockDecision::Park(engine::ParkError {
                     code: "lock_unavailable".into(),
-                    message: format!("Auto-sync parked: cannot open the advisory lock file: {e}"),
+                    message: format!(
+                        "Auto-sync parked: cannot open or lock the advisory lock file: {e}"
+                    ),
                     hint: Some(
-                        "Check permissions on ~/.alf/state/, then run alf_sync to resume.".into(),
+                        "Check permissions on ~/.alf/state/ and that it is on a \
+                         filesystem with flock support (network homes may lack it — \
+                         point ALF_HOME at a local disk); then alf_sync or \
+                         alf_watch_set {pause:false} to resume."
+                            .into(),
                     ),
                 })
             } else {
-                eprintln!("alf mcp serve: advisory lock open failed ({e}); will retry");
+                eprintln!("alf mcp serve: advisory lock open/lock failed ({e}); will retry");
                 LockDecision::SkipTick
             }
         }
@@ -623,12 +711,18 @@ pub async fn run_loop(
     // recursive `profiles/` watch would register over every sibling profile's
     // private `.env`/`sessions`/`state.db`, the exact dirs the surface must
     // never watch). They are detected by `rediscover_due`'s mtime poll alone.
-    let Some(mut surface) = compute_surface(&runtime, &workspace) else {
+    let Some(mut surface) = compute_surface(&runtime, &workspace, agent_id) else {
         handle.set_inactive_reason(format!(
             "watch loop not started: unknown runtime '{runtime}'"
         ));
         return;
     };
+    // The vault dir usually doesn't exist before the first `vault add`, and
+    // notify cannot register a nonexistent root — create it up front
+    // (best-effort) so CLI-side vault writes are watched from the start.
+    if let Some(home) = alf_core::home_dir() {
+        let _ = std::fs::create_dir_all(vault_dir(&home, agent_id));
+    }
     {
         let mut e = handle.engine.lock().expect("watch engine mutex");
         e.set_sources(&surface.sync_specs);
@@ -721,6 +815,7 @@ pub async fn run_loop(
                     refresh_surface(
                         &runtime,
                         &workspace,
+                        agent_id,
                         &handle,
                         Some(&mut watcher),
                         &mut watched,
@@ -914,7 +1009,7 @@ async fn run_due(
 async fn drive_rescan_only(
     handle: std::sync::Arc<WatchHandle>,
     mut surface: Surface,
-    _agent_id: uuid::Uuid,
+    agent_id: uuid::Uuid,
     lock_file: PathBuf,
     runtime: String,
     workspace: PathBuf,
@@ -936,6 +1031,7 @@ async fn drive_rescan_only(
             refresh_surface(
                 &runtime,
                 &workspace,
+                agent_id,
                 &handle,
                 None,
                 &mut watched,
@@ -1007,6 +1103,7 @@ fn register_watches(
 fn refresh_surface(
     runtime: &str,
     workspace: &Path,
+    agent_id: uuid::Uuid,
     handle: &WatchHandle,
     watcher: Option<&mut notify::RecommendedWatcher>,
     watched: &mut std::collections::HashSet<PathBuf>,
@@ -1014,7 +1111,7 @@ fn refresh_surface(
     mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
     rd_mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
 ) {
-    let Some(next) = compute_surface(runtime, workspace) else {
+    let Some(next) = compute_surface(runtime, workspace, agent_id) else {
         eprintln!("alf mcp serve: surface refresh failed (unknown runtime '{runtime}')");
         return;
     };
@@ -1371,7 +1468,8 @@ mod tests {
                  "namespace":"daily","chunking":"by_heading"}]}"#,
         )
         .unwrap();
-        let surface = compute_surface("generic", ws.path()).expect("generic surface");
+        let agent = uuid::Uuid::from_u128(0x51);
+        let surface = compute_surface("generic", ws.path(), agent).expect("generic surface");
         assert!(
             surface.resurface_ids.contains("sentinels"),
             "sentinels must be surface-defining: {:?}",
@@ -1381,7 +1479,93 @@ mod tests {
             !surface.resurface_ids.contains("journal"),
             "ordinary sources must not resurface"
         );
-        assert!(compute_surface("no-such-runtime", ws.path()).is_none());
+        // The central vault root (MAJ-3) rides every runtime's surface.
+        assert!(
+            surface.sync_specs.iter().any(|s| s.id == VAULT_SOURCE_ID),
+            "surface must include the agent-vault source: {:?}",
+            surface.sync_specs.iter().map(|s| &s.id).collect::<Vec<_>>()
+        );
+        assert!(compute_surface("no-such-runtime", ws.path(), agent).is_none());
+    }
+
+    #[test]
+    fn acquire_lock_file_contended_reports_agent_busy() {
+        // MAJ-6: the bounded-wait acquisition shared by the MCP tools and the
+        // plain-CLI sync/restore paths. Contention → the coded agent_busy
+        // error (never a silent proceed).
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.lock");
+        let _held = lock::try_acquire(&path).unwrap().unwrap();
+        let err = acquire_lock_file_timeout(&path, Duration::from_millis(150))
+            .expect_err("contended lock must error");
+        let cli = err
+            .downcast_ref::<crate::errors::CliError>()
+            .expect("agent_busy is a coded CliError");
+        assert_eq!(cli.code, codes::AGENT_BUSY);
+    }
+
+    #[test]
+    fn acquire_lock_file_uncontended_returns_a_guard() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("agent.lock");
+        let guard = acquire_lock_file_timeout(&path, Duration::from_millis(150))
+            .expect("uncontended acquisition succeeds");
+        drop(guard);
+        // Reusable after release.
+        assert!(acquire_lock_file_timeout(&path, Duration::from_millis(150)).is_ok());
+    }
+
+    #[test]
+    fn vault_spec_roots_the_agent_vault_dir_and_dedupes() {
+        let home = Path::new("/home/u");
+        let agent = uuid::Uuid::from_u128(0x51);
+        let mut specs = vec![WatchSpec::file("journal", "/ws/memories")];
+        append_vault_spec(&mut specs, home, agent);
+        let vault = specs
+            .iter()
+            .find(|s| s.id == VAULT_SOURCE_ID)
+            .expect("vault spec appended");
+        assert_eq!(
+            vault.roots,
+            vec![PathBuf::from(format!("/home/u/.alf/vault/{agent}"))],
+            "the DIRECTORY is the watch root (the file is replaced by temp+rename)"
+        );
+        assert!(!vault.tracked, "vault changes ride the delta channel");
+        // A map source that already claims the reserved id wins — no conflation.
+        let mut taken = vec![WatchSpec::file(VAULT_SOURCE_ID, "/ws/whatever")];
+        append_vault_spec(&mut taken, home, agent);
+        assert_eq!(taken.len(), 1, "reserved-id collision must not double-add");
+    }
+
+    #[test]
+    fn note_vault_mutation_dirties_the_vault_source() {
+        let handle = WatchHandle::new(WatchConfig::default());
+        handle.set_sources_for_test(&[
+            WatchSpec::file("journal", "/ws/memories"),
+            WatchSpec::dir(VAULT_SOURCE_ID, "/home/u/.alf/vault/x"),
+        ]);
+        // set_sources starts everything dirty; clear by taking a snapshot after
+        // marking... simpler: assert the dirty_count increments.
+        let before = handle
+            .snapshot()
+            .sources
+            .iter()
+            .find(|s| s.source == VAULT_SOURCE_ID)
+            .expect("vault source present")
+            .dirty_count;
+        handle.note_vault_mutation();
+        let after = handle
+            .snapshot()
+            .sources
+            .iter()
+            .find(|s| s.source == VAULT_SOURCE_ID)
+            .expect("vault source present")
+            .dirty_count;
+        assert_eq!(after, before + 1, "vault mutation must dirty the source");
+
+        // Safe no-op without a vault source (loop not running that surface).
+        let bare = WatchHandle::new(WatchConfig::default());
+        bare.note_vault_mutation();
     }
 
     #[test]

@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 const DOC_FILES: &[&str] = &[
     "skills/agent-life/SKILL.md",
     "docs/cli-reference.md",
+    "docs/alf-mcp-server-user-manual.md",
     "docs/multi-agent-support/openclaw-alf-user-guide.md",
     "docs/multi-agent-support/zeroclaw-alf-user-guide.md",
     "docs/multi-agent-support/hermes-alf-user-guide.md",

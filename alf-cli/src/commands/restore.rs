@@ -475,7 +475,8 @@ fn perform_restore(
                 .with_context(|| format!("creating preview dir {}", dir.display()))?;
             // Merge is meaningless against an empty preview dir: force Total.
             let warning = matches!(mode, RestoreMode::Merge).then(|| {
-                "mode=merge ignored for point-in-time previews (imported as total into an                  empty preview directory)"
+                "mode=merge ignored for point-in-time previews (imported as total into an \
+                 empty preview directory)"
                     .to_string()
             });
             (dir, RestoreMode::Total, warning)
@@ -601,22 +602,10 @@ pub(crate) fn run_for_mcp(
     // sync state, so it takes the per-agent advisory lock. Previews and dry
     // runs are read-only with respect to shared state — lock-free.
     let _agent_lock = if !dry_run && at_sequence.is_none() {
-        let lock_file = crate::commands::mcp::watch::lock_path(target.agent_id)?;
-        if let Some(dir) = lock_file.parent() {
-            let _ = fs::create_dir_all(dir);
-        }
-        Some(
-            crate::commands::mcp::watch::lock::acquire_timeout(
-                &lock_file,
-                std::time::Duration::from_secs(10),
-                std::time::Duration::from_millis(250),
-            )?
-            .ok_or_else(|| {
-                crate::commands::mcp::agent_busy(
-                    "another ALF process is syncing or restoring this agent",
-                )
-            })?,
-        )
+        Some(crate::commands::mcp::watch::acquire_agent_lock_timeout(
+            target.agent_id,
+            std::time::Duration::from_secs(10),
+        )?)
     } else {
         None
     };
@@ -684,6 +673,20 @@ pub fn run(
     if dry_run {
         return run_dry_run(&target.client, agent_id, adapt, at_sequence, human);
     }
+
+    // L3 (MAJ-6): a CLI HEAD restore rewrites the live workspace and moves the
+    // sync state — take the same cross-process advisory lock the MCP tools and
+    // the watch loop hold, so a concurrent watch export can never upload a
+    // half-restored workspace. Previews are lock-free (dry runs returned
+    // above); uncontended (no server running) this costs one open+flock.
+    let _agent_lock = if !preview {
+        Some(crate::commands::mcp::watch::acquire_agent_lock_timeout(
+            agent_id,
+            std::time::Duration::from_secs(10),
+        )?)
+    } else {
+        None
+    };
 
     // WP1: move any legacy vault/key to the per-agent layout before the
     // adapter writes Layer 4 — otherwise the key leg is missed on the first

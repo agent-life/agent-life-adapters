@@ -138,7 +138,10 @@ class Config:
 
     @classmethod
     def from_env(cls, interactive: bool = True) -> "Config":
-        dotenv.load_dotenv()
+        # adapters/.env is the authoritative (and only) config source — load it
+        # explicitly rather than let dotenv walk up the tree into another repo,
+        # and override ambient shell values.
+        dotenv.load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
         missing = []
         for var in ("API_BASE_URL", "API_KEY", "NEON_DATABASE_URL", "S3_BUCKET_NAME"):
             if not os.environ.get(var):

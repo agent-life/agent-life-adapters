@@ -889,10 +889,12 @@ Tools surface as `mcp_alf_*` (`mcp_alf_alf_sync`). Because Hermes strips the env
 ### ZeroClaw (`mcp_bundles` — one server entry per agent)
 
 ```toml
+[mcp]
+deferred_loading = false           # global, not per-server; false (the default) = eager
+
 [mcp_servers.alf-kleo-a1b2]
 command = "alf"
 args = ["mcp", "serve", "-r", "zeroclaw"]
-deferred_loading = false          # eager, for unattended runs
 [mcp_servers.alf-kleo-a1b2.env]
 ALF_AGENT = "kleo-a1b2"
 ALF_API_KEY = "alf_..."
@@ -901,7 +903,7 @@ ALF_API_KEY = "alf_..."
 servers = ["alf-kleo-a1b2"]
 ```
 
-Env is **per-server, not per-agent**, so a multi-agent host declares one `[mcp_servers.alf-<agent>]` per agent (design §7.W7). Keep `deferred_loading = false` (the default) so the loop runs unattended.
+Env is **per-server, not per-agent**, so a multi-agent host declares one `[mcp_servers.alf-<agent>]` per agent (design §7.W7). A server entry itself takes `transport`/`command`/`args`/`env` — `deferred_loading` is a **global** `mcp` setting, not a server field: leave it at its default `false` so the tools are live (and the watch loop starts) without an agent having to activate a stub first.
 
 ### Timeouts and respawn hygiene
 
@@ -930,7 +932,13 @@ The `generic` runtime has no built-in knowledge of a framework's layout: a `.alf
     { "id": "knowledge","glob": "knowledge/**/*.md", "memory_type": "semantic",
       "namespace": "curated",    "chunking": "per_file", "timestamp": "file_mtime" },
     { "id": "howto",    "glob": "procedures/*.md",   "memory_type": "procedural",
-      "namespace": "procedural", "chunking": "per_file", "timestamp": "file_mtime" }
+      "namespace": "procedural", "chunking": "per_file", "timestamp": "file_mtime" },
+    { "id": "brain",    "glob": "data/brain.db",     "memory_type": "semantic",
+      "namespace": "curated",    "chunking": "sqlite_rows",   // one record per table row
+      "sqlite": { "table": "memories",              // required for sqlite_rows
+                  "id_column": "id",                 // stable primary key -> record id
+                  "content_column": "content",       // the memory text
+                  "timestamp_column": "updated_at" } }  // optional; else the .db mtime
   ],
   "watch": { "default_interval": "15m",
              "per_source": { "journal": "5m" },
@@ -947,6 +955,8 @@ The map is the dashboard-parity enforcement point. An invalid map is rejected at
 | `memory_type` | Must be `episodic` / `semantic` / `procedural` for the dashboard filter chips. A non-canonical type is an **error** unless the source carries `"allow_noncanonical": true`, which downgrades it to a warning (and forfeits chip filtering). |
 | `namespace` | `daily` / `curated` / `procedural` get chip filtering + grouping; anything else still exports but loses them — a **warning**, not an error. |
 | `watch` intervals | Clamped: deltas to `[1 min, 24 h]`, `tracked_files_interval` to `[15 min, 24 h]`. Values above the floors are entirely yours. |
+| `sqlite` block | Required when `chunking` is `sqlite_rows` (missing ⇒ **error**: "requires a `sqlite` block with table, id_column, and content_column"). Present on any other chunking ⇒ ignored, with a **warning**. |
+| `sqlite` identifiers | `table`, `id_column`, `content_column`, and `timestamp_column` must be plain SQL identifiers (`[A-Za-z_][A-Za-z0-9_]*`) — they are interpolated into the SELECT, so anything else is a fail-closed **error**. |
 | unknown fields | Preserved verbatim (forward-compatible). |
 
 Globs use single-segment `*` (never crosses `/`) and whole-component `**` (`knowledge/**/*.md`); a mid-segment `**` (`dir/**.md`) is rejected, because glob semantics are an id-stability contract.
@@ -955,7 +965,8 @@ Globs use single-segment `*` (never crosses `/`) and whole-component `**` (`know
 
 - **`timestamp`** — `filename_date` (a `YYYY-MM-DD` filename → midnight UTC → `created_at` + `observed_at`); `frontmatter:<key>` (a YAML front-matter key); or `file_mtime` (`created_at` = mtime, no `observed_at`). `updated_at` is always the file mtime.
 - **`tags`** — a list of directives: `hashtags` extracts `#word` tokens from the content; `static:<tag>` adds that literal tag to every record from the source; `frontmatter:<key>` reads tags from a YAML front-matter key. A bare literal string (e.g. `"kb"`) is rejected — write `static:kb`. The namespace is always added as a tag.
-- **`chunking`** — `per_file` (the whole file is one record; `heading: null`, `line_start: 1`) or `by_heading` (split on ATX level-2 `## ` headings, fence-aware). Ids are content-addressed (UUIDv5 over `GENERIC_NS`), so an in-place body edit reconciles to the **same record id** (1 Update) while a heading rewrite is a delete+create.
+- **`chunking`** — `per_file` (the whole file is one record; `heading: null`, `line_start: 1`), `by_heading` (split on ATX level-2 `## ` headings, fence-aware), or `sqlite_rows` (see below). For the two text modes ids are content-addressed (UUIDv5 over `GENERIC_NS`), so an in-place body edit reconciles to the **same record id** (1 Update) while a heading rewrite is a delete+create. *Caveat for `per_file` on non-markdown files* (e.g. a `notes/*.txt` glob): the heading-based rescue pass cannot pair a rewritten record, so an in-place edit is a delete+create rather than 1 Update — prefer `by_heading`, or start the file with a `## ` line, if edit history matters.
+- **`sqlite_rows`** — one record per row of `sqlite.table`, read read-only (a 5 s busy timeout waits out a short-lived writer; an absent table simply yields no records, so a lazy store never fails the export). The record id is a UUIDv5 over the matched **db file path + source id + table + the row's `id_column` value** — *not* the content — so an in-place row `UPDATE` keeps the id and reconciles to exactly **1 Update**; rows with equal primary keys in different files matched by the same glob stay distinct. Because the path is part of the identity, **moving or renaming a `.db` re-mints its rows' ids** (the same trade-off text sources make for renames). `timestamp_column` accepts RFC3339, SQLite's `YYYY-MM-DD HH:MM:SS`, or integer epoch seconds; unparseable values fall back to the file mtime with a counted warning. A NULL or duplicate `id_column` value is a hard export failure (silent row loss is worse than a loud stop). The `.db` and any `-wal`/`-shm` sidecars always travel verbatim under `raw/generic/` — a glob that also matches the sidecars is fine, they are preserved rather than parsed — so a same-runtime restore rewrites the database, not the rows.
 
 ### Worked example
 
@@ -1019,10 +1030,19 @@ When any command fails, stdout contains a JSON error object:
 The `hint` field is omitted when there is no specific remediation to suggest.
 The same error is also written to stderr for human visibility.
 
-`code` is present only for the machine-distinguishable multi-agent failure
-classes: `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`,
-`no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`.
-Legacy errors keep the two-field shape.
+`code` is present for the machine-distinguishable failure classes:
+
+- multi-agent (1.0.0): `agent_selection_ambiguous`, `agent_not_found`,
+  `agent_disabled`, `no_agents`, `agent_id_drift`, `registration_failed`,
+  `sync_upload_failed`
+- vault (1.0.0): `vault_key_unresolved`, `vault_rotate_failed`,
+  `vault_rotate_no_destination`, `vault_migration_blocked`
+- v1.1: `agent_busy`, `auth_failed`, `subscription_denied`,
+  `sync_base_unreadable`, `workspace_missing`, `path_denylisted` — the first
+  five are emitted by plain CLI `alf sync`/`alf restore` too, not only the MCP
+  tools
+
+Errors without a matching class keep the two-field shape.
 
 ---
 

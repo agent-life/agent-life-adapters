@@ -9,9 +9,12 @@
 //! (`.alf-include.lock`, [`acquire_blocking`]) is INNERMOST — never acquire
 //! this per-agent lock while holding it.
 //!
-//! The plain CLI keeps its historical contract (goal c): same-agent CLI sync
-//! races are arbitrated by the service's atomic sequence CAS (case E7); only
-//! the MCP server paths take these locks.
+//! Since the MAJ-6 fix, plain-CLI `alf sync` and head `alf restore` take this
+//! lock too (a deliberate goal-c deviation): a CLI mutation must not
+//! interleave with a watch-loop export on the same agent — the sequence CAS
+//! arbitrates ordering across machines (case E7), but cannot stop a torn
+//! same-host read. Uncontended (no MCP server running) the acquisition is one
+//! open+flock; contended callers get `agent_busy` after a bounded wait.
 //!
 //! The lock is an exclusive `flock` on `~/.alf/state/{agent_id}.lock`, released
 //! when the guard drops (or the process dies — the kernel drops flocks on close,
@@ -31,11 +34,26 @@ pub struct AgentLock {
     _file: File,
 }
 
+/// True when `e` is the platform's "lock held by someone else" error — fs2 maps
+/// contention to `WouldBlock` on most platforms, but some surface the raw errno,
+/// so compare against [`fs2::lock_contended_error`] too. Anything else (ENOLCK /
+/// EOPNOTSUPP on NFS/FUSE/SMB homes, EIO, …) means the lock is UNUSABLE, not
+/// busy — mapping those to "contended" made the watch loop silently never sync
+/// and every tool report a phantom `agent_busy` on such filesystems.
+fn contended(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::WouldBlock
+        || (e.raw_os_error().is_some()
+            && e.raw_os_error() == fs2::lock_contended_error().raw_os_error())
+}
+
 /// Try to acquire the lock at `lock_path` without blocking.
 ///
 /// - `Ok(Some(guard))` — acquired; hold it for the sync/restore.
 /// - `Ok(None)` — another process holds it; skip this tick.
-/// - `Err(_)` — the lock file could not be created (permissions, missing dir).
+/// - `Err(_)` — the lock file could not be created (permissions, missing dir) or
+///   the filesystem cannot take the lock (no flock support). Callers treat this
+///   as a real failure: the watch loop's strike counter parks on it, tools fail
+///   fast instead of waiting out their bounded poll.
 pub fn try_acquire(lock_path: &Path) -> io::Result<Option<AgentLock>> {
     let file = OpenOptions::new()
         .create(true)
@@ -45,10 +63,8 @@ pub fn try_acquire(lock_path: &Path) -> io::Result<Option<AgentLock>> {
         .open(lock_path)?;
     match file.try_lock_exclusive() {
         Ok(()) => Ok(Some(AgentLock { _file: file })),
-        Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        // fs2 maps a contended lock to WouldBlock; some platforms surface it as a
-        // raw errno. Treat any lock error as "contended, skip" rather than fatal.
-        Err(_) => Ok(None),
+        Err(e) if contended(&e) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -117,6 +133,25 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("no-such-dir").join("agent.lock");
         assert!(try_acquire(&path).is_err());
+    }
+
+    #[test]
+    fn contended_matches_only_the_platform_contention_error() {
+        // The two shapes real contention arrives in.
+        assert!(contended(&io::Error::from(io::ErrorKind::WouldBlock)));
+        assert!(contended(&fs2::lock_contended_error()));
+        // Unusable-lock errors must NOT read as contention: a filesystem
+        // without flock support (ENOLCK/EOPNOTSUPP — NFS, some FUSE/SMB homes)
+        // previously made the loop skip every tick forever and the tools
+        // report a phantom agent_busy.
+        assert!(!contended(&io::Error::new(
+            io::ErrorKind::Unsupported,
+            "flock unsupported"
+        )));
+        assert!(!contended(&io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )));
+        assert!(!contended(&io::Error::other("I/O error")));
     }
 
     #[test]

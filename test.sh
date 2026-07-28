@@ -21,7 +21,7 @@
 #                  └ the MCP-driven CI tier (WP-M4): the toy generic runtime, every
 #                    alf op over a `docker exec -i … alf mcp serve` stdio session.
 #   lifecycle-llm  tests/lifecycle/driver.py --llm proxy --backend real  (needs: docker,
-#                  python3 + requests, $ALF_SERVICE_REPO checkout with its .env)
+#                  python3 + requests, adapters/.env, $ALF_SERVICE_REPO e2e crate)
 #                  └ mints a runtime key, drives real LLM turns, asserts the ⊙
 #                    API/S3/Neon lanes, ALWAYS runs the teardown ladder. Z1-Z4+Z13
 #                    with exactly one XFAIL (wp3-brain-db-extraction).
@@ -116,12 +116,13 @@ WALKTHROUGH_MATRIX=(
     "wt:vault|integration_walkthrough_for_vault.py|"
 )
 
-# lifecycle-llm needs the service checkout (provisioner) + its .env, and a
-# python3 that can import requests (see tests/lifecycle/requirements.txt).
+# lifecycle-llm needs the service checkout for the e2e mint/scavenge BINARIES
+# (its .env is never read — config comes from adapters/.env), the adapters
+# .env, and a python3 that can import requests (tests/lifecycle/requirements.txt).
 lifecycle_llm_ready() {
     local service="${ALF_SERVICE_REPO:-$ROOT/../agent-life-service}"
-    [ -f "$service/scripts/provision-test-runtime.sh" ] \
-        && [ -f "$service/.env" ] \
+    [ -f "$service/tests/e2e/Cargo.toml" ] \
+        && [ -f "$ROOT/.env" ] \
         && python3 -c 'import requests' >/dev/null 2>&1
 }
 
@@ -214,7 +215,7 @@ for tier in "${TIERS[@]}"; do
             elif ! docker_ready; then
                 skip_tier lifecycle-llm "docker not available (daemon running?)"
             elif ! lifecycle_llm_ready; then
-                skip_tier lifecycle-llm "needs \$ALF_SERVICE_REPO/.env + python3 with requests"
+                skip_tier lifecycle-llm "needs adapters/.env + \$ALF_SERVICE_REPO e2e crate + python3 with requests"
             else
                 run_tier lifecycle-llm python3 tests/lifecycle/driver.py \
                     --framework zeroclaw --llm proxy --backend real --no-pause
@@ -225,7 +226,7 @@ for tier in "${TIERS[@]}"; do
             elif ! docker_ready; then
                 skip_tier lifecycle-mcp-llm "docker not available (daemon running?)"
             elif ! lifecycle_llm_ready; then
-                skip_tier lifecycle-mcp-llm "needs \$ALF_SERVICE_REPO/.env + python3 with requests"
+                skip_tier lifecycle-mcp-llm "needs adapters/.env + \$ALF_SERVICE_REPO e2e crate + python3 with requests"
             else
                 run_tier lifecycle-mcp-llm python3 tests/lifecycle/driver.py \
                     --framework hermes-mcp --llm proxy --backend real --no-pause \

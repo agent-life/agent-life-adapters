@@ -1,8 +1,13 @@
 """Mint → run.env/manifest → teardown ladder → leak scan (plan §4, D5).
 
-Mint: ONE provision-test-runtime.sh call per driver invocation. Its stdout
-(the only place the raw runtime key ever exists outside ~/.alf memory) goes
-to a chmod-600 tmpfile inside the run dir, is parsed, and is deleted.
+Mint: ONE mint per driver invocation. We invoke the service checkout's `e2e`
+cargo binary (`provision_test_runtime`) DIRECTLY — not its `provision-test-
+runtime.sh` wrapper — because the wrapper loads `service/.env` and would let
+that repo's config override our backend targets (the prod-API-in-a-test-run
+bug). All configuration comes from `cfg.subprocess_env()`, built solely from
+adapters/.env; the service checkout supplies only the binary. The bin's stdout
+(the only place the raw runtime key ever exists outside ~/.alf memory) goes to
+a chmod-600 tmpfile inside the run dir, is parsed, and is deleted.
 
 Teardown: a manifest-driven ladder, idempotent and ledger-recorded, runnable
 after a hard abort via `driver.py --teardown <run-dir>`. The lazily-registered
@@ -76,21 +81,32 @@ def _parse_block(text: str, key: str) -> str:
 
 
 def mint(service_repo: Path, variant: str, run_dir: Path,
-         model: Optional[str] = None) -> RuntimeCreds:
-    """One provisioner call; stdout parsed via a 600 tmpfile then deleted."""
+         model: Optional[str] = None, env: Optional[dict] = None) -> RuntimeCreds:
+    """One mint via the `e2e` provision_test_runtime bin; stdout parsed via a
+    600 tmpfile then deleted. `env` is the subprocess environment built from
+    adapters/.env (HarnessConfig.subprocess_env); when omitted it is built from
+    this repo's .env here, so the service checkout's .env is never consulted."""
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
     tmp = run_dir / ".provision-out.tmp"
     tmp.touch()
     os.chmod(tmp, 0o600)
-    argv = ["bash", "scripts/provision-test-runtime.sh", "test", "--variant", variant]
+    # Invoke the cargo bin directly (NOT scripts/provision-test-runtime.sh):
+    # the wrapper loads service/.env and would override our adapters/.env
+    # targets. `env` is the sole config source; the bin runs no dotenvy.
+    argv = ["cargo", "run", "-p", "e2e", "--bin", "provision_test_runtime",
+            "--", "--variant", variant]
     if model:
         argv += ["--llm-model", model]
     try:
         with tmp.open("w") as out:
             proc = subprocess.run(argv, cwd=service_repo, stdout=out,
-                                  stderr=subprocess.PIPE, text=True, timeout=600)
+                                  stderr=subprocess.PIPE, text=True, timeout=600,
+                                  env=env)
         if proc.returncode != 0:
             raise RuntimeError(
-                f"provision-test-runtime.sh failed (exit {proc.returncode}):\n"
+                f"provision_test_runtime failed (exit {proc.returncode}):\n"
                 f"{(proc.stderr or '')[-2000:]}"
             )
         text = tmp.read_text(encoding="utf-8")
@@ -147,25 +163,37 @@ def load_run_env(run_dir: Path) -> dict:
 # Teardown ladder (§4) — idempotent, ledger-driven
 # ---------------------------------------------------------------------------
 
-def _scavenge(service_repo: Path, args: list[str]) -> subprocess.CompletedProcess:
-    script = service_repo / "scripts" / "scavenge-test-runtimes.sh"
-    if not script.is_file():
+def _scavenge(service_repo: Path, args: list[str],
+              env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    # Invoke the `e2e` scavenge bin directly (NOT scripts/scavenge-test-
+    # runtimes.sh) so cleanup uses adapters/.env, never service/.env.
+    crate = service_repo / "tests" / "e2e" / "Cargo.toml"
+    if not crate.is_file():
         # A clear ledger entry beats a FileNotFoundError traceback mid-ladder.
         return subprocess.CompletedProcess(
-            args=["scavenge-test-runtimes.sh", *args], returncode=127, stdout="",
-            stderr=f"service checkout not found: {script} (set ALF_SERVICE_REPO)")
+            args=["scavenge_test_runtimes", *args], returncode=127, stdout="",
+            stderr=f"service e2e crate not found: {crate} (set ALF_SERVICE_REPO)")
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
     return subprocess.run(
-        ["bash", "scripts/scavenge-test-runtimes.sh", "test", *args],
-        cwd=service_repo, capture_output=True, text=True, timeout=600,
+        ["cargo", "run", "-p", "e2e", "--bin", "scavenge_test_runtimes",
+         "--", *args],
+        cwd=service_repo, capture_output=True, text=True, timeout=600, env=env,
     )
 
 
 def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
-                    service_repo: Path, runtime: str) -> bool:
+                    service_repo: Path, runtime: str,
+                    env: Optional[dict] = None) -> bool:
     """Rungs 1–6. `api` = ApiClient with the run's key (may be None if the key
-    is already dead), `container` = DockerContainer or None. Records each rung
-    in the manifest ledger; returns overall success."""
+    is already dead), `container` = DockerContainer or None. `env` is the
+    adapters/.env-derived subprocess env for the scavenge bin (built here when
+    omitted). Records each rung in the manifest ledger; returns overall success."""
     ok_all = True
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
 
     def record(rung: str, status: str):
         manifest.teardown[rung] = status
@@ -224,7 +252,7 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
 
     # Rung 4 — scavenge the seed agent (cascades runtime row + api key + S3).
     if manifest.seed_agent_id:
-        proc = _scavenge(service_repo, ["--agent", manifest.seed_agent_id, "--delete"])
+        proc = _scavenge(service_repo, ["--agent", manifest.seed_agent_id, "--delete"], env)
         if proc.returncode == 0:
             record("rung4-scavenge-seed", "ok")
         else:
@@ -235,7 +263,7 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
         # leak (these agents are invisible to batch scavenge) — never "ok".
         if api is None:
             for agent_id in manifest.lifecycle_agents:
-                proc = _scavenge(service_repo, ["--agent", agent_id, "--delete"])
+                proc = _scavenge(service_repo, ["--agent", agent_id, "--delete"], env)
                 if proc.returncode == 0:
                     record("rung4b-scavenge-lifecycle", f"{agent_id}: ok")
                 else:
@@ -248,7 +276,7 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
 
     # Rung 5 — leak check: scavenge dry-run; warn on any 'Local %' rows.
     # A dry-run that itself failed proves nothing — record that honestly.
-    proc = _scavenge(service_repo, [])
+    proc = _scavenge(service_repo, [], env)
     combined = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         ok_all = False

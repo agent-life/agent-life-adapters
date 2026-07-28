@@ -157,6 +157,29 @@ pub(crate) fn lock_include_list(
 fn add_in_workspace(workspace: &Path, path: &str) -> Result<AddResult> {
     // Rejects missing files, paths outside the workspace, and the sentinels.
     let rel = normalize_include_path(workspace, path)?;
+    // MAJ-7: the sensitive-path denylist gates in-workspace tracking too — a
+    // runtime whose workspace is home-adjacent (hermes' ~/.hermes) keeps its
+    // plaintext secrets IN the workspace, and the agent-invokable alf_track
+    // must not be able to opt them into sync. Non-overridable, same posture
+    // as the external ceremony. (Export re-checks via `safe_include_path`,
+    // so a restored/hand-edited list cannot smuggle one past this either.)
+    let abs = workspace
+        .join(&rel)
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.join(&rel));
+    if alf_core::include::is_denylisted(&abs) {
+        return Err(crate::errors::CliError {
+            code: crate::errors::codes::PATH_DENYLISTED,
+            cause: format!(
+                "{rel} matches the sensitive-path denylist — secret material must \
+                 not enter plaintext backups"
+            ),
+            remedy: "store secrets in the encrypted vault instead (`alf vault add`; \
+                     MCP: alf_vault_add); the denylist is not overridable"
+                .to_string(),
+        }
+        .into());
+    }
     let _include_lock = lock_include_list(workspace)?;
     let mut list = IncludeList::load(workspace)?;
     let added = list.add(&rel);
@@ -287,6 +310,34 @@ mod tests {
                 "{wired} must pass the runtime gate, not bail on it: {err:#}"
             );
         }
+    }
+
+    #[test]
+    fn in_workspace_add_refuses_denylisted_paths_with_code() {
+        // MAJ-7: for a runtime whose workspace is home-adjacent (hermes'
+        // ~/.hermes), the plaintext secrets live IN the workspace — the
+        // sensitive-path denylist must gate in-workspace tracking too, and the
+        // agent-invokable alf_track path gets no escape hatch.
+        let ws = TempDir::new().unwrap();
+        std::fs::write(ws.path().join(".env"), "OPENAI_API_KEY=sk-secret").unwrap();
+        let err = add_in_workspace(ws.path(), ".env").unwrap_err();
+        let cli = err
+            .downcast_ref::<crate::errors::CliError>()
+            .expect("denylist refusal must be a coded error");
+        assert_eq!(cli.code, crate::errors::codes::PATH_DENYLISTED);
+        assert!(
+            cli.remedy.contains("vault"),
+            "remedy must route secrets to the vault: {}",
+            cli.remedy
+        );
+        // Nothing was recorded.
+        let list = IncludeList::load(ws.path()).unwrap();
+        assert_eq!(list.paths().len(), 0, "a refused add must record nothing");
+
+        // A benign file still tracks.
+        std::fs::write(ws.path().join("notes.md"), "n").unwrap();
+        let res = add_in_workspace(ws.path(), "notes.md").unwrap();
+        assert!(res.added);
     }
 
     #[test]

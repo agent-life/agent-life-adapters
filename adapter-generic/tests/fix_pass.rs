@@ -640,3 +640,75 @@ fn sqlite_multi_db_glob_mints_distinct_ids_per_file() {
         );
     }
 }
+
+#[test]
+fn sqlite_glob_matching_sidecars_exports_cleanly() {
+    // MAJ-5: a sqlite source glob like `data/*` also matches the db's own
+    // `-wal`/`-shm` sidecars the moment WAL mode creates them. The sidecars
+    // must travel raw with the trio — never be opened as databases (which
+    // hard-failed the whole export, silently stopping auto-sync).
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(ws.join("data")).unwrap();
+    write(
+        &ws,
+        ".alf-map.json",
+        r#"{"version":1,"memory_sources":[
+            {"id":"brain","glob":"data/*","memory_type":"semantic",
+             "namespace":"curated","chunking":"sqlite_rows",
+             "sqlite":{"table":"memories","id_column":"id",
+                       "content_column":"content"}}]}"#,
+    );
+    let conn = rusqlite::Connection::open(ws.join("data/brain.db")).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE memories (id TEXT PRIMARY KEY, content TEXT);
+         INSERT INTO memories VALUES ('a', 'alpha'), ('b', 'beta');",
+    )
+    .unwrap();
+    drop(conn);
+    // Fake sidecars standing in for a live WAL-mode store's companions.
+    write(&ws, "data/brain.db-wal", "fake wal bytes");
+    write(&ws, "data/brain.db-shm", "fake shm bytes");
+
+    let out = tmp.path().join("out.alf");
+    export(&ws, &out);
+    let recs = memory(&out);
+    assert_eq!(recs.len(), 2, "rows extracted from the db exactly once");
+    let names = archive_names(&out);
+    for entry in [
+        "raw/generic/data/brain.db",
+        "raw/generic/data/brain.db-wal",
+        "raw/generic/data/brain.db-shm",
+    ] {
+        assert!(
+            names.iter().any(|n| n == entry),
+            "{entry} must travel raw with the trio: {names:?}"
+        );
+    }
+}
+
+#[test]
+fn sqlite_source_matching_only_a_sidecar_still_hard_fails() {
+    // A glob that names a sidecar with no matching base `.db` is a genuine
+    // misconfiguration — the hard-fail contract (decision 4) stays.
+    isolate_home();
+    let tmp = TempDir::new().unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(&ws).unwrap();
+    write(
+        &ws,
+        ".alf-map.json",
+        r#"{"version":1,"memory_sources":[
+            {"id":"brain","glob":"brain.db-wal","memory_type":"semantic",
+             "namespace":"curated","chunking":"sqlite_rows",
+             "sqlite":{"table":"memories","id_column":"id",
+                       "content_column":"content"}}]}"#,
+    );
+    write(&ws, "brain.db-wal", "not a database");
+    let out = tmp.path().join("out.alf");
+    let err = GenericAdapter
+        .export(&ws, &out)
+        .expect_err("a sidecar-only sqlite source must still hard-fail");
+    assert!(format!("{err:#}").contains(adapter_generic::SQLITE_EXTRACTION_FAILED));
+}

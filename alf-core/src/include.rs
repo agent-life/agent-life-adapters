@@ -138,6 +138,16 @@ impl IncludeList {
         self.files.iter().filter(|e| e.external)
     }
 
+    /// External entries verified on THIS host — the only externals export
+    /// packs (`external_entries_for_export`) and therefore the only ones a
+    /// watch surface may root. A restored archive's externals come back
+    /// inert (`verified: false`, D3 — "a hostile archive's externals do
+    /// nothing"): watching them would fire tracked syncs that capture nothing
+    /// and let a crafted archive choose filesystem watch roots.
+    pub fn verified_externals(&self) -> impl Iterator<Item = &IncludeEntry> {
+        self.externals().filter(|e| e.verified)
+    }
+
     /// Remove a workspace-relative path. Returns true if it was present.
     pub fn remove(&mut self, rel: &str) -> bool {
         let before = self.files.len();
@@ -310,6 +320,16 @@ pub fn safe_include_path(workspace: &Path, rel: &str) -> Result<PathBuf> {
     let rel_str = stripped.to_string_lossy().replace('\\', "/");
     if rel_str == INCLUDE_FILE || rel_str == SYNC_LOG_FILE {
         bail!("{rel_str} is managed by alf and cannot be tracked");
+    }
+    // MAJ-7: the sensitive-path denylist applies to stored in-workspace
+    // entries too — `alf add` refuses them up front, but the list can be
+    // restored from an archive or hand-edited, so export must re-check here
+    // (callers skip+warn, same as the other rejections).
+    if is_denylisted(&abs) {
+        bail!(
+            "tracked path {rel} matches the sensitive-path denylist — not packed \
+             (secrets belong in the encrypted vault: alf vault add)"
+        );
     }
     Ok(abs)
 }
@@ -653,6 +673,26 @@ mod tests {
         assert!(safe_include_path(dir.path(), "/etc/hostname").is_err());
         fs::write(dir.path().join(INCLUDE_FILE), "{\"files\":[]}").unwrap();
         assert!(safe_include_path(dir.path(), INCLUDE_FILE).is_err());
+    }
+
+    #[test]
+    fn safe_include_path_rejects_denylisted_entries() {
+        // MAJ-7 second line of defense: a restored/hand-edited list naming an
+        // in-workspace secret (hermes' workspace IS ~/.hermes, holding .env)
+        // must not pack — adapters skip+warn on this error.
+        let dir = ws();
+        for name in [".env", "server.pem", "signing.key"] {
+            fs::write(dir.path().join(name), "secret").unwrap();
+            let err = safe_include_path(dir.path(), name)
+                .expect_err("a denylisted stored entry must be rejected at export");
+            assert!(
+                format!("{err:#}").contains("denylist"),
+                "the rejection must name the denylist: {err:#}"
+            );
+        }
+        // Benign entries are unaffected.
+        fs::write(dir.path().join("notes.md"), "n").unwrap();
+        assert!(safe_include_path(dir.path(), "notes.md").is_ok());
     }
 
     #[test]

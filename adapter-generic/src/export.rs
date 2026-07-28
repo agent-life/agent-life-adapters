@@ -601,6 +601,12 @@ fn is_not_found(err: &anyhow::Error) -> bool {
         .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
 }
 
+/// `Some(base)` when `rel` carries a SQLite sidecar suffix (`x.db-wal` → `x.db`).
+fn sidecar_base(rel: &str) -> Option<&str> {
+    rel.strip_suffix("-wal")
+        .or_else(|| rel.strip_suffix("-shm"))
+}
+
 /// Everything one workspace walk produces: parsed records + the deduplicated raw
 /// tree (keyed by the path passed to `add_raw_source`), plus counts/warnings.
 struct Collected {
@@ -647,6 +653,21 @@ fn collect(workspace: &Path, map: &MemoryMap, agent_id: Uuid) -> Result<Collecte
         let src = &map.memory_sources[idx];
         let bytes = read_raw_capped(&abs, &rel)?;
         if src.chunking.is_sqlite() {
+            // A `-wal`/`-shm` sidecar the SAME source's glob happens to match
+            // (`data/*`, `brain.db*` — inevitable once WAL mode creates them)
+            // is not a database: capture it raw and move on, never route it
+            // through row extraction (opening a WAL file as a database
+            // hard-failed the whole export). Only skipped when the matched
+            // base `.db` actually exists — a glob naming ONLY a sidecar is a
+            // real misconfiguration and keeps the hard-fail (decision 4).
+            if let Some(base_rel) = sidecar_base(&rel) {
+                if alf_core::chunk::path_matches(&src.glob, base_rel)
+                    && workspace.join(base_rel).is_file()
+                {
+                    raw.entry(rel).or_insert(RawSource::Bytes(bytes));
+                    continue;
+                }
+            }
             // A `sqlite_rows` source: the `.db` bytes were just read; capture
             // its `-wal`/`-shm` sidecars eagerly and CONSECUTIVELY (WP-G.3) so
             // the trio travels as one near-consistent unit, BEFORE row
@@ -703,7 +724,10 @@ fn collect(workspace: &Path, map: &MemoryMap, agent_id: Uuid) -> Result<Collecte
                 )),
             }
         }
-        raw.insert(rel, RawSource::Bytes(bytes));
+        // First capture wins (`or_insert`): a sidecar captured consecutively
+        // with its `.db` (the WP-G.3 trio) must not be replaced by this later
+        // re-read when a glob also matches the sidecar itself.
+        raw.entry(rel).or_insert(RawSource::Bytes(bytes));
     }
     records.sort_by_key(|r| r.temporal.created_at);
 

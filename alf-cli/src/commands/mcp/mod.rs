@@ -155,6 +155,17 @@ impl AlfServer {
             self.agent.clone(),
         )
     }
+
+    /// After a vault tool call that actually mutated the vault, dirty the watch
+    /// loop's vault source so the change auto-syncs (manual §3.8). A tool error
+    /// (`isError`) mutated nothing — don't schedule a no-change sync for it.
+    fn note_vault_mutation_on_success(&self, res: &Result<CallToolResult, ErrorData>) {
+        if let (Ok(r), Some(h)) = (res, &self.watch) {
+            if r.is_error != Some(true) {
+                h.note_vault_mutation();
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -571,7 +582,9 @@ to confirm the map/tracked files resolve as expected before syncing.",
 already tracked). Tracked files sync as RAW BYTES (no memory-record parsing), and any change to \
 one triggers a FULL-SNAPSHOT rollover on the tracked-files cadence (15 min floor, alf_watch_set \
 tracked_files_interval) — track sparingly; map memory sources instead where possible. \
-Workspace-relative by default. With external:true a file outside the workspace can be tracked, \
+Workspace-relative by default. Paths matching the sensitive-path denylist (.env, *.pem, *.key, \
+~/.ssh/**, …) are refused in-workspace too — secrets belong in alf_vault_add, and the denylist is \
+not overridable. With external:true a file outside the workspace can be tracked, \
 but only under a pre-blessed root and never on the sensitive denylist — blessing a new root \
 stays a CLI/human ceremony.",
         output_schema = rmcp::handler::server::tool::schema_for_output::<add::AddResult>()
@@ -653,10 +666,12 @@ rejected unless update:true.",
         Parameters(params): Parameters<VaultAddParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (runtime, workspace, agent) = self.owned();
-        call_blocking_locked(self.write_lock.clone(), move || {
+        let res = call_blocking_locked(self.write_lock.clone(), move || {
             vault_add_impl(&runtime, workspace.as_deref(), agent.as_deref(), params)
         })
-        .await
+        .await;
+        self.note_vault_mutation_on_success(&res);
+        res
     }
 
     /// List the vault's plaintext descriptors — no key touched.
@@ -692,10 +707,12 @@ earlier sequence.",
         Parameters(params): Parameters<VaultDeleteParams>,
     ) -> Result<CallToolResult, ErrorData> {
         let (runtime, workspace, agent) = self.owned();
-        call_blocking_locked(self.write_lock.clone(), move || {
+        let res = call_blocking_locked(self.write_lock.clone(), move || {
             vault_delete_impl(&runtime, workspace.as_deref(), agent.as_deref(), params)
         })
-        .await
+        .await;
+        self.note_vault_mutation_on_success(&res);
+        res
     }
 
     /// List the tracked-agent mapping joined with sync state.
@@ -1115,38 +1132,20 @@ pub(crate) fn agent_busy(cause: &str) -> anyhow::Error {
 
 /// L3 for the vault tools: the per-agent advisory lock by known agent id.
 fn vault_agent_lock(agent_id: Uuid) -> anyhow::Result<watch::lock::AgentLock> {
-    let lock_file = watch::lock_path(agent_id)?;
-    if let Some(dir) = lock_file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    watch::lock::acquire_timeout(
-        &lock_file,
-        Duration::from_secs(10),
-        Duration::from_millis(250),
-    )?
-    .ok_or_else(|| agent_busy("another ALF process is syncing or restoring this agent"))
+    watch::acquire_agent_lock_timeout(agent_id, Duration::from_secs(10))
 }
 
 /// L3: acquire the per-agent cross-process advisory lock with a bounded wait
 /// (10 s), resolving the pinned agent first. `agent_busy` if another ALF
 /// process holds it past the wait. Callers hold the returned guard across the
 /// whole-workspace operation.
-fn acquire_agent_lock(
+pub(crate) fn acquire_agent_lock(
     runtime: &str,
     workspace: Option<&Path>,
     agent: Option<&str>,
 ) -> anyhow::Result<watch::lock::AgentLock> {
     let (_ws, agent_id) = watch::resolve_loop_context(runtime, workspace, agent)?;
-    let lock_file = watch::lock_path(agent_id)?;
-    if let Some(dir) = lock_file.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    watch::lock::acquire_timeout(
-        &lock_file,
-        Duration::from_secs(10),
-        Duration::from_millis(250),
-    )?
-    .ok_or_else(|| agent_busy("another ALF process is syncing or restoring this agent"))
+    watch::acquire_agent_lock_timeout(agent_id, Duration::from_secs(10))
 }
 
 // ---------------------------------------------------------------------------

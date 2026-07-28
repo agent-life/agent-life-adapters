@@ -217,9 +217,11 @@ enum Command {
         into the workspace.\n\n\
         Default: restores the head of history. Updates ~/.alf/state/ so the next `alf sync` \
         runs against the restored base.\n\n\
-        --at-sequence N: point-in-time preview. Rebuilds the workspace as it looked after \
-        sequence N was applied, WITHOUT touching ~/.alf/state/. Use this to inspect history; \
-        run plain `alf restore` again to return to head. See docs/how_alf_syncs.md.\n\n\
+        --at-sequence N: point-in-time preview. Materializes the merged archive as it looked \
+        after sequence N into ~/.alf/preview/{agent}/seq-N/ (the three newest previews are \
+        kept; the JSON result carries `preview_path`). The live workspace, -w, and \
+        ~/.alf/state/ are untouched — no follow-up restore is needed. See \
+        docs/how_alf_syncs.md.\n\n\
         Vault key: same behavior as `alf import` — with a resolved key, Layer 4 is decrypted into \
         the runtime; without a key, restore still applies other layers and warnings explain that \
         secrets were not restored.\n\n\
@@ -227,7 +229,7 @@ enum Command {
         UUID — an unmapped UUID restores by id onto a fresh host), then ALF_AGENT, then the \
         sole enabled mapped agent, then the single tracked agent in ~/.alf/state/.\n\n\
         Example: alf restore -r openclaw -w ./my-agent --agent <alias-or-id>\n\
-        Example: alf restore --at-sequence 3 -r openclaw -w ./preview --agent <alias-or-id>"
+        Example: alf restore --at-sequence 3 -r openclaw --agent <alias-or-id>"
     )]
     Restore {
         /// Agent framework runtime (openclaw, zeroclaw, hermes, generic)

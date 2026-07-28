@@ -91,14 +91,13 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
     }
 
-    // Include list: in-workspace tracked paths + external sources, as one §6.1
-    // rollover unit; and the sentinels themselves.
+    // Include list: in-workspace tracked paths only, as one §6.1 rollover
+    // unit; and the sentinels themselves. No external roots: the zeroclaw
+    // export never packs external entries (`alf add --external` refuses this
+    // runtime), so a root here would fire tracked syncs that capture nothing
+    // (MAJ-4/MIN-8).
     if let Ok(list) = IncludeList::load(&install) {
-        let mut roots: Vec<PathBuf> = list.paths().iter().map(|p| install.join(p)).collect();
-        roots.extend(
-            list.externals()
-                .filter_map(|e| e.source.as_ref().map(PathBuf::from)),
-        );
+        let roots: Vec<PathBuf> = list.paths().iter().map(|p| install.join(p)).collect();
         if !roots.is_empty() {
             specs.push(WatchSpec {
                 id: "tracked-files".into(),
@@ -228,7 +227,11 @@ mod tests {
     }
 
     #[test]
-    fn tracked_files_group_in_workspace_and_external() {
+    fn tracked_files_in_workspace_only_externals_never_watched() {
+        // The zeroclaw export never packs external entries (`alf add
+        // --external` refuses this runtime), so only in-workspace tracked
+        // paths are watched — an external root would fire tracked syncs that
+        // capture nothing (MAJ-4/MIN-8). Even a verified entry stays unwatched.
         let tmp = TempDir::new().unwrap();
         let install = tmp.path();
         fs::write(install.join("config.toml"), "").unwrap();
@@ -243,9 +246,6 @@ mod tests {
         let specs = watch_paths(install);
         let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
         assert!(tracked.tracked);
-        assert!(tracked.roots.contains(&install.join("kb.md")));
-        assert!(tracked
-            .roots
-            .contains(&PathBuf::from("/etc/proj/AGENTS.md")));
+        assert_eq!(tracked.roots, vec![install.join("kb.md")]);
     }
 }

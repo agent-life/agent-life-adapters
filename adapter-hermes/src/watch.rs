@@ -21,7 +21,8 @@
 //! - **`profiles/`** (default profile only) — a **`rediscover`** spec: a new
 //!   `profiles/<name>/` created mid-session re-runs discovery so the new agent
 //!   surfaces in `alf_agents_list` (registration stays lazy; design §14).
-//! - **include-list** (in-workspace + external) on the §6.1 tracked channel, and
+//! - **include-list** (in-workspace + *verified* external — inert restored
+//!   externals are not packed, so not watched) on the §6.1 tracked channel, and
 //!   the **sentinels** (`.alf-include.json`, `.alf-sync-log.md`).
 
 use std::ffi::{OsStr, OsString};
@@ -92,12 +93,14 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         specs.push(WatchSpec::dir("profiles", workspace.join("profiles")).rediscovering());
     }
 
-    // Include list: in-workspace tracked paths + external sources, one §6.1
-    // rollover unit; and the sentinels themselves.
+    // Include list: in-workspace tracked paths + VERIFIED external sources,
+    // one §6.1 rollover unit; and the sentinels themselves. Inert (restored,
+    // unverified) externals are skipped by the export, so they must not be
+    // watch roots either (MAJ-4 / D3).
     if let Ok(list) = IncludeList::load(workspace) {
         let mut roots: Vec<PathBuf> = list.paths().iter().map(|p| workspace.join(p)).collect();
         roots.extend(
-            list.externals()
+            list.verified_externals()
                 .filter_map(|e| e.source.as_ref().map(PathBuf::from)),
         );
         if !roots.is_empty() {
@@ -152,6 +155,39 @@ mod tests {
 
     fn by_id<'a>(specs: &'a [WatchSpec], id: &str) -> Option<&'a WatchSpec> {
         specs.iter().find(|s| s.id == id)
+    }
+
+    #[test]
+    fn inert_externals_are_not_watched() {
+        // D3: a restored archive's externals come back verified=false and the
+        // export skips them — watching them would fire tracked syncs that
+        // capture nothing (and let a hostile archive pick watch roots).
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        fs::write(
+            ws.join(alf_core::include::INCLUDE_FILE),
+            r#"{"files":[
+                {"path":"kb.md","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
+                {"path":"AGENTS.md","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/proj/AGENTS.md","verified":true},
+                {"path":"cursorrules","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/proj/.cursorrules","verified":false}
+            ]}"#,
+        )
+        .unwrap();
+        let specs = watch_paths(ws);
+        let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
+        assert!(tracked.roots.contains(&ws.join("kb.md")));
+        assert!(
+            tracked
+                .roots
+                .contains(&PathBuf::from("/etc/proj/AGENTS.md")),
+            "verified externals stay watched"
+        );
+        assert!(
+            !tracked
+                .roots
+                .contains(&PathBuf::from("/etc/proj/.cursorrules")),
+            "inert (unverified) externals must not be watched"
+        );
     }
 
     #[test]

@@ -11,8 +11,8 @@
 //!   recursively; a metachar-free glob is a single file),
 //! - the optional `identity_file`,
 //! - a single **tracked-files** spec (§6.1 rollover channel) carrying every
-//!   in-workspace include-list path **and** every external entry's absolute
-//!   source,
+//!   in-workspace include-list path **and** every *verified* external entry's
+//!   absolute source (inert restored externals are not packed, so not watched),
 //! - a **sentinels** spec for `.alf-map.json` / `.alf-include.json` themselves
 //!   (editing them changes the watch set / extraction).
 //!
@@ -73,10 +73,12 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     }
 
     // Tracked-file channel: every in-workspace include-list path + every
-    // external entry's absolute source, as one §6.1 rollover unit.
+    // VERIFIED external entry's absolute source, as one §6.1 rollover unit.
+    // Inert (restored, unverified) externals are skipped by the export, so
+    // they must not be watch roots either (MAJ-4 / D3).
     if let Ok(list) = IncludeList::load(workspace) {
         let mut roots: Vec<PathBuf> = list.paths().iter().map(|p| workspace.join(p)).collect();
-        for ext in list.externals() {
+        for ext in list.verified_externals() {
             if let Some(source) = &ext.source {
                 roots.push(PathBuf::from(source));
             }
@@ -254,7 +256,8 @@ mod tests {
             ws.join(INCLUDE_FILE),
             r#"{"files":[
                 {"path":"config.toml","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
-                {"path":"secret.txt","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/host/secret.txt","verified":true}
+                {"path":"secret.txt","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/host/secret.txt","verified":true},
+                {"path":"inert.txt","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/host/inert.txt","verified":false}
             ]}"#,
         )
         .unwrap();
@@ -278,6 +281,14 @@ mod tests {
         assert!(tracked
             .roots
             .contains(&PathBuf::from("/etc/host/secret.txt")));
+        // A restored (inert, verified=false) external is skipped by export —
+        // it must not be a watch root either (MAJ-4 / D3).
+        assert!(
+            !tracked
+                .roots
+                .contains(&PathBuf::from("/etc/host/inert.txt")),
+            "inert externals must not be watched"
+        );
 
         let sentinels = by_id("sentinels").expect("sentinels spec");
         assert!(

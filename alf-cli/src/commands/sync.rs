@@ -312,6 +312,14 @@ pub fn run(
         );
     }
 
+    // L3 (MAJ-6): hold the per-agent advisory lock across the whole sync — the
+    // same lock the MCP server and the watch loop take — so a CLI sync cannot
+    // interleave with a watch export/restore on this agent. (The lock lives
+    // OUTSIDE `run_one_agent`: the MCP tool and the watch loop already hold it
+    // when they enter that seam, and flock does not nest.) Cross-machine races
+    // remain the service sequence CAS's job (E7).
+    let _agent_lock = crate::commands::mcp::acquire_agent_lock(runtime, workspace_flag, agent)?;
+
     // CLI single-agent path: progress to stderr (unchanged), render the outcome.
     let (outcome, selected) = run_one_agent(
         runtime,
@@ -443,17 +451,26 @@ fn run_all(
             "Syncing agent '{}' ({})...",
             sel.alias, sel.alf_agent_id
         ));
-        match sync_one(
-            &client,
-            adapt,
-            runtime,
-            sel,
-            None,
-            recover,
-            force_first_sync,
-            /* human: */ false,
-            Progress::stderr(),
-        ) {
+        // L3 (MAJ-6): per-agent lock held across this agent's sync (`_lock`
+        // lives for the closure). A busy agent becomes its `agent_busy` error
+        // row below while the rest of --all proceeds.
+        match crate::commands::mcp::watch::acquire_agent_lock_timeout(
+            sel.alf_agent_id,
+            std::time::Duration::from_secs(10),
+        )
+        .and_then(|_lock| {
+            sync_one(
+                &client,
+                adapt,
+                runtime,
+                sel,
+                None,
+                recover,
+                force_first_sync,
+                /* human: */ false,
+                Progress::stderr(),
+            )
+        }) {
             Ok(outcome) => results.push(SyncAllEntry {
                 runtime_agent: sel.alias.clone(),
                 alf_agent_id: sel.alf_agent_id,

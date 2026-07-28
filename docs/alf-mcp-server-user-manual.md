@@ -41,13 +41,13 @@ Two things run inside the process:
 
 ### 2.1 Installing and wiring a client
 
-Install the `alf` CLI (see the README / `https://agent-life.ai/install.sh`). Then either run `alf mcp configure <client>` to write the server entry into a supported MCP client's config, or add it manually:
+Install the `alf` CLI (see the README / `https://agent-life.ai/install.sh`), then add the server entry to your MCP client's config by hand:
 
 ```json
 { "command": "alf", "args": ["mcp", "serve", "-r", "generic", "-w", "/path/to/workspace"] }
 ```
 
-`alf mcp configure` validates before writing, writes atomically, and never clobbers unrelated entries in an existing client config.
+`alf mcp serve` is the binary's only `mcp` subcommand. Per-client config shapes — Claude Code `.mcp.json`, Hermes `mcp_servers` (env must be explicit), ZeroClaw `mcp_servers` + `mcp_bundles` one-per-agent — are in `docs/cli-reference.md` § **MCP client configuration**, and `alf_docs topic="mcp"` returns them in-session.
 
 ### 2.2 The API key
 
@@ -160,10 +160,12 @@ Call `alf_status` first in every session. Once configured, the watch loop syncs 
 Tracked files sync as **RAW BYTES** — no memory-record parsing — and any change to one triggers a **full-snapshot rollover** on the tracked-files cadence (15-minute floor; see `alf_watch_set`). Track sparingly; map memory sources instead where possible.
 
 **Parameters.**
-- `path` (string, required) — an EXISTING regular file, workspace-relative or absolute; unless `external: true` it must resolve inside the workspace. ALF's own managed files cannot be tracked.
+- `path` (string, required) — an EXISTING regular file, workspace-relative or absolute; unless `external: true` it must resolve inside the workspace. ALF's own managed files cannot be tracked. Paths matching the sensitive-path denylist (`.env`, `.env.*`, `*.pem`, `*.key`, `id_rsa*`, `~/.ssh/**`, …) are refused with `path_denylisted` — in-workspace too, not only external — and the denylist is not overridable: secrets belong in `alf_vault_add`.
 - `external` (bool, default `false`) — track a file outside the workspace. Hermes and generic runtimes only; the file must lie under a pre-blessed root (`alf add --allow-root`, a CLI ceremony), must not be on the sensitive denylist, and must not exceed the 64 MiB per-file cap *(v1.1)*. Setting `true` is your consent.
 
 **Result.** `{ok, added, path, external?}`.
+
+**Failures (coded).** `path_denylisted` (secret-shaped path — use `alf_vault_add`).
 
 **Behavior notes.** A successful track refreshes the watch surface — the file is watched immediately, no server restart needed *(v1.1)*.
 

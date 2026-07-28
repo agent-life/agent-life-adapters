@@ -26,9 +26,10 @@
 //! - **`~/.openclaw/openclaw.json`** — the agent set + per-agent workspace +
 //!   version. A change here means the discovered topology moved, so it must
 //!   re-sync (and, on the CLI, be re-discovered by `alf check`).
-//! - **external include-list entries** — files tracked from outside the
-//!   workspace via `alf add --external`, carried on the §6.1 tracked-file
-//!   rollover channel.
+//!
+//! External include-list entries are deliberately NOT watched: the openclaw
+//! export never packs them (`alf add --external` refuses this runtime), so a
+//! root for one would fire tracked syncs that capture nothing (MAJ-4/MIN-8).
 //!
 //! In-workspace tracked files are *already* covered by the recursive workspace
 //! watch; the engine governs their §6.1 rollover on the delta cadence (the
@@ -37,7 +38,6 @@
 
 use std::path::{Path, PathBuf};
 
-use alf_core::include::IncludeList;
 use alf_core::WatchSpec;
 
 /// Build the OpenClaw watch surface for `workspace`.
@@ -53,26 +53,11 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         specs.push(WatchSpec::file("openclaw-config", config).resurfacing());
     }
 
-    // External tracked files (the recursive workspace watch misses them). Their
-    // absolute sources form one §6.1 rollover unit.
-    if let Ok(list) = IncludeList::load(workspace) {
-        let roots: Vec<PathBuf> = list
-            .externals()
-            .filter_map(|e| e.source.as_ref().map(PathBuf::from))
-            .collect();
-        if !roots.is_empty() {
-            specs.push(WatchSpec {
-                id: "tracked-files".into(),
-                roots,
-                recursive: false,
-                exclude: Vec::new(),
-                tracked: true,
-                sqlite: false,
-                rediscover: false,
-                resurface: false,
-            });
-        }
-    }
+    // No external roots: the openclaw export never packs external include
+    // entries (`alf add --external` refuses this runtime), so an external
+    // watch root would only fire tracked syncs that capture nothing
+    // (MAJ-4/MIN-8). In-workspace tracked files are covered by the recursive
+    // workspace watch above.
 
     specs
 }
@@ -139,11 +124,14 @@ mod tests {
     }
 
     #[test]
-    fn watch_paths_carries_external_tracked_sources_only() {
+    fn externals_never_yield_a_tracked_spec() {
+        // The openclaw export never packs external entries (`alf add
+        // --external` refuses this runtime), so externals — however they got
+        // into the list (restored archive, hand edit) — must not be watched:
+        // a root here would fire tracked syncs that capture nothing
+        // (MAJ-4/MIN-8). Even a verified entry stays unwatched.
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
-        // One in-workspace entry (covered by the recursive watch → no tracked
-        // spec) and one external entry (needs an explicit tracked root).
         fs::write(
             ws.join(alf_core::include::INCLUDE_FILE),
             r#"{"files":[
@@ -154,9 +142,7 @@ mod tests {
         .unwrap();
 
         let specs = watch_paths(ws);
-        let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
-        assert!(tracked.tracked);
-        assert_eq!(tracked.roots, vec![PathBuf::from("/etc/proj/AGENTS.md")]);
+        assert!(by_id(&specs, "tracked-files").is_none());
     }
 
     #[test]

@@ -37,6 +37,12 @@ struct AgentRecord {
 struct BackendState {
     agents: HashMap<String, AgentRecord>,
     auth_rejected: bool,
+    /// First-sync registrations refused with 409 `exists` — the observable for
+    /// "the watch loop attempted another sync" in the fork park/un-park test.
+    register_conflicts: u64,
+    /// Restore-plan fetches — the observable for "an auto-recover attempt
+    /// actually pulled the cloud base" in the E7 park test.
+    restore_fetches: u64,
 }
 
 /// A running mock backend. Dropping it stops the server thread.
@@ -91,6 +97,31 @@ impl MockBackend {
     /// Toggle 401 rejection on every `/agents…` route (for auth-park tests).
     pub fn set_auth_rejected(&self, on: bool) {
         self.state.lock().unwrap().auth_rejected = on;
+    }
+
+    /// Pre-create an agent record (no snapshot) — stages the E3 fork: the next
+    /// first-sync registration hits 409 `exists` → `already_existed` → the
+    /// watch loop parks with `sync_first_sync_conflict`.
+    pub fn seed_agent(&self, agent_id: &str, name: &str) {
+        self.state.lock().unwrap().agents.insert(
+            agent_id.to_string(),
+            AgentRecord {
+                name: name.into(),
+                source_runtime: "generic".into(),
+                created_at: "2026-01-01T00:00:00Z".into(),
+                ..Default::default()
+            },
+        );
+    }
+
+    /// How many registrations were refused with 409 `exists` so far.
+    pub fn register_conflicts(&self) -> u64 {
+        self.state.lock().unwrap().register_conflicts
+    }
+
+    /// How many restore plans were served (each auto-recover fetches one).
+    pub fn restore_fetches(&self) -> u64 {
+        self.state.lock().unwrap().restore_fetches
     }
 
     /// Force the next delta push to 409 by advancing the agent's sequence out
@@ -286,6 +317,7 @@ fn register_agent(req: &Request, state: &Arc<Mutex<BackendState>>) -> Vec<u8> {
         .to_string();
     let mut st = state.lock().unwrap();
     if st.agents.contains_key(&id) {
+        st.register_conflicts += 1;
         return json_response(409, "Conflict", &json!({"error": "exists"}));
     }
     st.agents.insert(
@@ -384,7 +416,8 @@ fn get_restore(
     addr: SocketAddr,
 ) -> Vec<u8> {
     let up_to: Option<u64> = req.query.get("up_to_sequence").and_then(|v| v.parse().ok());
-    let st = state.lock().unwrap();
+    let mut st = state.lock().unwrap();
+    st.restore_fetches += 1;
     let Some(a) = st.agents.get(id) else {
         return json_response(404, "Not Found", &json!({"error": "no agent"}));
     };

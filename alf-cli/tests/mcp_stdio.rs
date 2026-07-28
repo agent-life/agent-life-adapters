@@ -84,6 +84,13 @@ fn clean_alf_env(cmd: &mut Command) {
 /// Spawn `alf mcp serve -r generic -w <copy>` with an isolated `ALF_HOME` and the
 /// env cleaned so a stray var can't flip stdout or short-circuit auto-keygen.
 fn spawn(home: &Path, workspace: &Path) -> Child {
+    spawn_with_env(home, workspace, &[])
+}
+
+/// [`spawn`] with extra env applied AFTER the cleaning pass — the seam the
+/// watch-loop e2e tests use to shorten the loop cadence (same `ALF_WATCH_*`
+/// overrides as the Python Z16/Z17 live gates; production defaults untouched).
+fn spawn_with_env(home: &Path, workspace: &Path, extra_env: &[(&str, &str)]) -> Child {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_alf"));
     cmd.args(["mcp", "serve", "-r", "generic", "-w"])
         .arg(workspace)
@@ -92,7 +99,46 @@ fn spawn(home: &Path, workspace: &Path) -> Child {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     clean_alf_env(&mut cmd);
+    for (k, v) in extra_env {
+        cmd.env(k, v);
+    }
     cmd.spawn().expect("spawn alf mcp serve")
+}
+
+/// The fastest cadence the engine's clamps allow (tick ≥ 1 s, delta floor
+/// ≥ 1 s, quiesce ≥ 100 ms) — auto-sync effects land within a couple of
+/// seconds instead of the production hour.
+const FAST_WATCH: &[(&str, &str)] = &[
+    ("ALF_WATCH_TICK_MS", "1000"),
+    ("ALF_WATCH_DELTA_FLOOR_MS", "1000"),
+    ("ALF_WATCH_DEFAULT_INTERVAL_MS", "1000"),
+    ("ALF_WATCH_QUIESCE_MS", "100"),
+];
+
+/// Strip the toy map's `watch` block so every source falls back to the env
+/// default cadence (FAST_WATCH's 1 s) — the fixture's own block pins the
+/// journal source to a 5 m interval, which would idle the delta-asserting
+/// e2e tests out. (First/catch-up syncs are interval-independent, so the
+/// park/backoff tests don't need this.)
+fn strip_map_watch_block(workspace: &Path) {
+    let map_path = workspace.join(".alf-map.json");
+    let mut v: Value = serde_json::from_str(&std::fs::read_to_string(&map_path).unwrap()).unwrap();
+    v.as_object_mut().unwrap().remove("watch");
+    std::fs::write(&map_path, serde_json::to_string_pretty(&v).unwrap()).unwrap();
+}
+
+/// Poll `probe` every 100 ms until it returns true, panicking after `secs`.
+/// Deadline-based — never a fixed sleep — so the watch e2e tests are as fast
+/// as the loop and only as slow as a genuinely missed deadline.
+fn wait_until(secs: u64, what: &str, mut probe: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    while std::time::Instant::now() < deadline {
+        if probe() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out after {secs}s waiting for {what}");
 }
 
 fn call(id: i64, name: &str, arguments: Value) -> Value {
@@ -461,14 +507,38 @@ impl Conversation {
         Self::start_inner(Some(api_url))
     }
 
+    /// [`start_with_backend`] plus extra child env — the watch-loop e2e seam.
+    fn start_with_backend_watched(api_url: &str, extra_env: &[(&str, &str)]) -> Self {
+        Self::start_full(Some(api_url), extra_env, |_| {})
+    }
+
+    /// [`start_with_backend_watched`] plus a pre-spawn workspace hook (e.g.
+    /// stripping the toy map's `watch` block so the env cadence applies).
+    fn start_with_backend_watched_prepped(
+        api_url: &str,
+        extra_env: &[(&str, &str)],
+        prep: impl FnOnce(&Path),
+    ) -> Self {
+        Self::start_full(Some(api_url), extra_env, prep)
+    }
+
     fn start_inner(api_url: Option<&str>) -> Self {
+        Self::start_full(api_url, &[], |_| {})
+    }
+
+    fn start_full(
+        api_url: Option<&str>,
+        extra_env: &[(&str, &str)],
+        prep: impl FnOnce(&Path),
+    ) -> Self {
         let home = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         copy_dir(Path::new(&toy_fixture()), workspace.path()).unwrap();
+        prep(workspace.path());
         if let Some(url) = api_url {
             common::seed_config(home.path(), url);
         }
-        let mut child = spawn(home.path(), workspace.path());
+        let mut child = spawn_with_env(home.path(), workspace.path(), extra_env);
         let stdin = child.stdin.take().unwrap();
         let reader = BufReader::new(child.stdout.take().unwrap());
         let mut conv = Conversation {
@@ -1197,4 +1267,168 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         out[i * 4..i * 4 + 4].copy_from_slice(&word.to_be_bytes());
     }
     out
+}
+
+// ===========================================================================
+// Watch-loop end-to-end (MAJ-9) — the loop's real spine through a live server:
+// task spawn → catch-up scan → event routing → sync → record_result. Cadence
+// comes from the same ALF_WATCH_* seam the Python Z16/Z17 live gates use;
+// every assertion is a deadline-poll against the mock backend or alf_status,
+// never a fixed sleep.
+// ===========================================================================
+
+/// The loop syncs entirely on its own: the boot catch-up scan registers and
+/// uploads snapshot 1, and a file touched behind the server's back rides the
+/// next due tick as a delta — with NO tool call ever issued.
+#[test]
+fn watch_loop_auto_syncs_without_any_tool_call() {
+    let backend = common::MockBackend::start();
+    let conv = Conversation::start_with_backend_watched_prepped(
+        &backend.url(),
+        FAST_WATCH,
+        strip_map_watch_block,
+    );
+
+    wait_until(20, "the catch-up auto-sync to upload snapshot 1", || {
+        backend.latest_sequence(TOY_AGENT_ID) == Some(1)
+    });
+
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-05.md"),
+        "## Auto\n\nWritten behind the server's back.\n",
+    )
+    .unwrap();
+    wait_until(20, "the touched file to auto-sync as a delta", || {
+        backend.delta_count(TOY_AGENT_ID) >= 1
+    });
+    conv.finish();
+}
+
+/// E3 fork: a cloud agent that already exists parks the loop with
+/// `sync_first_sync_conflict` (visible in alf_status), and the documented
+/// un-park gesture `alf_watch_set {pause:false}` (manual §4.2, the MAJ-1 fix)
+/// actually resumes it — proven race-free by the mock counting a NEW
+/// registration conflict after the un-park (only a cleared park can re-sync).
+#[test]
+fn watch_loop_parks_on_fork_and_watch_set_unparks() {
+    let backend = common::MockBackend::start();
+    backend.seed_agent(TOY_AGENT_ID, "imposter");
+    let mut conv = Conversation::start_with_backend_watched(&backend.url(), FAST_WATCH);
+
+    let mut id = 100_i64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let parked_code = loop {
+        id += 1;
+        let st = conv.call(id, "alf_status", json!({}));
+        if let Some(code) = st["structuredContent"]["watch"]["parked"]["code"].as_str() {
+            break code.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loop never parked on the staged fork"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(parked_code, "sync_first_sync_conflict");
+    let conflicts_at_park = backend.register_conflicts();
+    assert!(conflicts_at_park >= 1, "the park came from a real 409");
+
+    let ws = conv.call(200, "alf_watch_set", json!({"pause": false}));
+    assert_eq!(
+        ws["structuredContent"]["ok"], true,
+        "{}",
+        ws["structuredContent"]
+    );
+    wait_until(
+        20,
+        "a post-un-park re-sync attempt (the park was cleared)",
+        || backend.register_conflicts() > conflicts_at_park,
+    );
+    conv.finish();
+}
+
+/// E7 with a persistently conflicted head: the mock's bump is metadata-only
+/// (the "parallel delta" has no fetchable blob), so the single auto-recover
+/// attempt pulls the cloud base, lands back on the stale sequence, hits the
+/// 409 again — and PARKS instead of retrying forever. This pins the ladder's
+/// bounded-recovery contract end to end: 409 → Conflict → one real
+/// restore-plan fetch → `sync_conflict_unresolved`. (The happy recover path,
+/// where the parallel delta is fetchable, is the live lifecycle gates' job —
+/// it needs a real second writer producing real blobs.)
+#[test]
+fn watch_loop_recovers_once_then_parks_on_a_persistent_conflict() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend_watched_prepped(
+        &backend.url(),
+        FAST_WATCH,
+        strip_map_watch_block,
+    );
+
+    wait_until(20, "the catch-up auto-sync to upload snapshot 1", || {
+        backend.latest_sequence(TOY_AGENT_ID) == Some(1)
+    });
+    backend.bump_sequence(TOY_AGENT_ID); // cloud head 2; its delta blob does not exist
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-06.md"),
+        "## Conflict fodder\n\nA change that will hit the 409.\n",
+    )
+    .unwrap();
+
+    // The ladder really attempted recovery: it fetched the cloud restore plan.
+    wait_until(30, "the auto-recover to fetch the cloud base", || {
+        backend.restore_fetches() >= 1
+    });
+    // …and, with the conflict unresolvable, parked after that one attempt.
+    let mut id = 400_i64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let parked_code = loop {
+        id += 1;
+        let st = conv.call(id, "alf_status", json!({}));
+        if let Some(code) = st["structuredContent"]["watch"]["parked"]["code"].as_str() {
+            break code.to_string();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "loop never parked on the persistent conflict"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    };
+    assert_eq!(parked_code, "sync_conflict_unresolved");
+    conv.finish();
+}
+
+/// Auth rejection: one 401 is a strike + transient backoff (visible as
+/// `backoff_retry_in_secs`), never an instant park (the budget is 3); fixing
+/// the credential server-side lets the backed-off retry sync cleanly.
+#[test]
+fn watch_loop_backs_off_on_auth_rejection_then_recovers() {
+    let backend = common::MockBackend::start();
+    backend.set_auth_rejected(true);
+    let mut conv = Conversation::start_with_backend_watched(&backend.url(), FAST_WATCH);
+
+    let mut id = 300_i64;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        id += 1;
+        let st = conv.call(id, "alf_status", json!({}));
+        let w = &st["structuredContent"]["watch"];
+        assert!(
+            w["parked"].is_null(),
+            "one auth blip must back off, not park: {w}"
+        );
+        if w["backoff_retry_in_secs"].as_u64().is_some() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no backoff surfaced after the auth rejection"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    backend.set_auth_rejected(false);
+    wait_until(30, "the post-backoff retry to sync cleanly", || {
+        backend.latest_sequence(TOY_AGENT_ID) == Some(1)
+    });
+    conv.finish();
 }

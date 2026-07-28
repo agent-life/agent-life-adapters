@@ -457,6 +457,23 @@ mod tests {
     }
 
     #[test]
+    fn map_file_docs_cover_the_sqlite_rows_mode() {
+        // MAJ-13: `sqlite_rows` ships in v1.1 and `alf_configure` points agents
+        // at this topic for "the exact shape" — the schema block, its required
+        // keys, and the validation rules must all be inside the section, or an
+        // agent cannot configure a SQLite-backed framework.
+        let map = resolve("map-file").unwrap().content;
+        assert!(map.contains("sqlite_rows"), "sqlite_rows mode undocumented");
+        for key in ["table", "id_column", "content_column", "timestamp_column"] {
+            assert!(map.contains(key), "sqlite key `{key}` undocumented");
+        }
+        assert!(
+            map.contains("requires a `sqlite` block"),
+            "the required-block validation rule is undocumented"
+        );
+    }
+
+    #[test]
     fn map_file_docs_state_the_full_tag_grammar() {
         // M.2: the real grammar is hashtags | static:<tag> | frontmatter:<key>.
         let map = resolve("map-file").unwrap().content;

@@ -869,9 +869,10 @@ fn base_unreadable(err: anyhow::Error, path: &Path) -> anyhow::Error {
     CliError {
         code: codes::SYNC_BASE_UNREADABLE,
         cause: format!("local delta base {} is unreadable: {err:#}", path.display()),
-        remedy: "re-run alf sync with --recover (MCP: alf_sync recover:true) to re-pull \
-             the base from cloud truth"
-            .to_string(),
+        // Phrased as the exact CLI invocation so the MCP rewrite's
+        // longest-match rule turns it into `alf_sync with recover:true`
+        // (hand-annotating the MCP form here would double up — MIN-2).
+        remedy: "re-run alf sync --recover to re-pull the base from cloud truth".to_string(),
     }
     .into()
 }

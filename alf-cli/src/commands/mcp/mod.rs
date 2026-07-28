@@ -1276,32 +1276,51 @@ fn structured_ok<T: serde::Serialize>(value: &T) -> Result<CallToolResult, Error
 const MCP_REMEDY_REWRITES: &[(&str, &str)] = &[
     (
         "alf sync --force-first-sync",
-        "the CLI ceremony `alf sync --force-first-sync` (human terminal — see alf_docs          topic \"force-first-sync\")",
+        "the CLI ceremony `alf sync --force-first-sync` (human terminal — see alf_docs topic \"force-first-sync\")",
     ),
     ("alf sync --recover", "alf_sync with recover:true"),
     (
         "alf vault rotate-key",
-        "the CLI ceremony `alf vault rotate-key` (human terminal — see alf_docs topic          \"rotate-key\")",
+        "the CLI ceremony `alf vault rotate-key` (human terminal — see alf_docs topic \"rotate-key\")",
     ),
     (
         "alf vault migrate",
-        "the CLI ceremony `alf vault migrate` (human terminal — see alf_docs topic          \"vault\")",
+        "the CLI ceremony `alf vault migrate` (human terminal — see alf_docs topic \"vault\")",
     ),
     (
         "alf agents enable",
         "the CLI ceremony `alf agents enable` (human terminal — enable/disable are not tools)",
     ),
     ("alf login", "the CLI ceremony `alf login` (human terminal)"),
-    ("alf check", "the alf_check tool (CLI: `alf check`"),
-    ("alf restore", "the alf_restore tool (CLI: `alf restore`"),
-    ("alf sync", "the alf_sync tool (CLI: `alf sync`"),
+    ("alf check", "the alf_check tool (CLI: `alf check`)"),
+    ("alf restore", "the alf_restore tool (CLI: `alf restore`)"),
+    ("alf sync", "the alf_sync tool (CLI: `alf sync`)"),
 ];
 
 /// Apply [`MCP_REMEDY_REWRITES`] to a remedy string.
+///
+/// **Single pass, longest-match-first.** The input is scanned once and emitted
+/// text is never rescanned, so a replacement that quotes a CLI phrase (the
+/// force-first-sync ceremony quotes the very command it replaces, which
+/// contains the later plain-`alf sync` trigger) cannot be re-rewritten into
+/// nested garbage. A `replace()` chain — the original implementation — did
+/// exactly that.
 fn mcp_hint(remedy: &str) -> String {
-    let mut out = remedy.to_string();
-    for (cli, tool) in MCP_REMEDY_REWRITES {
-        out = out.replace(cli, tool);
+    let mut out = String::with_capacity(remedy.len());
+    let mut rest = remedy;
+    'scan: while !rest.is_empty() {
+        for (cli, tool) in MCP_REMEDY_REWRITES {
+            if let Some(tail) = rest.strip_prefix(cli) {
+                out.push_str(tool);
+                rest = tail;
+                continue 'scan;
+            }
+        }
+        // No rule matches here: emit one char and advance (char-wise so a
+        // multi-byte remedy can never be split mid-codepoint).
+        let ch = rest.chars().next().expect("rest is non-empty");
+        out.push(ch);
+        rest = &rest[ch.len_utf8()..];
     }
     out
 }
@@ -1446,6 +1465,81 @@ mod tests {
         let hinted = mcp_hint("Run 'alf vault rotate-key' to rotate");
         assert!(hinted.contains("human terminal"), "{hinted}");
         assert!(hinted.contains("alf_docs"), "{hinted}");
+    }
+
+    /// MIN-2: the rewrite table is agent-facing prose — every replacement must
+    /// be well-formed on the wire. Table hygiene, so a future rule cannot
+    /// reintroduce the dangling `(CLI: \`alf check\`` or the literal 10-space
+    /// runs this test was written for.
+    #[test]
+    fn remedy_rewrites_are_well_formed() {
+        for (cli, tool) in MCP_REMEDY_REWRITES {
+            assert!(
+                !tool.contains("  "),
+                "rule {cli:?}: replacement has a run of spaces: {tool:?}"
+            );
+            assert_eq!(
+                tool.matches('(').count(),
+                tool.matches(')').count(),
+                "rule {cli:?}: unbalanced parens: {tool:?}"
+            );
+            assert_eq!(
+                tool.matches('`').count() % 2,
+                0,
+                "rule {cli:?}: unbalanced backticks: {tool:?}"
+            );
+        }
+    }
+
+    /// MIN-2: rewriting is a SINGLE pass — replacement text is never rescanned,
+    /// so a replacement that legitimately quotes a CLI phrase (the
+    /// force-first-sync ceremony quotes `alf sync --force-first-sync`, which
+    /// contains the later `alf sync` trigger) cannot be re-mangled into nested
+    /// garbage.
+    #[test]
+    fn mcp_hint_does_not_rewrite_inside_its_own_replacements() {
+        let hinted = mcp_hint("choose local-truth: run alf sync --force-first-sync");
+        assert!(
+            hinted.contains("`alf sync --force-first-sync`"),
+            "the quoted ceremony must survive verbatim: {hinted}"
+        );
+        assert!(
+            !hinted.contains("the alf_sync tool"),
+            "the plain `alf sync` rule must not fire inside the replacement: {hinted}"
+        );
+    }
+
+    /// Every rule is reachable and produces clean text — the two live remedies
+    /// the review found broken (`workspace_missing`, and the `--recover`
+    /// remedy whose wording the longest-match rule misses) included.
+    #[test]
+    fn every_remedy_rewrite_produces_balanced_text() {
+        let live_remedies = [
+            "restore the workspace or fix the -w path, then re-run alf sync",
+            "re-run alf sync --recover to re-pull the base from cloud truth",
+            "run alf check to re-discover the agent",
+            "run alf restore first to hydrate local state",
+            "run alf login to refresh the API key",
+            "run alf agents enable <alias> first",
+            "run alf vault migrate to move the legacy vault",
+        ];
+        for remedy in live_remedies {
+            let hinted = mcp_hint(remedy);
+            assert_eq!(
+                hinted.matches('(').count(),
+                hinted.matches(')').count(),
+                "unbalanced parens rewriting {remedy:?}: {hinted}"
+            );
+            assert_eq!(
+                hinted.matches('`').count() % 2,
+                0,
+                "unbalanced backticks rewriting {remedy:?}: {hinted}"
+            );
+            assert!(
+                !hinted.contains("  "),
+                "space run rewriting {remedy:?}: {hinted}"
+            );
+        }
     }
 
     #[test]

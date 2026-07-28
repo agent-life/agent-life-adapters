@@ -27,19 +27,12 @@ TEMPLATE = VIZ_DIR / "index.html"
 # bake REFUSES to write a share file that still carries one.
 sys.path.insert(0, str(VIZ_DIR.parent))
 from alflab import redact as _redact  # noqa: E402
+from alflab.viz_server import VIZ_ARTIFACTS  # noqa: E402
 
-# Small text artifacts worth inlining for the hybrid drawer.
-ARTIFACT_CANDIDATES = [
-    "report.json",
-    "run-manifest.json",
-    "mcp-interactions.log",
-    "z16-serve-stderr.log",
-    "home/config.yaml",
-    "home/memories/MEMORY.md",
-    "home/profiles/agent_b/config.yaml",
-    "home/profiles/agent_b/SOUL.md",
-    "alf-home/config.toml",
-]
+# Small text artifacts worth inlining for the hybrid drawer — the SAME set the
+# live viz server is allowed to serve (`alflab.viz_server.VIZ_ARTIFACTS`), so
+# the baked and live views can never drift apart.
+ARTIFACT_CANDIDATES = list(VIZ_ARTIFACTS)
 
 MAX_ARTIFACT_BYTES = 400_000
 

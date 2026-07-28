@@ -526,6 +526,29 @@ impl Conversation {
         Self::start_full(api_url, &[], |_| {})
     }
 
+    /// Stop this server and start a NEW one against the same home + workspace
+    /// — a host respawn after a crash. The on-disk state carries over, which
+    /// is the whole point for the crash-window tests. (`config.toml` in the
+    /// home already points at the backend, so no re-seeding is needed.)
+    fn restart(mut self) -> Self {
+        self.stdin.take(); // close stdin → server exits on EOF
+        let _ = self.child.wait();
+        let mut child = spawn_with_env(self.home.path(), self.workspace.path(), &[]);
+        let stdin = child.stdin.take().unwrap();
+        let reader = BufReader::new(child.stdout.take().unwrap());
+        let mut conv = Conversation {
+            child,
+            stdin: Some(stdin),
+            reader,
+            home: self.home,
+            workspace: self.workspace,
+        };
+        conv.send(&initialize(1, "2025-11-25"));
+        conv.recv_id(1);
+        conv.send(&initialized());
+        conv
+    }
+
     fn start_full(
         api_url: Option<&str>,
         extra_env: &[(&str, &str)],
@@ -1496,5 +1519,108 @@ fn vault_add_retry_without_a_label_does_not_duplicate() {
     assert_success(&other, "alf_vault_add", &schema);
     let list2 = conv.call(8, "alf_vault_list", json!({}));
     assert_eq!(list2["structuredContent"]["count"], 2);
+    conv.finish();
+}
+
+// ===========================================================================
+// MIN-3 — the first-sync crash window (upload landed, state did not)
+// ===========================================================================
+
+/// The on-disk state a SIGKILL between `upload_snapshot` and `persist_local`
+/// leaves behind: cloud has the snapshot, this machine has neither state file
+/// nor base — only the in-flight marker written just before the upload.
+fn simulate_crash_after_first_upload(home: &Path, with_marker: bool) {
+    let state = home.join(".alf").join("state");
+    let _ = std::fs::remove_file(state.join(format!("{TOY_AGENT_ID}.toml")));
+    let _ = std::fs::remove_file(state.join(format!("{TOY_AGENT_ID}-snapshot.alf")));
+    let marker = state.join(format!("{TOY_AGENT_ID}.first-sync-inflight"));
+    if with_marker {
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(&marker, "in-flight\n").unwrap();
+    } else {
+        let _ = std::fs::remove_file(&marker);
+    }
+}
+
+/// MIN-3: after the crash window, a restarted server must SELF-HEAL — adopt
+/// the snapshot it already uploaded as the local base and land the current
+/// workspace on top — instead of parking on `sync_first_sync_conflict` and
+/// asking a human to resolve a "fork" that is its own upload.
+#[test]
+fn first_sync_crash_window_self_heals_on_restart() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    // A real first sync: registers the agent and uploads snapshot sequence 1.
+    let first = conv.call(3, "alf_sync", json!({}));
+    assert_success(&first, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(1));
+
+    // …then the kill, right after the upload landed.
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ true);
+    // The workspace moved on between the crash and the restart — the recovery
+    // must carry this change, not silently stamp state and drop it.
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-07.md"),
+        "## Post-crash\n\nWritten after the kill, before the restart.\n",
+    )
+    .unwrap();
+
+    let mut conv = conv.restart();
+    let healed = conv.call(4, "alf_sync", json!({}));
+    assert_success(&healed, "alf_sync", &conv.schema_for("alf_sync"));
+    let sc = &healed["structuredContent"];
+    assert_eq!(
+        sc["delta"], true,
+        "recovery lands the workspace as a delta on the adopted base: {sc}"
+    );
+    assert_eq!(
+        backend.delta_count(TOY_AGENT_ID),
+        1,
+        "exactly one delta — the post-crash change"
+    );
+    assert_eq!(
+        backend.latest_sequence(TOY_AGENT_ID),
+        Some(2),
+        "no duplicate snapshot: history advanced 1 → 2"
+    );
+
+    // The marker is cleared, so a later genuine conflict still parks.
+    let marker = conv
+        .home
+        .path()
+        .join(".alf/state")
+        .join(format!("{TOY_AGENT_ID}.first-sync-inflight"));
+    assert!(!marker.exists(), "the in-flight marker must be cleared");
+    conv.finish();
+}
+
+/// The E3 guard is NOT weakened: the same cloud-side conflict WITHOUT this
+/// machine's in-flight marker is a genuine fork and still refuses to upload.
+#[test]
+fn first_sync_conflict_without_the_marker_still_refuses() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    let first = conv.call(3, "alf_sync", json!({}));
+    assert_success(&first, "alf_sync", &conv.schema_for("alf_sync"));
+
+    // Same lost local state — but no marker, i.e. this machine never uploaded
+    // (the agent came from somewhere else).
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ false);
+
+    let mut conv = conv.restart();
+    let forked = conv.call(4, "alf_sync", json!({}));
+    assert_tool_error(&forked, "alf_sync");
+    let text = forked["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("already exists in the cloud"),
+        "the fork refusal must still name the E3 case: {text}"
+    );
+    assert_eq!(
+        backend.delta_count(TOY_AGENT_ID),
+        0,
+        "a parked fork uploads nothing"
+    );
     conv.finish();
 }

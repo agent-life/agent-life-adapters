@@ -181,7 +181,7 @@ impl WatchHandle {
         self.engine
             .lock()
             .expect("watch engine mutex")
-            .set_sources(specs);
+            .set_sources(specs, self.now());
     }
 
     /// Park the engine directly — unit-test seam for the un-park gestures.
@@ -725,7 +725,7 @@ pub async fn run_loop(
     }
     {
         let mut e = handle.engine.lock().expect("watch engine mutex");
-        e.set_sources(&surface.sync_specs);
+        e.set_sources(&surface.sync_specs, handle.now());
         e.mark_all_dirty(handle.now()); // catch-up scan (design §5.2)
     }
     // The surface is registered and syncs are reachable → the loop is genuinely
@@ -996,8 +996,13 @@ async fn run_due(
             e.record_result(now, Err(class));
         }
         Err(join) => {
+            // The task panicked (or was cancelled). Record it as a real failure
+            // class: `abort_in_flight` alone preserved the dirty flags and left
+            // `last_fire` untouched, so the next tick re-authorized the same
+            // sync — a deterministic panic hot-looped forever with nothing in
+            // `alf_status` (MIN-5).
             eprintln!("alf mcp serve: watch sync task failed: {join}");
-            e.abort_in_flight();
+            e.record_result(now, Err(SyncErrorClass::Panicked));
         }
     }
 }
@@ -1117,7 +1122,7 @@ fn refresh_surface(
     };
     {
         let mut e = handle.engine.lock().expect("watch engine mutex");
-        e.set_sources(&next.sync_specs);
+        e.set_sources(&next.sync_specs, handle.now());
     }
     if let Some(watcher) = watcher {
         // Compute the notify targets the new surface wants, drop the rest.
@@ -1608,7 +1613,7 @@ mod tests {
         let handle = WatchHandle::new(WatchConfig::default());
         {
             let mut e = handle.engine.lock().unwrap();
-            e.set_sources(&[spec]);
+            e.set_sources(&[spec], Duration::ZERO);
             // Drain the catch-up dirty so the rescan's mark is observable.
             assert!(matches!(e.poll(Duration::ZERO), Tick::Sync(_)));
             e.record_result(Duration::ZERO, Ok(()));
@@ -1723,7 +1728,7 @@ mod tests {
         let handle = WatchHandle::new(cfg);
         {
             let mut e = handle.engine.lock().unwrap();
-            e.set_sources(&[WatchSpec::file("journal", "/ws/j.md")]);
+            e.set_sources(&[WatchSpec::file("journal", "/ws/j.md")], Duration::ZERO);
             assert!(matches!(e.poll(Duration::ZERO), Tick::Sync(_)));
             e.record_result(Duration::ZERO, Err(SyncErrorClass::Fatal));
             assert!(e.is_parked());

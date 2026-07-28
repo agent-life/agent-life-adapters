@@ -221,6 +221,12 @@ pub enum SyncErrorClass {
     /// Config/authorization (no API key, disabled agent, drift). Park with the
     /// coded error; a session change (`alf_watch_set`, re-config) is required.
     Fatal,
+    /// The sync task itself panicked (a `spawn_blocking` JoinError). Not a sync
+    /// outcome at all — a bug — so it gets the same posture as `Auth`: back off
+    /// (a one-off panic must not need a human), then park with `watch_panicked`
+    /// once the budget is spent, because a deterministic panic will not fix
+    /// itself and must never hot-loop silently (MIN-5).
+    Panicked,
 }
 
 impl SyncErrorClass {
@@ -340,10 +346,14 @@ pub struct WatchEngine {
     /// Consecutive `Auth` failures. 401/403 parks after a small budget
     /// (manual §4.2): one blip retries, a dead key parks with `auth_failed`.
     auth_attempts: u32,
+    /// Consecutive sync-task panics; mirrors `auth_attempts` (MIN-5).
+    panic_attempts: u32,
 }
 
 /// Auth failures back off this many times before parking.
 const AUTH_ATTEMPT_BUDGET: u32 = 3;
+/// Sync-task panics back off this many times before parking.
+const PANIC_ATTEMPT_BUDGET: u32 = 3;
 
 /// Every park code the engine can emit — the single source of truth the docs
 /// drift test pins `docs/cli-reference.md` (and the user manual) against.
@@ -357,6 +367,7 @@ pub const PARK_CODES: &[&str] = &[
     "sync_missing_base_unresolved",
     "sync_poisoned_base_unresolved",
     "auth_failed",
+    "watch_panicked",
     "lock_unavailable",
 ];
 
@@ -373,6 +384,7 @@ impl WatchEngine {
             in_flight: Vec::new(),
             in_flight_recover: false,
             auth_attempts: 0,
+            panic_attempts: 0,
         }
     }
 
@@ -397,14 +409,20 @@ impl WatchEngine {
             self.backoff = None;
             self.recover_attempted = false;
             self.auth_attempts = 0;
+            self.panic_attempts = 0;
         }
     }
 
     /// (Re)register the watch surface. Existing source state is preserved by id
     /// (so a dynamic re-registration — hermes profile re-discovery, M5 — does not
     /// lose dirty/last_fire); new ids start dirty (catch-up); vanished ids drop.
-    /// `now` stamps the catch-up dirty time for genuinely new sources.
-    pub fn set_sources(&mut self, specs: &[WatchSpec]) {
+    /// `now` stamps `pending_since` for genuinely new sources. It must be the
+    /// CURRENT time, not the loop's start: a source introduced by a mid-session
+    /// refresh (`alf_track`, a new hermes profile) that inherited
+    /// `pending_since = 0` tripped the 24 h never-quiesced alarm instantly on
+    /// any server up longer than a day, the moment its file was edited and it
+    /// sat in the ordinary 3 s quiesce window (MIN-4).
+    pub fn set_sources(&mut self, specs: &[WatchSpec], now: Mono) {
         let mut next: BTreeMap<String, SourceState> = BTreeMap::new();
         for spec in specs {
             let interval = self.config.interval_for(&spec.id, spec.tracked);
@@ -425,7 +443,7 @@ impl WatchEngine {
                             dirty_count: 1,
                             last_change: None,
                             last_fire: None,
-                            pending_since: Some(Duration::ZERO),
+                            pending_since: Some(now),
                         },
                     );
                 }
@@ -566,6 +584,7 @@ impl WatchEngine {
                 self.recover_pending = false;
                 self.in_flight_recover = false;
                 self.auth_attempts = 0;
+                self.panic_attempts = 0;
             }
             Err(class) => {
                 self.in_flight.clear();
@@ -612,6 +631,27 @@ impl WatchEngine {
                                     .into(),
                             ),
                         });
+                    }
+                    SyncErrorClass::Panicked => {
+                        self.panic_attempts = self.panic_attempts.saturating_add(1);
+                        if self.panic_attempts >= PANIC_ATTEMPT_BUDGET {
+                            self.parked = Some(ParkError {
+                                code: "watch_panicked".into(),
+                                message: "Auto-sync parked: the sync task panicked \
+                                          repeatedly."
+                                    .into(),
+                                hint: Some(
+                                    "This is a bug — the panic is on the server's stderr. \
+                                     Fix or remove the offending workspace file, then a \
+                                     successful manual alf_sync resumes auto-sync."
+                                        .into(),
+                                ),
+                            });
+                        } else {
+                            // Back off even below the budget: without this a
+                            // deterministic panic re-fires every tick forever.
+                            self.apply_backoff(now);
+                        }
                     }
                     SyncErrorClass::Fatal => {
                         self.parked = Some(ParkError {
@@ -675,6 +715,7 @@ impl WatchEngine {
         self.recover_attempted = false;
         self.recover_pending = false;
         self.auth_attempts = 0;
+        self.panic_attempts = 0;
     }
 
     /// Park the loop from the driver side (e.g. `lock_unavailable` — the
@@ -768,8 +809,53 @@ mod tests {
         };
         cfg.set_default(DELTA_FLOOR);
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("journal", false)]);
+        e.set_sources(&[spec("journal", false)], Duration::ZERO);
         e
+    }
+
+    /// MIN-4: a source registered by a MID-SESSION surface refresh (alf_track,
+    /// a new hermes profile) must be stamped with the current time, not the
+    /// loop's start. With `pending_since = 0` the 24 h "never quiesced" alarm
+    /// is instantly true on any long-lived server, so a seconds-old file that
+    /// is merely inside its ordinary 3 s quiesce window reports a day-long
+    /// stall.
+    #[test]
+    fn a_source_added_after_24h_does_not_report_a_stall() {
+        let mut e = engine_one_source(secs(3));
+        let day = 24 * 60 * 60;
+        let t = secs(day + 100); // the server has been up for over a day
+
+        // Mid-session refresh introduces a new source…
+        e.set_sources(&[spec("journal", false), spec("newly-tracked", false)], t);
+        // …the agent edits it, so it is dirty and inside the quiesce window.
+        e.mark_dirty("newly-tracked", t + secs(1));
+
+        let snap = e.snapshot(t + secs(2));
+        let fresh = snap
+            .sources
+            .iter()
+            .find(|s| s.source == "newly-tracked")
+            .expect("new source present");
+        assert!(fresh.dirty, "precondition: the new source is dirty");
+        assert!(
+            !fresh.never_quiesced_warning,
+            "a source seconds old must not report a 24 h stall"
+        );
+
+        // The alarm still works for a source that genuinely never settles.
+        for i in 0..(day + 30) {
+            e.mark_dirty("newly-tracked", t + secs(2 + i));
+        }
+        let churning = e.snapshot(t + secs(day + 32));
+        let churning = churning
+            .sources
+            .iter()
+            .find(|s| s.source == "newly-tracked")
+            .unwrap();
+        assert!(
+            churning.never_quiesced_warning,
+            "a genuinely stuck source must still warn"
+        );
     }
 
     #[test]
@@ -850,7 +936,7 @@ mod tests {
         };
         cfg.set_tracked(TRACKED_FLOOR); // 15-minute floor — the cadence the DoD names
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("tracked-files", true)]);
+        e.set_sources(&[spec("tracked-files", true)], Duration::ZERO);
         // Drain catch-up.
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
@@ -912,7 +998,7 @@ mod tests {
         let mut e = WatchEngine::new(cfg);
         let mut db = spec("brain.db", false);
         db.sqlite = true; // structural hint only; inert for scheduling
-        e.set_sources(&[db]);
+        e.set_sources(&[db], Duration::ZERO);
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
         // A change → must wait out the quiesce window, DB or not.
@@ -931,7 +1017,7 @@ mod tests {
         };
         cfg.set_default(DELTA_FLOOR);
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("a", false), spec("b", false)]);
+        e.set_sources(&[spec("a", false), spec("b", false)], Duration::ZERO);
         // Drain the catch-up (both new sources start with last_change None).
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
@@ -958,7 +1044,7 @@ mod tests {
         };
         cfg.set_default(DELTA_FLOOR);
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("journal", false)]);
+        e.set_sources(&[spec("journal", false)], Duration::ZERO);
         e.mark_all_dirty(secs(0));
         assert_eq!(e.poll(secs(1)), Tick::Idle, "1s < 3s window");
         assert!(matches!(e.poll(secs(3)), Tick::Sync(_)));
@@ -1089,7 +1175,10 @@ mod tests {
         e.record_result(secs(0), Ok(())); // journal now clean, last_fire=0
 
         // Re-register with journal + a new source (hermes profile re-discovery).
-        e.set_sources(&[spec("journal", false), spec("profile-b", false)]);
+        e.set_sources(
+            &[spec("journal", false), spec("profile-b", false)],
+            Duration::ZERO,
+        );
         // journal keeps its clean/last_fire state; profile-b is dirty (catch-up).
         let snap = e.snapshot(secs(1));
         let journal = snap.sources.iter().find(|s| s.source == "journal").unwrap();
@@ -1112,7 +1201,7 @@ mod tests {
         };
         cfg.set_per_source("journal", secs(120));
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("journal", false)]);
+        e.set_sources(&[spec("journal", false)], Duration::ZERO);
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
         e.mark_dirty("journal", secs(61));
@@ -1133,7 +1222,10 @@ mod tests {
         cfg.set_default(DELTA_FLOOR);
         cfg.set_tracked(TRACKED_FLOOR);
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("journal", false), spec("tracked-files", true)]);
+        e.set_sources(
+            &[spec("journal", false), spec("tracked-files", true)],
+            Duration::ZERO,
+        );
         // Drain the catch-up tick (both sources never fired → both due).
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
@@ -1167,7 +1259,7 @@ mod tests {
         cfg.set_default(DELTA_FLOOR);
         cfg.set_per_source("kb", secs(300));
         let mut e = WatchEngine::new(cfg);
-        e.set_sources(&[spec("journal", false), spec("kb", false)]);
+        e.set_sources(&[spec("journal", false), spec("kb", false)], Duration::ZERO);
         assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
         e.record_result(secs(0), Ok(()));
 
@@ -1287,6 +1379,80 @@ mod tests {
         );
     }
 
+    /// MIN-5: a panicking sync task used to only clear the single-flight guard
+    /// — dirty flags preserved, `last_fire` untouched — so the very next tick
+    /// re-authorized the same sync. A deterministic panic in the export path
+    /// (a bad unwrap on one workspace file) therefore hot-looped forever at the
+    /// tick rate with NOTHING in `alf_status`: no backoff, no park, just
+    /// stderr spam. A panic is now a first-class failure class: back off, then
+    /// park with a distinct code.
+    #[test]
+    fn a_panicking_sync_backs_off_then_parks() {
+        let mut e = engine_one_source(Duration::ZERO);
+
+        // First panic: backs off (the hot loop stops immediately) and does NOT
+        // park — a one-off panic should not need human intervention.
+        assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
+        e.record_result(secs(0), Err(SyncErrorClass::Panicked));
+        assert!(!e.is_parked(), "one panic must not park");
+        assert_eq!(
+            e.poll(secs(1)),
+            Tick::Idle,
+            "a panicking sync must not re-fire on the next tick"
+        );
+        let snap = e.snapshot(secs(1));
+        assert!(
+            snap.backoff_retry_in.is_some(),
+            "the backoff must be visible in alf_status"
+        );
+
+        // Repeated panics exhaust the budget and park with the distinct code.
+        let mut t = 5;
+        for _ in 0..2 {
+            assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+            e.record_result(secs(t), Err(SyncErrorClass::Panicked));
+            t += 20;
+        }
+        let parked = e.snapshot(secs(t)).parked.expect("parked after the budget");
+        assert_eq!(parked.code, "watch_panicked");
+        assert!(
+            parked.hint.is_some_and(|h| h.contains("stderr")),
+            "the hint must point at where the panic was logged"
+        );
+    }
+
+    /// A panic budget must not be sticky: a success in between clears it, so
+    /// unrelated one-off panics days apart never accumulate into a park.
+    #[test]
+    fn a_successful_sync_resets_the_panic_budget() {
+        let mut e = engine_one_source(Duration::ZERO);
+        // Two panics, each waiting out its own backoff (5 s, then 10 s).
+        let mut t = 0u64;
+        for gap in [6u64, 20] {
+            assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+            e.record_result(secs(t), Err(SyncErrorClass::Panicked));
+            t += gap;
+        }
+        assert!(!e.is_parked(), "two panics are still under the budget");
+
+        // A clean sync in between — which also clears the dirty flag, so the
+        // source has to change again (and wait out its 60 s interval) before
+        // the next sync is due.
+        assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+        e.record_result(secs(t), Ok(()));
+        e.mark_dirty("journal", secs(t + 1));
+        t += 61;
+
+        // Budget reset: two more panics still do not park (cumulatively four —
+        // which WOULD have parked without the reset).
+        for gap in [6u64, 20] {
+            assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+            e.record_result(secs(t), Err(SyncErrorClass::Panicked));
+            t += gap;
+        }
+        assert!(!e.is_parked(), "the success reset the panic budget");
+    }
+
     #[test]
     fn every_park_path_emits_a_code_listed_in_park_codes() {
         // Drive every engine park path and pin the emitted set against
@@ -1321,6 +1487,17 @@ mod tests {
             for gap in [5u64, 10, 0] {
                 assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
                 e.record_result(secs(t), Err(SyncErrorClass::Auth));
+                t += gap;
+            }
+            emitted.insert(e.snapshot(secs(t)).parked.unwrap().code);
+        }
+        // Panics park on the third, like Auth (each waits out its backoff).
+        {
+            let mut e = engine_one_source(Duration::ZERO);
+            let mut t = 0;
+            for gap in [6u64, 20, 0] {
+                assert!(matches!(e.poll(secs(t)), Tick::Sync(_)));
+                e.record_result(secs(t), Err(SyncErrorClass::Panicked));
                 t += gap;
             }
             emitted.insert(e.snapshot(secs(t)).parked.unwrap().code);

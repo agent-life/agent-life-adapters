@@ -12,9 +12,9 @@ This guide replaces the per-release runbooks. For any release after v0.1.5, foll
 
 | Artifact | Repo / location | Versioning |
 |---|---|---|
-| `alf` CLI binaries | `agent-life-adapters`, GitHub Releases | Semver (`v0.x.y`) |
+| `alf` CLI binaries | `agent-life-adapters`, GitHub Releases | Semver (`vX.Y.Z`) |
 | `skills/agent-life/SKILL.md` | `agent-life-adapters`, published to ClawHub | Independent semver (`1.x.y`) |
-| `docs/cli.md` and `docs/cli` (rendered) | `agent-life-web`, served from `agent-life.ai/docs/` | Tracks the CLI release |
+| `docs/cli.md` and `docs/cli` (rendered) | **`agent-life-adapters`** — `docs/cli-reference.md`, auto-published to `agent-life.ai/docs/cli{,.md}` by `release.yml` on every `v*` tag | Tracks the CLI release |
 | Other web docs (vault guide, etc.) | `agent-life-web` | Untracked; deploy on demand |
 
 CLI and skill versions are independent on purpose: a SKILL.md wording fix shouldn't require a CLI release, and a CLI patch shouldn't force a skill republish.
@@ -25,11 +25,11 @@ CLI and skill versions are independent on purpose: a SKILL.md wording fix should
 
 ### CLI (`alf`)
 
-While in 0.x:
+Since 1.0.0 (the format spec and the JSON output contract are committed):
 
-- **`y` bump** (`0.1.5` → `0.1.6`): bug fixes, internal refactors, non-breaking additions.
-- **`x` bump** (`0.1.x` → `0.2.0`): new features, breaking changes to CLI flags or JSON output. Acceptable in 0.x — semver permits breaking changes between minor versions before 1.0.
-- **`1.0.0`**: ship when the ALF format spec is frozen and the CLI's JSON output contract is something we're willing to commit to for a year+.
+- **patch** (`1.1.0` → `1.1.1`): bug fixes, internal refactors, no contract change.
+- **minor** (`1.1.x` → `1.2.0`): additive features — new commands, flags, JSON fields, MCP tools. Existing callers keep working.
+- **major** (`1.x` → `2.0.0`): a breaking change to CLI flags, exit codes, the JSON output contract, or the archive format.
 
 ### Skill (`agent-life` on ClawHub)
 
@@ -164,12 +164,25 @@ Canonical pre-release lifecycle runs (real install + real backend; see
     python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --interactive
     python3 tests/lifecycle/driver.py --framework zeroclaw --llm proxy --backend real --no-pause
 
-Scheduled live gates (run once per release, keep the artifact — see
-[tests/lifecycle/README.md](tests/lifecycle/README.md) §"Scheduled live gates"):
-the **hermes-mcp** MCP-LLM tier (`./test.sh lifecycle-mcp-llm`) and the
-**pre-upload abort catch-up** gate (`preupload_abort_catchup_gate.py`; formerly
-"kill-9" — it exercises a cooperative `exit(137)` at the pre-upload seam, not a
-kernel SIGKILL).
+Scheduled live gates (run once per release, keep the artifacts — see
+[tests/lifecycle/README.md](tests/lifecycle/README.md) §"Scheduled live gates").
+Run the whole live set in one command, which prints a combined summary and a
+`<!-- LIFECYCLE-RUN … -->` verdict line:
+
+    python3 tests/lifecycle/run_all.py --set live --yes-live --strict
+
+That covers the zeroclaw proxy/real tier, the **hermes-mcp** MCP-LLM tier
+(Z15 + the Z16 watch auto-sync gate) and the **Z17** multi-agent watch + vault
+round-trip. `--yes-live` is required: these mint a runtime key, create cloud
+agents and drive a real LLM. `--strict` makes a missing prerequisite a failure
+rather than a skip, which is what a release run wants.
+
+Do NOT use `./test.sh lifecycle-mcp-llm` as the release gate: that tier is
+`--stages Z1-Z3,Z15` only and covers neither Z16 nor Z17.
+
+Separately, the **pre-upload abort catch-up** gate
+(`preupload_abort_catchup_gate.py`; formerly "kill-9" — it exercises a
+cooperative `exit(137)` at the pre-upload seam, not a kernel SIGKILL).
 
 If the JSON contract changed:
 
@@ -199,9 +212,19 @@ If the release workflow uses a different trigger pattern, document it in this gu
 
 ### 5. Update web docs
 
-In `agent-life-web`:
+**The CLI reference publishes itself.** `release.yml`'s `upload-s3` job renders
+this repo's `docs/cli-reference.md` with pandoc and uploads it to
+`s3://$BUCKET/docs/cli/index.html` and `/docs/cli.md` on every `v*` tag — so the
+CLI docs are edited HERE, in `docs/cli-reference.md`, and never hand-copied into
+`agent-life-web`. The pandoc step is deliberately non-fatal, so **check it
+actually succeeded** in the workflow log rather than assuming.
 
-- Update `/docs/cli.md` and `/docs/cli` (rendered) for any flag, field, or schema changes.
+In `agent-life-web` (only what the auto-publish does not cover):
+
+- The web app renders its own `/docs/cli` page from a checked-in copy plus a
+  hardcoded TOC (`constants/cliReferenceNav.ts`). A new `##` section in
+  `cli-reference.md` will NOT appear in that page's navigation until the TOC is
+  updated there — the S3 upload alone is not enough.
 - Update any other docs the SKILL.md links to (e.g. `/docs/vault`).
 - Deploy to production.
 
@@ -292,7 +315,7 @@ struct Issue {
 }
 ```
 
-Document the deprecation in the CHANGELOG. Drop the deprecated field in the next minor (in 0.x) or major (post-1.0) version. This pattern works for any JSON field rename; don't apply it preemptively (it adds noise) but keep it ready.
+Document the deprecation in the CHANGELOG. Drop the deprecated field in the next major version. This pattern works for any JSON field rename; don't apply it preemptively (it adds noise) but keep it ready.
 
 ---
 
@@ -336,7 +359,7 @@ Document things that surprised us; future-us will be grateful.
 2. **`clawhub skill publish` flag set.** The `--version` flag is assumed; the canonical command may differ. Verify against `clawhub skill publish --help` and update the Step 6 commands if needed.
 3. **Web docs deploy timing.** `agent-life-web` deploys may have a delay between merge and live URL. Step 5 includes a `curl` verification; if the doc isn't live within the SSR build window, hold the skill publish.
 4. **Code Insight cache.** Anecdotally, Code Insight verdicts can lag a publish by 10–20 minutes. If Step 7 polling completes but the VirusTotal page still shows the old verdict, refresh after 15 minutes before concluding the rescan didn't work.
-5. **ClawHub skill versioning vs. CLI versioning drift.** Skill `1.x.0` numbers tend to outpace CLI `0.x.y` numbers because skill bumps fire on every wording change. Don't try to align them; document the dependency (e.g. "skill 1.5.0 requires CLI >= 0.1.5") in the skill changelog and let them drift.
+5. **ClawHub skill versioning vs. CLI versioning drift.** Skill and CLI version numbers drift because skill bumps fire on every wording change. Don't try to align them; document the dependency (e.g. "skill 2.0.0 requires CLI >= 1.1.0") in the skill changelog and let them drift.
 6. **The "Common Errors and Fixes" section title.** The word "fix" in a section header is fine — Code Insight cares about JSON field semantics, not headings. Don't preemptively rename to avoid a non-issue.
 
 ---

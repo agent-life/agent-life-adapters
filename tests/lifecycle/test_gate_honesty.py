@@ -14,6 +14,8 @@ import importlib.util
 import unittest
 from pathlib import Path
 
+from alflab import provision
+
 _W1 = Path(__file__).resolve().parent / "w1_walkthrough.py"
 _SPEC = importlib.util.spec_from_file_location("w1_walkthrough", _W1)
 w1 = importlib.util.module_from_spec(_SPEC)
@@ -103,6 +105,39 @@ class StagesSourceContractTest(unittest.TestCase):
         self.assertIn("Z17 vault round-trip precondition", self.src)
         self.assertIn("every local ciphertext copy deleted", self.src)
 
+
+class LeakScanTrustTest(unittest.TestCase):
+    """NEW-1: the leak scan is an audit — it must see EVERY tenant's agents.
+    `agents` carries RLS keyed on a session GUC, so a connection that does not
+    bypass RLS would return one tenant's subset and the tool would print
+    "clean" while other tenants' agents leaked. A silent partial audit is worse
+    than a crash; this refuses to answer instead."""
+
+    class _Db:
+        def __init__(self, row):
+            self.row = row
+
+        def query(self, sql, params=None):
+            return [self.row]
+
+    def test_a_bypassing_role_is_trusted(self):
+        provision.assert_scan_sees_everything(
+            self._Db({"role": "neondb_owner", "bypass": True, "tenant": ""}))
+
+    def test_a_non_bypassing_role_is_refused(self):
+        with self.assertRaises(provision.ScanUntrustworthy) as ctx:
+            provision.assert_scan_sees_everything(
+                self._Db({"role": "app_user", "bypass": False, "tenant": ""}))
+        self.assertIn("does NOT bypass", str(ctx.exception))
+
+    def test_the_refusal_names_a_pinned_tenant(self):
+        # The dangerous case: RLS active AND a tenant pinned — the scan would
+        # quietly return that tenant's rows only.
+        with self.assertRaises(provision.ScanUntrustworthy) as ctx:
+            provision.assert_scan_sees_everything(self._Db(
+                {"role": "app_user", "bypass": False,
+                 "tenant": "3c94ff20-7c28-4f9a-86e6-2262d4144172"}))
+        self.assertIn("3c94ff20", str(ctx.exception))
 
 if __name__ == "__main__":
     unittest.main()

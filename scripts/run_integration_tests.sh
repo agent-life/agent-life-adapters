@@ -17,8 +17,21 @@ if ! command -v git &> /dev/null; then
 fi
 
 # 2. Set up Python environment
+#
+# `--user` is INVALID inside a virtualenv — pip refuses with "Can not perform a
+# '--user' install. User site-packages are not visible in this virtualenv." This
+# repo ships a venv/, so a developer with it active hit an immediate exit 1 (the
+# `integration` tier of ./test.sh failing in 0s). Install into whichever
+# environment is actually active instead. `python3 -m pip` (not `pip3`)
+# guarantees it is the same interpreter that runs generate_synthetic_data.py
+# below.
 echo "-> Installing requirements..."
-pip3 install --user -r scripts/requirements.txt
+if python3 -c 'import sys; sys.exit(0 if sys.prefix != sys.base_prefix else 1)'; then
+    echo "   (virtualenv detected: $(python3 -c 'import sys; print(sys.prefix)'))"
+    python3 -m pip install -q -r scripts/requirements.txt
+else
+    python3 -m pip install -q --user -r scripts/requirements.txt
+fi
 
 # 3. Clone / Update schemas from upstream
 SCHEMA_REPO_DIR="/tmp/agent-life-data-format"

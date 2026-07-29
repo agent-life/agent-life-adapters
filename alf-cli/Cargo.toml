@@ -39,10 +39,10 @@ uuid = { version = "1", features = ["v7"] }
 # blocking reqwest — the new weight is rmcp/schemars only (see WP-M2a handoff).
 # P4 re-check (WP-M6, 2026-07-08): 2.1.0 is the latest published rmcp and it
 # already lists 2026-07-28 in KNOWN_VERSIONS, so it echo-negotiates every
-# revision through the RC (design §4/F16). Locked to 2.1.0 in Cargo.lock. The
-# 2026-07-28 spec FINAL had not published as of the pin date; its choices (stderr
-# logging, no sampling/roots/tasks) match design §4, so no change is expected —
-# the human re-verifies the final text at/after 2026-07-28 before the release cut.
+# revision through the RC (design §4/F16). Locked to 2.1.0 in Cargo.lock.
+# Final re-verified 2026-07-29: no relevant change for this stdio server (all
+# breaks are Streamable-HTTP-scoped or optional extensions; the deprecated
+# capabilities were never used here) — rmcp 3.x adoption is a v1.2 work item.
 rmcp = { version = "2.1", default-features = false, features = ["server", "macros", "transport-io"] }
 schemars = { version = "1", features = ["chrono04", "uuid1"] }
 tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "sync", "io-std", "macros", "time"] }
@@ -63,7 +63,10 @@ predicates = "3"
 serde_json = "1"
 shlex = "1"
 # MCP stdout-discipline harness: validate tool `structuredContent` against each
-# tool's declared `outputSchema`.
-jsonschema = "0.46"
+# tool's declared `outputSchema`. Both schema and instance are already in
+# memory, so the default features are all cost and no benefit: `resolve-http`
+# pulls a SECOND reqwest major plus rustls/aws-lc-sys (a cmake C build) into
+# every `cargo test --workspace`, for remote `$ref` fetching this never does.
+jsonschema = { version = "0.46", default-features = false }
 
 

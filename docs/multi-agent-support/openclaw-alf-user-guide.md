@@ -68,6 +68,8 @@ Each agent's backup contains **only that agent's directory**. Because OpenClaw k
 
 ALF does **not** back up OpenClaw's gateway state database (`state/openclaw.sqlite` — auth, routing, and scheduling bookkeeping shared across the whole install). That isn't agent memory, so it stays out of scope.
 
+ALF does not filter what your agent remembers. Memory is captured as written — not inspected, classified, or redacted — so a credential recorded in `MEMORY.md` or the `memory/` folder is included like any other memory, and is readable wherever that backup reaches: the archive, any restore of it, and the dashboard. Keep credentials in the encrypted vault instead (below); vault entries are encrypted on your machine, and the service never receives the key.
+
 ### Your agent curates its memory — ALF keeps up
 
 OpenClaw agents don't just append to `MEMORY.md`; they **curate** it — rewriting sections, re-ranking them, dropping notes that stopped mattering. ALF tracks this precisely: each memory keeps a stable identity across edits, so a rewritten section syncs as *that memory, updated* (one small delta), a re-shuffle costs nothing, and your dashboard shows one memory evolving over time rather than a churn of unrelated entries.

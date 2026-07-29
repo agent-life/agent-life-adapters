@@ -309,6 +309,7 @@ def leak_scan(db, manifests_glob: list[Path]) -> list[dict]:
                 known.add(m.seed_agent_id)
         except (OSError, json.JSONDecodeError, TypeError):
             continue
+    assert_scan_sees_everything(db)
     rows = db.query(
         "SELECT a.id::text AS id, a.name, a.created_at::text AS created_at "
         "FROM agents a JOIN tenants t ON t.id = a.tenant_id "
@@ -316,6 +317,42 @@ def leak_scan(db, manifests_glob: list[Path]) -> list[dict]:
         "AND a.name NOT LIKE 'Local %'"
     )
     return [r for r in rows if r["id"] not in known]
+
+
+class ScanUntrustworthy(RuntimeError):
+    """The leak scan cannot see the whole table, so a clean result would be a
+    lie. Raised instead of returning a possibly-partial answer."""
+
+
+def assert_scan_sees_everything(db) -> None:
+    """A leak scan is an audit: it must see EVERY tenant's agents.
+
+    `agents` has row-level security keyed on `current_setting('app.current_tenant')`
+    (service migrations 002/012). The harness normally connects as an owner role
+    that bypasses RLS, but nothing guaranteed it: a non-bypassing role with the
+    tenant GUC set — trivially possible on a POOLED endpoint, where a session is
+    reused with whatever the previous borrower left behind — would silently
+    return that tenant's subset, and the scan would report "clean" while other
+    tenants' agents leaked. That silent-subset case is the dangerous one; the
+    loud variant (an EMPTY GUC, `""::uuid`) is what crashed this tool on
+    2026-07-28 with a raw traceback.
+
+    Fail loudly instead: an audit that cannot prove it saw everything must not
+    return a verdict."""
+    row = db.query(
+        "SELECT current_user AS role, "
+        "coalesce((SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user), false) "
+        "AS bypass, "
+        "coalesce(current_setting('app.current_tenant', true), '') AS tenant"
+    )[0]
+    if row["bypass"]:
+        return  # RLS does not apply — the scan sees the whole table
+    raise ScanUntrustworthy(
+        f"connected as {row['role']!r}, which does NOT bypass row-level security"
+        + (f" and has app.current_tenant={row['tenant']!r}" if row["tenant"] else "")
+        + " — the scan would see one tenant's rows at most and could report "
+          "'clean' while agents leak. Point NEON_DATABASE_URL at the owner role."
+    )
 
 
 def utc_ts() -> str:

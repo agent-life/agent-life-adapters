@@ -674,7 +674,24 @@ def leak_scan_cli(cfg: HarnessConfig) -> int:
     from .backend import DbClient
     db = DbClient(cfg.db_url)
     manifests = sorted((LIFECYCLE_DIR / "runs").glob("*/run-manifest.json"))
-    rows = provision.leak_scan(db, manifests)
+    # A safety tool must fail as a VERDICT, never as a traceback: an operator
+    # checking for leaks after a crashed run reads the exit code, and a stack
+    # trace scrolling past is easy to mistake for noise. One retry covers the
+    # pooled-endpoint transients this hit on 2026-07-28.
+    try:
+        rows = provision.leak_scan(db, manifests)
+    except provision.ScanUntrustworthy as e:
+        ui.fail(f"leak scan REFUSED — {e}")
+        return 2
+    except Exception as e:  # noqa: BLE001 — any DB/driver failure
+        try:
+            rows = provision.leak_scan(db, manifests)
+        except Exception as retry_err:  # noqa: BLE001
+            ui.fail(f"leak scan could NOT run ({type(retry_err).__name__}: "
+                    f"{str(retry_err).strip()[:200]}) — this is NOT a clean result; "
+                    f"re-run, and check the DB lane in .env")
+            return 2
+        ui.emit(f"  (first attempt failed: {type(e).__name__}; retry succeeded)")
     if rows:
         ui.fail(f"{len(rows)} internal-tenant agent(s) unaccounted for by runs/:")
         for r in rows:

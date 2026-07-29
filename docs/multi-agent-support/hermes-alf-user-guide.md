@@ -69,6 +69,8 @@ Each agent's backup contains **only that profile**. Because Hermes keeps agents 
 
 ALF does **not** back up Hermes's **shared runtime** — the code checkout (`hermes-agent/`), the Hermes-managed `node/`, and `bin/` (uv) that sit under `~/.hermes` alongside your default profile. Those are the program, not your agent's memory, so they stay out of scope. ALF also does not back up the raw `state.db` binary, transient `logs/`, or caches. Your `.env` file — where Hermes keeps runtime secrets — is **never** backed up; for secrets you want to keep, use the vault below.
 
+ALF does not filter what your agent remembers. Memory is captured as written — not inspected, classified, or redacted — so a credential recorded in `memories/`, or captured from a session, is included like any other memory, and is readable wherever that backup reaches: the archive, any restore of it, and the dashboard. Keep credentials in the encrypted vault instead (below); vault entries are encrypted on your machine, and the service never receives the key.
+
 ### How your two memory stores are backed up
 
 A Hermes agent remembers in two ways, and ALF backs up both:

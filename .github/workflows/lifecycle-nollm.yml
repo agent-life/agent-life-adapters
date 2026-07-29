@@ -1,17 +1,25 @@
-# Lifecycle harness — PR guards only.
+# Lifecycle harness self-tests — PR guard.
 #
 # The full container-based lifecycle run is a LOCAL, dev-owned, pre-release
 # check (see tests/lifecycle/README.md), not a CI step: the bind-mounted home
 # dir is created by the container's `agent` user and isn't accessible to the CI
 # runner (uid mismatch across the bind mount), and we deliberately don't run
-# the Z-stage lifecycle in CI. CI keeps only the cheap, container-free guards —
-# the secret-pattern gate and the harness's own unit tests. Those unit tests now
-# include the WP-M4 MCP coverage (test_mcp_client, test_invoker: the stdlib MCP
-# client + the CLI/MCP invoker seam, no alf binary or docker needed;
-# test_mcp_generic skips without a built alf). Run the container lifecycle
-# locally:  python3 tests/lifecycle/driver.py --framework <fw> --llm none --backend none
-# (the MCP-driven generic tier: --framework generic, or `./test.sh lifecycle-generic`).
-name: lifecycle-nollm
+# the Z-stage lifecycle in CI. What CI keeps is the harness's OWN unit tests —
+# container-free, no alf binary needed: redaction + the scenario drift guard,
+# the WP-M4 MCP coverage (test_mcp_client, test_invoker — the stdlib MCP client
+# and the CLI/MCP invoker seam; test_mcp_generic skips without a built alf), the
+# archive identity oracles, the bake/viz-server secret policy, and the
+# gate-honesty pins.
+#
+# The repo-wide secret-pattern gate used to be a second step here. It moved to
+# secret-scan.yml, which is deliberately UNFILTERED: a whole-tree scan must not
+# be conditional on which crate a PR happened to touch (a docs- or
+# fixture-only PR — exactly the kind that carries pasted output — never ran it).
+#
+# Run the container lifecycle locally — one tier, or the whole offline set:
+#   python3 tests/lifecycle/driver.py --framework <fw> --llm none --backend none
+#   python3 tests/lifecycle/run_all.py          (or ./test.sh lifecycle-all)
+name: lifecycle-selftests
 
 on:
   pull_request:
@@ -21,6 +29,10 @@ on:
       - "adapter-openclaw/**"
       - "adapter-zeroclaw/**"
       - "adapter-hermes/**"
+      # adapter-generic's map schema is coupled to the generic/generic-mcp kit
+      # fixtures (tests/lifecycle/frameworks/generic*/fixture/.alf-map.json), so
+      # a change here can invalidate the harness. Missing until 2026-07-28.
+      - "adapter-generic/**"
       - "tests/lifecycle/**"
       - ".github/workflows/lifecycle-nollm.yml"
   push:
@@ -31,22 +43,12 @@ permissions:
   contents: read
 
 jobs:
-  lifecycle:
-    name: lifecycle (${{ matrix.framework }}, no-LLM/no-backend)
+  selftests:
+    name: harness self-tests (container-free)
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        framework: [zeroclaw]
     steps:
       - uses: actions/checkout@v4
 
-      # Secret-pattern gate: no real key shape may exist anywhere in the tree.
-      # (Committed fake markers are …-FAKE-… and do not match; the regex
-      # *pattern* string doesn't match itself — '[' is not alphanumeric.)
-      - name: Secret-pattern gate
-        run: '! git grep -IE "alf_[A-Za-z0-9]{32}"'
-
-      - name: Harness self-tests (redaction + scenario drift guard)
+      - name: Harness self-tests
         run: python3 -m unittest discover -s tests/lifecycle -p 'test_*.py' -v

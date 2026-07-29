@@ -115,6 +115,15 @@ const FAST_WATCH: &[(&str, &str)] = &[
     ("ALF_WATCH_QUIESCE_MS", "100"),
 ];
 
+/// Loop alive, but rate-limited to exactly one sync: a fast tick (so the loop
+/// is genuinely polling, holding its locks and honoring the restore guard) with
+/// the PRODUCTION delta floor, so no second sync can fire inside a test. Lets a
+/// test interleave with a live loop without racing it.
+const WATCH_ALIVE_ONE_SYNC: &[(&str, &str)] = &[
+    ("ALF_WATCH_TICK_MS", "1000"),
+    ("ALF_WATCH_QUIESCE_MS", "100"),
+];
+
 /// Strip the toy map's `watch` block so every source falls back to the env
 /// default cadence (FAST_WATCH's 1 s) — the fixture's own block pins the
 /// journal source to a 5 m interval, which would idle the delta-asserting
@@ -452,6 +461,60 @@ fn negotiation_matrix_echoes_known_revisions() {
             result["protocolVersion"], session.stderr
         );
     }
+}
+
+/// MIN-15: the OTHER half of negotiation — a revision the server does not know.
+/// The spec requires the server to answer with its own latest supported version
+/// (so the client can decide whether to proceed), NOT to echo the unknown string
+/// back and NOT to fail the handshake. Only the echo path was covered, so a
+/// regression here — rmcp changing its fallback, or a future pin echoing
+/// blindly — would break every newer-than-us client with nothing to catch it.
+#[test]
+fn negotiation_falls_back_to_our_latest_for_unknown_revisions() {
+    // A future revision, a far-future one, a malformed date, and outright
+    // garbage: all are "not one of ours" and must resolve the same way.
+    for version in ["2027-01-01", "2099-12-31", "not-a-date", ""] {
+        let session = run_session(&[initialize(1, version)]);
+        let msgs = parse_protocol_stdout(&session.stdout);
+        let response = response_with_id(&msgs, 1);
+        assert!(
+            response.get("error").is_none(),
+            "an unknown revision {version:?} must not fail the handshake: {response}\nstderr:\n{}",
+            session.stderr
+        );
+        let negotiated = &response["result"]["protocolVersion"];
+        assert_eq!(
+            negotiated, "2025-11-25",
+            "unknown revision {version:?} must negotiate down to the server's \
+             latest supported revision, not echo the client's; got {negotiated}"
+        );
+        assert_ne!(
+            negotiated, version,
+            "the server must never echo a revision it does not implement"
+        );
+    }
+}
+
+/// An unknown-revision client is still fully functional after the fallback —
+/// the handshake result is not a dead end.
+#[test]
+fn a_future_client_can_still_call_tools_after_falling_back() {
+    let session = run_session(&[
+        initialize(1, "2099-12-31"),
+        initialized(),
+        call(2, "alf_status", json!({})),
+    ]);
+    let msgs = parse_protocol_stdout(&session.stdout);
+    assert_eq!(
+        response_with_id(&msgs, 1)["result"]["protocolVersion"],
+        "2025-11-25"
+    );
+    let result = &response_with_id(&msgs, 2)["result"];
+    assert_eq!(
+        result["isError"], false,
+        "tools must work after a downgraded handshake: {result}"
+    );
+    assert_structured_and_dual(result);
 }
 
 /// A 2025-03-26-era client (predates structured output, 2025-06-18) ignores
@@ -1622,5 +1685,136 @@ fn first_sync_conflict_without_the_marker_still_refuses() {
         0,
         "a parked fork uploads nothing"
     );
+    conv.finish();
+}
+
+// ===========================================================================
+// MIN-16 — head (non-preview) alf_restore over the MCP surface
+// ===========================================================================
+
+/// The MCP suite only ever drove `alf_restore` as an offline error or as a PIT
+/// preview at sequence 1 — which applies ZERO deltas — so nothing exercised the
+/// path that actually rewrites the live workspace: fetch snapshot + deltas,
+/// merge, import over the workspace, move `~/.alf/state` to the cloud head.
+#[test]
+fn head_restore_over_mcp_applies_deltas_and_rewrites_the_workspace() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    // Cloud history worth restoring: snapshot(1), then a delta(2) carrying a
+    // file that exists ONLY in the delta.
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    let delta_only = conv.workspace.path().join("memories").join("2026-07-09.md");
+    std::fs::write(
+        &delta_only,
+        "## Delta-only\n\nThis section exists only in delta sequence 2.\n",
+    )
+    .unwrap();
+    assert_success(
+        &conv.call(4, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 1, "a delta was pushed");
+
+    // Now diverge the live workspace: lose the delta's file and clobber a file
+    // that came from the snapshot.
+    std::fs::remove_file(&delta_only).unwrap();
+    let identity = conv.workspace.path().join("IDENTITY.md");
+    let identity_before = std::fs::read_to_string(&identity).unwrap();
+    std::fs::write(&identity, "CLOBBERED\n").unwrap();
+
+    // Head restore — no at_sequence.
+    let restore = conv.call(5, "alf_restore", json!({}));
+    assert_success(&restore, "alf_restore", &conv.schema_for("alf_restore"));
+    let sc = &restore["structuredContent"];
+    assert_eq!(
+        sc["preview"], false,
+        "a head restore is not a preview: {sc}"
+    );
+    assert!(
+        sc["preview_path"].is_null(),
+        "head restores have no preview path: {sc}"
+    );
+    assert_eq!(
+        sc["sequence"], 2,
+        "restored to the cloud head (snapshot + delta): {sc}"
+    );
+
+    // Delta application: the file that existed only in delta 2 is back.
+    assert!(
+        delta_only.is_file(),
+        "the delta's file was not applied by the restore"
+    );
+    let restored = std::fs::read_to_string(&delta_only).unwrap();
+    assert!(
+        restored.contains("This section exists only in delta sequence 2"),
+        "delta content missing after restore: {restored}"
+    );
+    // Workspace mutation: the clobbered snapshot file was rewritten.
+    assert_eq!(
+        std::fs::read_to_string(&identity).unwrap(),
+        identity_before,
+        "the restore did not rewrite the clobbered workspace file"
+    );
+
+    // The sync cursor moved to the restored head, so a following sync is a
+    // no-op rather than a re-upload of what we just pulled.
+    let after = conv.call(6, "alf_sync", json!({}));
+    assert_success(&after, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(
+        after["structuredContent"]["no_changes"], true,
+        "state was not moved to head: {}",
+        after["structuredContent"]
+    );
+    conv.finish();
+}
+
+/// A head restore rewrites the live workspace while the watch loop is watching
+/// it. The loop's restore guard plus the L2/L3 locks must let the restore
+/// through (no `agent_busy`, no deadlock) and must not leave a torn upload
+/// behind: after the restore the workspace matches cloud head, so the loop has
+/// nothing to sync.
+#[test]
+fn head_restore_cooperates_with_a_running_watch_loop() {
+    let backend = common::MockBackend::start();
+    // The loop polls every second (locks live, restore guard live) but keeps the
+    // production delta floor, so it cannot sync a SECOND time during the test —
+    // otherwise it could legitimately upload the clobber below and the restore
+    // would faithfully bring the clobber back, making this a coin flip.
+    let mut conv = Conversation::start_with_backend_watched_prepped(
+        &backend.url(),
+        WATCH_ALIVE_ONE_SYNC,
+        strip_map_watch_block,
+    );
+
+    wait_until(20, "the catch-up auto-sync to upload snapshot 1", || {
+        backend.latest_sequence(TOY_AGENT_ID) == Some(1)
+    });
+
+    // Diverge the workspace, then restore head while the loop is live.
+    let identity = conv.workspace.path().join("IDENTITY.md");
+    let identity_before = std::fs::read_to_string(&identity).unwrap();
+    std::fs::write(&identity, "CLOBBERED WHILE WATCHED\n").unwrap();
+
+    let restore = conv.call(3, "alf_restore", json!({}));
+    assert_success(&restore, "alf_restore", &conv.schema_for("alf_restore"));
+    assert_eq!(
+        std::fs::read_to_string(&identity).unwrap(),
+        identity_before,
+        "the restore did not rewrite the workspace"
+    );
+    // The loop never fought the restore for the lock: nothing new was uploaded,
+    // so no torn intermediate state entered cloud history.
+    assert_eq!(
+        backend.latest_sequence(TOY_AGENT_ID),
+        Some(1),
+        "a sync raced the restore and pushed a torn workspace"
+    );
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
     conv.finish();
 }

@@ -796,7 +796,7 @@ The `--json` flag on `alf help status` is still accepted for backward compatibil
 
 Run a stdio [MCP](https://modelcontextprotocol.io) (Model Context Protocol) server inside the `alf` binary so an MCP-capable agent host can drive ALF by tool call instead of shelling out. The host spawns the process, speaks JSON-RPC 2.0 on stdin/stdout, and terminates it (stdin close → SIGTERM → SIGKILL) when the session ends. **The protocol owns stdout** — every diagnostic goes to stderr. Once configured, a background [watch loop](#the-watch-loop) auto-syncs changes at zero token cost; the agent configures once and monitors by query.
 
-Protocol posture: built on rmcp, declares revision `2025-11-25`, and echo-negotiates any known revision (2024-11-05 through the 2026-07-28 RC), so one binary interoperates with clients on every revision. Every tool returns typed `structuredContent` **and** the same JSON as a text block, so both modern and pre-2025-06-18 clients get the identical payload the CLI prints.
+Protocol posture: built on rmcp, declares revision `2025-11-25`, and echo-negotiates any known revision (2024-11-05 through the 2026-07-28 RC); a client announcing a revision the server does not know negotiates down to `2025-11-25` rather than failing the handshake, so one binary interoperates with clients on every revision — including ones newer than itself. Every tool returns typed `structuredContent` **and** the same JSON as a text block, so both modern and pre-2025-06-18 clients get the identical payload the CLI prints.
 
 ### Usage
 

@@ -1231,8 +1231,15 @@ def z15_mcp_llm_gate(run, result: StageResult):
     # (5) The agent drives a vault add by calling the tool — count from list.
     _, lstj = run.container.exec_json(["alf", "vault", "list", "-r", kit.name])
     labels = [c.get("label") for c in (lstj or {}).get("credentials", []) if c.get("label")]
-    if "z15" not in labels:
-        labels = list(dict.fromkeys([*labels, "z15"]))
+    # MIN-19: report what the vault ACTUALLY holds. This used to inject "z15"
+    # when it was absent, so a failed tool-driven vault add still rendered as a
+    # success in the viz (and in the baked customer artifact) while report.md
+    # said FAIL — two contradictory accounts of the same run.
+    vault_landed = "z15" in labels
+    result.add(_passfail(
+        vault_landed,
+        "⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
+        f"labels={labels}"))
     events.state("service", {
         "packet": "mcp-sync",
         "activity": "MCP tool-driven sync landed",
@@ -1242,11 +1249,12 @@ def z15_mcp_llm_gate(run, result: StageResult):
     events.state("agentA", {
         "activity": "synced via mcp_alf_* (no terminal alf sync)",
         "synced": True,
-        "vault": ["z15"],
+        "vault": ["z15"] if vault_landed else [],
         "mutations": [
             {"path": "memories/MEMORY.md", "op": "sync", "note": "tool-driven export"},
             {"path": "state.db", "op": "sync", "note": "tool-driven export"},
-            {"path": "credentials.json (vault)", "op": "add", "note": "z15 via mcp_alf_*"},
+            *([{"path": "credentials.json (vault)", "op": "add",
+                "note": "z15 via mcp_alf_*"}] if vault_landed else []),
         ],
     }, stage_id="z15")
 
@@ -1329,8 +1337,12 @@ def z16_watch_autosync(run, result: StageResult):
     try:
         time.sleep(2)  # boot + the (no-op) catch-up-on-start
         if not sess.alive():
+            # MIN-22: stop here. Continuing drove ~40 s of mutations, polls and
+            # backend assertions against a dead server, burning live-tier time
+            # and stacking cascading FAILs that bury this root cause.
             result.add(_passfail(False, "Z16: watch server stayed up",
                                  ("".join(serve_err)[-300:]) or "serve exited at startup"))
+            return
         # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
         #    After each quiesce window, poll the backend so the viz can show
         #    sequence climbing one delta at a time (not a single 1→N jump).
@@ -1443,8 +1455,13 @@ def z16_watch_autosync(run, result: StageResult):
                 present = sum(1 for m in markers if m in recs)
                 if present >= len(markers):
                     break
+        # MIN-20: every marker must be present, not 4 of 6. Each watch sync is a
+        # full-export diff against the last synced base, so every earlier marker
+        # rides ANY later delta — after the final sync + index the whole set is
+        # in head memory or content was genuinely lost. (Delta COUNT may
+        # legitimately coalesce; that is the separate check above.)
         result.add(_passfail(
-            present >= 4,
+            present == len(markers),
             "⊙ delta content: markers indexed into head memory (POST /index → GET /memory)",
             f"{present}/{len(markers)} markers after on-demand indexing"))
     finally:
@@ -1774,9 +1791,29 @@ def z17_multiagent_watch_vault(run, result: StageResult):
     # ciphertext came BACK from the backend — i.e. the watch loop truly pushed it.
     # (A's key at .hermes/state/<id>/ is allowlist-excluded, so it survives the
     # restore and still opens the restored vault.)
-    run.container.sh(
-        f"rm -f /home/agent/.alf/vault/{agent_id_a}/credentials.json "
-        f"/home/agent/.alf/vault/credentials.json", user="agent")
+    # MIN-21: the whole proof rests on the local ciphertext being GONE — an
+    # unverified `rm -f` exits 0 having deleted nothing if the vault path ever
+    # drifts, and the later decrypt would silently read the untouched local copy.
+    # So: require at least one copy to exist, delete, then confirm none remain.
+    vault_paths = [
+        f"/home/agent/.alf/vault/{agent_id_a}/credentials.json",
+        "/home/agent/.alf/vault/credentials.json",
+    ]
+    listed = run.container.sh(
+        "ls -1 " + " ".join(vault_paths) + " 2>/dev/null || true", user="agent")
+    existed = [p for p in vault_paths if p in (listed.stdout or "")]
+    result.add(_passfail(
+        bool(existed),
+        "Z17 vault round-trip precondition: a local ciphertext copy exists to delete",
+        f"found={existed or 'NONE — the vault path drifted; the proof below would be vacuous'}"))
+    run.container.sh("rm -f " + " ".join(vault_paths), user="agent")
+    still = run.container.sh(
+        "ls -1 " + " ".join(vault_paths) + " 2>/dev/null || true", user="agent")
+    remaining = [p for p in vault_paths if p in (still.stdout or "")]
+    result.add(_passfail(
+        not remaining,
+        "Z17 vault round-trip precondition: every local ciphertext copy deleted",
+        f"remaining={remaining}" if remaining else "none left locally"))
     rest = run.container.exec(
         ["alf", "restore", "-r", kit.name, "--agent", slot_a], timeout=300)
     dec = run.container.exec(

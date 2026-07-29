@@ -102,6 +102,10 @@ class Transcript:
     def __init__(self) -> None:
         self.lines: list[str] = []
         self.tool_calls = 0
+        # Tools whose call returned an error (MIN-18): the transcript used to
+        # render "⚠️ tool error" into prose that nothing read, so a fully broken
+        # onboarding still exited 0 as long as it stayed under the call budget.
+        self.failed: list[str] = []
 
     def head(self, title: str, detail: str) -> None:
         self.lines += [f"## {title}", "", detail, ""]
@@ -109,6 +113,8 @@ class Transcript:
     def step(self, tool: str, args: dict, result) -> None:
         self.tool_calls += 1
         ok = result.ok
+        if not ok:
+            self.failed.append(tool)
         body = result.parsed()
         summary = _summarize(tool, ok, body)
         arg_str = json.dumps(_trim_args(args)) if args else "{}"
@@ -244,10 +250,17 @@ def run(out_path: Path | None) -> int:
     # inflate the former without touching the latter.
     wire_calls = client.tool_calls_sent
     within = wire_calls <= 6
+    # MIN-18: the budget is only half the gate. Every onboarding call must also
+    # have SUCCEEDED — a run where all five tools errored still sends ≤ 6 calls,
+    # and reporting that as "criterion met" records onboarding that never
+    # happened. `t.failed` collects the steps whose tool result was an error.
+    failed = list(t.failed)
     t.lines += [
         "## Verdict", "",
         f"* onboarding tool calls (wire, tools/call sent): **{wire_calls}** "
         f"(criterion: ≤ 6) — {'✅ within budget' if within else '❌ over budget'}",
+        f"* onboarding calls that errored: **{len(failed)}** (criterion: 0) — "
+        + ("✅ all succeeded" if not failed else f"❌ {', '.join(failed)}"),
         f"* transcript steps rendered: {t.tool_calls}",
     ]
     if wire_calls != t.tool_calls:
@@ -264,7 +277,7 @@ def run(out_path: Path | None) -> int:
         out_path.write_text(text, encoding="utf-8")
         print(f"transcript written to {out_path}", file=sys.stderr)
     print(text)
-    return 0 if within else 1
+    return 0 if (within and not failed) else 1
 
 
 def main() -> int:

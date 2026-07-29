@@ -17,6 +17,10 @@
 #   lifecycle    tests/lifecycle/driver.py, no-LLM/no-backend       (needs: docker, python3)
 #                  └ the CI tier: real zeroclaw install, seeded markers, alf check,
 #                    Z13' determinism (Z1-Z3,Z13). Zero secrets, stdlib-only Python.
+#   lifecycle-all  tests/lifecycle/run_all.py                        (needs: docker, python3)
+#                  └ every OFFLINE lifecycle tier in sequence (zeroclaw, generic,
+#                    generic-mcp) with one summary table + a LIFECYCLE-RUN verdict
+#                    line. `--set live --yes-live` adds the proxy/real gates.
 #   lifecycle-generic tests/lifecycle/driver.py --framework generic (needs: docker, python3)
 #                  └ the MCP-driven CI tier (WP-M4): the toy generic runtime, every
 #                    alf op over a `docker exec -i … alf mcp serve` stdio session.
@@ -60,7 +64,7 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 cd "$ROOT"
 
-ALL_TIERS=(fmt clippy unit integration installer lifecycle lifecycle-generic lifecycle-llm lifecycle-mcp-llm walkthroughs)
+ALL_TIERS=(fmt clippy unit integration installer lifecycle lifecycle-generic lifecycle-all lifecycle-llm lifecycle-mcp-llm walkthroughs)
 
 # --- colours (only when stdout is a tty) ----------------------------------
 if [ -t 1 ]; then
@@ -84,7 +88,7 @@ while [ $# -gt 0 ]; do
         --installer-full)  INSTALLER_FULL=1 ;;
         --list)            printf '%s\n' "${ALL_TIERS[@]}"; exit 0 ;;
         -h|--help)         usage; exit 0 ;;
-        fmt|clippy|unit|integration|installer|lifecycle|lifecycle-generic|lifecycle-llm|lifecycle-mcp-llm|walkthroughs) SELECTED+=("$1") ;;
+        fmt|clippy|unit|integration|installer|lifecycle|lifecycle-generic|lifecycle-all|lifecycle-llm|lifecycle-mcp-llm|walkthroughs) SELECTED+=("$1") ;;
         *) echo "unknown argument: $1 (try --help)" >&2; exit 2 ;;
     esac
     shift
@@ -199,6 +203,14 @@ for tier in "${TIERS[@]}"; do
             else
                 run_tier lifecycle python3 tests/lifecycle/driver.py \
                     --framework zeroclaw --llm none --backend none --ci --stages Z1-Z3,Z13
+            fi ;;
+        lifecycle-all)
+            if ! have python3; then
+                skip_tier lifecycle-all "python3 not found"
+            elif ! docker_ready; then
+                skip_tier lifecycle-all "docker not available (daemon running?)"
+            else
+                run_tier lifecycle-all python3 tests/lifecycle/run_all.py
             fi ;;
         lifecycle-generic)
             if ! have python3; then

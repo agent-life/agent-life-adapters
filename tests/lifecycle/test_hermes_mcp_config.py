@@ -175,7 +175,26 @@ class HermesMcpConfigTest(unittest.TestCase):
         alf = doc["mcp_servers"]["alf"]
         self.assertEqual(alf["command"], ALF_BIN)
         self.assertEqual(alf["args"], ["mcp", "serve", "-r", "hermes"])
-        self.assertEqual(sorted(alf["env"]), ["ALF_API_KEY", "ALF_API_URL", "ALF_HOME", "HOME"])
+        self.assertEqual(
+            sorted(alf["env"]),
+            ["ALF_API_KEY", "ALF_API_URL", "ALF_HOME", "ALF_WATCH_QUIESCE_MS",
+             "ALF_WATCH_TICK_MS", "HOME"])
+
+    def test_watch_loop_is_suppressed_for_the_hermes_spawned_server(self):
+        # Z03 asserts lazy registration by probing the backend for the mapping
+        # id. Hermes spawns this server for every agent turn, INCLUDING Z02's,
+        # and a fresh watch loop's first sync is due immediately (`last_fire =
+        # None` ⇒ `cooled_down`), so a session that lived ~5 s registered the
+        # agent and Z03 saw HTTP 200. It fired on 3 of 42 recorded runs.
+        #
+        # Both values are the 24 h clamp ceiling: QUIESCE means no source is ever
+        # quiesced (no sync can fire however the ticks land), TICK covers a source
+        # added later by rediscovery whose `last_change = None` reads as quiesced.
+        # Drop either and the race comes back as a rare red on a LIVE tier —
+        # so this is pinned rather than left to the comment in kit.py.
+        for var in ("ALF_WATCH_QUIESCE_MS", "ALF_WATCH_TICK_MS"):
+            self.assertIn(f'{var}: "86400000"', self.cfg,
+                          f"{var} must pin the watch loop off for this server")
 
 
 class MintRuntimeVariantTest(unittest.TestCase):

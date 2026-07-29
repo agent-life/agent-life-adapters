@@ -1229,17 +1229,37 @@ def z15_mcp_llm_gate(run, result: StageResult):
         "activity": "mcp_alf_* tools invoked by agent",
     }, stage_id="z15")
     # (5) The agent drives a vault add by calling the tool — count from list.
-    _, lstj = run.container.exec_json(["alf", "vault", "list", "-r", kit.name])
+    #     PINNED to the agent Z15 pinned into config.yaml. On the full ladder Z08
+    #     has already enabled a SECOND hermes agent, and an unpinned read is then
+    #     (correctly) refused with `agent_selection_ambiguous` — the vault is
+    #     per-agent, so alf will not guess which one to open.
+    agent_id = run.state.get("alf_agent_id", "")
+    _, lstj = run.container.exec_json(
+        ["alf", "vault", "list", "-r", kit.name, "--agent", agent_id])
+    # A failed READ is not an absent CREDENTIAL. `(lstj or {}).get("credentials")`
+    # alone turns `{"ok":false,…}` into `[]`, which then reads as "the tool-driven
+    # vault add did not land" — blaming the product for a harness fault. That
+    # exact misattribution cost a live run on 2026-07-29 (unpinned read after
+    # Z08). Separate the two verdicts.
+    vault_read_ok = bool(lstj) and lstj.get("ok") is not False
     labels = [c.get("label") for c in (lstj or {}).get("credentials", []) if c.get("label")]
     # MIN-19: report what the vault ACTUALLY holds. This used to inject "z15"
     # when it was absent, so a failed tool-driven vault add still rendered as a
     # success in the viz (and in the baked customer artifact) while report.md
     # said FAIL — two contradictory accounts of the same run.
-    vault_landed = "z15" in labels
-    result.add(_passfail(
-        vault_landed,
-        "⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
-        f"labels={labels}"))
+    vault_landed = vault_read_ok and "z15" in labels
+    if not vault_read_ok:
+        result.add(Check(
+            name="⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
+            status="FAIL",
+            detail="vault READ failed — cannot judge whether the add landed: "
+                   f"{(lstj or {}).get('code') or 'no JSON from alf vault list'}"
+                   f" ({(lstj or {}).get('error', '')[:120]}) [agent={agent_id or 'UNSET'}]"))
+    else:
+        result.add(_passfail(
+            vault_landed,
+            "⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
+            f"labels={labels}"))
     events.state("service", {
         "packet": "mcp-sync",
         "activity": "MCP tool-driven sync landed",

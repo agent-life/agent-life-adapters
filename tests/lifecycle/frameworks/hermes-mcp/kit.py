@@ -198,6 +198,36 @@ class HermesMcpKit(HermesKit):
             # the mapping the harness builds, and the server never sees the agent.
             '      ALF_HOME: "/home/agent"',
             '      HOME: "/home/agent"',
+            # Silence THIS server's watch loop for the whole run (both values are
+            # the 24 h clamp ceiling, so neither warns).
+            #
+            # Hermes spawns `alf mcp serve` for every agent turn, including Z02's
+            # — before Z03 asserts laziness. A fresh loop marks all sources dirty
+            # at startup (§5.2 catch-up) with `last_fire = None`, which
+            # `cooled_down` treats as due regardless of interval, so any session
+            # that lived ~5 s (one tick past the 3 s quiesce window) ran the
+            # agent's FIRST sync and registered it — Z03 then probed and got HTTP
+            # 200, not 404. Session lifetime is LLM latency, so this was a ~7%
+            # coin flip: it fired twice on 2026-07-11 and once on 2026-07-29.
+            #
+            # QUIESCE carries the suppression (no source is ever quiesced, so no
+            # sync can fire however the ticks land); TICK closes the gap for a
+            # source added later by rediscovery, whose `last_change = None` reads
+            # as quiesced. Belt and braces because the failure it prevents is a
+            # rare, expensive-to-reproduce red on a live tier.
+            #
+            # A test-isolation knob, not a workaround for a product bug: lazy
+            # registration is a claim about `alf check`, and a watch loop
+            # registering on first sync is correct, documented behavior
+            # (cli-reference.md §agents). Suppressing it also makes Z15's "agent
+            # registered by the MCP-driven sync" attribute the registration to the
+            # tool call that actually caused it, rather than to whichever actor
+            # happened to get there first.
+            #
+            # Z16/Z17 are unaffected: they spawn their own persistent servers with
+            # their own ~1 s ALF_WATCH_* env and never read this block.
+            '      ALF_WATCH_QUIESCE_MS: "86400000"',
+            '      ALF_WATCH_TICK_MS: "86400000"',
         ]
         if agent_id:
             env_lines.insert(0, f'      ALF_AGENT: "{agent_id}"')

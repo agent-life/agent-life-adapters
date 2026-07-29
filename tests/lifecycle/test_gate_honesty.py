@@ -97,7 +97,33 @@ class StagesSourceContractTest(unittest.TestCase):
         # MIN-19: the label used to be injected when absent, so the viz showed a
         # credential the run never landed.
         self.assertNotIn('labels = list(dict.fromkeys([*labels, "z15"]))', self.src)
-        self.assertIn('vault_landed = "z15" in labels', self.src)
+        # The predicate gained a read-succeeded conjunct on 2026-07-29 (a failed
+        # read must not read as "landed"); the label itself is still never
+        # synthesized — `labels` comes only from what alf actually returned.
+        self.assertIn('"z15" in labels', self.src)
+
+    def test_z15_vault_read_is_pinned_to_the_agent(self):
+        # The vault is PER-AGENT, and Z08 enables a second hermes agent. On the
+        # full ladder an unpinned `alf vault list` is therefore refused with
+        # `agent_selection_ambiguous` — correct product behavior. The read must
+        # name the agent Z15 pinned into config.yaml.
+        window = self.src[max(0, self.src.index("⊙ Z15 vault:") - 1200):
+                          self.src.index("⊙ Z15 vault:")]
+        self.assertIn('"vault", "list"', window, "sanity: found the Z15 vault read")
+        self.assertIn('"--agent", agent_id', window,
+                      "the Z15 vault read must pin the agent (Z08 enables a second one)")
+
+    def test_z15_distinguishes_a_failed_read_from_an_absent_credential(self):
+        # `(lstj or {}).get("credentials", [])` maps {"ok":false,…} to [], which
+        # then reads as "the tool-driven vault add did not land" — a harness
+        # fault reported as a product fault. It cost a live run on 2026-07-29.
+        window = self.src[max(0, self.src.index("⊙ Z15 vault:") - 1200):
+                          self.src.index("⊙ Z15 vault:") + 600]
+        self.assertIn("vault_read_ok", window)
+        self.assertIn("vault READ failed", window,
+                      "a read failure must say so, not claim the add is missing")
+        self.assertIn('vault_landed = vault_read_ok and "z15" in labels', self.src,
+                      "a failed read must never satisfy the landed predicate")
 
     def test_z17_verifies_the_vault_deletion(self):
         # MIN-21: an unverified `rm -f` made the "came back from the backend"

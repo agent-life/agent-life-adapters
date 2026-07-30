@@ -199,13 +199,24 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
         manifest.teardown[rung] = status
         manifest.save(manifest_path)
 
+    # Every per-agent rung records ONE line naming EVERY agent it touched.
+    # These loops used to call record() per iteration, so the dict entry kept
+    # only the LAST agent: a two-agent run showed one id, and — worse — a failed
+    # purge/scavenge on agent A followed by a success on B was overwritten into a
+    # clean "ok". The ledger is the forensic record of what teardown actually
+    # did; it must not be able to omit an agent or a failure (2026-07-29).
+    def record_per_agent(rung: str, results: list, empty: str):
+        record(rung, "; ".join(results) if results else empty)
+
     # Rung 1 — product path: in-container `alf purge` per lifecycle agent.
     if container is not None and container.alive() and manifest.lifecycle_agents:
+        results = []
         for agent_id in manifest.lifecycle_agents:
             proc = container.exec(["alf", "purge", "-r", runtime, "--agent", agent_id],
                                   timeout=120)
-            status = "ok" if proc.returncode == 0 else f"best-effort (exit {proc.returncode})"
-            record("rung1-alf-purge", status)
+            results.append(f"{agent_id}: " + ("ok" if proc.returncode == 0
+                                              else f"best-effort (exit {proc.returncode})"))
+        record_per_agent("rung1-alf-purge", results, "no lifecycle agents")
     else:
         record("rung1-alf-purge", "skipped (no container/agents)")
 
@@ -213,17 +224,22 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
     # Transport errors (API unreachable, DNS, Lambda alias drift) must NOT
     # abort the ladder: the direct-DB rungs 4/4b below still work without it.
     if api is not None:
+        results = []
         try:
             for agent_id in manifest.lifecycle_agents:
                 r = api.get(f"/agents/{agent_id}")
                 if r.status_code == 200:
                     d = api.delete(f"/agents/{agent_id}")
-                    record("rung2-api-delete", f"{agent_id}: {d.status_code}")
+                    results.append(f"{agent_id}: {d.status_code}")
                 else:
-                    record("rung2-api-delete", f"{agent_id}: already gone ({r.status_code})")
+                    results.append(f"{agent_id}: already gone ({r.status_code})")
+            record_per_agent("rung2-api-delete", results, "no lifecycle agents")
         except Exception as e:  # noqa: BLE001
             ok_all = False
-            record("rung2-api-delete", f"API unreachable ({type(e).__name__}) — "
+            # Keep whatever was already disposed of — the agents BEFORE the
+            # failure are exactly the ones a human must not re-hunt.
+            done = ("; ".join(results) + " | ") if results else ""
+            record("rung2-api-delete", f"{done}API unreachable ({type(e).__name__}) — "
                                        "continuing with direct-DB rungs")
             api = None  # rung 3 can't verify either; 4b covers the agents
     else:
@@ -241,8 +257,14 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
             if leftovers:
                 ok_all = False
                 record("rung3-verify-404", f"LEFTOVER: {leftovers}")
+            elif manifest.lifecycle_agents:
+                record("rung3-verify-404",
+                       f"ok ({len(manifest.lifecycle_agents)} agent(s) verified 404)")
             else:
-                record("rung3-verify-404", "ok")
+                # A bare "ok" here claimed a verification that never happened —
+                # zero agents means nothing was checked, not that all is well.
+                record("rung3-verify-404",
+                       "no lifecycle agents to verify (none were registered)")
         except Exception as e:  # noqa: BLE001
             ok_all = False
             record("rung3-verify-404", f"API unreachable ({type(e).__name__})")
@@ -262,15 +284,16 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
         # targeted scavenge per lifecycle agent id. A failure here is a REAL
         # leak (these agents are invisible to batch scavenge) — never "ok".
         if api is None:
+            results = []
             for agent_id in manifest.lifecycle_agents:
                 proc = _scavenge(service_repo, ["--agent", agent_id, "--delete"], env)
                 if proc.returncode == 0:
-                    record("rung4b-scavenge-lifecycle", f"{agent_id}: ok")
+                    results.append(f"{agent_id}: ok")
                 else:
                     ok_all = False
-                    record("rung4b-scavenge-lifecycle",
-                           f"{agent_id}: FAILED exit {proc.returncode}: "
-                           f"{(proc.stderr or proc.stdout or '')[-200:]}")
+                    results.append(f"{agent_id}: FAILED exit {proc.returncode}: "
+                                   f"{(proc.stderr or proc.stdout or '')[-200:]}")
+            record_per_agent("rung4b-scavenge-lifecycle", results, "no lifecycle agents")
     else:
         record("rung4-scavenge-seed", "skipped (no seed agent)")
 

@@ -46,6 +46,8 @@ pub mod codes {
     pub const SUBSCRIPTION_DENIED: &str = "subscription_denied";
     pub const SYNC_BASE_UNREADABLE: &str = "sync_base_unreadable";
     pub const WORKSPACE_MISSING: &str = "workspace_missing";
+    /// A prior head restore may have partially changed its workspace; syncing is unsafe until it is completed.
+    pub const RESTORE_INCOMPLETE: &str = "restore_incomplete";
     /// `alf add`/`alf_track` refused: the path matches the non-overridable
     /// sensitive-path denylist (MAJ-7 — secrets belong in the vault).
     pub const PATH_DENYLISTED: &str = "path_denylisted";

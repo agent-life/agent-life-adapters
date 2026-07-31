@@ -3,9 +3,12 @@
 //! Flow (head restore, default):
 //! 1. Load config (check API key)
 //! 2. Parse agent ID
-//! 3. [`pull_cloud_base`] — fetch snapshot + deltas, merge, persist `~/.alf/state/{id}-snapshot.alf`,
-//!    write state.toml. Atomic-write order: base.alf BEFORE state.toml.
-//! 4. Resolve adapter, import the merged archive into the workspace
+//! 3. Fetch and rebuild the cloud archive in memory (no local state change).
+//! 4. Resolve adapter; write a durable, workspace-bound restore marker; import
+//!    the merged archive into the live workspace.
+//! 5. Persist `~/.alf/state/{id}-snapshot.alf`, then state.toml, then clear
+//!    the marker. An interruption leaves sync parked until the original
+//!    workspace's head restore is rerun.
 //!
 //! Flow (point-in-time preview, `--at-sequence N`):
 //! 1-2. As above.
@@ -19,14 +22,17 @@
 use crate::adapter;
 use crate::api_client::ApiClient;
 use crate::config::Config;
+use crate::errors::{codes, CliError};
 use crate::output;
 use crate::output::Progress;
 use crate::selector;
-use crate::state::{local_base_path, AgentState};
+use crate::state::{
+    clear_restore_inflight, load_restore_inflight, local_base_path, restore_inflight_path,
+    save_restore_inflight, state_file_path, AgentState, RestoreInflight, RestoreInflightPhase,
+};
 use crate::vault_key::{self, VaultKeyArgs};
 use crate::vault_migrate;
 
-use alf_core::archive::AlfReader;
 use alf_core::rebuild::rebuild_snapshot;
 use alf_core::{Adapter, ArchiveEnumeration, FileEntry, ImportOptions, ImportReport, RestoreMode};
 
@@ -37,7 +43,6 @@ use colored::Colorize;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
-use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -159,8 +164,6 @@ impl From<RestoreDryRunResult> for RestoreToolResult {
 
 /// Result of a successful [`pull_cloud_base`] call.
 pub(crate) struct CloudBase {
-    /// The merged archive bytes (snapshot + applied deltas).
-    pub final_bytes: Vec<u8>,
     /// The cloud sequence after applying any deltas.
     pub latest_sequence: u64,
     /// Path the merged archive was written to (`~/.alf/state/{id}-snapshot.alf`).
@@ -174,17 +177,6 @@ pub(crate) fn merge_snapshot_with_deltas(
 ) -> Result<Vec<u8>> {
     let delta_refs: Vec<&[u8]> = delta_byte_vecs.iter().map(|v| v.as_slice()).collect();
     rebuild_snapshot(snapshot_bytes, &delta_refs).map_err(|e| anyhow::anyhow!(e))
-}
-
-fn merged_last_sequence(merged_bytes: &[u8], snapshot_sequence: u64) -> Result<u64> {
-    let reader = AlfReader::new(Cursor::new(merged_bytes))
-        .context("Failed to read merged restore archive")?;
-    Ok(reader
-        .manifest()
-        .sync
-        .as_ref()
-        .map(|s| s.last_sequence)
-        .unwrap_or(snapshot_sequence))
 }
 
 /// Fetch the restore manifest, download snapshot + deltas, and merge them.
@@ -252,38 +244,52 @@ fn fetch_restore_payload(
     let final_bytes = merge_snapshot_with_deltas(&snapshot_bytes, &delta_byte_vecs)
         .context("Failed to merge snapshot and deltas for restore")?;
 
-    let latest_sequence = merged_last_sequence(&final_bytes, snapshot_sequence)?;
+    // The response sequence is the cloud's authoritative optimistic-concurrency
+    // cursor. The archive manifest records the source workspace's sync state,
+    // which may legitimately predate the revision just restored (for example,
+    // a first uploaded snapshot). Never derive the cursor from that manifest.
+    let latest_sequence = restore
+        .deltas
+        .iter()
+        .map(|delta| delta.sequence)
+        .max()
+        .unwrap_or(snapshot_sequence);
     Ok((final_bytes, latest_sequence))
 }
 
-/// Download the cloud snapshot + deltas (head) for `agent_id`, merge them, and
-/// write the result to `~/.alf/state/{agent_id}-snapshot.alf`. Then update the
-/// state file with `Some(latest_sequence)` and a fresh `last_synced_at`.
-///
-/// **Does not touch the workspace.** Use [`run`] when the workspace itself
-/// needs to be rebuilt; reuse this helper from `alf sync --recover` to repair
-/// a missing local base without disturbing live workspace state.
-///
-/// # Atomic-write invariant
-///
-/// `base.alf` is written **before** `state.toml`. This guarantees that
-/// state.toml-present ⇒ base.alf-present at the moment of the last successful
-/// write. See [`docs/how_alf_syncs.md`].
-pub(crate) fn pull_cloud_base(
+/// A cloud restore payload that has been fetched and rebuilt in memory but
+/// has not been committed to local sync state.
+struct FetchedCloudBase {
+    final_bytes: Vec<u8>,
+    latest_sequence: u64,
+}
+
+/// Fetch the cloud snapshot + deltas (head) for `agent_id` and rebuild the
+/// complete archive in memory. This phase does not mutate local state.
+fn fetch_cloud_base(
     client: &ApiClient,
     agent_id: Uuid,
     progress: Progress,
-) -> Result<CloudBase> {
+) -> Result<FetchedCloudBase> {
     let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, None, progress)?;
+    Ok(FetchedCloudBase {
+        final_bytes,
+        latest_sequence,
+    })
+}
 
+/// Persist a fetched cloud base after the caller has established that its
+/// workspace is safe to pair with this cursor.
+///
+/// `base.alf` is written before `state.toml`, preserving the existing
+/// state-present-implies-base-present invariant.
+fn persist_cloud_base(agent_id: Uuid, cloud: &FetchedCloudBase) -> Result<PathBuf> {
     let local_base = local_base_path(agent_id)?;
     if let Some(parent) = local_base.parent() {
         fs::create_dir_all(parent)
             .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
     }
-    // Atomic (temp+fsync+rename): a crash mid-write must never leave a torn
-    // base — every later delta derivation reads this file (manual §4.5).
-    crate::fs_private::write_private_atomic_bytes(&local_base, &final_bytes).with_context(
+    crate::fs_private::write_private_atomic_bytes(&local_base, &cloud.final_bytes).with_context(
         || {
             format!(
                 "Failed to write restored snapshot base at {}",
@@ -294,14 +300,25 @@ pub(crate) fn pull_cloud_base(
 
     let state = AgentState {
         agent_id,
-        last_synced_sequence: Some(latest_sequence),
+        last_synced_sequence: Some(cloud.latest_sequence),
         last_synced_at: Some(Utc::now()),
     };
     state.save()?;
+    Ok(local_base)
+}
 
+/// Download the cloud snapshot + deltas (head), merge them, and immediately
+/// persist the result. `alf sync --recover` intentionally uses this composed
+/// helper because it never mutates the workspace.
+pub(crate) fn pull_cloud_base(
+    client: &ApiClient,
+    agent_id: Uuid,
+    progress: Progress,
+) -> Result<CloudBase> {
+    let fetched = fetch_cloud_base(client, agent_id, progress)?;
+    let local_base = persist_cloud_base(agent_id, &fetched)?;
     Ok(CloudBase {
-        final_bytes,
-        latest_sequence,
+        latest_sequence: fetched.latest_sequence,
         local_base,
     })
 }
@@ -467,6 +484,172 @@ pub(crate) fn purge_previews(agent_id: Uuid) {
     }
 }
 
+/// Render the only safe recovery command for an interrupted head restore.
+fn restore_resume_command(runtime: &str, workspace: &Path, agent_id: Uuid) -> String {
+    format!(
+        "alf restore -r {runtime} -w {} --agent {agent_id}",
+        workspace.display()
+    )
+}
+
+/// Bind a restore record to one concrete live workspace. Existing paths are
+/// canonicalized so equivalent symlink spellings resume the same workspace;
+/// a not-yet-created workspace is made absolute without changing the disk.
+fn workspace_binding(workspace: &Path) -> Result<PathBuf> {
+    match workspace.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(_) if workspace.is_absolute() => Ok(workspace.to_path_buf()),
+        Err(_) => Ok(std::env::current_dir()
+            .context("Could not determine the current directory for restore")?
+            .join(workspace)),
+    }
+}
+
+fn restore_incomplete_error(
+    agent_id: Uuid,
+    runtime: &str,
+    requested_workspace: &Path,
+    detail: impl Into<String>,
+) -> anyhow::Error {
+    CliError {
+        code: codes::RESTORE_INCOMPLETE,
+        cause: detail.into(),
+        remedy: format!(
+            "Re-run {} to complete the interrupted head restore before syncing.",
+            restore_resume_command(runtime, requested_workspace, agent_id)
+        ),
+    }
+    .into()
+}
+
+/// Refuse to overwrite a valid restore marker from another runtime or
+/// workspace. Completing in a different workspace could make a partially
+/// imported original workspace sync against the newly committed base.
+fn ensure_head_restore_can_resume(
+    agent_id: Uuid,
+    runtime: &str,
+    workspace: &Path,
+) -> Result<PathBuf> {
+    let requested = workspace_binding(workspace)?;
+    match load_restore_inflight(agent_id) {
+        Ok(None) => Ok(requested),
+        Ok(Some(record)) if record.runtime == runtime && record.workspace == requested => Ok(requested),
+        Ok(Some(record)) => Err(restore_incomplete_error(
+            agent_id,
+            runtime,
+            &record.workspace,
+            format!(
+                "Head restore for agent {agent_id} is incomplete in {} (runtime {}, phase {:?}); refusing to complete it in {} for runtime {runtime}.",
+                record.workspace.display(),
+                record.runtime,
+                record.phase,
+                requested.display(),
+            ),
+        )),
+        Err(err) => {
+            let marker = restore_inflight_path(agent_id)?;
+            Err(restore_incomplete_error(
+                agent_id,
+                runtime,
+                workspace,
+                format!(
+                    "Restore-in-flight record at {} is malformed or unreadable ({err:#}); refusing to replace it because its original workspace cannot be verified.",
+                    marker.display()
+                ),
+            ))
+        }
+    }
+}
+
+/// Common sync gate for the CLI, MCP tool, watch loop, and `--recover` path.
+/// A marker remains authoritative even when its contents cannot be parsed.
+pub(crate) fn ensure_sync_not_during_restore(
+    agent_id: Uuid,
+    runtime: &str,
+    workspace: &Path,
+) -> Result<()> {
+    match load_restore_inflight(agent_id) {
+        Ok(None) => Ok(()),
+        Ok(Some(record)) => Err(restore_incomplete_error(
+            agent_id,
+            runtime,
+            &record.workspace,
+            format!(
+                "Head restore for agent {agent_id} is incomplete in {} (phase {:?}); refusing to sync {} against an untrusted local base.",
+                record.workspace.display(),
+                record.phase,
+                workspace.display(),
+            ),
+        )),
+        Err(err) => {
+            let marker = restore_inflight_path(agent_id)?;
+            Err(restore_incomplete_error(
+                agent_id,
+                runtime,
+                workspace,
+                format!(
+                    "Restore-in-flight record at {} is malformed or unreadable ({err:#}); refusing to sync until the original workspace is verified.",
+                    marker.display()
+                ),
+            ))
+        }
+    }
+}
+
+fn optional_file_sha256(path: &Path) -> Result<Option<String>> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(alf_core::ids::sha256_hex(&bytes))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to read existing restore state at {}",
+                path.display()
+            )
+        }),
+    }
+}
+
+fn make_restore_inflight(
+    agent_id: Uuid,
+    runtime: &str,
+    workspace: PathBuf,
+    cloud: &FetchedCloudBase,
+) -> Result<RestoreInflight> {
+    Ok(RestoreInflight {
+        version: RestoreInflight::VERSION,
+        agent_id,
+        runtime: runtime.to_string(),
+        workspace,
+        target_sequence: cloud.latest_sequence,
+        staged_archive_sha256: alf_core::ids::sha256_hex(&cloud.final_bytes),
+        previous_base_sha256: optional_file_sha256(&local_base_path(agent_id)?)?,
+        previous_state_sha256: optional_file_sha256(&state_file_path(agent_id)?)?,
+        phase: RestoreInflightPhase::Importing,
+    })
+}
+
+#[cfg(feature = "fault-injection")]
+fn fault_after_restore_importing() {
+    if std::env::var_os("ALF_RESTORE_FAULT_AFTER_IMPORTING").is_some() {
+        eprintln!("alf: ALF_RESTORE_FAULT_AFTER_IMPORTING set — aborting after restore marker");
+        std::process::exit(137);
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_after_restore_importing() {}
+
+#[cfg(feature = "fault-injection")]
+fn fault_after_restore_imported() {
+    if std::env::var_os("ALF_RESTORE_FAULT_AFTER_IMPORTED").is_some() {
+        eprintln!("alf: ALF_RESTORE_FAULT_AFTER_IMPORTED set — aborting after workspace import");
+        std::process::exit(137);
+    }
+}
+
+#[cfg(not(feature = "fault-injection"))]
+fn fault_after_restore_imported() {}
+
 /// Perform a head restore into the live workspace, or a point-in-time preview
 /// into the preview directory. Returns the import report, the resolved cloud
 /// sequence, and the directory that was written.
@@ -483,24 +666,30 @@ fn perform_restore(
     with_credentials: bool,
     progress: Progress,
 ) -> Result<(ImportReport, u64, PathBuf)> {
-    // Branch on at_sequence:
-    //   None    → head restore: pull_cloud_base writes base.alf + state.toml,
-    //             then the archive imports into the LIVE workspace.
-    //   Some(n) → PIT preview: fetch only; the archive imports into the
-    //             preview dir. The live workspace and ~/.alf/state are NEVER
-    //             touched, so the watch loop has nothing to pick up and a
-    //             later sync is unaffected (manual §3.4).
-    let (final_bytes, latest_sequence) = match at_sequence {
-        None => {
-            let base = pull_cloud_base(client, agent_id, progress)?;
-            (base.final_bytes, base.latest_sequence)
-        }
-        Some(n) => fetch_point_in_time(client, agent_id, n, progress)?,
+    // A head restore fetches first but must not move local state until the
+    // live adapter import has succeeded. Point-in-time previews remain fully
+    // read-only with respect to shared state.
+    let head_workspace = at_sequence
+        .is_none()
+        .then(|| ensure_head_restore_can_resume(agent_id, runtime, workspace))
+        .transpose()?;
+    let cloud_base = match at_sequence {
+        None => Some(fetch_cloud_base(client, agent_id, progress)?),
+        Some(_) => None,
+    };
+    let point_in_time = match at_sequence {
+        None => None,
+        Some(n) => Some(fetch_point_in_time(client, agent_id, n, progress)?),
+    };
+    let (final_bytes, latest_sequence) = match (&cloud_base, &point_in_time) {
+        (Some(base), None) => (base.final_bytes.as_slice(), base.latest_sequence),
+        (None, Some((bytes, sequence))) => (bytes.as_slice(), *sequence),
+        _ => unreachable!("head and point-in-time payloads are mutually exclusive"),
     };
 
     let temp_dir = tempfile::tempdir().context("Failed to create temp directory")?;
     let temp_alf = temp_dir.path().join("restored.alf");
-    fs::write(&temp_alf, &final_bytes)?;
+    fs::write(&temp_alf, final_bytes)?;
 
     let (target_dir, mode, merge_warning) = match at_sequence {
         None => (workspace.to_path_buf(), mode, None),
@@ -554,7 +743,41 @@ fn perform_restore(
         // Sandboxed: keep Layer 4 inside the preview tree, never the live vault.
         preview: at_sequence.is_some(),
     };
+    // The marker becomes durable at the final safe point before a live adapter
+    // can mutate the workspace. All earlier failures leave base/cursor alone;
+    // every later failure leaves this guard for sync to observe.
+    let mut restore_marker = cloud_base
+        .as_ref()
+        .map(|cloud| {
+            make_restore_inflight(
+                agent_id,
+                runtime,
+                head_workspace
+                    .clone()
+                    .expect("head restore has a workspace binding"),
+                cloud,
+            )
+        })
+        .transpose()?;
+    if let Some(marker) = &restore_marker {
+        save_restore_inflight(marker)?;
+        fault_after_restore_importing();
+    }
+
     let mut import_report = adapt.import_with_options(&temp_alf, &target_dir, import_options)?;
+    if let Some(marker) = restore_marker.as_mut() {
+        marker.phase = RestoreInflightPhase::Imported;
+        save_restore_inflight(marker)?;
+        fault_after_restore_imported();
+        persist_cloud_base(
+            agent_id,
+            cloud_base
+                .as_ref()
+                .expect("restore marker requires cloud base"),
+        )?;
+        clear_restore_inflight(agent_id)?;
+    }
+
     if let Some(w) = merge_warning {
         import_report.warnings.push(w);
     }
@@ -924,6 +1147,8 @@ fn run_dry_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alf_core::archive::AlfReader;
+    use std::io::Cursor;
 
     /// MIN-12: a preview is inspection scratch — it expires, regardless of how
     /// few previews exist. (The keep-N cap alone let one sit forever until two

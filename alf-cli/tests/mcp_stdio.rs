@@ -23,11 +23,10 @@
 //! the toy fixture (so the write tools never dirty the repo fixture) with an
 //! isolated `ALF_HOME`.
 
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-
-use serde_json::{json, Value};
 use tempfile::TempDir;
 
 mod common;
@@ -76,9 +75,32 @@ fn clean_alf_env(cmd: &mut Command) {
         "ALF_WATCH_DEFAULT_INTERVAL_MS",
         "ALF_WATCH_TICK_MS",
         "ALF_WATCH_FAULT_BEFORE_UPLOAD",
+        "ALF_RESTORE_FAULT_AFTER_IMPORTING",
+        "ALF_RESTORE_FAULT_AFTER_IMPORTED",
     ] {
         cmd.env_remove(var);
     }
+}
+/// Run the CLI against an isolated home/workspace. Used by crash tests that
+/// must terminate the whole process at a fault seam rather than an MCP worker.
+#[cfg(feature = "fault-injection")]
+fn run_cli(
+    home: &Path,
+    workspace: &Path,
+    args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> std::process::Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_alf"));
+    cmd.args(args)
+        .arg(workspace)
+        .env("ALF_HOME", home)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    clean_alf_env(&mut cmd);
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    cmd.output().expect("run alf CLI")
 }
 
 /// Spawn `alf mcp serve -r generic -w <copy>` with an isolated `ALF_HOME` and the
@@ -1772,6 +1794,219 @@ fn head_restore_over_mcp_applies_deltas_and_rewrites_the_workspace() {
         after["structuredContent"]
     );
     conv.finish();
+}
+
+/// RF-003: an interrupted head restore must block every sync path until the
+/// same live workspace completes a head restore and commits its base/cursor.
+#[test]
+fn incomplete_head_restore_blocks_sync_until_original_workspace_is_restored() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    let state_dir = conv.home.path().join(".alf/state");
+    let state_path = state_dir.join(format!("{TOY_AGENT_ID}.toml"));
+    let base_path = state_dir.join(format!("{TOY_AGENT_ID}-snapshot.alf"));
+    let marker_path = state_dir.join(format!("{TOY_AGENT_ID}.restore-inflight.json"));
+    let old_state = std::fs::read(&state_path).unwrap();
+    let old_base = std::fs::read(&base_path).unwrap();
+
+    let original_workspace = conv.workspace.path().canonicalize().unwrap();
+    std::fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&json!({
+            "version": 1,
+            "agent_id": TOY_AGENT_ID,
+            "runtime": "generic",
+            "workspace": original_workspace,
+            "target_sequence": 1,
+            "staged_archive_sha256": "test-only",
+            "previous_base_sha256": "test-only",
+            "previous_state_sha256": "test-only",
+            "phase": "importing"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let original_marker = std::fs::read(&marker_path).unwrap();
+    let mut wrong_marker: serde_json::Value = serde_json::from_slice(&original_marker).unwrap();
+    wrong_marker["workspace"] = json!(original_workspace.join("different-workspace"));
+    std::fs::write(
+        &marker_path,
+        serde_json::to_vec_pretty(&wrong_marker).unwrap(),
+    )
+    .unwrap();
+
+    let wrong_restore = conv.call(10, "alf_restore", json!({}));
+    assert_tool_error_coded(&wrong_restore, "alf_restore", "restore_incomplete");
+    assert!(
+        marker_path.exists(),
+        "wrong workspace must not clear the guard"
+    );
+    std::fs::write(&marker_path, original_marker).unwrap();
+
+    // If this were allowed to sync, the modified identity would become a
+    // cloud delta derived from a base the workspace no longer proves.
+    std::fs::write(conv.workspace.path().join("IDENTITY.md"), "UNTRUSTED\n").unwrap();
+    let blocked = conv.call(4, "alf_sync", json!({"recover": true}));
+    assert_tool_error_coded(&blocked, "alf_sync", "restore_incomplete");
+    assert_eq!(
+        backend.delta_count(TOY_AGENT_ID),
+        0,
+        "blocked sync must not upload"
+    );
+    assert_eq!(
+        std::fs::read(&state_path).unwrap(),
+        old_state,
+        "cursor unchanged"
+    );
+    assert_eq!(
+        std::fs::read(&base_path).unwrap(),
+        old_base,
+        "base unchanged"
+    );
+    assert!(
+        marker_path.exists(),
+        "guard remains until a restore succeeds"
+    );
+
+    let restored = conv.call(5, "alf_restore", json!({}));
+    assert_success(&restored, "alf_restore", &conv.schema_for("alf_restore"));
+    assert!(
+        !marker_path.exists(),
+        "successful head restore clears guard"
+    );
+
+    let after = conv.call(6, "alf_sync", json!({}));
+    assert_success(&after, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(after["structuredContent"]["no_changes"], true);
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
+    conv.finish();
+}
+
+/// RF-003 crash windows: after either durable marker phase, sync must remain
+/// blocked until a head restore completes the original workspace transaction.
+#[cfg(feature = "fault-injection")]
+#[test]
+fn crashed_head_restore_parks_sync_until_rerun_for_both_marker_phases() {
+    for fault in [
+        "ALF_RESTORE_FAULT_AFTER_IMPORTING",
+        "ALF_RESTORE_FAULT_AFTER_IMPORTED",
+    ] {
+        let backend = common::MockBackend::start();
+        let home = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        copy_dir(Path::new(&toy_fixture()), workspace.path()).unwrap();
+        common::seed_config(home.path(), &backend.url());
+
+        let first = run_cli(
+            home.path(),
+            workspace.path(),
+            &["sync", "-r", "generic", "-w"],
+            &[],
+        );
+        assert!(first.status.success(), "first sync failed: {first:?}");
+        assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(1));
+
+        let state_dir = home.path().join(".alf/state");
+        let state_path = state_dir.join(format!("{TOY_AGENT_ID}.toml"));
+        let base_path = state_dir.join(format!("{TOY_AGENT_ID}-snapshot.alf"));
+        let marker_path = state_dir.join(format!("{TOY_AGENT_ID}.restore-inflight.json"));
+        let old_state = std::fs::read(&state_path).unwrap();
+        let old_base = std::fs::read(&base_path).unwrap();
+
+        let aborted = run_cli(
+            home.path(),
+            workspace.path(),
+            &["restore", "-r", "generic", "-w"],
+            &[(fault, "1")],
+        );
+        assert_eq!(
+            aborted.status.code(),
+            Some(137),
+            "fault {fault}: {aborted:?}"
+        );
+        assert!(
+            marker_path.exists(),
+            "fault {fault} must leave a durable guard"
+        );
+        assert_eq!(
+            std::fs::read(&state_path).unwrap(),
+            old_state,
+            "fault {fault} moved cursor"
+        );
+        assert_eq!(
+            std::fs::read(&base_path).unwrap(),
+            old_base,
+            "fault {fault} moved base"
+        );
+
+        let blocked = run_cli(
+            home.path(),
+            workspace.path(),
+            &["sync", "--recover", "-r", "generic", "-w"],
+            &[],
+        );
+        assert!(
+            !blocked.status.success(),
+            "recover unexpectedly passed for {fault}"
+        );
+        let blocked_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&blocked.stdout),
+            String::from_utf8_lossy(&blocked.stderr),
+        );
+        assert!(
+            blocked_text.contains("restore_incomplete"),
+            "{fault}: {blocked_text}"
+        );
+        assert_eq!(
+            backend.delta_count(TOY_AGENT_ID),
+            0,
+            "{fault} allowed an upload"
+        );
+
+        let completed = run_cli(
+            home.path(),
+            workspace.path(),
+            &["restore", "-r", "generic", "-w"],
+            &[],
+        );
+        assert!(
+            completed.status.success(),
+            "rerun restore failed for {fault}: {completed:?}"
+        );
+        assert!(
+            !marker_path.exists(),
+            "rerun restore did not clear {fault} guard"
+        );
+
+        std::fs::write(
+            workspace.path().join("IDENTITY.md"),
+            "Changed after recovery\n",
+        )
+        .unwrap();
+        let next = run_cli(
+            home.path(),
+            workspace.path(),
+            &["sync", "-r", "generic", "-w"],
+            &[],
+        );
+        assert!(
+            next.status.success(),
+            "post-recovery sync failed for {fault}: {next:?}"
+        );
+        assert!(
+            backend
+                .latest_sequence(TOY_AGENT_ID)
+                .is_some_and(|sequence| sequence > 1),
+            "post-recovery edit did not sync for {fault}"
+        );
+    }
 }
 
 /// A head restore rewrites the live workspace while the watch loop is watching

@@ -348,6 +348,7 @@ pub fn classify(err: &anyhow::Error) -> SyncErrorClass {
             // 401/403: park after a small retry budget (manual §4.2) — the key
             // will not fix itself, but one blip shouldn't park either.
             codes::AUTH_FAILED => SyncErrorClass::Auth,
+            codes::RESTORE_INCOMPLETE => SyncErrorClass::RestoreIncomplete,
             // Corrupt/truncated local base: recover-once re-pulls it from cloud
             // truth — the correct self-heal, same as E4.
             codes::SYNC_BASE_UNREADABLE => SyncErrorClass::MissingBase,
@@ -1260,6 +1261,10 @@ mod tests {
             classify(&cli_err(codes::SYNC_BASE_UNREADABLE, "torn zip")),
             SyncErrorClass::MissingBase,
             "a corrupt base self-heals via recover-once (re-pull from cloud truth)"
+        );
+        assert_eq!(
+            classify(&cli_err(codes::RESTORE_INCOMPLETE, "restore not committed")),
+            SyncErrorClass::RestoreIncomplete
         );
         // Pre-wrap seams reject auth without a code — still an auth park.
         assert_eq!(

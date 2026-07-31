@@ -18,7 +18,7 @@
 
 use crate::adapter;
 use crate::api_client::{ApiClient, RegisterAgentOutcome};
-use crate::commands::restore::pull_cloud_base;
+use crate::commands::restore::{ensure_sync_not_during_restore, pull_cloud_base};
 use crate::config::Config;
 use crate::errors::{codes, CliError};
 use crate::output;
@@ -455,6 +455,10 @@ pub(crate) fn run_one_agent(
         selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?;
     selector::require_enabled_for_sync(&selected)?;
 
+    // Check before vault migration too: an interrupted restore must not let a
+    // manual/MCP sync perform unrelated mutation before reporting its park.
+    ensure_sync_not_during_restore(selected.alf_agent_id, runtime, &selected.workspace)?;
+
     // WP1: move any legacy vault/key to the per-agent layout before export —
     // adapters read only per-agent vault paths (no legacy fallback), so an
     // unmigrated vault would silently drop Layer 4 from the upload.
@@ -636,6 +640,11 @@ pub(crate) fn sync_one(
     let (workspace, adhoc) = selector::effective_workspace(selected, workspace_flag);
 
     // A mapped per-agent workspace is adapter-owned and may not exist yet
+    // A head restore can leave the workspace partially imported while its
+    // old base/cursor remain on disk. Never prune, export, recover, or upload
+    // until that workspace-bound transaction has been completed.
+    ensure_sync_not_during_restore(selected.alf_agent_id, runtime, &workspace)?;
+
     // (`export_agent` creates it); only validate an explicit -w target. Coded
     // (`workspace_missing`) so the watch loop parks instead of retrying forever.
     if adhoc && !workspace.exists() {

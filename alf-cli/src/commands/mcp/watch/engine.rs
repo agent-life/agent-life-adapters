@@ -212,6 +212,9 @@ pub enum SyncErrorClass {
     /// E3 — the agent already exists in the cloud but was never restored here.
     /// A human fork; park immediately with a hint.
     Fork,
+    /// A prior head restore may have left the workspace partially imported.
+    /// Only that workspace-bound head restore may clear the guard.
+    RestoreIncomplete,
     /// Transient (network, 5xx, timeout). Exponential backoff + jitter, retry.
     Transient,
     /// HTTP 401/403 — the service rejected the API key. Backoff for a small
@@ -366,6 +369,7 @@ pub const PARK_CODES: &[&str] = &[
     "sync_conflict_unresolved",
     "sync_missing_base_unresolved",
     "sync_poisoned_base_unresolved",
+    "restore_incomplete",
     "auth_failed",
     "watch_panicked",
     "lock_unavailable",
@@ -629,6 +633,15 @@ impl WatchEngine {
                                  (alf_restore then alf_sync) or local-truth (CLI \
                                  --force-first-sync)."
                                     .into(),
+                            ),
+                        });
+                    }
+                    SyncErrorClass::RestoreIncomplete => {
+                        self.parked = Some(ParkError {
+                            code: "restore_incomplete".into(),
+                            message: "Auto-sync parked: a head restore did not finish committing its local state.".into(),
+                            hint: Some(
+                                "Re-run alf_restore for the original workspace to complete the restore; alf_sync recover cannot repair a partial workspace import.".into(),
                             ),
                         });
                     }
@@ -1460,8 +1473,12 @@ mod tests {
         // const, closing the loop (manual §4.2).
         let mut emitted: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-        // Fork and Fatal park on the first failure.
-        for class in [SyncErrorClass::Fork, SyncErrorClass::Fatal] {
+        // Fork, an incomplete restore, and Fatal park on the first failure.
+        for class in [
+            SyncErrorClass::Fork,
+            SyncErrorClass::RestoreIncomplete,
+            SyncErrorClass::Fatal,
+        ] {
             let mut e = engine_one_source(Duration::ZERO);
             assert!(matches!(e.poll(secs(0)), Tick::Sync(_)));
             e.record_result(secs(0), Err(class));

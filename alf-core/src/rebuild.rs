@@ -53,6 +53,23 @@ pub fn rebuild_snapshot(
     base_bytes: &[u8],
     delta_bytes_list: &[&[u8]],
 ) -> Result<Vec<u8>, RebuildError> {
+    rebuild_snapshot_inner(base_bytes, delta_bytes_list, None)
+}
+
+/// Rebuild a snapshot and stamp an authoritative service sequence.
+pub fn rebuild_snapshot_with_sequence(
+    base_bytes: &[u8],
+    delta_bytes_list: &[&[u8]],
+    authoritative_sequence: u64,
+) -> Result<Vec<u8>, RebuildError> {
+    rebuild_snapshot_inner(base_bytes, delta_bytes_list, Some(authoritative_sequence))
+}
+
+fn rebuild_snapshot_inner(
+    base_bytes: &[u8],
+    delta_bytes_list: &[&[u8]],
+    authoritative_sequence: Option<u64>,
+) -> Result<Vec<u8>, RebuildError> {
     // ── 1. Read all layers from the base snapshot ─────────────────
 
     let mut base = AlfReader::new(Cursor::new(base_bytes))?;
@@ -155,6 +172,20 @@ pub fn rebuild_snapshot(
 
     // ── 4. Build new manifest ─────────────────────────────────────
 
+    let sync = match authoritative_sequence {
+        Some(sequence) => Some(SyncCursor {
+            last_sequence: sequence,
+            last_sync_at: Some(Utc::now()),
+            extra: std::collections::HashMap::new(),
+        }),
+        None if base_manifest.sync.is_some() || !delta_bytes_list.is_empty() => Some(SyncCursor {
+            last_sequence: highest_sequence,
+            last_sync_at: Some(Utc::now()),
+            extra: std::collections::HashMap::new(),
+        }),
+        None => None,
+    };
+
     let manifest = Manifest {
         alf_version: base_manifest.alf_version,
         created_at: Utc::now(),
@@ -162,11 +193,7 @@ pub fn rebuild_snapshot(
         // layers is overwritten by AlfWriter::finish()
         layers: base_manifest.layers,
         runtime_hints: base_manifest.runtime_hints,
-        sync: Some(SyncCursor {
-            last_sequence: highest_sequence,
-            last_sync_at: Some(Utc::now()),
-            extra: std::collections::HashMap::new(),
-        }),
+        sync,
         raw_sources: base_manifest.raw_sources,
         checksum: None, // recalculated on next export if needed
         extra: base_manifest.extra,
@@ -659,6 +686,23 @@ mod tests {
         let rebuilt_identity = read_identity(&rebuilt);
         assert!(rebuilt_identity.is_some());
         assert_eq!(rebuilt_identity.unwrap().version, 1);
+    }
+
+    /// An adapter export is not necessarily a cloud-synced archive. Rebuilding
+    /// such a snapshot must not invent `last_sequence: 0`, because that value
+    /// can later be mistaken for the cloud concurrency cursor during a
+    /// rollover restore.
+    #[test]
+    fn rebuild_no_deltas_does_not_invent_zero_cursor() {
+        let base = build_snapshot(None, &[make_record(1, "uncursored", 1)]);
+
+        let rebuilt = rebuild_snapshot(&base, &[]).unwrap();
+        let reader = AlfReader::new(Cursor::new(rebuilt)).unwrap();
+
+        assert!(
+            reader.manifest().sync.is_none(),
+            "a rebuild without cloud sequence metadata must preserve an absent cursor"
+        );
     }
 
     #[test]

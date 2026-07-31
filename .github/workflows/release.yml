@@ -75,9 +75,26 @@ jobs:
       - name: Run tests
         run: cargo test --workspace
 
+  fault-injection:
+    name: Fault-injection tests
+    needs: verify-version
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run fault-injection tests
+        run: cargo test --workspace --features fault-injection
+
   build:
     name: ${{ matrix.bin_name }}
-    needs: test
+    needs: [test, fault-injection]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

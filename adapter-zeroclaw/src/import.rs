@@ -55,13 +55,22 @@ pub fn import(
     fs::create_dir_all(workspace)?;
     fs::create_dir_all(workspace.join("memory"))?;
 
+    // A point-in-time preview must be fully contained in the supplied
+    // workspace. Head restores retain install-root discovery for flat,
+    // multi-agent, and legacy workspace layouts.
+    let install_root = if preview {
+        workspace.to_path_buf()
+    } else {
+        crate::export::zeroclaw_home(workspace)
+    };
+
     // Check for raw/zeroclaw/ sources
     let file_names = alf.file_names();
     let raw_prefix = "raw/zeroclaw/";
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
 
     if has_raw {
-        restore_raw_sources(&mut alf, workspace, raw_prefix, &file_names)?;
+        restore_raw_sources(&mut alf, &install_root, raw_prefix, &file_names)?;
     } else {
         warnings.push(
             "No raw/zeroclaw/ sources in archive — reconstructing from structured data."
@@ -148,7 +157,6 @@ pub fn import(
     // carry ZeroClaw provenance (manifest.agent.extra.zeroclaw_alias); cross-
     // runtime archives fall through to the Markdown reconstruction path.
     if let Some(archived) = archived_agent(&manifest) {
-        let install_root = crate::export::zeroclaw_home(workspace);
         let db_path = crate::export::brain_db_path(&install_root);
         let rows: Vec<NativeRow> = all_memory
             .iter()
@@ -439,15 +447,13 @@ fn restore_agent_vault(
 
 fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
     alf: &mut AlfReader<R>,
-    workspace: &Path,
+    install_root: &Path,
     prefix: &str,
     file_names: &[String],
 ) -> Result<()> {
     // Everything an export captured (config.toml, SOUL.md, memory/*, …) was
-    // taken relative to the install root; restore it back there. The install
-    // root is resolved from `workspace`, which may be a per-agent binding
-    // (`<root>/agents/<alias>/workspace`) or the root itself.
-    let install_root = crate::export::zeroclaw_home(workspace);
+    // taken relative to the install root; restore it back at the explicit root
+    // selected by the import boundary.
 
     let mut total_bytes: u64 = 0;
     for name in file_names {
@@ -464,7 +470,7 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
         // Reject path-traversal / absolute entry names relative to the install
         // root — a hostile or compromised-server archive must not escape it
         // (Zip Slip; see threat model A4.1/A1.1).
-        let target = alf_core::safe_extract_path(&install_root, relative)
+        let target = alf_core::safe_extract_path(install_root, relative)
             .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
 
         // The raw files (config.toml, SOUL.md, memory/*) live at the SHARED
@@ -901,6 +907,127 @@ mod tests {
         let report = import(&alf_file, &deep, None, RestoreMode::Total, false).unwrap();
         assert_eq!(report.agent_name, "DirTest");
         assert!(deep.is_dir());
+    }
+
+    /// Capture every regular file below `root`, excluding `excluded` and its
+    /// descendants. The preview containment regression compares the ALF state
+    /// outside the preview tree before and after import.
+    fn snapshot_files_outside(root: &Path, excluded: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file() && !entry.path().starts_with(excluded))
+            .map(|entry| {
+                (
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        files
+    }
+
+    #[test]
+    fn preview_nested_below_alf_config_never_uses_ancestor_as_install_root() {
+        isolate_home();
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
+        let (source_dir, source_root) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
+                ("memory/2026-01-15.md", "## Entry\n\nArchived memory.\n"),
+            ],
+        );
+        create_test_db(&source_root);
+        let alf_file = source_dir.path().join("export.alf");
+        export::export(&source_root, &alf_file).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let alf_home = home.join(".alf");
+        let preview = alf_home
+            .join("preview")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("seq-7");
+        fs::create_dir_all(&preview).unwrap();
+        fs::write(
+            alf_home.join("config.toml"),
+            "service_url = \"https://example.test\"\n",
+        )
+        .unwrap();
+        let before = snapshot_files_outside(&alf_home, &preview);
+
+        import(&alf_file, &preview, None, RestoreMode::Total, true).unwrap();
+
+        assert!(preview.join("SOUL.md").is_file());
+        assert!(preview.join("memory/2026-01-15.md").is_file());
+        assert!(preview.join(".alf-agent-id").is_file());
+        let db = preview.join("data/memory/brain.db");
+        assert!(
+            db.is_file(),
+            "brain.db must be bootstrapped inside the preview"
+        );
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id=?1 AND key='pref_lang'",
+                [A_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the archived agent slice belongs in the preview DB");
+
+        assert_eq!(before, snapshot_files_outside(&alf_home, &preview));
+        assert!(
+            !alf_home.join("SOUL.md").exists(),
+            "raw restore escaped the preview into the ALF state directory"
+        );
+        assert!(
+            !alf_home.join("data/memory/brain.db").exists(),
+            "brain restore escaped the preview into the ALF state directory"
+        );
+    }
+
+    #[test]
+    fn head_restore_from_multi_agent_workspace_uses_shared_install_root() {
+        isolate_home();
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
+        let (source_dir, source_root) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
+                ("memory/2026-01-15.md", "## Entry\n\nArchived memory.\n"),
+            ],
+        );
+        create_test_db(&source_root);
+        let alf_file = source_dir.path().join("export.alf");
+        export::export(&source_root, &alf_file).unwrap();
+
+        let target = TempDir::new().unwrap();
+        let install = target.path().join("install");
+        let workspace = install.join("agents/agent_a/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(install.join("config.toml"), config).unwrap();
+
+        import(&alf_file, &workspace, None, RestoreMode::Total, false).unwrap();
+
+        assert!(install.join("SOUL.md").is_file());
+        assert!(install.join("memory/2026-01-15.md").is_file());
+        let db = install.join("data/memory/brain.db");
+        assert!(db.is_file(), "brain.db belongs to the shared install root");
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("data/memory/brain.db").exists());
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id=?1 AND key='pref_lang'",
+                [A_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the archived agent slice belongs in the shared DB");
     }
 
     // -- Zip Slip / path-traversal regression (threat model A4.1/A1.1) ------

@@ -23,6 +23,7 @@ pub mod chunk;
 pub mod credentials;
 pub mod crypto;
 pub mod delta;
+pub mod extract;
 pub mod fs_atomic;
 pub mod identity;
 pub mod ids;
@@ -53,6 +54,7 @@ pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,
     CredentialsDiff, PrincipalsDiff,
 };
+pub use extract::{write_extracted_file, write_private_extracted_target, ExtractWriteMode};
 pub use fs_atomic::write_atomic;
 pub use identity::*;
 pub use include::{

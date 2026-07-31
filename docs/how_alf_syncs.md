@@ -37,11 +37,12 @@ These two stores are decoupled. The workspace can be mutated freely between sync
 
 ## 4. Layout of `~/.alf/state/`
 
-For each agent, exactly two files:
+For each agent, two steady-state files and, only while a head restore is incomplete, one private transaction record:
 
 ```
-~/.alf/state/{agent_id}.toml             ← state file
-~/.alf/state/{agent_id}-snapshot.alf     ← local base snapshot
+~/.alf/state/{agent_id}.toml                   ← state file
+~/.alf/state/{agent_id}-snapshot.alf           ← local base snapshot
+~/.alf/state/{agent_id}.restore-inflight.json  ← temporary head-restore guard
 ```
 
 A typical state file:
@@ -55,6 +56,8 @@ last_synced_at = "2026-05-09T18:42:11Z"
 `last_synced_sequence` is the sole sync-control variable. `last_synced_at` is **informational metadata**: written on every save, displayed by `alf help status`, and propagated into delta manifests as `base_timestamp`. It is **not read by any control flow** and exists only for human audit trails.
 
 If the state file does not exist, the agent has never completed a sync (sequence is `None`). If the state file exists but the `-snapshot.alf` next to it is missing, the local base is incomplete — `alf sync` will refuse to push a delta until the base is reconstructed; see [`--recover`](#9-what---recover-does-and-does-not).
+
+If `{agent_id}.restore-inflight.json` exists, a head restore began after staging a cloud archive but did not finish atomically pairing the live workspace with its new base and cursor. `alf sync` and `alf sync --recover` both fail closed with `restore_incomplete`; neither may export or upload from that uncertain workspace. Re-run the **head** restore against the workspace named in the record. The record moves from `importing` to `imported` after the adapter returns, then disappears only after the base and state file are durable. A restore invoked for a different workspace is refused: it cannot clear an interrupted restore elsewhere.
 
 ## 5. The happy path
 

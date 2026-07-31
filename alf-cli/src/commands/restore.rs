@@ -20,7 +20,7 @@
 //! `pull_cloud_base` is also reused by `alf sync --recover` (commands/sync.rs).
 
 use crate::adapter;
-use crate::api_client::ApiClient;
+use crate::api_client::{ApiClient, RestoreDelta};
 use crate::config::Config;
 use crate::errors::{codes, CliError};
 use crate::output;
@@ -33,7 +33,10 @@ use crate::state::{
 use crate::vault_key::{self, VaultKeyArgs};
 use crate::vault_migrate;
 
+use alf_core::archive::{AlfReader, DeltaReader};
+#[cfg(test)]
 use alf_core::rebuild::rebuild_snapshot;
+use alf_core::rebuild::rebuild_snapshot_with_sequence;
 use alf_core::{Adapter, ArchiveEnumeration, FileEntry, ImportOptions, ImportReport, RestoreMode};
 
 use anyhow::Context;
@@ -43,6 +46,7 @@ use colored::Colorize;
 use schemars::JsonSchema;
 use serde::Serialize;
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -171,6 +175,7 @@ pub(crate) struct CloudBase {
 }
 
 /// Merge a base snapshot with zero or more delta archives (same semantics as cloud restore).
+#[cfg(test)]
 pub(crate) fn merge_snapshot_with_deltas(
     snapshot_bytes: &[u8],
     delta_byte_vecs: &[Vec<u8>],
@@ -241,19 +246,20 @@ fn fetch_restore_payload(
         out
     };
 
-    let final_bytes = merge_snapshot_with_deltas(&snapshot_bytes, &delta_byte_vecs)
-        .context("Failed to merge snapshot and deltas for restore")?;
+    let latest_sequence = validated_restore_sequence(
+        &snapshot_bytes,
+        snapshot_sequence,
+        &restore.deltas,
+        &delta_byte_vecs,
+        up_to_sequence,
+    )?;
 
-    // The response sequence is the cloud's authoritative optimistic-concurrency
-    // cursor. The archive manifest records the source workspace's sync state,
-    // which may legitimately predate the revision just restored (for example,
-    // a first uploaded snapshot). Never derive the cursor from that manifest.
-    let latest_sequence = restore
-        .deltas
+    let delta_refs: Vec<&[u8]> = delta_byte_vecs
         .iter()
-        .map(|delta| delta.sequence)
-        .max()
-        .unwrap_or(snapshot_sequence);
+        .map(|bytes| bytes.as_slice())
+        .collect();
+    let final_bytes = rebuild_snapshot_with_sequence(&snapshot_bytes, &delta_refs, latest_sequence)
+        .context("Failed to merge snapshot and deltas for restore")?;
     Ok((final_bytes, latest_sequence))
 }
 
@@ -1144,6 +1150,94 @@ fn run_dry_run(
     Ok(())
 }
 
+/// Validate the service metadata and downloaded archive manifests before using
+/// their cursor for local optimistic concurrency.
+fn validated_restore_sequence(
+    snapshot_bytes: &[u8],
+    snapshot_sequence: u64,
+    deltas: &[RestoreDelta],
+    delta_byte_vecs: &[Vec<u8>],
+    up_to_sequence: Option<u64>,
+) -> Result<u64> {
+    if deltas.len() != delta_byte_vecs.len() {
+        anyhow::bail!(
+            "restore response has {} delta metadata entries but {} downloaded delta archives",
+            deltas.len(),
+            delta_byte_vecs.len()
+        );
+    }
+
+    if let Some(bound) = up_to_sequence {
+        if snapshot_sequence > bound {
+            anyhow::bail!(
+                "restore snapshot sequence {} exceeds requested point-in-time bound {}",
+                snapshot_sequence,
+                bound
+            );
+        }
+    }
+
+    let snapshot = AlfReader::new(Cursor::new(snapshot_bytes))?
+        .manifest()
+        .clone();
+    let mut cursor = snapshot_sequence;
+
+    for (delta_info, delta_bytes) in deltas.iter().zip(delta_byte_vecs) {
+        if let Some(bound) = up_to_sequence {
+            if delta_info.sequence > bound {
+                anyhow::bail!(
+                    "restore delta sequence {} exceeds requested point-in-time bound {}",
+                    delta_info.sequence,
+                    bound
+                );
+            }
+        }
+
+        let expected = cursor
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("restore sequence overflow after {}", cursor))?;
+        if delta_info.sequence != expected {
+            anyhow::bail!(
+                "restore delta sequence {} is not the expected next sequence {}",
+                delta_info.sequence,
+                expected
+            );
+        }
+
+        let delta = DeltaReader::new(Cursor::new(delta_bytes))?;
+        let manifest = delta.manifest();
+        if manifest.agent.id != snapshot.agent.id {
+            anyhow::bail!(
+                "restore delta sequence {} belongs to a different agent",
+                delta_info.sequence
+            );
+        }
+        if manifest.sync.base_sequence != cursor
+            || (manifest.sync.new_sequence != 0
+                && manifest.sync.new_sequence != delta_info.sequence)
+        {
+            anyhow::bail!(
+                "restore delta sequence {} has inconsistent base/new cursor {}/{}",
+                delta_info.sequence,
+                manifest.sync.base_sequence,
+                manifest.sync.new_sequence
+            );
+        }
+        cursor = delta_info.sequence;
+    }
+
+    if let Some(sync) = snapshot.sync {
+        if sync.last_sequence > cursor {
+            anyhow::bail!(
+                "restore snapshot cursor {} is ahead of validated service head {}",
+                sync.last_sequence,
+                cursor
+            );
+        }
+    }
+
+    Ok(cursor)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1305,7 +1399,7 @@ mod tests {
     use alf_core::archive::{AlfWriter, DeltaMemoryEntry, DeltaWriter};
     use alf_core::manifest::{
         AgentMetadata, ChangeInventory, DeltaAgentRef, DeltaManifest, DeltaOperation,
-        DeltaSyncCursor, LayerInventory, Manifest,
+        DeltaSyncCursor, LayerInventory, Manifest, SyncCursor,
     };
     use alf_core::memory::{
         MemoryRecord, MemoryStatus, MemoryType, SourceProvenance, TemporalMetadata,
@@ -1460,6 +1554,26 @@ mod tests {
             .collect()
     }
 
+    fn build_empty_snapshot_with_cursor(cursor: Option<u64>) -> Vec<u8> {
+        let mut manifest = make_manifest();
+        manifest.sync = cursor.map(|last_sequence| SyncCursor {
+            last_sequence,
+            last_sync_at: None,
+            extra: HashMap::new(),
+        });
+        let writer = AlfWriter::new(Cursor::new(Vec::new()), manifest).unwrap();
+        writer.finish().unwrap().into_inner()
+    }
+
+    fn restore_delta(sequence: u64) -> RestoreDelta {
+        RestoreDelta {
+            url: format!("https://example.invalid/delta/{sequence}"),
+            sequence,
+            size_bytes: 0,
+            created_at: "2026-07-30T00:00:00Z".into(),
+        }
+    }
+
     #[test]
     fn merge_with_deltas_includes_delta_memory_changes() {
         let a = make_record(1, "A");
@@ -1544,5 +1658,62 @@ mod tests {
         let pit0 = merge_snapshot_with_deltas(&snap, &[]).unwrap();
         let pit0_contents = read_record_contents(&pit0);
         assert_eq!(pit0_contents, vec!["A".to_string()]);
+    }
+
+    #[test]
+    fn validated_restore_sequence_uses_service_metadata_and_rejects_bad_chains() {
+        let uncursored = build_empty_snapshot_with_cursor(None);
+        assert_eq!(
+            validated_restore_sequence(&uncursored, 7, &[], &[], None).unwrap(),
+            7
+        );
+
+        let legacy_cursor = build_empty_snapshot_with_cursor(Some(0));
+        assert_eq!(
+            validated_restore_sequence(&legacy_cursor, 7, &[], &[], None).unwrap(),
+            7
+        );
+
+        let delta_8 = build_delta(7, &[]);
+        let delta_9 = build_delta(8, &[]);
+        let deltas = vec![restore_delta(8), restore_delta(9)];
+        assert_eq!(
+            validated_restore_sequence(
+                &uncursored,
+                7,
+                &deltas,
+                &[delta_8.clone(), delta_9.clone()],
+                None,
+            )
+            .unwrap(),
+            9
+        );
+
+        let future_cursor = build_empty_snapshot_with_cursor(Some(99));
+        assert!(validated_restore_sequence(&future_cursor, 7, &[], &[], None).is_err());
+        assert!(validated_restore_sequence(
+            &uncursored,
+            7,
+            &[restore_delta(9), restore_delta(8)],
+            &[delta_8.clone(), delta_9.clone()],
+            None,
+        )
+        .is_err());
+        assert!(validated_restore_sequence(
+            &uncursored,
+            7,
+            &[restore_delta(8)],
+            &[build_delta(8, &[])],
+            None,
+        )
+        .is_err());
+        assert!(validated_restore_sequence(
+            &uncursored,
+            7,
+            &[restore_delta(9)],
+            &[delta_9],
+            Some(8),
+        )
+        .is_err());
     }
 }

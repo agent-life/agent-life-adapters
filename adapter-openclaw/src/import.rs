@@ -7,13 +7,13 @@
 //! 2. **Cross-runtime migration**: reconstruct workspace files from ALF
 //!    structured data (identity prose, principals prose, memory records).
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, VaultKey};
+mod structured_import;
 
 use crate::ImportReport;
 
@@ -84,25 +84,29 @@ pub fn import(
 
     let mut warnings = Vec::new();
 
-    // Ensure workspace directory exists
-    fs::create_dir_all(workspace)?;
-    fs::create_dir_all(workspace.join("memory"))?;
-
-    // Check if raw/openclaw/ sources are available
+    // Check if raw/openclaw/ sources are available.
     let file_names = alf.file_names();
     let raw_prefix = "raw/openclaw/";
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
-
+    let structured_plan = if has_raw {
+        None
+    } else {
+        Some(structured_import::build(&mut alf, workspace)?)
+    };
+    // A structured archive is fully parsed and its paths validated before this
+    // first destination mutation. Raw entries receive their own shared writer.
+    fs::create_dir_all(workspace)?;
+    fs::create_dir_all(workspace.join("memory"))?;
     if has_raw {
-        // Path 1: Raw source restore (lossless)
         restore_raw_sources(&mut alf, workspace, raw_prefix, &file_names)?;
     } else {
-        // Path 2: Cross-runtime migration
         warnings.push(
             "No raw/openclaw/ sources in archive — reconstructing from structured data."
                 .to_string(),
         );
-        reconstruct_from_structured(&mut alf, workspace, &mut warnings)?;
+        structured_plan
+            .expect("structured plan exists when raw sources are absent")
+            .apply(workspace, &mut warnings)?;
     }
 
     // Inert-on-restore (security design §3.5, manual §7): external include
@@ -119,8 +123,12 @@ pub fn import(
     }
 
     // Write the agent ID for future exports
-    let id_file = workspace.join(".alf-agent-id");
-    fs::write(&id_file, agent_id.to_string())?;
+    alf_core::write_extracted_file(
+        workspace,
+        ".alf-agent-id",
+        agent_id.to_string().as_bytes(),
+        alf_core::ExtractWriteMode::Normal,
+    )?;
 
     // Credentials: decrypt and restore when a key is supplied; otherwise
     // emit the legacy "re-authenticate" warning.
@@ -358,10 +366,7 @@ fn restore_credentials(
 
     let serialized = serde_json::to_string_pretty(&Value::Object(profiles))?;
     let target = target.path();
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    alf_core::fs_atomic::write_private_atomic(&target, serialized.as_bytes())
+    alf_core::write_private_extracted_target(&target, serialized.as_bytes())
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(restored)
@@ -409,13 +414,7 @@ fn restore_agent_vault(
             .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
     };
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // 0600 + atomic: the document carries ciphertext AND plaintext
-    // descriptors (service, username, label), and a crash must never
-    // truncate a just-restored vault.
-    alf_core::fs_atomic::write_private_atomic(
+    alf_core::write_private_extracted_target(
         &target,
         serde_json::to_string_pretty(&doc)?.as_bytes(),
     )
@@ -448,9 +447,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
         // Reject path-traversal / absolute entry names before any write —
         // a hostile or compromised-server archive must not escape the
         // workspace (Zip Slip; see threat model A4.1/A1.1).
-        let target = alf_core::safe_extract_path(workspace, relative)
-            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
-
         // Bound decompression to defend against zip bombs.
         let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
         total_bytes = total_bytes.saturating_add(data.len() as u64);
@@ -461,11 +457,13 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             );
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            workspace,
+            relative,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -473,150 +471,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 // Path 2: Cross-runtime reconstruction
 // ---------------------------------------------------------------------------
-
-/// Reconstruct OpenClaw workspace files from structured ALF data.
-fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
-    alf: &mut AlfReader<R>,
-    workspace: &Path,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    // Identity → SOUL.md
-    if let Some(identity) = alf.read_identity()? {
-        if let Some(ref prose) = identity.prose {
-            if let Some(ref soul) = prose.soul {
-                fs::write(workspace.join("SOUL.md"), soul)?;
-            }
-            if let Some(ref profile) = prose.identity_profile {
-                fs::write(workspace.join("IDENTITY.md"), profile)?;
-            }
-            if let Some(ref instructions) = prose.operating_instructions {
-                fs::write(workspace.join("AGENTS.md"), instructions)?;
-            }
-        } else if let Some(ref structured) = identity.structured {
-            // Synthesize a minimal SOUL.md from structured data
-            let name = structured
-                .names
-                .as_ref()
-                .map(|n| n.primary.as_str())
-                .unwrap_or("Agent");
-            let role = structured.role.as_deref().unwrap_or("AI Assistant");
-            let soul = format!("# {name}\n\n{role}\n");
-            fs::write(workspace.join("SOUL.md"), soul)?;
-        }
-    }
-
-    // Principals → USER.md
-    if let Some(principals) = alf.read_principals()? {
-        if let Some(principal) = principals.principals.first() {
-            if let Some(ref prose) = principal.profile.prose {
-                if let Some(ref user_profile) = prose.user_profile {
-                    fs::write(workspace.join("USER.md"), user_profile)?;
-                }
-            } else if let Some(ref structured) = principal.profile.structured {
-                // Synthesize minimal USER.md
-                let name = structured.name.as_deref().unwrap_or("User");
-                let mut content = format!("# {name}\n");
-                if let Some(ref tz) = structured.timezone {
-                    content.push_str(&format!("\n## Timezone\n\n{tz}\n"));
-                }
-                fs::write(workspace.join("USER.md"), content)?;
-            }
-        }
-    }
-
-    // Memory records → MEMORY.md + memory/YYYY-MM-DD.md
-    let all_records = alf.read_all_memory()?;
-    if all_records.is_empty() {
-        return Ok(());
-    }
-
-    // Separate by namespace
-    let mut curated_sections: Vec<String> = Vec::new();
-    let mut daily_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for record in &all_records {
-        // Skip tombstones/replaced records: a Superseded record's replacement
-        // is already in this set, and a Deleted record is gone — materializing
-        // either would resurrect content the agent removed (WP4.1 §8.1). This
-        // only affects the structured fallback; a same-runtime restore prefers
-        // the verbatim raw tree and never reaches here.
-        if !record.status.is_materialized() {
-            continue;
-        }
-        let origin_file = record.source.origin_file.as_deref().unwrap_or("");
-
-        match record.namespace.as_str() {
-            "curated" => {
-                curated_sections.push(record.content.clone());
-            }
-            "daily" => {
-                // Group by origin file or by observed_at date
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else if let Some(observed) = record.temporal.observed_at {
-                    format!("memory/{}.md", observed.format("%Y-%m-%d"))
-                } else {
-                    format!(
-                        "memory/{}.md",
-                        record.temporal.created_at.format("%Y-%m-%d")
-                    )
-                };
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            _ => {
-                // Use origin_file if available, otherwise namespace-based path
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    format!("memory/{}.md", record.namespace)
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-        }
-    }
-
-    // Write MEMORY.md
-    if !curated_sections.is_empty() {
-        let content = curated_sections.join("\n\n");
-        fs::write(workspace.join("MEMORY.md"), content)?;
-    }
-
-    // Write daily log files
-    for (file_path, sections) in &daily_groups {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    // Write other memory files
-    for (file_path, sections) in &other_files {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    if !all_records.is_empty() {
-        warnings.push(format!(
-            "Reconstructed {} memory record(s) from structured data.",
-            all_records.len()
-        ));
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests

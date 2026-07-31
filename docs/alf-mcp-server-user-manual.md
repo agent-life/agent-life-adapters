@@ -120,7 +120,7 @@ Call `alf_status` first in every session. Once configured, the watch loop syncs 
 
 **Concurrency.** Takes the in-process sync lock and the per-agent advisory lock *(v1.1)*. If another sync/restore (this process, the watch loop, or another process) holds them past the wait budget, fails with code `agent_busy` — retry shortly.
 
-**Failures (coded).** `agent_busy`; `auth_failed` (HTTP 401/403 — fix the API key); `subscription_denied` (HTTP 402 at registration); `workspace_missing`; `sync_base_unreadable` (corrupt local base — call again with `recover: true`); `sync_upload_failed` (sequence conflict → the hint explains E7 recovery); `registration_failed`; agent-selection codes (`no_agents`, `agent_not_found`, `agent_selection_ambiguous`, `agent_disabled`, `agent_id_drift`); `vault_migration_blocked`. On the generic runtime, a SQLite memory-source read failure fails the whole sync (section 3.7.1) — **it never silently drops records** *(v1.1)*.
+**Failures (coded).** `agent_busy`; `auth_failed` (HTTP 401/403 — fix the API key); `subscription_denied` (HTTP 402 at registration); `workspace_missing`; `sync_base_unreadable` (corrupt local base — call again with `recover: true`); `restore_incomplete` (a head restore may have partially changed its original workspace — rerun `alf_restore` there; `recover:true` cannot repair it); `sync_upload_failed` (sequence conflict → the hint explains E7 recovery); `registration_failed`; agent-selection codes (`no_agents`, `agent_not_found`, `agent_selection_ambiguous`, `agent_disabled`, `agent_id_drift`); `vault_migration_blocked`. On the generic runtime, a SQLite memory-source read failure fails the whole sync (section 3.7.1) — **it never silently drops records** *(v1.1)*.
 
 ### 3.4 `alf_restore`
 
@@ -141,7 +141,7 @@ Call `alf_status` first in every session. Once configured, the watch loop syncs 
 
 **Progress.** Same progress-token behavior as `alf_sync`.
 
-**Concurrency.** Head restores take the sync lock + advisory lock and wait for an in-flight watch sync to finish *(v1.1)*. Previews and dry runs take no locks (they are read-only with respect to shared state).
+**Concurrency and crash safety.** Head restores take the sync lock + advisory lock and wait for an in-flight watch sync to finish *(v1.1)*. Before changing the live workspace, a head restore writes a private restore-in-flight record; it commits the cloud base and cursor only after import succeeds. A crash or import failure parks sync until a head restore is rerun against that record's **original workspace**. Previews and dry runs take no locks (they are read-only with respect to shared state).
 
 **Credentials in a preview *(v1.1)*.** A preview never writes the live vault
 (`~/.alf/vault/{agent_id}/`) — the historical Layer 4 is materialized inside the
@@ -298,7 +298,7 @@ A sync tick fires when: at least one source is dirty AND every dirty source is q
 - **Auth errors** (HTTP 401/403) park after 3 attempts with backoff between *(v1.1)*.
 - **Lock-file I/O errors** (not contention — an unopenable lock file) park after 3 consecutive failures *(v1.1)*.
 
-**Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`.
+**Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `restore_incomplete`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`.
 
 | Code | Meaning | Operator remedy |
 |---|---|---|
@@ -307,11 +307,12 @@ A sync tick fires when: at least one source is dirty AND every dirty source is q
 | `sync_missing_base_unresolved` | E4 missing local base; auto-recovery failed | Same |
 | `sync_poisoned_base_unresolved` | E9 base parity failure; auto-recovery failed | Same |
 | `watch_parked` | Fatal configuration/authorization error (e.g. underlying code `agent_disabled`, `workspace_missing`, `subscription_denied`) | Fix the named cause; the park message carries the underlying error |
+| `restore_incomplete` | A head restore was interrupted after it could have changed the workspace | Re-run `alf_restore` for the original workspace; `alf_sync recover:true` cannot clear it |
 | `auth_failed` | Service rejected the API key (401/403) | Fix the key (`alf login` / config), then one manual `alf_sync` |
 | `watch_panicked` | The sync task panicked repeatedly (a bug; the panic is on the server's stderr) *(v1.1)* | Fix or remove the offending workspace file, then `alf_sync` |
 | `lock_unavailable` | The advisory lock file cannot be opened (permissions/state dir) | Fix `~/.alf/state/` permissions, then `alf_sync` |
 
-**What clears a park:** a successful manual `alf_sync`, or `alf_watch_set {pause:false}`.
+**What clears a park:** a successful manual `alf_sync`, or `alf_watch_set {pause:false}`. The exception is `restore_incomplete`: only a successful head `alf_restore` for the original workspace removes its on-disk guard; resuming the watch loop without it immediately parks again.
 
 ### 4.3 Watch surface
 
@@ -348,7 +349,7 @@ Every tool failure is a **tool error** (`isError: true`), never a protocol error
 
 Protocol errors are reserved for infrastructure failure (a panicked worker). Agents should branch on `code` when present and follow `hint` otherwise.
 
-**Machine-readable codes** (`errors.rs::codes`): `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`, `no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`, `vault_key_unresolved`, `vault_rotate_failed`, `vault_rotate_no_destination`, `vault_migration_blocked`, plus *(v1.1)* `agent_busy`, `auth_failed`, `subscription_denied`, `sync_base_unreadable`, `workspace_missing`.
+**Machine-readable codes** (`errors.rs::codes`): `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`, `no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`, `vault_key_unresolved`, `vault_rotate_failed`, `vault_rotate_no_destination`, `vault_migration_blocked`, plus *(v1.1)* `agent_busy`, `auth_failed`, `subscription_denied`, `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`.
 
 **Hints speak tool language** *(v1.1)*. A hint reaching the MCP wire names tools (`alf_sync with recover:true`, `the alf_check tool`), not CLI flags. Where the remedy is a CLI-only ceremony, the hint labels it explicitly as a human-terminal step and names the `alf_docs` topic to read (e.g. `rotate-key`, `force-first-sync`).
 

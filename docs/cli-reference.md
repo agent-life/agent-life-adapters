@@ -846,7 +846,7 @@ The loop is what makes MCP mode token-free (design §11). It marks a source dirt
 - **Intervals.** Memory/raw changes ride the delta channel: floor **1 min**, ceiling **24 h**. A change to a tracked (`alf_track`) file triggers a **full-snapshot rollover** (§6.1) batched on its own knob — floor **15 min**, default **1 h**. Both are validation-clamped; steer them with `alf_watch_set` or the map's `watch` block.
 - **Catch-up on start.** On spawn the loop dirty-scans against the base snapshot, so anything changed while no server was alive syncs on the first tick. A crashed server, a rebooted machine, and a laptop closed for a week all resolve the same way: next session, first tick, one delta.
 - **Crash-safe by SIGKILL.** The spec sanctions SIGKILL as normal shutdown, so mid-sync death is safe by construction: state writes are temp+rename atomic and the upload is sequence-CAS'd server-side, so a killed sync leaves either "old base + old state" (retry = the same delta) or "new state fully committed".
-- **Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`. A successful manual `alf_sync` (or an `alf_watch_set` resume) clears the park.
+- **Park codes.** When auto-sync parks, `alf_status` reports one of `sync_first_sync_conflict`, `sync_conflict_unresolved`, `sync_missing_base_unresolved`, `sync_poisoned_base_unresolved`, `restore_incomplete`, `watch_parked`, `auth_failed`, `watch_panicked`, `lock_unavailable`. A successful manual `alf_sync` (or an `alf_watch_set` resume) clears the park, except `restore_incomplete`: re-run the head restore for its original workspace first.
 - **No daemon mode.** The loop lives only as long as the host keeps the session alive (the MCP convention: the client owns the process). Host-independent cadence stays with the CLI + OS cron on user machines and the boot/shutdown hooks on cloud runtimes.
 
 Per-host setup is in [MCP client configuration](#mcp-client-configuration); retiring an agent is in [Decommissioning an agent](#decommissioning-an-agent).
@@ -1041,8 +1041,8 @@ The same error is also written to stderr for human visibility.
 - vault (1.0.0): `vault_key_unresolved`, `vault_rotate_failed`,
   `vault_rotate_no_destination`, `vault_migration_blocked`
 - v1.1: `agent_busy`, `auth_failed`, `subscription_denied`,
-  `sync_base_unreadable`, `workspace_missing`, `path_denylisted` — the first
-  five are emitted by plain CLI `alf sync`/`alf restore` too, not only the MCP
+  `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`, `path_denylisted` — the first
+  six are emitted by plain CLI `alf sync`/`alf restore` too, not only the MCP
   tools
 
 Errors without a matching class keep the two-field shape.

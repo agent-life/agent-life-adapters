@@ -142,6 +142,33 @@ impl MockBackend {
             .map(|a| a.latest_sequence)
     }
 
+    /// Replace the latest snapshot without advancing the cloud cursor, matching
+    /// production snapshot rollover semantics. The existing snapshot bytes are
+    /// retained and the separate delta list is cleared.
+    pub fn rollover_snapshot_at_current_sequence(&self, agent_id: &str) {
+        let mut state = self.state.lock().unwrap();
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .expect("rollover requires a registered agent with a snapshot");
+        assert!(
+            agent.snapshot.is_some(),
+            "rollover requires an existing snapshot"
+        );
+        agent.snapshot_sequence = agent.latest_sequence;
+        agent.deltas.clear();
+    }
+
+    /// The current snapshot's service sequence, if one has been stored.
+    pub fn snapshot_sequence(&self, agent_id: &str) -> Option<u64> {
+        self.state
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.snapshot.as_ref().map(|_| agent.snapshot_sequence))
+    }
+
     /// How many deltas the agent has accumulated.
     pub fn delta_count(&self, agent_id: &str) -> usize {
         self.state
@@ -149,7 +176,7 @@ impl MockBackend {
             .unwrap()
             .agents
             .get(agent_id)
-            .map(|a| a.deltas.len())
+            .map(|agent| agent.deltas.len())
             .unwrap_or(0)
     }
 }

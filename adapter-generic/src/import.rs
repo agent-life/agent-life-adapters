@@ -208,9 +208,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
         let Some(relative) = name.strip_prefix(prefix).filter(|r| !r.is_empty()) else {
             continue;
         };
-        let target = alf_core::safe_extract_path(workspace, relative)
-            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
-
         let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
         total_bytes = total_bytes.saturating_add(data.len() as u64);
         if total_bytes > alf_core::MAX_RAW_TOTAL_BYTES {
@@ -219,11 +216,13 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
                 alf_core::MAX_RAW_TOTAL_BYTES
             );
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            workspace,
+            relative,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -258,13 +257,7 @@ fn restore_agent_vault(
             .map(|h| alf_core::agent_vault_path(&h, agent_id))
             .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
     };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // 0600 + atomic: the document carries ciphertext AND plaintext
-    // descriptors (service, username, label), and a crash must never
-    // truncate a just-restored vault.
-    alf_core::fs_atomic::write_private_atomic(
+    alf_core::write_private_extracted_target(
         &target,
         serde_json::to_string_pretty(&doc)?.as_bytes(),
     )

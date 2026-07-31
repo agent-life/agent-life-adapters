@@ -23,8 +23,9 @@
 //! the toy fixture (so the write tools never dirty the repo fixture) with an
 //! isolated `ALF_HOME`.
 
+use alf_core::archive::AlfReader;
 use serde_json::{json, Value};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Cursor, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
 use tempfile::TempDir;
@@ -1203,6 +1204,77 @@ fn alf_sync_success_roundtrip_uploads_snapshot_then_delta() {
     );
     assert_eq!(backend.delta_count(TOY_AGENT_ID), 1, "one delta pushed");
 
+    conv.finish();
+}
+
+/// RF-004: production snapshot rollover retains the service head instead of
+/// incrementing it. `sync --recover` must stamp that head into the local base,
+/// then the next delta must be accepted against it.
+#[test]
+fn sync_recover_keeps_nonzero_rollover_sequence() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+
+    let mut added_files = Vec::new();
+    for (index, day) in ["30", "31", "32"].iter().enumerate() {
+        let path = conv
+            .workspace
+            .path()
+            .join("memories")
+            .join(format!("2026-07-{day}.md"));
+        std::fs::write(&path, format!("## Delta {day}\n\nRollover setup.\n")).unwrap();
+        added_files.push(path);
+        let sync = conv.call(4 + index as i64, "alf_sync", json!({}));
+        assert_success(&sync, "alf_sync", &conv.schema_for("alf_sync"));
+        assert_eq!(
+            sync["structuredContent"]["sequence"].as_u64(),
+            Some(index as u64 + 2)
+        );
+    }
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(4));
+
+    backend.rollover_snapshot_at_current_sequence(TOY_AGENT_ID);
+    assert_eq!(backend.snapshot_sequence(TOY_AGENT_ID), Some(4));
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(4));
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
+    for path in added_files {
+        std::fs::remove_file(path).unwrap();
+    }
+
+    let state_dir = conv.home.path().join(".alf/state");
+    let state_path = state_dir.join(format!("{TOY_AGENT_ID}.toml"));
+    let base_path = state_dir.join(format!("{TOY_AGENT_ID}-snapshot.alf"));
+    std::fs::remove_file(&base_path).unwrap();
+
+    let recover = conv.call(8, "alf_sync", json!({"recover": true}));
+    assert_success(&recover, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(recover["structuredContent"]["sequence"], 4);
+    assert_eq!(recover["structuredContent"]["no_changes"], true);
+    assert!(
+        std::fs::read_to_string(&state_path)
+            .unwrap()
+            .contains("last_synced_sequence = 4"),
+        "recovery must keep the service head in state"
+    );
+    let rebuilt = std::fs::read(&base_path).unwrap();
+    let reader = AlfReader::new(Cursor::new(rebuilt)).unwrap();
+    assert_eq!(reader.manifest().sync.as_ref().unwrap().last_sequence, 4);
+
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-08-01.md"),
+        "## Post-rollover\n\nThis must delta from base sequence four.\n",
+    )
+    .unwrap();
+    let next = conv.call(9, "alf_sync", json!({}));
+    assert_success(&next, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(next["structuredContent"]["sequence"], 5);
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(5));
     conv.finish();
 }
 

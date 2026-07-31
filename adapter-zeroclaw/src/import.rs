@@ -10,7 +10,6 @@
 //!    leaving every other agent's rows untouched. This runs independently of the
 //!    file half because `brain.db` is not a raw source.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -18,6 +17,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 
 use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, RestoreMode, VaultKey};
+mod structured_import;
 
 use crate::brain_db::{self, ArchivedAgent, BrainDbSchema, NativeRow};
 use crate::ImportReport;
@@ -51,10 +51,6 @@ pub fn import(
 
     let mut warnings = Vec::new();
 
-    // Ensure workspace directory structure
-    fs::create_dir_all(workspace)?;
-    fs::create_dir_all(workspace.join("memory"))?;
-
     // A point-in-time preview must be fully contained in the supplied
     // workspace. Head restores retain install-root discovery for flat,
     // multi-agent, and legacy workspace layouts.
@@ -63,12 +59,18 @@ pub fn import(
     } else {
         crate::export::zeroclaw_home(workspace)
     };
-
-    // Check for raw/zeroclaw/ sources
     let file_names = alf.file_names();
     let raw_prefix = "raw/zeroclaw/";
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
-
+    let structured_plan = if has_raw {
+        None
+    } else {
+        Some(structured_import::build(&mut alf, workspace)?)
+    };
+    // The structured plan is complete before the first workspace or database
+    // mutation. Raw entries receive the RF-006 shared extraction writer.
+    fs::create_dir_all(workspace)?;
+    fs::create_dir_all(workspace.join("memory"))?;
     if has_raw {
         restore_raw_sources(&mut alf, &install_root, raw_prefix, &file_names)?;
     } else {
@@ -76,12 +78,18 @@ pub fn import(
             "No raw/zeroclaw/ sources in archive — reconstructing from structured data."
                 .to_string(),
         );
-        reconstruct_from_structured(&mut alf, workspace, &mut warnings)?;
+        structured_plan
+            .expect("structured plan exists when raw sources are absent")
+            .apply(workspace, &mut warnings)?;
     }
 
     // Write agent ID file
-    let id_file = workspace.join(".alf-agent-id");
-    let _ = fs::write(&id_file, agent_id.to_string());
+    alf_core::write_extracted_file(
+        workspace,
+        ".alf-agent-id",
+        agent_id.to_string().as_bytes(),
+        alf_core::ExtractWriteMode::Normal,
+    )?;
 
     // Inert-on-restore (D3): the raw tree carries `.alf-include.json`, so
     // external include entries come back unverified — a hostile/compromised
@@ -378,7 +386,7 @@ fn restore_credentials(
 
     let target = workspace.join("auth_profiles.json");
     let serialized = serde_json::to_string_pretty(&Value::Object(profiles))?;
-    fs::write(&target, serialized)
+    alf_core::write_private_extracted_target(&target, serialized.as_bytes())
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(restored)
@@ -426,13 +434,7 @@ fn restore_agent_vault(
             .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
     };
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    // 0600 + atomic: the document carries ciphertext AND plaintext
-    // descriptors (service, username, label), and a crash must never
-    // truncate a just-restored vault.
-    alf_core::fs_atomic::write_private_atomic(
+    alf_core::write_private_extracted_target(
         &target,
         serde_json::to_string_pretty(&doc)?.as_bytes(),
     )
@@ -493,11 +495,13 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             );
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            install_root,
+            relative,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -505,178 +509,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 // Path 2: Cross-runtime reconstruction
 // ---------------------------------------------------------------------------
-
-fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
-    alf: &mut AlfReader<R>,
-    workspace: &Path,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    // Identity → SOUL.md (+ IDENTITY.md, AGENTS.md)
-    if let Some(identity) = alf.read_identity()? {
-        if let Some(ref prose) = identity.prose {
-            if let Some(ref soul) = prose.soul {
-                fs::write(workspace.join("SOUL.md"), soul)?;
-            }
-            if let Some(ref profile) = prose.identity_profile {
-                fs::write(workspace.join("IDENTITY.md"), profile)?;
-            }
-            if let Some(ref instructions) = prose.operating_instructions {
-                fs::write(workspace.join("AGENTS.md"), instructions)?;
-            }
-        } else if let Some(ref structured) = identity.structured {
-            // Synthesize a minimal SOUL.md
-            let name = structured
-                .names
-                .as_ref()
-                .map(|n| n.primary.as_str())
-                .unwrap_or("Agent");
-            let role = structured.role.as_deref().unwrap_or("AI Assistant");
-            let soul = format!("# {name}\n\n{role}\n");
-            fs::write(workspace.join("SOUL.md"), soul)?;
-        }
-
-        // If AIEOS raw source is present, write identity.json
-        if identity.source_format.as_deref() == Some("aieos") {
-            if let Some(ref raw) = identity.raw_source {
-                let json = serde_json::to_string_pretty(raw)?;
-                fs::write(workspace.join("identity.json"), json)?;
-            }
-        }
-    }
-
-    // Principals → USER.md
-    if let Some(principals) = alf.read_principals()? {
-        if let Some(principal) = principals.principals.first() {
-            if let Some(ref prose) = principal.profile.prose {
-                if let Some(ref user_profile) = prose.user_profile {
-                    fs::write(workspace.join("USER.md"), user_profile)?;
-                }
-            } else if let Some(ref structured) = principal.profile.structured {
-                let name = structured.name.as_deref().unwrap_or("User");
-                let mut content = format!("# {name}\n");
-                if let Some(ref tz) = structured.timezone {
-                    content.push_str(&format!("\n## Timezone\n\n{tz}\n"));
-                }
-                fs::write(workspace.join("USER.md"), content)?;
-            }
-        }
-    }
-
-    // Memory records → memory/YYYY-MM-DD.md files
-    let all_records = alf.read_all_memory()?;
-    if all_records.is_empty() {
-        return Ok(());
-    }
-
-    // Group by namespace/origin for reconstruction
-    let mut core_sections: Vec<String> = Vec::new();
-    let mut daily_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for record in &all_records {
-        // Skip tombstones/replaced records (WP4.1 §8.1) — ZeroClaw's brain.db
-        // extractor is the one adapter that actually emits `Superseded` rows
-        // (from `superseded_by`), so without this filter a cross-runtime
-        // restore resurrects them next to their replacements.
-        if !record.status.is_materialized() {
-            continue;
-        }
-        let origin_file = record.source.origin_file.as_deref().unwrap_or("");
-
-        match record.namespace.as_str() {
-            "core" => {
-                core_sections.push(record.content.clone());
-            }
-            "daily" => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else if let Some(observed) = record.temporal.observed_at {
-                    format!("memory/{}.md", observed.format("%Y-%m-%d"))
-                } else {
-                    format!(
-                        "memory/{}.md",
-                        record.temporal.created_at.format("%Y-%m-%d")
-                    )
-                };
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            "conversation" => {
-                // Conversation records grouped by date
-                let key = format!(
-                    "memory/{}.md",
-                    record.temporal.created_at.format("%Y-%m-%d")
-                );
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            "session" => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    let short_id = &record.id.to_string()[..8];
-                    format!("memory/session_{short_id}.md")
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            _ => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    format!("memory/{}.md", record.namespace)
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-        }
-    }
-
-    // Write core sections as a single file (ZeroClaw's memory_store Core)
-    if !core_sections.is_empty() {
-        let content = core_sections.join("\n\n");
-        let target = workspace.join("memory").join("core.md");
-        fs::write(&target, content)?;
-    }
-
-    // Write daily files
-    for (file_path, sections) in &daily_groups {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    // Write other memory files
-    for (file_path, sections) in &other_files {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    if !all_records.is_empty() {
-        warnings.push(format!(
-            "Reconstructed {} memory record(s) as Markdown files. \
-             Run `zeroclaw` to ingest into SQLite if desired.",
-            all_records.len()
-        ));
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests

@@ -18,7 +18,9 @@
 
 use crate::adapter;
 use crate::api_client::{ApiClient, RegisterAgentOutcome};
-use crate::commands::restore::{ensure_sync_not_during_restore, pull_cloud_base};
+use crate::commands::restore::{
+    ensure_sync_not_during_restore, fetch_cloud_base, persist_cloud_base, pull_cloud_base,
+};
 use crate::config::Config;
 use crate::errors::{codes, CliError};
 use crate::output;
@@ -36,7 +38,7 @@ use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use colored::Colorize;
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::{Cursor, Read, Seek};
@@ -175,10 +177,9 @@ pub(crate) enum FirstSyncConflict {
     /// No conflict (or the operator forced it, or nothing is in the cloud to
     /// overwrite): upload the snapshot as planned.
     Upload,
-    /// **Our own** first sync was interrupted after its upload landed (MIN-3):
-    /// adopt the cloud snapshot as the local base and land the current
-    /// workspace on top of it — the same ladder E7 recovery uses.
-    AdoptCloudBase,
+    /// A digest-bearing local marker exists, so the caller must fetch and
+    /// compare the raw cloud snapshot before it can decide to adopt it.
+    VerifyCloudSnapshot,
     /// A genuine fork (E3): the cloud has history this machine never wrote.
     /// Park and ask a human.
     Park,
@@ -187,16 +188,15 @@ pub(crate) enum FirstSyncConflict {
 /// Decide the first-sync branch. Pure so the matrix is unit-testable
 /// (mirrors [`decide_sync_mode`]).
 ///
-/// The discriminator for MIN-3 is the **in-flight marker**: `alf` writes
-/// `~/.alf/state/{id}.first-sync-inflight` immediately before a first-sync
-/// upload and removes it once the state file lands. Its presence is local,
-/// per-agent proof that THIS machine was mid-first-sync for THIS id — a fork
-/// created on another machine leaves no such marker. Without that evidence a
-/// "the agent exists in the cloud" conflict stays a park, exactly as before.
+/// The discriminator for MIN-3 is a valid, digest-bound **in-flight marker**:
+/// `alf` writes it immediately before a first-sync upload and removes it once
+/// a matching cloud base and local state are durable. The marker proves only
+/// that this host attempted to upload particular bytes; it is never proof that
+/// arbitrary cloud history belongs to this host. A cloud snapshot fetch must
+/// match its digest before [`FirstSyncConflict::VerifyCloudSnapshot`] adopts it.
 ///
-/// `cloud_latest_sequence == 0` with a marker means the register call landed
-/// but the upload did not: there is no cloud history to overwrite, so the
-/// upload simply proceeds.
+/// `cloud_latest_sequence == 0` with a valid marker means no snapshot history
+/// exists, so the upload simply proceeds.
 pub(crate) fn decide_first_sync_conflict(
     already_existed: bool,
     cloud_latest_sequence: u64,
@@ -208,26 +208,37 @@ pub(crate) fn decide_first_sync_conflict(
     }
     match (inflight_marker, cloud_latest_sequence) {
         (true, 0) => FirstSyncConflict::Upload,
-        (true, _) => FirstSyncConflict::AdoptCloudBase,
+        (true, _) => FirstSyncConflict::VerifyCloudSnapshot,
         (false, _) => FirstSyncConflict::Park,
     }
 }
 
 /// The in-flight marker path for `agent_id` (see [`decide_first_sync_conflict`]).
+#[derive(Debug, Serialize, Deserialize)]
+struct FirstSyncInflight {
+    version: u8,
+    agent_id: uuid::Uuid,
+    snapshot_sha256: String,
+}
+const FIRST_SYNC_INFLIGHT_VERSION: u8 = 1;
 fn first_sync_marker_path(agent_id: uuid::Uuid) -> Result<std::path::PathBuf> {
     Ok(AgentState::state_dir()?.join(format!("{agent_id}.first-sync-inflight")))
 }
 
-/// Record that a first-sync upload is about to start. Best-effort by design:
-/// if the marker cannot be written the sync still proceeds — the only cost is
-/// that a crash in the upload window falls back to the pre-MIN-3 park.
-fn mark_first_sync_inflight(agent_id: uuid::Uuid) {
-    if let Ok(path) = first_sync_marker_path(agent_id) {
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let _ = fs::write(&path, "in-flight first sync; see sync.rs MIN-3\n");
+/// Durably record the exact archive a first-sync upload is about to send.
+fn mark_first_sync_inflight(agent_id: uuid::Uuid, snapshot: &[u8]) -> Result<()> {
+    let path = first_sync_marker_path(agent_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
     }
+    let marker = FirstSyncInflight {
+        version: FIRST_SYNC_INFLIGHT_VERSION,
+        agent_id,
+        snapshot_sha256: alf_core::ids::sha256_hex(snapshot),
+    };
+    let json = serde_json::to_string(&marker)?;
+    crate::fs_private::write_private_atomic(&path, &json)?;
+    Ok(())
 }
 
 /// Clear the in-flight marker once the sync state is durable.
@@ -237,8 +248,21 @@ fn clear_first_sync_inflight(agent_id: uuid::Uuid) {
     }
 }
 
-fn first_sync_marker_present(agent_id: uuid::Uuid) -> bool {
-    first_sync_marker_path(agent_id).is_ok_and(|p| p.exists())
+fn load_first_sync_inflight(agent_id: uuid::Uuid) -> Option<FirstSyncInflight> {
+    let path = first_sync_marker_path(agent_id).ok()?;
+    let json = fs::read_to_string(path).ok()?;
+    let marker: FirstSyncInflight = serde_json::from_str(&json).ok()?;
+    if marker.version != FIRST_SYNC_INFLIGHT_VERSION
+        || marker.agent_id != agent_id
+        || marker.snapshot_sha256.len() != 64
+        || !marker
+            .snapshot_sha256
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return None;
+    }
+    Some(marker)
 }
 
 /// E3 guard: refuse to upload an empty/local-only workspace as a "first sync"
@@ -1014,14 +1038,15 @@ fn execute_first_sync(
         .register_agent(agent_id, agent_name, runtime)
         .map_err(wrap_registration)?;
 
+    let inflight_marker = load_first_sync_inflight(agent_id);
     match decide_first_sync_conflict(
         outcome.already_existed,
         outcome.info.latest_sequence,
-        first_sync_marker_present(agent_id),
+        inflight_marker.is_some(),
         force_first_sync,
     ) {
         FirstSyncConflict::Upload => {}
-        FirstSyncConflict::AdoptCloudBase => {
+        FirstSyncConflict::VerifyCloudSnapshot => {
             // MIN-3: this machine's own first sync was killed between a
             // successful upload and the state write, so the "already exists"
             // conflict is our own snapshot, not a fork. Adopt cloud truth as
@@ -1032,13 +1057,20 @@ fn execute_first_sync(
                 "  Interrupted first sync detected (upload landed, state did not) — \
                  adopting the uploaded snapshot as the base...",
             );
-            let cloud = pull_cloud_base(client, agent_id, progress)?;
+            let marker = inflight_marker.expect("verification requires a valid marker");
+            let cloud = fetch_cloud_base(client, agent_id, progress)?;
+            if alf_core::ids::sha256_hex(&cloud.snapshot_bytes) != marker.snapshot_sha256 {
+                progress.emit("  First-sync marker does not match the cloud snapshot; refusing to adopt foreign history.");
+                check_first_sync_safety(agent_id, runtime, &outcome, force_first_sync)?;
+            }
+            persist_cloud_base(agent_id, &cloud)?;
+            clear_first_sync_inflight(agent_id);
             // Base the delta on the SERVER's head (from the registration
             // probe), not on the sequence derived from the adopted archive:
             // a first-sync snapshot carries a sync cursor written at export
             // time — before the service assigned it a sequence — so the
             // archive reads back as 0 and the delta's CAS would 409.
-            let base_sequence = outcome.info.latest_sequence.max(cloud.latest_sequence);
+            let base_sequence = cloud.latest_sequence;
             let result = execute_delta(
                 client,
                 agent_id,
@@ -1051,9 +1083,6 @@ fn execute_first_sync(
                 /* recovered: */ true,
                 progress,
             );
-            if result.is_ok() {
-                clear_first_sync_inflight(agent_id);
-            }
             return result;
         }
         FirstSyncConflict::Park => {
@@ -1064,7 +1093,7 @@ fn execute_first_sync(
     fault_before_upload();
     // The marker must be durable BEFORE the upload: it is the only local
     // evidence that a cloud agent appearing at the next start is ours.
-    mark_first_sync_inflight(agent_id);
+    mark_first_sync_inflight(agent_id, alf_bytes)?;
     let upload = client
         .upload_snapshot(agent_id, alf_bytes)
         .map_err(wrap_upload)?;
@@ -1660,12 +1689,12 @@ mod tests {
     }
 
     #[test]
-    fn first_sync_conflict_with_a_marker_adopts_the_cloud_base() {
+    fn first_sync_conflict_with_a_marker_requires_cloud_verification() {
         // Our own upload landed before the crash (cloud has history) →
         // self-heal instead of asking a human.
         assert_eq!(
             decide_first_sync_conflict(true, 1, true, false),
-            FirstSyncConflict::AdoptCloudBase
+            FirstSyncConflict::VerifyCloudSnapshot
         );
     }
 

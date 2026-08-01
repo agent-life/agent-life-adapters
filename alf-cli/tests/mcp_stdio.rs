@@ -1698,6 +1698,32 @@ fn simulate_crash_after_first_upload(home: &Path, with_marker: bool) {
         let _ = std::fs::remove_file(&marker);
     }
 }
+/// Write the versioned RF-007 first-sync marker that a real pre-upload path
+/// leaves on disk. Keeping this test-side serializer explicit means legacy
+/// text markers cannot accidentally be treated as valid recovery proof.
+fn write_first_sync_marker(home: &Path, digest: &str) {
+    let state = home.join(".alf").join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    let marker = state.join(format!("{TOY_AGENT_ID}.first-sync-inflight"));
+    std::fs::write(
+        marker,
+        serde_json::to_vec(&json!({
+            "version": 1,
+            "agent_id": TOY_AGENT_ID,
+            "snapshot_sha256": digest,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+}
+/// The versioned form of the state a SIGKILL between `upload_snapshot` and
+/// `persist_local` leaves behind: a digest bound to the uploaded snapshot.
+fn simulate_digest_bound_crash_after_first_upload(home: &Path) {
+    let state = home.join(".alf").join("state");
+    let uploaded = std::fs::read(state.join(format!("{TOY_AGENT_ID}-snapshot.alf"))).unwrap();
+    simulate_crash_after_first_upload(home, /* with_marker: */ false);
+    write_first_sync_marker(home, &sha256_hex(&uploaded));
+}
 
 /// MIN-3: after the crash window, a restarted server must SELF-HEAL — adopt
 /// the snapshot it already uploaded as the local base and land the current
@@ -1714,7 +1740,7 @@ fn first_sync_crash_window_self_heals_on_restart() {
     assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(1));
 
     // …then the kill, right after the upload landed.
-    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ true);
+    simulate_digest_bound_crash_after_first_upload(conv.home.path());
     // The workspace moved on between the crash and the restart — the recovery
     // must carry this change, not silently stamp state and drop it.
     std::fs::write(
@@ -1782,6 +1808,193 @@ fn first_sync_conflict_without_the_marker_still_refuses() {
     conv.finish();
 }
 
+/// RF-007: a marker proves only that this host attempted to upload archive A.
+/// It must not adopt a cloud snapshot B simply because the marker exists.
+#[test]
+fn first_sync_marker_for_different_cloud_snapshot_parks() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(1));
+    // Simulate a stale, syntactically valid marker for a different archive A,
+    // with cloud history B. The pre-RF-007 presence check incorrectly adopts B.
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ false);
+    write_first_sync_marker(conv.home.path(), &"00".repeat(32));
+    let mut conv = conv.restart();
+    let forked = conv.call(4, "alf_sync", json!({}));
+    assert_tool_error(&forked, "alf_sync");
+    let text = forked["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("already exists in the cloud"),
+        "the mismatch must use actionable E3 fork guidance: {text}"
+    );
+    assert!(
+        !conv
+            .home
+            .path()
+            .join(".alf/state")
+            .join(format!("{TOY_AGENT_ID}-snapshot.alf"))
+            .exists(),
+        "a nonmatching marker must not persist the foreign cloud base"
+    );
+    assert_eq!(
+        backend.delta_count(TOY_AGENT_ID),
+        0,
+        "a mismatched marker must not derive a local delta over foreign history"
+    );
+    conv.finish();
+}
+/// RF-007: legacy text markers are unproven and retain the normal E3 park.
+#[test]
+fn first_sync_legacy_marker_parks() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ false);
+    let marker = conv
+        .home
+        .path()
+        .join(".alf/state")
+        .join(format!("{TOY_AGENT_ID}.first-sync-inflight"));
+    std::fs::write(marker, b"in-flight first sync; see sync.rs MIN-3\n").unwrap();
+    let mut conv = conv.restart();
+    let forked = conv.call(4, "alf_sync", json!({}));
+    assert_tool_error(&forked, "alf_sync");
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
+    conv.finish();
+}
+/// RF-007: malformed markers are also unproven and must not trigger adoption.
+#[test]
+fn first_sync_malformed_marker_parks() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ false);
+    let marker = conv
+        .home
+        .path()
+        .join(".alf/state")
+        .join(format!("{TOY_AGENT_ID}.first-sync-inflight"));
+    std::fs::write(marker, b"{").unwrap();
+    let mut conv = conv.restart();
+    let forked = conv.call(4, "alf_sync", json!({}));
+    assert_tool_error(&forked, "alf_sync");
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
+    conv.finish();
+}
+/// RF-007: a valid marker can retry when registration landed but no snapshot
+/// history exists yet.
+#[test]
+fn first_sync_valid_marker_without_cloud_history_retries_upload() {
+    let backend = common::MockBackend::start();
+    backend.seed_agent(TOY_AGENT_ID, "registered without snapshot");
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    write_first_sync_marker(conv.home.path(), &"00".repeat(32));
+    let retried = conv.call(3, "alf_sync", json!({}));
+    assert_success(&retried, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(
+        backend.latest_sequence(TOY_AGENT_ID),
+        Some(1),
+        "the retry uploads the first snapshot when cloud history is empty"
+    );
+    conv.finish();
+}
+/// RF-007: compare against the raw snapshot, then retain later deltas in the
+/// adopted cloud base and derive the next delta from the authoritative head.
+#[test]
+fn first_sync_matching_snapshot_with_later_deltas_adopts_cloud_head() {
+    let backend = common::MockBackend::start();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    assert_success(
+        &conv.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    let snapshot_a = std::fs::read(
+        conv.home
+            .path()
+            .join(".alf/state")
+            .join(format!("{TOY_AGENT_ID}-snapshot.alf")),
+    )
+    .unwrap();
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-08.md"),
+        "## Host B\n\nCloud delta after snapshot A.\n",
+    )
+    .unwrap();
+    assert_success(
+        &conv.call(4, "alf_sync", json!({})),
+        "alf_sync",
+        &conv.schema_for("alf_sync"),
+    );
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(2));
+    simulate_crash_after_first_upload(conv.home.path(), /* with_marker: */ false);
+    write_first_sync_marker(conv.home.path(), &sha256_hex(&snapshot_a));
+    std::fs::write(
+        conv.workspace.path().join("memories").join("2026-07-09.md"),
+        "## Post-crash\n\nLocal delta after cloud head.\n",
+    )
+    .unwrap();
+    let mut conv = conv.restart();
+    let healed = conv.call(5, "alf_sync", json!({}));
+    assert_success(&healed, "alf_sync", &conv.schema_for("alf_sync"));
+    assert_eq!(healed["structuredContent"]["sequence"], 3);
+    assert_eq!(backend.latest_sequence(TOY_AGENT_ID), Some(3));
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 2);
+    conv.finish();
+}
+/// RF-007: an ambiguous failed upload leaves A's real marker behind; once a
+/// different host establishes B, retrying A must park rather than adopt B.
+#[test]
+fn first_sync_failed_upload_then_foreign_history_parks() {
+    let foreign_backend = common::MockBackend::start();
+    let mut foreign = Conversation::start_with_backend(&foreign_backend.url());
+    std::fs::write(
+        foreign
+            .workspace
+            .path()
+            .join("memories")
+            .join("2026-07-08.md"),
+        "## Foreign B\n\nDifferent first snapshot.\n",
+    )
+    .unwrap();
+    assert_success(
+        &foreign.call(3, "alf_sync", json!({})),
+        "alf_sync",
+        &foreign.schema_for("alf_sync"),
+    );
+    let snapshot_b = foreign_backend.snapshot_bytes(TOY_AGENT_ID).unwrap();
+    foreign.finish();
+    let backend = common::MockBackend::start();
+    backend.fail_next_snapshot_upload();
+    let mut conv = Conversation::start_with_backend(&backend.url());
+    let failed = conv.call(3, "alf_sync", json!({}));
+    assert_tool_error(&failed, "alf_sync");
+    assert!(conv
+        .home
+        .path()
+        .join(".alf/state")
+        .join(format!("{TOY_AGENT_ID}.first-sync-inflight"))
+        .exists());
+    backend.replace_snapshot(TOY_AGENT_ID, snapshot_b);
+    let mut conv = conv.restart();
+    let forked = conv.call(4, "alf_sync", json!({}));
+    assert_tool_error(&forked, "alf_sync");
+    assert_eq!(backend.delta_count(TOY_AGENT_ID), 0);
+    conv.finish();
+}
 // ===========================================================================
 // MIN-16 — head (non-preview) alf_restore over the MCP surface
 // ===========================================================================

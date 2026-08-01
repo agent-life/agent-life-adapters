@@ -199,6 +199,16 @@ fn fetch_restore_payload(
     up_to_sequence: Option<u64>,
     progress: Progress,
 ) -> Result<(Vec<u8>, u64)> {
+    let (final_bytes, latest_sequence, _) =
+        fetch_restore_payload_with_snapshot(client, agent_id, up_to_sequence, progress)?;
+    Ok((final_bytes, latest_sequence))
+}
+fn fetch_restore_payload_with_snapshot(
+    client: &ApiClient,
+    agent_id: Uuid,
+    up_to_sequence: Option<u64>,
+    progress: Progress,
+) -> Result<(Vec<u8>, u64, Vec<u8>)> {
     progress.emit("  Fetching restore manifest...");
     let restore = client.restore(agent_id, up_to_sequence)?;
 
@@ -260,25 +270,28 @@ fn fetch_restore_payload(
         .collect();
     let final_bytes = rebuild_snapshot_with_sequence(&snapshot_bytes, &delta_refs, latest_sequence)
         .context("Failed to merge snapshot and deltas for restore")?;
-    Ok((final_bytes, latest_sequence))
+    Ok((final_bytes, latest_sequence, snapshot_bytes))
 }
 
 /// A cloud restore payload that has been fetched and rebuilt in memory but
 /// has not been committed to local sync state.
-struct FetchedCloudBase {
-    final_bytes: Vec<u8>,
-    latest_sequence: u64,
+pub(crate) struct FetchedCloudBase {
+    pub(crate) snapshot_bytes: Vec<u8>,
+    pub(crate) final_bytes: Vec<u8>,
+    pub(crate) latest_sequence: u64,
 }
 
 /// Fetch the cloud snapshot + deltas (head) for `agent_id` and rebuild the
 /// complete archive in memory. This phase does not mutate local state.
-fn fetch_cloud_base(
+pub(crate) fn fetch_cloud_base(
     client: &ApiClient,
     agent_id: Uuid,
     progress: Progress,
 ) -> Result<FetchedCloudBase> {
-    let (final_bytes, latest_sequence) = fetch_restore_payload(client, agent_id, None, progress)?;
+    let (final_bytes, latest_sequence, snapshot_bytes) =
+        fetch_restore_payload_with_snapshot(client, agent_id, None, progress)?;
     Ok(FetchedCloudBase {
+        snapshot_bytes,
         final_bytes,
         latest_sequence,
     })
@@ -289,7 +302,7 @@ fn fetch_cloud_base(
 ///
 /// `base.alf` is written before `state.toml`, preserving the existing
 /// state-present-implies-base-present invariant.
-fn persist_cloud_base(agent_id: Uuid, cloud: &FetchedCloudBase) -> Result<PathBuf> {
+pub(crate) fn persist_cloud_base(agent_id: Uuid, cloud: &FetchedCloudBase) -> Result<PathBuf> {
     let local_base = local_base_path(agent_id)?;
     if let Some(parent) = local_base.parent() {
         fs::create_dir_all(parent)

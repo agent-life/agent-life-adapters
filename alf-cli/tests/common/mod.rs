@@ -37,6 +37,7 @@ struct AgentRecord {
 struct BackendState {
     agents: HashMap<String, AgentRecord>,
     auth_rejected: bool,
+    fail_next_snapshot_upload: bool,
     /// First-sync registrations refused with 409 `exists` — the observable for
     /// "the watch loop attempted another sync" in the fork park/un-park test.
     register_conflicts: u64,
@@ -97,6 +98,33 @@ impl MockBackend {
     /// Toggle 401 rejection on every `/agents…` route (for auth-park tests).
     pub fn set_auth_rejected(&self, on: bool) {
         self.state.lock().unwrap().auth_rejected = on;
+    }
+    /// Return 503 for exactly one snapshot upload without mutating history.
+    pub fn fail_next_snapshot_upload(&self) {
+        self.state.lock().unwrap().fail_next_snapshot_upload = true;
+    }
+    /// Copy the currently stored raw snapshot bytes for another test backend.
+    pub fn snapshot_bytes(&self, agent_id: &str) -> Option<Vec<u8>> {
+        self.state
+            .lock()
+            .unwrap()
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.snapshot.as_ref())
+            .cloned()
+    }
+    /// Establish already-existing foreign snapshot history without involving the
+    /// client under test.
+    pub fn replace_snapshot(&self, agent_id: &str, snapshot: Vec<u8>) {
+        let mut state = self.state.lock().unwrap();
+        let agent = state
+            .agents
+            .get_mut(agent_id)
+            .expect("agent must be registered");
+        agent.latest_sequence = 1;
+        agent.snapshot_sequence = 1;
+        agent.snapshot = Some(snapshot);
+        agent.deltas.clear();
     }
 
     /// Pre-create an agent record (no snapshot) — stages the E3 fork: the next
@@ -384,6 +412,14 @@ fn get_agent(id: &str, state: &Arc<Mutex<BackendState>>) -> Vec<u8> {
 
 fn put_snapshot(id: &str, req: &Request, state: &Arc<Mutex<BackendState>>) -> Vec<u8> {
     let mut st = state.lock().unwrap();
+    if st.fail_next_snapshot_upload {
+        st.fail_next_snapshot_upload = false;
+        return json_response(
+            503,
+            "Service Unavailable",
+            &json!({"error": "injected upload failure"}),
+        );
+    }
     let Some(a) = st.agents.get_mut(id) else {
         return json_response(404, "Not Found", &json!({"error": "no agent"}));
     };

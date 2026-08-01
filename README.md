@@ -596,7 +596,7 @@ INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localho
 
 ### Integration walkthroughs
 
-**Main pipeline** (`scripts/integration_walkthrough.py`) is both an end-to-end functional test and an educational tool for new contributors. It walks through the complete agent lifecycle — connectivity, create agent, snapshot, deltas, restore, point-in-time restore, simulated data loss, recovery, and cleanup — with explanations at each step of what is happening and where data lives (API, Neon, S3).
+**Main pipeline** (`scripts/integration_walkthrough.py`) is both an end-to-end functional test and an educational tool for new contributors. It walks through the complete agent lifecycle — connectivity, create agent, snapshot, deltas, restore, point-in-time restore, simulated data loss, recovery, and cleanup — with explanations at each step of what is happening and where data lives (API, Neon, S3). For Hermes and ZeroClaw it also keeps a real `alf mcp serve` session open while the allowlisted content root is absent, then proves root creation and a later nested edit each auto-sync to the cloud and survive a read-only restore preview.
 
 **Vault-focused** (`scripts/integration_walkthrough_for_vault.py`) covers Layer 4: zero-knowledge boundary, on-disk vs cloud representation, snapshot upload with `credentials.json`, optional `alf vault list`, and cleanup. Same `.env` variables as the main script.
 

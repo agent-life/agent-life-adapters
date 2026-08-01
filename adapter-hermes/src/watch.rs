@@ -56,14 +56,16 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         resurface: false,
     });
 
-    // Allowlisted content dirs, only when present (Hermes has no whole-home
-    // recursive watch to fall back onto, and the home holds the runtime we must
-    // not walk).
+    // Allowlisted content dirs are logical roots even when absent. The watch
+    // loop temporarily watches their nearest existing ancestor, then upgrades
+    // to this recursive root when it appears.
     for dir in CONTENT_DIRS {
         let root = workspace.join(dir);
-        if root.is_dir() {
-            specs.push(WatchSpec::dir(*dir, root.clone()).excluding([root.join(".git")]));
-        }
+        specs.push(
+            WatchSpec::dir(*dir, root.clone())
+                .excluding([root.join(".git")])
+                .resurfacing(),
+        );
     }
 
     // state.db + WAL/SHM sidecars, one dirty unit.
@@ -229,18 +231,20 @@ mod tests {
     }
 
     #[test]
-    fn allowlisted_dirs_watched_only_when_present() {
+    fn allowlisted_dirs_are_resurfacing_roots_when_absent() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
-        fs::create_dir_all(home.join("memories")).unwrap();
-        // skill-bundles / cron / skills absent.
         let specs = watch_paths(home);
-        assert!(by_id(&specs, "memories").is_some());
-        assert!(by_id(&specs, "skill-bundles").is_none());
-        assert!(by_id(&specs, "cron").is_none());
-        assert!(by_id(&specs, "skills").is_none());
-        let memories = by_id(&specs, "memories").unwrap();
-        assert!(memories.recursive);
+        for dir in CONTENT_DIRS {
+            let spec = by_id(&specs, dir).expect("allowlisted content spec");
+            assert!(spec.recursive, "{dir} must be recursive after it appears");
+            assert!(
+                spec.resurface,
+                "{dir} must refresh the watch surface on creation"
+            );
+            assert_eq!(spec.roots, vec![home.join(dir)]);
+            assert_eq!(spec.exclude, vec![home.join(dir).join(".git")]);
+        }
     }
 
     #[test]

@@ -52,14 +52,15 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         resurface: false,
     });
 
-    // Markdown backend: memory/ (only when present — ZeroClaw has no
-    // whole-install recursive watch to fall back onto; a memory/ dir first
-    // created mid-session is not watched until restart — the generic-G2
-    // limitation, §D2).
+    // Markdown backend: memory/ is a logical root even when absent. The loop
+    // temporarily watches its nearest existing ancestor and upgrades to the
+    // recursive root when it appears.
     let memory = install.join("memory");
-    if memory.is_dir() {
-        specs.push(WatchSpec::dir("memory", memory.clone()).excluding([memory.join(".git")]));
-    }
+    specs.push(
+        WatchSpec::dir("memory", memory.clone())
+            .excluding([memory.join(".git")])
+            .resurfacing(),
+    );
 
     // Root-level structural files. Every candidate is a root so the rescan
     // backstop tracks it (and catches a later-created file); notify watches the
@@ -215,15 +216,16 @@ mod tests {
     }
 
     #[test]
-    fn markdown_memory_dir_watched_when_present() {
+    fn markdown_memory_is_a_resurfacing_root_when_absent() {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path();
         fs::write(install.join("config.toml"), "").unwrap();
-        fs::create_dir_all(install.join("memory")).unwrap();
         let specs = watch_paths(install);
         let memory = by_id(&specs, "memory").expect("memory spec");
         assert!(memory.recursive);
+        assert!(memory.resurface);
         assert_eq!(memory.roots, vec![install.join("memory")]);
+        assert_eq!(memory.exclude, vec![install.join("memory").join(".git")]);
     }
 
     #[test]

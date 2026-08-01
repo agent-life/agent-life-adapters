@@ -18,7 +18,7 @@ pub mod capture;
 pub mod engine;
 pub mod lock;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -777,8 +777,9 @@ pub async fn run_loop(
         };
     // Only sync specs get an OS-notify watch (review B1); rediscover roots are
     // mtime-polled, so registering them would over-watch sibling-profile content.
-    let mut watched: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-    register_watches(&mut watcher, &surface.sync_specs, &mut watched);
+    let mut watched = BTreeMap::new();
+    let desired = desired_watch_targets(&surface.sync_specs);
+    register_watches(&mut watcher, &desired, &mut watched);
 
     // Seed the rescan mtime cache (file roots + recursive dir roots, §4.3) and
     // the rediscover-root mtime cache (agent-set boundary dirs, e.g. Hermes
@@ -1023,7 +1024,7 @@ async fn drive_rescan_only(
     agent: Option<String>,
     sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
 ) {
-    let mut watched = std::collections::HashSet::new(); // no watcher — stays empty
+    let mut watched = BTreeMap::new(); // no watcher — stays empty
     let mut mtimes = seed_mtimes(&surface.index, None);
     let mut rd_mtimes: HashMap<PathBuf, Option<std::time::SystemTime>> = surface
         .rediscover_roots
@@ -1063,42 +1064,102 @@ async fn drive_rescan_only(
     }
 }
 
-/// Register a `notify` watch for each spec root. A root that does not exist yet
-/// falls back to watching its parent directory (the rescan covers the rest);
-/// failures are logged, never fatal.
-fn register_watches(
-    watcher: &mut notify::RecommendedWatcher,
-    specs: &[WatchSpec],
-    watched: &mut std::collections::HashSet<PathBuf>,
-) {
+/// Compute the concrete notify registrations for a logical watch surface.
+///
+/// A present root keeps its requested mode. An absent root is represented by a
+/// **non-recursive** watch on its nearest existing ancestor: that is sufficient
+/// to observe creation of the next path component without recursively watching
+/// an entire runtime home. When the root appears, its resurfacing spec causes a
+/// refresh that replaces the temporary ancestor watch with the recursive root.
+///
+/// `BTreeMap` makes collisions deterministic. Recursive wins if two specs want
+/// the same concrete target, so the registration never loses coverage.
+fn desired_watch_targets(specs: &[WatchSpec]) -> BTreeMap<PathBuf, RecursiveMode> {
+    let mut desired = BTreeMap::new();
     for spec in specs {
-        let mode = if spec.recursive {
+        let requested = if spec.recursive {
             RecursiveMode::Recursive
         } else {
             RecursiveMode::NonRecursive
         };
         for root in &spec.roots {
-            let target: &Path = if root.exists() {
-                root
+            let (target, mode) = if root.exists() {
+                (root.clone(), requested)
+            } else if let Some(ancestor) = nearest_existing_ancestor(root.parent()) {
+                (ancestor, RecursiveMode::NonRecursive)
             } else {
-                match root.parent() {
-                    Some(p) if p.exists() => p,
-                    _ => continue,
-                }
-            };
-            // Dedupe across specs AND across surface refreshes: an
-            // already-registered target is never re-watched (§4.3).
-            if !watched.insert(target.to_path_buf()) {
                 continue;
-            }
-            if let Err(e) = watcher.watch(target, mode) {
-                eprintln!(
-                    "alf mcp serve: cannot watch {} ({e}); relying on rescan",
-                    target.display()
-                );
-            }
+            };
+            desired
+                .entry(target)
+                .and_modify(|active| {
+                    if *active == RecursiveMode::NonRecursive && mode == RecursiveMode::Recursive {
+                        *active = RecursiveMode::Recursive;
+                    }
+                })
+                .or_insert(mode);
         }
     }
+    desired
+}
+
+/// The closest existing parent suitable for a temporary non-recursive watch.
+fn nearest_existing_ancestor(path: Option<&Path>) -> Option<PathBuf> {
+    let mut current = path;
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(candidate.to_path_buf());
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// Register desired targets that are not already active. Failed registrations
+/// stay absent from `watched`, so a future surface refresh retries them; the
+/// mtime rescan remains the non-fatal backstop.
+fn register_watches(
+    watcher: &mut notify::RecommendedWatcher,
+    desired: &BTreeMap<PathBuf, RecursiveMode>,
+    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
+) {
+    for (target, mode) in desired {
+        if watched.get(target) == Some(mode) {
+            continue;
+        }
+        if watched.contains_key(target) {
+            let _ = watcher.unwatch(target);
+            watched.remove(target);
+        }
+        match watcher.watch(target, *mode) {
+            Ok(()) => {
+                watched.insert(target.clone(), *mode);
+            }
+            Err(e) => eprintln!(
+                "alf mcp serve: cannot watch {} ({e}); relying on rescan",
+                target.display()
+            ),
+        }
+    }
+}
+
+/// Reconcile active registrations with the desired target-to-mode map. A mode
+/// transition is an unwatch plus a fresh registration, which is how a temporary
+/// ancestor watch becomes the recursive logical-root watch after creation.
+fn reconcile_watches(
+    watcher: &mut notify::RecommendedWatcher,
+    desired: &BTreeMap<PathBuf, RecursiveMode>,
+    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
+) {
+    let stale: Vec<PathBuf> = watched
+        .iter()
+        .filter_map(|(target, mode)| (desired.get(target) != Some(mode)).then(|| target.clone()))
+        .collect();
+    for target in stale {
+        let _ = watcher.unwatch(&target);
+        watched.remove(&target);
+    }
+    register_watches(watcher, desired, watched);
 }
 
 /// Re-derive the watch surface and re-point everything at it (manual §4.3):
@@ -1112,7 +1173,7 @@ fn refresh_surface(
     agent_id: uuid::Uuid,
     handle: &WatchHandle,
     watcher: Option<&mut notify::RecommendedWatcher>,
-    watched: &mut std::collections::HashSet<PathBuf>,
+    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
     surface: &mut Surface,
     mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
     rd_mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
@@ -1126,24 +1187,8 @@ fn refresh_surface(
         e.set_sources(&next.sync_specs, handle.now());
     }
     if let Some(watcher) = watcher {
-        // Compute the notify targets the new surface wants, drop the rest.
-        let mut desired: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-        for spec in &next.sync_specs {
-            for root in &spec.roots {
-                if root.exists() {
-                    desired.insert(root.clone());
-                } else if let Some(p) = root.parent() {
-                    if p.exists() {
-                        desired.insert(p.to_path_buf());
-                    }
-                }
-            }
-        }
-        for gone in watched.iter().filter(|t| !desired.contains(*t)) {
-            let _ = watcher.unwatch(gone);
-        }
-        watched.retain(|t| desired.contains(t));
-        register_watches(watcher, &next.sync_specs, watched);
+        let desired = desired_watch_targets(&next.sync_specs);
+        reconcile_watches(watcher, &desired, watched);
     }
     *mtimes = seed_mtimes(&next.index, Some(mtimes));
     let old_rd = std::mem::take(rd_mtimes);
@@ -1600,6 +1645,182 @@ mod tests {
         handle.request_resurface();
         assert!(handle.take_resurface(), "consumes the request");
         assert!(!handle.take_resurface(), "one-shot");
+    }
+
+    #[test]
+    fn desired_watch_targets_upgrade_absent_root_to_recursive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("missing").join("memory");
+        let spec = WatchSpec::dir("memory", root.clone()).resurfacing();
+
+        let absent = desired_watch_targets(std::slice::from_ref(&spec));
+        assert_eq!(absent.len(), 1);
+        assert_eq!(
+            absent.get(&tmp.path().to_path_buf()),
+            Some(&RecursiveMode::NonRecursive),
+            "an absent root must watch only its nearest existing ancestor"
+        );
+
+        std::fs::create_dir_all(&root).unwrap();
+        let present = desired_watch_targets(&[spec]);
+        assert_eq!(present.len(), 1);
+        assert_eq!(
+            present.get(&root),
+            Some(&RecursiveMode::Recursive),
+            "the refresh target must become the recursive logical root"
+        );
+    }
+
+    #[test]
+    fn desired_watch_targets_dedupe_and_prefer_recursive_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("shared");
+        std::fs::create_dir_all(&target).unwrap();
+        let recursive = WatchSpec::dir("content", target.clone());
+        let file = WatchSpec::file("single", target.clone());
+
+        for specs in [
+            vec![file.clone(), recursive.clone()],
+            vec![recursive.clone(), file.clone()],
+        ] {
+            let desired = desired_watch_targets(&specs);
+            assert_eq!(desired.len(), 1, "shared targets must deduplicate");
+            assert_eq!(desired.get(&target), Some(&RecursiveMode::Recursive));
+        }
+    }
+
+    #[test]
+    fn desired_watch_targets_deduplicates_absent_sibling_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+        let specs = [
+            WatchSpec::dir("memories", tmp.path().join("memories")).resurfacing(),
+            WatchSpec::dir("skills", tmp.path().join("skills")).resurfacing(),
+        ];
+
+        let desired = desired_watch_targets(&specs);
+        assert_eq!(desired.len(), 1, "absent siblings share one parent watch");
+        assert_eq!(
+            desired.get(&tmp.path().to_path_buf()),
+            Some(&RecursiveMode::NonRecursive),
+            "the shared parent must never be watched recursively"
+        );
+    }
+
+    #[test]
+    fn notify_reconciles_lazy_root_then_routes_descendant_edit() {
+        use std::sync::mpsc;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().to_path_buf();
+        let root = home.join("memories");
+        let child = root.join("first.md");
+        let spec = WatchSpec::dir("memories", root.clone()).resurfacing();
+        let index = RootIndex::build(std::slice::from_ref(&spec));
+        let (tx, rx) = mpsc::channel();
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                if let Ok(event) = event {
+                    for path in event.paths {
+                        let _ = tx.send(path);
+                    }
+                }
+            })
+            .expect("create notify watcher");
+        let mut watched = BTreeMap::new();
+
+        let absent = desired_watch_targets(std::slice::from_ref(&spec));
+        register_watches(&mut watcher, &absent, &mut watched);
+        if watched.get(&home) != Some(&RecursiveMode::NonRecursive) {
+            // Some constrained CI hosts exhaust their inotify watch quota while
+            // the deterministic planner/rescan regressions remain runnable.
+            // Do not turn host resource exhaustion into a product failure.
+            eprintln!("skipping notify assertion: temporary watch registration unavailable");
+            return;
+        }
+        assert_eq!(watched.len(), 1);
+
+        std::fs::create_dir_all(&root).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut creation_routed = false;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(path) = rx.recv_timeout(remaining) else {
+                break;
+            };
+            if index.ids_for(&path) == ["memories"] {
+                creation_routed = true;
+                break;
+            }
+        }
+        assert!(
+            creation_routed,
+            "temporary parent registration must route root creation to memories"
+        );
+
+        let present = desired_watch_targets(std::slice::from_ref(&spec));
+        reconcile_watches(&mut watcher, &present, &mut watched);
+        assert_eq!(watched.get(&root), Some(&RecursiveMode::Recursive));
+        assert!(
+            !watched.contains_key(&home),
+            "the temporary parent registration must be removed after refresh"
+        );
+
+        while rx.try_recv().is_ok() {}
+        std::fs::write(&child, "nested edit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut child_routed = false;
+        while Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let Ok(path) = rx.recv_timeout(remaining) else {
+                break;
+            };
+            if path == child && index.ids_for(&path) == ["memories"] {
+                child_routed = true;
+                break;
+            }
+        }
+        assert!(
+            child_routed,
+            "recursive root registration must route a descendant edit without restart"
+        );
+    }
+
+    #[test]
+    fn rescan_detects_absent_resurfacing_dir_creation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        let spec = WatchSpec::dir("memory", root.clone()).resurfacing();
+        let index = RootIndex::build(std::slice::from_ref(&spec));
+        let surface = Surface {
+            sync_specs: vec![spec.clone()],
+            rediscover_roots: vec![],
+            index,
+            resurface_ids: ["memory".to_string()].into_iter().collect(),
+        };
+        let handle = WatchHandle::new(WatchConfig::default());
+        {
+            let mut e = handle.engine.lock().unwrap();
+            e.set_sources(&[spec], Duration::ZERO);
+            assert!(matches!(e.poll(Duration::ZERO), Tick::Sync(_)));
+            e.record_result(Duration::ZERO, Ok(()));
+        }
+        let mut mtimes = seed_mtimes(&surface.index, None);
+        assert_eq!(mtimes.get(&root), Some(&None), "absent root is seeded");
+
+        std::fs::create_dir_all(&root).unwrap();
+        rescan(&handle, &surface, &mut mtimes);
+
+        assert!(
+            handle.take_resurface(),
+            "root creation must request refresh"
+        );
+        let source = handle
+            .snapshot()
+            .sources
+            .into_iter()
+            .find(|source| source.source == "memory")
+            .expect("memory source");
+        assert!(source.dirty, "root creation must dirty the content source");
     }
 
     #[test]

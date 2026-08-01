@@ -61,6 +61,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -514,6 +515,73 @@ def run_cli(ctx: RunContext, argv: list[str], *, timeout: int = 180,
                 print(f"    {c('red', err[:220])}")
         print()
     return proc, parsed
+
+
+def start_watch_server(ctx: RunContext) -> tuple[subprocess.Popen, list[str], threading.Thread]:
+    """Start a persistent MCP server with a test-only short watch cadence.
+
+    The server needs no MCP request to start watching; keeping stdin open gives
+    the loop the same lifetime as a real MCP host session. Stderr is drained in
+    a background thread so watch diagnostics cannot block the child. Stdout is
+    the JSON-RPC protocol stream and is unused by this walkthrough.
+    """
+    env = {
+        **os.environ,
+        "HOME": str(ctx.home),
+        "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+        "ALF_WATCH_QUIESCE_MS": "1000",
+        "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+        "ALF_WATCH_TICK_MS": "1000",
+    }
+    env.pop("ALF_HUMAN", None)
+    env.pop("ALF_AGENT", None)
+    proc = subprocess.Popen(
+        [ctx.alf, "mcp", "serve", "-r", ctx.runtime, "-w", str(ctx.ws)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    stderr_lines: list[str] = []
+
+    def drain_stderr():
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    drainer = threading.Thread(target=drain_stderr, daemon=True)
+    drainer.start()
+    return proc, stderr_lines, drainer
+
+
+def stop_watch_server(proc: subprocess.Popen, drainer: threading.Thread) -> None:
+    """End the stdio session cleanly, then terminate only if it ignores EOF."""
+    if proc.stdin is not None and not proc.stdin.closed:
+        proc.stdin.close()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    drainer.join(timeout=3)
+
+
+def wait_for(predicate, *, timeout: float, interval: float = 0.25) -> bool:
+    """Poll a local/API predicate with a bounded integration-test wait."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -1101,6 +1169,176 @@ def step_identity_principals_delta(cfg: Config, ctx: RunContext, report: Report)
     pause(cfg)
 
 
+def step_lazy_content_root_watch(cfg: Config, ctx: RunContext, db: DbClient,
+                                 report: Report):
+    """RF-008 regression: create an allowlisted content root after the MCP
+    watcher starts, then prove a later descendant edit is auto-synced too."""
+    if ctx.runtime not in {"hermes", "zeroclaw"}:
+        return
+
+    section("5b", "Lazy Content Root — Watch Refresh + Auto-sync")
+    if ctx.runtime == "hermes":
+        root = ctx.ws / "memories"
+        probe_rel = Path("memories") / "rf008" / "probe.md"
+        marker_prefix = "RF008-HERMES"
+        probe_base = ctx.ws
+    else:
+        # ZeroClaw resolves the install from config.toml, so its markdown root
+        # is at the install root, not the legacy workspace child.
+        root = ctx.runtime_home / "memory"
+        probe_rel = Path("memory") / "rf008" / "probe.md"
+        marker_prefix = "RF008-ZEROCLAW"
+        probe_base = ctx.runtime_home
+
+    explain(f"""
+        RF-008 regression: {ctx.runtime} must watch an allowlisted content root
+        that does not exist when `alf mcp serve` starts. We first remove only
+        `{root.name}/` and commit that deletion as a manual baseline. Then a
+        persistent watcher creates `{probe_rel}` and later appends to the same
+        already-existing file. The cloud sequence must advance once for creation
+        and again for the nested edit; a read-only restore preview must contain
+        both markers.
+    """)
+    flow(f"absent {root.name}/ ──mcp serve──▶ parent creation watch ──refresh──▶ recursive {root.name}/ watch")
+
+    t0 = time.time()
+    stderr_path = ctx.root / f"rf008-{ctx.runtime}-watch-stderr.log"
+    server: Optional[subprocess.Popen] = None
+    drainer: Optional[threading.Thread] = None
+    stderr_lines: list[str] = []
+    s0: Optional[int] = None
+    s1: Optional[int] = None
+    s2: Optional[int] = None
+    preview_path: Optional[Path] = None
+    token = uuid.uuid4().hex[:12]
+    create_marker = f"{marker_prefix}-CREATE-{token}"
+    nested_marker = f"{marker_prefix}-NESTED-{token}"
+    probe = probe_base / probe_rel
+    failure = ""
+
+    def latest_sequence() -> Optional[int]:
+        row = db.query_one(
+            "SELECT latest_sequence FROM agents WHERE id = %s", (str(ctx.agent_id),)
+        )
+        return int(row["latest_sequence"]) if row is not None else None
+
+    def advanced(past: int) -> bool:
+        current = latest_sequence()
+        return current is not None and current > past
+
+    def diagnostics() -> str:
+        return "".join(stderr_lines[-30:]).strip() or "no server stderr captured"
+
+    try:
+        if root.is_dir():
+            shutil.rmtree(root)
+        elif root.exists():
+            root.unlink()
+        root_absent = not root.exists()
+        (ok if root_absent else fail)(f"precondition: {ctx.disp(root)} is absent = {root_absent}")
+        if not root_absent:
+            raise RuntimeError(f"could not remove logical root {root}")
+
+        # Commit the deliberate deletion before starting the server. The later
+        # automatic advances therefore cannot be a delayed removal upload.
+        proc, baseline = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        if proc.returncode != 0 or not baseline:
+            raise RuntimeError((proc.stderr or proc.stdout or "baseline sync failed")[:500])
+        s0 = latest_sequence()
+        if s0 is None:
+            raise RuntimeError("baseline sync completed but Neon has no latest_sequence")
+        ok(f"manual baseline after root removal → sequence {s0}")
+
+        print()
+        cli_header()
+        print(f"    $ alf mcp serve -r {ctx.runtime} -w {ctx.disp(ctx.ws)}")
+        print(c("dim", "      persistent MCP session; all watch timings are 1 s for this test"))
+        print()
+        server, stderr_lines, drainer = start_watch_server(ctx)
+        active = wait_for(
+            lambda: any("watch loop active" in line for line in stderr_lines)
+            or server.poll() is not None,
+            timeout=12,
+        )
+        if (not active or server.poll() is not None
+                or not any("watch loop active" in line for line in stderr_lines)):
+            raise RuntimeError(f"watch server did not become active: {diagnostics()}")
+        ok("persistent watch loop is active while the logical root is absent")
+
+        probe.parent.mkdir(parents=True)
+        probe.write_text(f"# RF-008 watch probe\n\n{create_marker}\n", encoding="utf-8")
+        ok(f"created {ctx.disp(probe)} with {create_marker}")
+        if not wait_for(lambda: advanced(s0), timeout=25):
+            raise RuntimeError(f"root creation did not advance sequence above {s0}: {diagnostics()}")
+        s1 = latest_sequence()
+        if s1 is None:
+            raise RuntimeError("sequence disappeared after root creation")
+        refreshed = wait_for(
+            lambda: any("watch surface refreshed" in line for line in stderr_lines),
+            timeout=5,
+        )
+        (ok if refreshed else fail)(f"surface refresh observed after root creation = {refreshed}")
+        if not refreshed:
+            raise RuntimeError(f"no surface refresh after root creation: {diagnostics()}")
+        ok(f"cloud sequence advanced from {s0} to {s1} after root creation")
+
+        with probe.open("a", encoding="utf-8") as handle:
+            handle.write(f"{nested_marker}\n")
+        ok(f"appended nested marker to the already-existing {ctx.disp(probe)}")
+        if not wait_for(lambda: advanced(s1), timeout=25):
+            raise RuntimeError(f"nested edit did not advance sequence above {s1}: {diagnostics()}")
+        s2 = latest_sequence()
+        if s2 is None:
+            raise RuntimeError("sequence disappeared after nested edit")
+        ok(f"cloud sequence advanced from {s1} to {s2} after nested edit")
+    except Exception as exc:  # noqa: BLE001 - retain live-walkthrough diagnostics
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if server is not None and drainer is not None:
+            stop_watch_server(server, drainer)
+        stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+
+    if not failure and s2 is not None:
+        # The public point-in-time preview reads the reconstructed cloud head
+        # without changing the live workspace or local sync state.
+        proc, preview = run_cli(ctx, [
+            "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws),
+            "-a", str(ctx.agent_id), "--at-sequence", str(s2),
+        ])
+        raw_preview = (preview or {}).get("preview_path")
+        if proc.returncode != 0 or not raw_preview:
+            failure = (proc.stderr or proc.stdout or "restore preview failed")[:500]
+        else:
+            preview_path = Path(raw_preview)
+            restored_probe = preview_path / probe_rel
+            restored_text = restored_probe.read_text(encoding="utf-8") if restored_probe.is_file() else ""
+            markers_restored = create_marker in restored_text and nested_marker in restored_text
+            (ok if markers_restored else fail)(
+                f"read-only cloud preview contains both RF-008 markers = {markers_restored}")
+            if not markers_restored:
+                failure = f"preview {restored_probe} is missing one or both RF-008 markers"
+
+    duration = (time.time() - t0) * 1000
+    passed = not failure and s0 is not None and s1 is not None and s2 is not None
+    preview_display = str(preview_path) if preview_path is not None else "not-created"
+    detail = f"root={root.name}; S0={s0}; S1={s1}; S2={s2}; preview={preview_display}"
+    if passed:
+        print()
+        api_header()
+        ok(f"RF-008 watch walkthrough proved S0 < S1 < S2 ({s0} < {s1} < {s2})")
+        inspect(ctx, [
+            ("the two local probe markers", f"cat {ctx.disp(probe)}"),
+            ("the persistent server diagnostics", f"tail -60 {ctx.disp(stderr_path)}"),
+            ("the preview materialized from cloud history", f"cat {ctx.disp(preview_path / probe_rel)}"),
+        ])
+        report.add(StepResult("RF-008 lazy content-root watch", True, duration, detail))
+    else:
+        fail("RF-008 lazy content-root watch walkthrough failed")
+        report.add(StepResult("RF-008 lazy content-root watch", False, duration,
+                              error=f"{failure}\n{diagnostics()}"[:2000]))
+    pause(cfg)
+
+
 def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
     section(6, "Pull Deltas (API-only lane)")
     explain("""
@@ -1615,6 +1853,7 @@ def main():
         step_delta(cfg, ctx, db, s3, report, 2, "2026-01-17.md",
                    "## Results\n\nLoad test: p99 5ms on Redis 7.2.\n")
         step_identity_principals_delta(cfg, ctx, report)
+        step_lazy_content_root_watch(cfg, ctx, db, report)
         step_pull_deltas(cfg, api, report)
         step_restore(cfg, ctx, s3, db, report)
         step_point_in_time(cfg, ctx, api, report)

@@ -88,8 +88,61 @@ pub struct WatchStatus {
     /// Seconds until the next retry while backing off after a transient error.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub backoff_retry_in_secs: Option<u64>,
+    /// Whether filesystem notifications are active, or the loop is relying on
+    /// the bounded recursive polling backstop because the backend was
+    /// unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_backend: Option<String>,
+    /// Why the process could not create any notify backend. Present only when
+    /// `notify_backend` is `"rescan_only"` for that reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notify_error: Option<WatchRegistrationError>,
+    /// Per-target notify-registration health. An inactive target is still
+    /// covered by polling, but remains visible here until notify recovers.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub registrations: Vec<WatchRegistration>,
+    /// Sources whose latest polling scan was incomplete. An incomplete scan is
+    /// never treated as a clean fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub polling: Option<WatchPolling>,
     /// Per-source watch state.
     pub sources: Vec<WatchSource>,
+}
+
+/// Notify registration health for one concrete OS-watch target.
+#[derive(Serialize, JsonSchema)]
+pub struct WatchRegistration {
+    pub target: String,
+    /// `"recursive"` or `"non_recursive"`.
+    pub requested_mode: String,
+    pub active: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_in_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<WatchRegistrationError>,
+}
+
+/// A sanitized notify-registration error. It never carries file contents or
+/// any ALF credential material.
+#[derive(Serialize, JsonSchema)]
+pub struct WatchRegistrationError {
+    pub code: String,
+    pub message: String,
+}
+
+/// Bounded polling health for the watch surface.
+#[derive(Serialize, JsonSchema)]
+pub struct WatchPolling {
+    pub degraded_sources: Vec<WatchPollingDegradedSource>,
+}
+
+/// A source whose latest recursive scan could not produce an authoritative
+/// fingerprint (for example due to an entry, byte, or time limit).
+#[derive(Serialize, JsonSchema)]
+pub struct WatchPollingDegradedSource {
+    pub source: String,
+    pub code: String,
+    pub message: String,
 }
 
 /// A parked auto-sync error (coded, with a remediation hint).

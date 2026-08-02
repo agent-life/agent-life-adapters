@@ -387,7 +387,7 @@ cadence + dirty state, any backoff/parked recovery state).",
         // Snapshot the live watch loop (cheap, non-blocking) before deferring the
         // service query to the blocking pool.
         let watch = match &self.watch {
-            Some(h) if h.is_active() => watch::to_status(h.snapshot()),
+            Some(h) if h.is_active() => h.status(),
             Some(h) => WatchStatus {
                 inactive_reason: h.inactive_reason(),
                 ..WatchStatus::default()

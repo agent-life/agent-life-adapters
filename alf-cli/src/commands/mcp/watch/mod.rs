@@ -17,24 +17,40 @@
 pub mod capture;
 pub mod engine;
 pub mod lock;
+mod registration;
+mod rescan;
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use alf_core::WatchSpec;
-use notify::{RecursiveMode, Watcher};
+use notify::RecursiveMode;
 
 use crate::commands::sync;
 use crate::errors::codes;
 use crate::output::Progress;
 use engine::{Mono, SyncErrorClass, Tick, WatchConfig, WatchEngine, WatchSnapshot};
+use registration::RegistrationSet;
+use rescan::{FingerprintCache, PollingIssue, RescanBudget};
 
-/// How often the loop polls the engine and rescans file mtimes. Short enough
-/// that minute-scale debounces resolve promptly; long enough to be cheap.
+/// How often the loop polls the engine and runs a bounded recursive rescan.
+/// Short enough that minute-scale debounces resolve promptly; long enough to be cheap.
 const TICK_PERIOD: Duration = Duration::from_secs(5);
+
+/// Recursive rescan limits. A scan that reaches any limit is observable and
+/// non-authoritative: it never replaces the last complete fingerprint.
+const RESCAN_MAX_ENTRIES: usize = 10_000;
+const RESCAN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+const RESCAN_MAX_TICK: Duration = Duration::from_millis(250);
+
+/// Notify registration retry limits. This deliberately does not share the
+/// sync engine's network-backoff state.
+const WATCH_RETRY_INITIAL: Duration = Duration::from_secs(5);
+const WATCH_RETRY_MAX: Duration = Duration::from_secs(300);
 
 /// TEST-ONLY: `ALF_WATCH_TICK_MS` (whole ms) lowers the 5 s poll/rescan cadence so
 /// the Z16 watch test can react to ~3 s-spaced mutations. Unset (production, every
@@ -52,6 +68,41 @@ enum WatchMsg {
     /// The watcher dropped events (e.g. inotify queue overflow) — force a full
     /// catch-up so no change is silently lost.
     Overflow,
+}
+
+#[derive(Clone, Default)]
+struct WatchHealth {
+    notify_backend: Option<String>,
+    notify_error: Option<WatchIssue>,
+    registrations: Vec<RegistrationHealth>,
+    degraded_sources: Vec<PollingIssue>,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct WatchIssue {
+    code: String,
+    message: String,
+}
+
+#[derive(Clone)]
+struct RegistrationHealth {
+    target: PathBuf,
+    requested_mode: RecursiveMode,
+    active: bool,
+    retry_in: Option<Duration>,
+    last_error: Option<WatchIssue>,
+}
+
+fn sanitize_watch_error(error: impl Display) -> String {
+    let mut message = error.to_string().replace(['\n', '\r'], " ");
+    const MAX_ERROR_CHARS: usize = 320;
+    if message.chars().count() > MAX_ERROR_CHARS {
+        message = format!(
+            "{}…",
+            message.chars().take(MAX_ERROR_CHARS).collect::<String>()
+        );
+    }
+    message
 }
 
 /// Shared, thread-safe handle to the running watch loop. Held by [`AlfServer`]
@@ -84,6 +135,9 @@ pub struct WatchHandle {
     /// `alf_track`/`alf_configure` on success, by a sentinel-file change, and
     /// by rediscovery; consumed by the loop's next tick.
     resurface: AtomicBool,
+    /// Driver-owned notify and polling health, published for `alf_status`.
+    /// Never held while walking the filesystem or running a sync.
+    health: Mutex<WatchHealth>,
 }
 
 impl WatchHandle {
@@ -93,6 +147,7 @@ impl WatchHandle {
             restoring: AtomicUsize::new(0),
             start: Instant::now(),
             active: AtomicBool::new(false),
+            health: Mutex::new(WatchHealth::default()),
             inactive_reason: Mutex::new(None),
             lock_failures: AtomicU32::new(0),
             resurface: AtomicBool::new(false),
@@ -154,7 +209,19 @@ impl WatchHandle {
             .expect("watch engine mutex")
             .snapshot(now)
     }
+    fn publish_health(&self, health: WatchHealth) {
+        *self.health.lock().expect("watch health mutex") = health;
+    }
 
+    fn health(&self) -> WatchHealth {
+        self.health.lock().expect("watch health mutex").clone()
+    }
+
+    /// The complete `alf_status.watch` object, including the driver's
+    /// registration and bounded-polling health.
+    pub fn status(&self) -> crate::schema::WatchStatus {
+        to_status(self.snapshot(), self.health())
+    }
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
@@ -444,20 +511,6 @@ impl RootIndex {
         ids.dedup();
         ids
     }
-
-    /// All concrete file roots (for the mtime rescan backstop).
-    fn file_roots(&self) -> impl Iterator<Item = &PathBuf> {
-        self.files.keys()
-    }
-
-    /// All recursive directory roots. Their mtime joins the rescan backstop
-    /// (manual §4.3): a dir's mtime changes on direct-child create/delete/
-    /// rename — the dominant notify-miss pattern. Deep-nested-only changes
-    /// stay notify-covered (Overflow → mark_all_dirty is the loss backstop);
-    /// a bounded recursive scan was rejected as too hot for the 5 s tick.
-    fn dir_roots(&self) -> impl Iterator<Item = &PathBuf> {
-        self.dirs.iter().map(|(root, _, _)| root)
-    }
 }
 
 /// The loop's derived watch surface: what to watch, what dirties what, and
@@ -520,23 +573,6 @@ fn compute_surface(runtime: &str, workspace: &Path, agent_id: uuid::Uuid) -> Opt
         index,
         resurface_ids,
     })
-}
-
-/// Seed the rescan mtime cache: concrete file roots AND recursive dir roots
-/// (manual §4.3). `previous` preserves already-cached mtimes for retained
-/// paths so a surface refresh never spuriously dirties unchanged sources.
-fn seed_mtimes(
-    index: &RootIndex,
-    previous: Option<&HashMap<PathBuf, Option<std::time::SystemTime>>>,
-) -> HashMap<PathBuf, Option<std::time::SystemTime>> {
-    index
-        .file_roots()
-        .chain(index.dir_roots())
-        .map(|p| {
-            let cached = previous.and_then(|m| m.get(p).copied());
-            (p.clone(), cached.unwrap_or_else(|| file_mtime(p)))
-        })
-        .collect()
 }
 
 /// Resolve the agent workspace + alf agent id for the pinned server, mirroring
@@ -757,9 +793,12 @@ pub async fn run_loop(
         }) {
             Ok(w) => w,
             Err(e) => {
-                eprintln!("alf mcp serve: filesystem watcher unavailable ({e}); rescan-only");
+                let watcher_error = sanitize_watch_error(e);
+                eprintln!(
+                    "alf mcp serve: filesystem watcher unavailable ({watcher_error}); rescan-only"
+                );
                 // Fall through with a no-op watcher stand-in is not possible; continue
-                // with the timer-driven rescan only.
+                // with the timer-driven recursive fingerprint only.
                 drive_rescan_only(
                     handle,
                     surface,
@@ -770,6 +809,7 @@ pub async fn run_loop(
                     workspace_flag,
                     agent,
                     sync_lock,
+                    watcher_error,
                 )
                 .await;
                 return;
@@ -777,19 +817,20 @@ pub async fn run_loop(
         };
     // Only sync specs get an OS-notify watch (review B1); rediscover roots are
     // mtime-polled, so registering them would over-watch sibling-profile content.
-    let mut watched = BTreeMap::new();
+    let mut registrations = RegistrationSet::default();
     let desired = desired_watch_targets(&surface.sync_specs);
-    register_watches(&mut watcher, &desired, &mut watched);
+    registrations.reconcile(&mut watcher, &desired, handle.now());
+    let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
 
-    // Seed the rescan mtime cache (file roots + recursive dir roots, §4.3) and
-    // the rediscover-root mtime cache (agent-set boundary dirs, e.g. Hermes
-    // `profiles/`).
-    let mut mtimes = seed_mtimes(&surface.index, None);
-    let mut rd_mtimes: HashMap<PathBuf, Option<std::time::SystemTime>> = surface
+    // Rediscover roots (agent-set boundaries such as Hermes `profiles/`) remain
+    // metadata-polled only. Sync roots use the recursive fingerprint cache above.
+    let mut rd_mtimes: HashMap<PathBuf, Option<SystemTime>> = surface
         .rediscover_roots
         .iter()
         .map(|p| (p.clone(), file_mtime(p)))
         .collect();
+
+    publish_watch_health(&handle, "active", None, &registrations, &fingerprints);
 
     let mut ticker = tokio::time::interval(tick_period());
     loop {
@@ -820,19 +861,28 @@ pub async fn run_loop(
                         agent_id,
                         &handle,
                         Some(&mut watcher),
-                        &mut watched,
+                        &mut registrations,
                         &mut surface,
-                        &mut mtimes,
+                        &mut fingerprints,
                         &mut rd_mtimes,
                     );
                 }
-                rescan(&handle, &surface, &mut mtimes);
+                let desired = desired_watch_targets(&surface.sync_specs);
+                registrations.reconcile(&mut watcher, &desired, handle.now());
+                rescan(&handle, &surface, &mut fingerprints);
                 if rediscover_due(&surface.rediscover_roots, &mut rd_mtimes) {
                     // The agent set (mapping) may have changed — and with it the
                     // surface; re-derive on the next tick either way (§4.3).
                     run_rediscovery(&runtime, &workspace);
                     handle.request_resurface();
                 }
+                publish_watch_health(
+                    &handle,
+                    "active",
+                    None,
+                    &registrations,
+                    &fingerprints,
+                );
                 run_due(&handle, &runtime, workspace_flag.as_deref(), agent.as_deref(), &lock_file, &sync_lock).await;
             }
         }
@@ -880,29 +930,55 @@ fn run_rediscovery(runtime: &str, install: &Path) {
     }
 }
 
-/// Rescan the cached roots (concrete files + recursive dir roots, §4.3) for
-/// mtime changes notify may have missed (editors doing atomic rename, DB
-/// engines) and mark the corresponding sources. A changed surface-defining
-/// source also queues a surface refresh.
-fn rescan(
+/// Mark known source IDs dirty after a notify event, a complete fingerprint
+/// change, or a non-authoritative polling transition. The caller has already
+/// completed all filesystem work, so this lock is never held across I/O.
+fn mark_sources_dirty(handle: &WatchHandle, surface: &Surface, mut ids: Vec<String>) {
+    if ids.is_empty() {
+        return;
+    }
+    ids.sort();
+    ids.dedup();
+    let now = handle.now();
+    let mut engine = handle.engine.lock().expect("watch engine mutex");
+    for id in ids {
+        if surface.resurface_ids.contains(&id) {
+            handle.request_resurface();
+        }
+        engine.mark_dirty(&id, now);
+    }
+}
+
+fn default_rescan_budget() -> RescanBudget {
+    RescanBudget {
+        max_entries: RESCAN_MAX_ENTRIES,
+        max_bytes: RESCAN_MAX_BYTES,
+        max_tick: RESCAN_MAX_TICK,
+    }
+}
+
+/// Recursively fingerprint the adapter-owned surface. FingerprintCache never
+/// installs a partial result as a clean baseline; an incomplete scan dirties the
+/// source once and is published through alf_status.
+fn rescan(handle: &WatchHandle, surface: &Surface, fingerprints: &mut FingerprintCache) {
+    let changed = fingerprints.rescan(default_rescan_budget());
+    mark_sources_dirty(handle, surface, changed);
+}
+
+fn publish_watch_health(
     handle: &WatchHandle,
-    surface: &Surface,
-    mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
+    notify_backend: &str,
+    notify_error: Option<WatchIssue>,
+    registrations: &RegistrationSet,
+    fingerprints: &FingerprintCache,
 ) {
     let now = handle.now();
-    let mut e = handle.engine.lock().expect("watch engine mutex");
-    for (path, last) in mtimes.iter_mut() {
-        let current = file_mtime(path);
-        if current != *last {
-            *last = current;
-            for id in surface.index.ids_for(path) {
-                if surface.resurface_ids.contains(&id) {
-                    handle.request_resurface();
-                }
-                e.mark_dirty(&id, now);
-            }
-        }
-    }
+    handle.publish_health(WatchHealth {
+        notify_backend: Some(notify_backend.into()),
+        notify_error,
+        registrations: registrations.health(now),
+        degraded_sources: fingerprints.degraded_sources(),
+    });
 }
 
 /// Poll the engine and, if a sync is due and no restore is in progress, run it
@@ -1023,14 +1099,29 @@ async fn drive_rescan_only(
     workspace_flag: Option<PathBuf>,
     agent: Option<String>,
     sync_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    watcher_error: String,
 ) {
-    let mut watched = BTreeMap::new(); // no watcher — stays empty
-    let mut mtimes = seed_mtimes(&surface.index, None);
-    let mut rd_mtimes: HashMap<PathBuf, Option<std::time::SystemTime>> = surface
+    let mut registrations = RegistrationSet::default();
+    let desired = desired_watch_targets(&surface.sync_specs);
+    registrations.reconcile_without_watcher(&desired, handle.now());
+    let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
+    let notify_error = WatchIssue {
+        code: "watch_backend_unavailable".into(),
+        message: watcher_error,
+    };
+    let mut rd_mtimes: HashMap<PathBuf, Option<SystemTime>> = surface
         .rediscover_roots
         .iter()
         .map(|p| (p.clone(), file_mtime(p)))
         .collect();
+    publish_watch_health(
+        &handle,
+        "rescan_only",
+        Some(notify_error.clone()),
+        &registrations,
+        &fingerprints,
+    );
+
     let mut ticker = tokio::time::interval(tick_period());
     loop {
         ticker.tick().await;
@@ -1041,17 +1132,26 @@ async fn drive_rescan_only(
                 agent_id,
                 &handle,
                 None,
-                &mut watched,
+                &mut registrations,
                 &mut surface,
-                &mut mtimes,
+                &mut fingerprints,
                 &mut rd_mtimes,
             );
         }
-        rescan(&handle, &surface, &mut mtimes);
+        let desired = desired_watch_targets(&surface.sync_specs);
+        registrations.reconcile_without_watcher(&desired, handle.now());
+        rescan(&handle, &surface, &mut fingerprints);
         if rediscover_due(&surface.rediscover_roots, &mut rd_mtimes) {
             run_rediscovery(&runtime, &workspace);
             handle.request_resurface();
         }
+        publish_watch_health(
+            &handle,
+            "rescan_only",
+            Some(notify_error.clone()),
+            &registrations,
+            &fingerprints,
+        );
         run_due(
             &handle,
             &runtime,
@@ -1115,58 +1215,10 @@ fn nearest_existing_ancestor(path: Option<&Path>) -> Option<PathBuf> {
     None
 }
 
-/// Register desired targets that are not already active. Failed registrations
-/// stay absent from `watched`, so a future surface refresh retries them; the
-/// mtime rescan remains the non-fatal backstop.
-fn register_watches(
-    watcher: &mut notify::RecommendedWatcher,
-    desired: &BTreeMap<PathBuf, RecursiveMode>,
-    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
-) {
-    for (target, mode) in desired {
-        if watched.get(target) == Some(mode) {
-            continue;
-        }
-        if watched.contains_key(target) {
-            let _ = watcher.unwatch(target);
-            watched.remove(target);
-        }
-        match watcher.watch(target, *mode) {
-            Ok(()) => {
-                watched.insert(target.clone(), *mode);
-            }
-            Err(e) => eprintln!(
-                "alf mcp serve: cannot watch {} ({e}); relying on rescan",
-                target.display()
-            ),
-        }
-    }
-}
-
-/// Reconcile active registrations with the desired target-to-mode map. A mode
-/// transition is an unwatch plus a fresh registration, which is how a temporary
-/// ancestor watch becomes the recursive logical-root watch after creation.
-fn reconcile_watches(
-    watcher: &mut notify::RecommendedWatcher,
-    desired: &BTreeMap<PathBuf, RecursiveMode>,
-    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
-) {
-    let stale: Vec<PathBuf> = watched
-        .iter()
-        .filter(|(target, mode)| desired.get(*target) != Some(*mode))
-        .map(|(target, _)| target.clone())
-        .collect();
-    for target in stale {
-        let _ = watcher.unwatch(&target);
-        watched.remove(&target);
-    }
-    register_watches(watcher, desired, watched);
-}
-
 /// Re-derive the watch surface and re-point everything at it (manual §4.3):
 /// engine sources (state preserved by id, new ids start dirty), OS-notify
-/// watches (drop the vanished, add the new), and the rescan mtime caches
-/// (retained paths keep their cached mtime — no spurious dirties).
+/// registrations (retry state is retained by concrete target), and recursive
+/// fingerprint definitions.
 #[allow(clippy::too_many_arguments)]
 fn refresh_surface(
     runtime: &str,
@@ -1174,24 +1226,25 @@ fn refresh_surface(
     agent_id: uuid::Uuid,
     handle: &WatchHandle,
     watcher: Option<&mut notify::RecommendedWatcher>,
-    watched: &mut BTreeMap<PathBuf, RecursiveMode>,
+    registrations: &mut RegistrationSet,
     surface: &mut Surface,
-    mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
-    rd_mtimes: &mut HashMap<PathBuf, Option<std::time::SystemTime>>,
+    fingerprints: &mut FingerprintCache,
+    rd_mtimes: &mut HashMap<PathBuf, Option<SystemTime>>,
 ) {
     let Some(next) = compute_surface(runtime, workspace, agent_id) else {
         eprintln!("alf mcp serve: surface refresh failed (unknown runtime '{runtime}')");
         return;
     };
     {
-        let mut e = handle.engine.lock().expect("watch engine mutex");
-        e.set_sources(&next.sync_specs, handle.now());
+        let mut engine = handle.engine.lock().expect("watch engine mutex");
+        engine.set_sources(&next.sync_specs, handle.now());
     }
+    let definition_changes = fingerprints.reconcile(&next.sync_specs);
+    mark_sources_dirty(handle, &next, definition_changes);
     if let Some(watcher) = watcher {
         let desired = desired_watch_targets(&next.sync_specs);
-        reconcile_watches(watcher, &desired, watched);
+        registrations.reconcile(watcher, &desired, handle.now());
     }
-    *mtimes = seed_mtimes(&next.index, Some(mtimes));
     let old_rd = std::mem::take(rd_mtimes);
     *rd_mtimes = next
         .rediscover_roots
@@ -1212,8 +1265,8 @@ fn file_mtime(path: &Path) -> Option<std::time::SystemTime> {
     std::fs::metadata(path).and_then(|m| m.modified()).ok()
 }
 
-/// Map an engine snapshot into the `alf_status` watch stanza schema.
-pub fn to_status(snap: WatchSnapshot) -> crate::schema::WatchStatus {
+/// Map engine plus driver health into the `alf_status` watch stanza schema.
+fn to_status(snap: WatchSnapshot, health: WatchHealth) -> crate::schema::WatchStatus {
     crate::schema::WatchStatus {
         inactive_reason: None, // an active loop has no not-running reason
         active: snap.active,
@@ -1224,6 +1277,43 @@ pub fn to_status(snap: WatchSnapshot) -> crate::schema::WatchStatus {
             hint: p.hint,
         }),
         backoff_retry_in_secs: snap.backoff_retry_in.map(|d| d.as_secs()),
+        notify_backend: health.notify_backend,
+        notify_error: health
+            .notify_error
+            .map(|error| crate::schema::WatchRegistrationError {
+                code: error.code,
+                message: error.message,
+            }),
+        registrations: health
+            .registrations
+            .into_iter()
+            .map(|registration| crate::schema::WatchRegistration {
+                target: registration.target.display().to_string(),
+                requested_mode: match registration.requested_mode {
+                    RecursiveMode::Recursive => "recursive".into(),
+                    RecursiveMode::NonRecursive => "non_recursive".into(),
+                },
+                active: registration.active,
+                retry_in_secs: registration.retry_in.map(|duration| duration.as_secs()),
+                last_error: registration.last_error.map(|error| {
+                    crate::schema::WatchRegistrationError {
+                        code: error.code,
+                        message: error.message,
+                    }
+                }),
+            })
+            .collect(),
+        polling: (!health.degraded_sources.is_empty()).then(|| crate::schema::WatchPolling {
+            degraded_sources: health
+                .degraded_sources
+                .into_iter()
+                .map(|issue| crate::schema::WatchPollingDegradedSource {
+                    source: issue.source,
+                    code: issue.code,
+                    message: issue.message,
+                })
+                .collect(),
+        }),
         sources: snap
             .sources
             .into_iter()
@@ -1640,6 +1730,49 @@ mod tests {
     }
 
     #[test]
+    fn status_surfaces_registration_and_degraded_polling_health() {
+        let handle = WatchHandle::new(WatchConfig::default());
+        handle.publish_health(WatchHealth {
+            notify_backend: Some("active".into()),
+            notify_error: None,
+            registrations: vec![RegistrationHealth {
+                target: PathBuf::from("/workspace/memory"),
+                requested_mode: RecursiveMode::Recursive,
+                active: false,
+                retry_in: Some(Duration::from_secs(5)),
+                last_error: Some(WatchIssue {
+                    code: "watch_registration_failed".into(),
+                    message: "descriptor limit".into(),
+                }),
+            }],
+            degraded_sources: vec![PollingIssue {
+                source: "memory".into(),
+                code: "scan_entry_limit".into(),
+                message: "recursive polling reached its entry limit".into(),
+            }],
+        });
+
+        let status = handle.status();
+        assert_eq!(status.notify_backend.as_deref(), Some("active"));
+        assert_eq!(status.registrations.len(), 1);
+        assert!(!status.registrations[0].active);
+        assert_eq!(
+            status.registrations[0]
+                .last_error
+                .as_ref()
+                .map(|error| error.code.as_str()),
+            Some("watch_registration_failed")
+        );
+        assert_eq!(
+            status
+                .polling
+                .as_ref()
+                .map(|polling| polling.degraded_sources[0].source.as_str()),
+            Some("memory")
+        );
+    }
+
+    #[test]
     fn take_resurface_is_one_shot() {
         let handle = WatchHandle::new(WatchConfig::default());
         assert!(!handle.take_resurface(), "starts clear");
@@ -1727,18 +1860,23 @@ mod tests {
                 }
             })
             .expect("create notify watcher");
-        let mut watched = BTreeMap::new();
+        let mut registrations = RegistrationSet::default();
 
         let absent = desired_watch_targets(std::slice::from_ref(&spec));
-        register_watches(&mut watcher, &absent, &mut watched);
-        if watched.get(&home) != Some(&RecursiveMode::NonRecursive) {
+        registrations.reconcile(&mut watcher, &absent, Duration::ZERO);
+        let initial = registrations.health(Duration::ZERO);
+        if !initial.iter().any(|registration| {
+            registration.target == home
+                && registration.requested_mode == RecursiveMode::NonRecursive
+                && registration.active
+        }) {
             // Some constrained CI hosts exhaust their inotify watch quota while
             // the deterministic planner/rescan regressions remain runnable.
             // Do not turn host resource exhaustion into a product failure.
             eprintln!("skipping notify assertion: temporary watch registration unavailable");
             return;
         }
-        assert_eq!(watched.len(), 1);
+        assert_eq!(initial.len(), 1);
 
         std::fs::create_dir_all(&root).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -1759,10 +1897,17 @@ mod tests {
         );
 
         let present = desired_watch_targets(std::slice::from_ref(&spec));
-        reconcile_watches(&mut watcher, &present, &mut watched);
-        assert_eq!(watched.get(&root), Some(&RecursiveMode::Recursive));
+        registrations.reconcile(&mut watcher, &present, Duration::ZERO);
+        let refreshed = registrations.health(Duration::ZERO);
+        assert!(refreshed.iter().any(|registration| {
+            registration.target == root
+                && registration.requested_mode == RecursiveMode::Recursive
+                && registration.active
+        }));
         assert!(
-            !watched.contains_key(&home),
+            !refreshed
+                .iter()
+                .any(|registration| registration.target == home),
             "the temporary parent registration must be removed after refresh"
         );
 
@@ -1805,11 +1950,14 @@ mod tests {
             assert!(matches!(e.poll(Duration::ZERO), Tick::Sync(_)));
             e.record_result(Duration::ZERO, Ok(()));
         }
-        let mut mtimes = seed_mtimes(&surface.index, None);
-        assert_eq!(mtimes.get(&root), Some(&None), "absent root is seeded");
+        let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
+        assert!(
+            fingerprints.rescan(default_rescan_budget()).is_empty(),
+            "the absent logical root establishes a missing-root baseline"
+        );
 
         std::fs::create_dir_all(&root).unwrap();
-        rescan(&handle, &surface, &mut mtimes);
+        rescan(&handle, &surface, &mut fingerprints);
 
         assert!(
             handle.take_resurface(),
@@ -1845,14 +1993,13 @@ mod tests {
             assert!(matches!(e.poll(Duration::ZERO), Tick::Sync(_)));
             e.record_result(Duration::ZERO, Ok(()));
         }
-        let mut mtimes = seed_mtimes(&surface.index, None);
+        let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
         assert!(
-            mtimes.contains_key(dir.path()),
-            "dir roots must join the rescan cache"
+            fingerprints.rescan(default_rescan_budget()).is_empty(),
+            "the complete recursive scan establishes a baseline"
         );
-        std::thread::sleep(Duration::from_millis(20));
         std::fs::write(dir.path().join("new-file.md"), "x").unwrap();
-        rescan(&handle, &surface, &mut mtimes);
+        rescan(&handle, &surface, &mut fingerprints);
         let snap = handle.snapshot();
         let src = snap.sources.iter().find(|s| s.source == "memory").unwrap();
         assert!(src.dirty, "the dir-mtime backstop must dirty the source");

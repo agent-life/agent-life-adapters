@@ -1153,7 +1153,8 @@ fn reconcile_watches(
 ) {
     let stale: Vec<PathBuf> = watched
         .iter()
-        .filter_map(|(target, mode)| (desired.get(target) != Some(mode)).then(|| target.clone()))
+        .filter(|(target, mode)| desired.get(*target) != Some(*mode))
+        .map(|(target, _)| target.clone())
         .collect();
     for target in stale {
         let _ = watcher.unwatch(&target);

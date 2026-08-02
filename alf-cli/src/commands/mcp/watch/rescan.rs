@@ -15,6 +15,13 @@ use sha2::{Digest, Sha256};
 
 const DIGEST_BUFFER: usize = 64 * 1024;
 
+/// How many consecutive degraded scans pass before a still-degraded source is
+/// dirtied again. A source whose tree cannot complete inside one tick fails on
+/// every tick, so dirtying only on the transition into degraded would leave it
+/// silently unpolled forever after a single sync. Re-dirtying on a bounded
+/// cadence keeps the backstop honest without marking it dirty every tick.
+const DEGRADED_REDIRTY_SCANS: u32 = 60;
+
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct PollingIssue {
     pub(super) source: String,
@@ -79,13 +86,21 @@ impl ScanUse {
         Ok(())
     }
 
-    fn hash_file(&mut self, path: &Path, size: u64) -> Result<[u8; 32], ScanFailure> {
+    /// `Ok(None)` means the file vanished between `read_dir` and `open`. Editor
+    /// temp files and SQLite sidecars churn constantly, so that is an ordinary
+    /// missing entry — not a failure that should degrade the whole source.
+    /// Mirrors the `NotFound` arm of the stat path.
+    fn hash_file(&mut self, path: &Path, size: u64) -> Result<Option<[u8; 32]>, ScanFailure> {
         self.check_time()?;
         if self.bytes.saturating_add(size) > self.max_bytes {
             return Err(ScanFailure::byte_limit());
         }
 
-        let mut file = fs::File::open(path).map_err(|e| ScanFailure::io(path, e))?;
+        let mut file = match fs::File::open(path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ScanFailure::io(path, error)),
+        };
         let mut hasher = Sha256::new();
         let mut buffer = [0_u8; DIGEST_BUFFER];
         loop {
@@ -102,7 +117,7 @@ impl ScanUse {
             }
             hasher.update(&buffer[..read]);
         }
-        Ok(hasher.finalize().into())
+        Ok(Some(hasher.finalize().into()))
     }
 }
 
@@ -158,8 +173,15 @@ fn sanitize_error(error: impl std::fmt::Display) -> String {
 pub(super) struct FingerprintCache {
     definitions: BTreeMap<String, Vec<WatchSpec>>,
     complete: BTreeMap<String, SourceFingerprint>,
-    degraded: BTreeMap<String, PollingIssue>,
+    degraded: BTreeMap<String, DegradedSource>,
     next_source: usize,
+}
+
+/// A source whose latest scan did not complete, plus how many scans have passed
+/// since it was last dirtied (see [`DEGRADED_REDIRTY_SCANS`]).
+struct DegradedSource {
+    issue: PollingIssue,
+    scans_since_dirty: u32,
 }
 
 impl FingerprintCache {
@@ -245,9 +267,27 @@ impl FingerprintCache {
                         code: failure.code.into(),
                         message: failure.message,
                     };
-                    if self.degraded.get(source) != Some(&issue) {
-                        self.degraded.insert(source.clone(), issue);
-                        changed.push(source.clone());
+                    match self.degraded.get_mut(source) {
+                        // Still failing the same way: stay quiet, but do not go
+                        // silent forever — a tree that can never complete would
+                        // otherwise drop out of the backstop after one sync.
+                        Some(existing) if existing.issue == issue => {
+                            existing.scans_since_dirty += 1;
+                            if existing.scans_since_dirty >= DEGRADED_REDIRTY_SCANS {
+                                existing.scans_since_dirty = 0;
+                                changed.push(source.clone());
+                            }
+                        }
+                        _ => {
+                            self.degraded.insert(
+                                source.clone(),
+                                DegradedSource {
+                                    issue,
+                                    scans_since_dirty: 0,
+                                },
+                            );
+                            changed.push(source.clone());
+                        }
                     }
                 }
             }
@@ -258,7 +298,10 @@ impl FingerprintCache {
     }
 
     pub(super) fn degraded_sources(&self) -> Vec<PollingIssue> {
-        self.degraded.values().cloned().collect()
+        self.degraded
+            .values()
+            .map(|state| state.issue.clone())
+            .collect()
     }
 }
 
@@ -294,6 +337,7 @@ fn fingerprint_source(
                 root,
                 Path::new(""),
                 spec.recursive,
+                /* is_root */ true,
                 &spec.exclude,
                 &mut use_budget,
                 &mut entries,
@@ -320,11 +364,24 @@ fn entry_kind_rank(kind: EntryKind) -> u8 {
     }
 }
 
+fn missing_entry(root: &Path, relative: &Path) -> FingerprintEntry {
+    FingerprintEntry {
+        root: root.to_path_buf(),
+        relative: relative.to_path_buf(),
+        kind: EntryKind::Missing,
+        size: 0,
+        modified: None,
+        digest: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn scan_path(
     root: &Path,
     path: &Path,
     relative: &Path,
     recursive: bool,
+    is_root: bool,
     excludes: &[PathBuf],
     use_budget: &mut ScanUse,
     entries: &mut Vec<FingerprintEntry>,
@@ -334,21 +391,31 @@ fn scan_path(
     }
 
     use_budget.entry()?;
-    let metadata = match fs::symlink_metadata(path) {
+    let mut metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            entries.push(FingerprintEntry {
-                root: root.to_path_buf(),
-                relative: relative.to_path_buf(),
-                kind: EntryKind::Missing,
-                size: 0,
-                modified: None,
-                digest: None,
-            });
+            entries.push(missing_entry(root, relative));
             return Ok(());
         }
         Err(error) => return Err(ScanFailure::io(path, error)),
     };
+
+    // A spec root may legitimately BE a symlink to the real directory — a
+    // dotfile-managed install points `~/.openclaw` elsewhere, and notify
+    // resolves it the same way. Resolve it once, at the root only: otherwise
+    // the whole subtree fingerprints as a single link entry, the scan
+    // *succeeds*, and every change inside it reads as clean forever.
+    // Descendants are never followed, which keeps traversal cycle-free.
+    if is_root && metadata.file_type().is_symlink() {
+        metadata = match fs::metadata(path) {
+            Ok(resolved) => resolved,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                entries.push(missing_entry(root, relative));
+                return Ok(());
+            }
+            Err(error) => return Err(ScanFailure::io(path, error)),
+        };
+    }
 
     let file_type = metadata.file_type();
     let kind = if file_type.is_file() {
@@ -361,7 +428,15 @@ fn scan_path(
         EntryKind::Other
     };
     let digest = if kind == EntryKind::File {
-        Some(use_budget.hash_file(path, metadata.len())?)
+        match use_budget.hash_file(path, metadata.len())? {
+            Some(digest) => Some(digest),
+            // Vanished between `read_dir` and `open`: record the absence rather
+            // than degrading every other entry in this source.
+            None => {
+                entries.push(missing_entry(root, relative));
+                return Ok(());
+            }
+        }
     } else {
         None
     };
@@ -402,6 +477,7 @@ fn scan_path(
             &child,
             &relative.join(name),
             true,
+            /* is_root */ false,
             excludes,
             use_budget,
             entries,
@@ -496,5 +572,121 @@ mod tests {
 
         assert_eq!(cache.rescan(budget(100)), vec!["memory"]);
         assert!(cache.degraded_sources().is_empty());
+    }
+
+    #[test]
+    fn nested_create_rename_and_delete_each_change_the_fingerprint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        let nested = root.join("a");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("one.md"), "one").unwrap();
+
+        let spec = WatchSpec::dir("memory", root);
+        let mut cache = FingerprintCache::new(&[spec]);
+        assert!(cache.rescan(budget(100)).is_empty());
+
+        fs::write(nested.join("two.md"), "two").unwrap();
+        assert_eq!(cache.rescan(budget(100)), vec!["memory"], "nested create");
+
+        fs::rename(nested.join("two.md"), nested.join("three.md")).unwrap();
+        assert_eq!(cache.rescan(budget(100)), vec!["memory"], "nested rename");
+
+        fs::remove_file(nested.join("three.md")).unwrap();
+        assert_eq!(cache.rescan(budget(100)), vec!["memory"], "nested delete");
+
+        assert!(
+            cache.rescan(budget(100)).is_empty(),
+            "a settled tree stays clean"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlinked_root_is_fingerprinted_through_to_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real-memory");
+        let nested = real.join("a/note.md");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        fs::write(&nested, "first").unwrap();
+        let link = tmp.path().join("memory");
+        symlink(&real, &link).unwrap();
+
+        let spec = WatchSpec::dir("memory", link);
+        let mut cache = FingerprintCache::new(&[spec]);
+        assert!(cache.rescan(budget(100)).is_empty());
+        assert!(
+            cache.degraded_sources().is_empty(),
+            "a symlinked root must be scanned, not degraded"
+        );
+
+        fs::write(&nested, "second").unwrap();
+        assert_eq!(
+            cache.rescan(budget(100)),
+            vec!["memory"],
+            "an edit behind a symlinked root must not read as clean"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn dangling_root_symlink_is_recorded_missing_without_degrading() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let link = tmp.path().join("memory");
+        symlink(tmp.path().join("nowhere"), &link).unwrap();
+
+        let spec = WatchSpec::dir("memory", link);
+        let mut cache = FingerprintCache::new(&[spec]);
+        assert!(cache.rescan(budget(10)).is_empty());
+        assert!(cache.degraded_sources().is_empty());
+    }
+
+    #[test]
+    fn vanished_file_yields_no_digest_instead_of_degrading_the_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut use_budget = ScanUse {
+            entries: 0,
+            bytes: 0,
+            max_entries: 10,
+            max_bytes: 1024,
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+
+        let vanished = use_budget.hash_file(&tmp.path().join("gone.md"), 5);
+        assert!(
+            matches!(vanished, Ok(None)),
+            "a file that disappears mid-scan is a missing entry, not a scan failure"
+        );
+    }
+
+    #[test]
+    fn degraded_source_is_redirtied_on_a_bounded_cadence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("memory");
+        fs::create_dir_all(&root).unwrap();
+        for n in 0..3 {
+            fs::write(root.join(format!("{n}.md")), "x").unwrap();
+        }
+
+        let spec = WatchSpec::dir("memory", root);
+        let mut cache = FingerprintCache::new(&[spec]);
+
+        // The transition into degraded dirties once...
+        assert_eq!(cache.rescan(budget(2)), vec!["memory"]);
+        // ...then it stays quiet for a bounded run of scans...
+        for scan in 1..DEGRADED_REDIRTY_SCANS {
+            assert!(
+                cache.rescan(budget(2)).is_empty(),
+                "scan {scan} must not re-dirty before the cadence elapses"
+            );
+        }
+        // ...and re-dirties, so a tree that can never complete is never
+        // silently dropped from the backstop.
+        assert_eq!(cache.rescan(budget(2)), vec!["memory"]);
+        assert_eq!(cache.degraded_sources().len(), 1);
     }
 }

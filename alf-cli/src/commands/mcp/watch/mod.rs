@@ -466,18 +466,22 @@ fn split_specs(specs: &[WatchSpec]) -> (Vec<WatchSpec>, Vec<PathBuf>) {
     (sync_specs, rediscover_roots)
 }
 
-/// One watched file/dir root resolved to the id of the spec it belongs to.
+/// One watched file/dir root resolved deterministically to one sync source.
 struct RootIndex {
-    /// Concrete non-recursive file roots → spec id (exact-match).
-    files: HashMap<PathBuf, String>,
-    /// Recursive directory roots → (spec id, exclusions).
-    dirs: Vec<(PathBuf, String, Vec<PathBuf>)>,
+    roots: Vec<IndexedRoot>,
+}
+
+struct IndexedRoot {
+    root: PathBuf,
+    id: String,
+    recursive: bool,
+    tracked: bool,
+    exclude: Vec<PathBuf>,
 }
 
 impl RootIndex {
     fn build(specs: &[WatchSpec]) -> Self {
-        let mut files = HashMap::new();
-        let mut dirs = Vec::new();
+        let mut roots = Vec::new();
         for spec in specs {
             // Rediscover specs (Hermes `profiles/`) are an agent-set boundary, not
             // a sync source — the loop handles them separately (see
@@ -486,30 +490,66 @@ impl RootIndex {
                 continue;
             }
             for root in &spec.roots {
-                if spec.recursive {
-                    dirs.push((root.clone(), spec.id.clone(), spec.exclude.clone()));
-                } else {
-                    files.insert(root.clone(), spec.id.clone());
-                }
+                roots.push(IndexedRoot {
+                    root: root.clone(),
+                    id: spec.id.clone(),
+                    recursive: spec.recursive,
+                    tracked: spec.tracked,
+                    exclude: spec.exclude.clone(),
+                });
             }
         }
-        Self { files, dirs }
+        Self { roots }
     }
 
-    /// The spec ids a changed `path` dirties.
+    /// The one source a changed `path` dirties. Overlapping roots are resolved
+    /// by specificity, exact-file shape, tracked state and stable source ID so
+    /// event order cannot change the source's cadence.
     fn ids_for(&self, path: &Path) -> Vec<String> {
-        let mut ids = Vec::new();
-        if let Some(id) = self.files.get(path) {
-            ids.push(id.clone());
-        }
-        for (root, id, exclude) in &self.dirs {
-            if path.starts_with(root) && !exclude.iter().any(|e| path.starts_with(e)) {
-                ids.push(id.clone());
+        let mut selected: Option<&IndexedRoot> = None;
+        for candidate in self
+            .roots
+            .iter()
+            .filter(|candidate| candidate.matches(path))
+        {
+            if selected
+                .as_ref()
+                .map(|current| candidate.outranks(current))
+                .unwrap_or(true)
+            {
+                selected = Some(candidate);
             }
         }
-        ids.sort();
-        ids.dedup();
-        ids
+        selected
+            .map(|root| vec![root.id.clone()])
+            .unwrap_or_default()
+    }
+}
+
+impl IndexedRoot {
+    fn matches(&self, path: &Path) -> bool {
+        let inside_root = if self.recursive {
+            path.starts_with(&self.root)
+        } else {
+            path == self.root
+        };
+        inside_root && !self.exclude.iter().any(|exclude| path.starts_with(exclude))
+    }
+
+    /// Whether `self` wins over `other` when both match an event path.
+    fn outranks(&self, other: &Self) -> bool {
+        let depth = self.root.components().count();
+        let other_depth = other.root.components().count();
+        if depth != other_depth {
+            return depth > other_depth;
+        }
+        if self.recursive != other.recursive {
+            return !self.recursive;
+        }
+        if self.tracked != other.tracked {
+            return self.tracked;
+        }
+        self.id < other.id
     }
 }
 
@@ -1590,6 +1630,112 @@ mod tests {
             vec!["tracked-files"]
         );
         assert!(idx.ids_for(Path::new("/unrelated")).is_empty());
+    }
+
+    #[test]
+    fn root_index_prefers_a_specific_tracked_file_over_workspace() {
+        let specs = vec![
+            WatchSpec::dir("workspace", "/ws"),
+            WatchSpec::file("tracked-files", "/ws/notes/selected.md").as_tracked(),
+        ];
+        let idx = RootIndex::build(&specs);
+        assert_eq!(
+            idx.ids_for(Path::new("/ws/notes/selected.md")),
+            vec!["tracked-files"],
+            "an explicitly tracked input must not also dirty the broad workspace source"
+        );
+    }
+
+    #[test]
+    fn root_index_breaks_equal_matches_by_shape_tracked_state_and_id() {
+        let path = Path::new("/ws/shared");
+        let index = RootIndex::build(&[
+            WatchSpec::dir("untracked", path),
+            WatchSpec::dir("tracked", path).as_tracked(),
+        ]);
+        assert_eq!(index.ids_for(path), vec!["tracked"]);
+
+        let index =
+            RootIndex::build(&[WatchSpec::dir("zeta", path), WatchSpec::dir("alpha", path)]);
+        assert_eq!(
+            index.ids_for(path),
+            vec!["alpha"],
+            "stable IDs make equal matches independent of spec order"
+        );
+
+        let index = RootIndex::build(&[
+            WatchSpec::dir("recursive", path),
+            WatchSpec::file("exact", path),
+        ]);
+        assert_eq!(index.ids_for(path), vec!["exact"]);
+    }
+
+    #[test]
+    fn openclaw_rescan_keeps_tracked_and_workspace_changes_separate() {
+        let dirty_after = |change_tracked: bool| {
+            let tmp = tempfile::tempdir().unwrap();
+            let workspace = tmp.path();
+            let selected = workspace.join("selected.md");
+            std::fs::write(&selected, "first").unwrap();
+            std::fs::write(
+                workspace.join(alf_core::INCLUDE_FILE),
+                r#"{"files":[{"path":"selected.md","added_at":"2026-01-01T00:00:00Z"}]}"#,
+            )
+            .unwrap();
+
+            // Keep this test isolated from any real user OpenClaw config that
+            // the adapter may legitimately discover outside the temp workspace.
+            let sync_specs: Vec<WatchSpec> = adapter_openclaw::watch::watch_paths(workspace)
+                .into_iter()
+                .filter(|spec| spec.id != "openclaw-config")
+                .collect();
+            let surface = Surface {
+                index: RootIndex::build(&sync_specs),
+                resurface_ids: sync_specs
+                    .iter()
+                    .filter(|spec| spec.resurface)
+                    .map(|spec| spec.id.clone())
+                    .collect(),
+                sync_specs,
+                rediscover_roots: Vec::new(),
+            };
+            let handle = WatchHandle::new(WatchConfig::default());
+            {
+                let mut engine = handle.engine.lock().unwrap();
+                engine.set_sources(&surface.sync_specs, Duration::ZERO);
+                assert!(matches!(engine.poll(Duration::ZERO), Tick::Sync(_)));
+                engine.record_result(Duration::ZERO, Ok(()));
+            }
+            let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
+            assert!(fingerprints.rescan(default_rescan_budget()).is_empty());
+
+            let changed = if change_tracked {
+                selected
+            } else {
+                workspace.join("ordinary.md")
+            };
+            std::fs::write(changed, "changed").unwrap();
+            rescan(&handle, &surface, &mut fingerprints);
+            let dirty = handle
+                .snapshot()
+                .sources
+                .into_iter()
+                .filter(|source| source.dirty)
+                .map(|source| source.source)
+                .collect::<Vec<_>>();
+            (dirty, handle.take_resurface())
+        };
+
+        let (tracked_dirty, tracked_resurface) = dirty_after(true);
+        assert_eq!(tracked_dirty, vec!["tracked-files"]);
+        assert!(tracked_resurface, "a selected input is an optional root");
+
+        let (workspace_dirty, workspace_resurface) = dirty_after(false);
+        assert_eq!(workspace_dirty, vec!["workspace"]);
+        assert!(
+            !workspace_resurface,
+            "ordinary Markdown does not redefine the surface"
+        );
     }
 
     #[test]

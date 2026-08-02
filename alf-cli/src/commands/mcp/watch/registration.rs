@@ -81,6 +81,10 @@ fn retry_delay(failures: u32) -> Duration {
 #[derive(Default)]
 pub(super) struct RegistrationSet {
     targets: BTreeMap<PathBuf, RegistrationState>,
+    /// Set once the loop is running without any notify backend. Every target is
+    /// then permanently inactive and no retry will ever fire, so status must not
+    /// advertise a countdown that nothing will honor.
+    no_watcher: bool,
 }
 
 impl RegistrationSet {
@@ -90,6 +94,7 @@ impl RegistrationSet {
         desired: &BTreeMap<PathBuf, RecursiveMode>,
         now: Mono,
     ) {
+        self.no_watcher = false;
         let stale: Vec<PathBuf> = self
             .targets
             .keys()
@@ -133,6 +138,7 @@ impl RegistrationSet {
         desired: &BTreeMap<PathBuf, RecursiveMode>,
         now: Mono,
     ) {
+        self.no_watcher = true;
         self.targets
             .retain(|target, _| desired.contains_key(target));
         for (target, mode) in desired {
@@ -199,7 +205,8 @@ impl RegistrationSet {
                 target: target.clone(),
                 requested_mode: state.desired_mode,
                 active: state.is_active(),
-                retry_in: (!state.is_active()).then(|| state.retry_at.saturating_sub(now)),
+                retry_in: (!state.is_active() && !self.no_watcher)
+                    .then(|| state.retry_at.saturating_sub(now)),
                 last_error: state.last_error.clone(),
             })
             .collect()
@@ -251,5 +258,89 @@ mod tests {
         assert!(recovered[0].active);
         assert!(recovered[0].last_error.is_none());
         assert_eq!(watcher.calls.len(), 2);
+    }
+
+    #[test]
+    fn backoff_doubles_up_to_the_documented_ceiling() {
+        let target = PathBuf::from("/watch");
+        let desired = BTreeMap::from([(target, RecursiveMode::Recursive)]);
+        let mut watcher = FakeWatcher {
+            outcomes: vec![Err("descriptor limit".into()); 8],
+            ..FakeWatcher::default()
+        };
+        let mut registrations = RegistrationSet::default();
+
+        // 5s doubling, clamped at WATCH_RETRY_MAX (300s) — a dropped shift or a
+        // missing `.min()` would otherwise pass unnoticed.
+        let mut now = Duration::ZERO;
+        for (attempt, secs) in [5_u64, 10, 20, 40, 80, 160, 300, 300]
+            .into_iter()
+            .enumerate()
+        {
+            registrations.reconcile(&mut watcher, &desired, now);
+            assert_eq!(
+                registrations.health(now)[0].retry_in,
+                Some(Duration::from_secs(secs)),
+                "attempt {} must back off {secs}s",
+                attempt + 1
+            );
+            assert_eq!(watcher.calls.len(), attempt + 1);
+            now += Duration::from_secs(secs);
+        }
+    }
+
+    #[test]
+    fn success_resets_the_backoff_ladder() {
+        let target = PathBuf::from("/watch");
+        let desired = BTreeMap::from([(target.clone(), RecursiveMode::Recursive)]);
+        let mut watcher = FakeWatcher {
+            outcomes: vec![
+                Err("one".into()),
+                Err("two".into()),
+                Ok(()),
+                Err("three".into()),
+            ],
+            ..FakeWatcher::default()
+        };
+        let mut registrations = RegistrationSet::default();
+
+        registrations.reconcile(&mut watcher, &desired, Duration::ZERO);
+        registrations.reconcile(&mut watcher, &desired, Duration::from_secs(5));
+        assert_eq!(
+            registrations.health(Duration::from_secs(5))[0].retry_in,
+            Some(Duration::from_secs(10)),
+            "second consecutive failure backs off 10s"
+        );
+
+        registrations.reconcile(&mut watcher, &desired, Duration::from_secs(15));
+        assert!(registrations.health(Duration::from_secs(15))[0].active);
+
+        // A later failure must restart at the initial delay, not resume at 20s:
+        // the ladder is per-outage, not per-process. Flipping the desired mode
+        // forces a fresh registration attempt.
+        let flipped = BTreeMap::from([(target, RecursiveMode::NonRecursive)]);
+        registrations.reconcile(&mut watcher, &flipped, Duration::from_secs(20));
+        let health = registrations.health(Duration::from_secs(20));
+        assert!(!health[0].active);
+        assert_eq!(
+            health[0].retry_in,
+            Some(Duration::from_secs(5)),
+            "a success must clear the failure count"
+        );
+    }
+
+    #[test]
+    fn no_watcher_reports_inactive_targets_without_a_retry_countdown() {
+        let target = PathBuf::from("/watch");
+        let desired = BTreeMap::from([(target, RecursiveMode::Recursive)]);
+        let mut registrations = RegistrationSet::default();
+
+        registrations.reconcile_without_watcher(&desired, Duration::ZERO);
+        let health = registrations.health(Duration::from_secs(30));
+        assert!(!health[0].active);
+        assert_eq!(
+            health[0].retry_in, None,
+            "rescan-only mode must not advertise a retry it will never perform"
+        );
     }
 }

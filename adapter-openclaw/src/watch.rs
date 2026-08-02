@@ -31,35 +31,119 @@
 //! export never packs them (`alf add --external` refuses this runtime), so a
 //! root for one would fire tracked syncs that capture nothing (MAJ-4/MIN-8).
 //!
-//! In-workspace tracked files are *already* covered by the recursive workspace
-//! watch; the engine governs their §6.1 rollover on the delta cadence (the
-//! documented WP-M3 tracked/delta coupling — a whole-workspace export cannot
-//! rate-limit one in-workspace file independently), so they need no extra spec.
+//! In-workspace tracked files use their own tracked source so the engine applies
+//! `tracked_files_interval` before the export chooses its §6.1 full-snapshot
+//! rollover. The recursive workspace source retains the normal cadence for the
+//! rest of OpenClaw's broad Markdown surface.
 
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::{Component, Path, PathBuf};
 
+use alf_core::include::{
+    is_denylisted, safe_include_path, IncludeList, INCLUDE_FILE, SYNC_LOG_FILE,
+};
 use alf_core::WatchSpec;
 
 /// Build the OpenClaw watch surface for `workspace`.
 pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
-    let mut specs = vec![
-        // The whole workspace, recursively, with VCS churn pruned (matches the
-        // export's scatter-capture `.git/` skip).
-        WatchSpec::dir("workspace", workspace.to_path_buf()).excluding([workspace.join(".git")]),
-    ];
+    let tracked_roots = tracked_roots(workspace);
+    let control_roots = vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)];
+
+    // The whole workspace stays responsible for ordinary Markdown, but it must
+    // not also classify explicit tracked inputs as untracked.
+    let mut workspace_spec =
+        WatchSpec::dir("workspace", workspace.to_path_buf()).excluding([workspace.join(".git")]);
+    workspace_spec.exclude.extend(tracked_roots.iter().cloned());
+    workspace_spec.exclude.extend(control_roots.iter().cloned());
+    let mut specs = vec![workspace_spec];
+
+    if !tracked_roots.is_empty() {
+        specs.push(WatchSpec {
+            id: "tracked-files".into(),
+            roots: tracked_roots,
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: true,
+            sqlite: false,
+            rediscover: false,
+            resurface: true,
+        });
+    }
+
+    // The include list changes the tracked surface; the sync log is also an
+    // exported tracked input. Both follow the tracked-file cadence.
+    specs.push(WatchSpec {
+        id: "tracked-controls".into(),
+        roots: control_roots,
+        recursive: false,
+        exclude: Vec::new(),
+        tracked: true,
+        sqlite: false,
+        rediscover: false,
+        resurface: true,
+    });
 
     // Out-of-workspace: the OpenClaw config drives agent-set/workspace/version.
     if let Some(config) = openclaw_config_path(workspace) {
         specs.push(WatchSpec::file("openclaw-config", config).resurfacing());
     }
 
-    // No external roots: the openclaw export never packs external include
-    // entries (`alf add --external` refuses this runtime), so an external
-    // watch root would only fire tracked syncs that capture nothing
-    // (MAJ-4/MIN-8). In-workspace tracked files are covered by the recursive
-    // workspace watch above.
-
     specs
+}
+
+/// Return the optional, in-workspace tracked roots that OpenClaw can export.
+/// Missing entries remain roots so their later creation/deletion is observable;
+/// entries which could escape the workspace or never be exported are ignored.
+fn tracked_roots(workspace: &Path) -> Vec<PathBuf> {
+    IncludeList::load(workspace)
+        .map(|list| {
+            list.paths()
+                .into_iter()
+                .filter_map(|path| optional_tracked_root(workspace, &path))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Validate an include entry for watching without requiring the optional file
+/// to exist yet. Existing paths reuse export's full validation; a missing path
+/// is accepted only when its lexical path and nearest existing ancestor both
+/// remain inside the workspace.
+fn optional_tracked_root(workspace: &Path, path: &str) -> Option<PathBuf> {
+    let workspace_canon = workspace.canonicalize().ok()?;
+    let mut candidate = workspace.to_path_buf();
+    let mut has_normal_component = false;
+    for component in Path::new(path).components() {
+        match component {
+            Component::Normal(part) => {
+                candidate.push(part);
+                has_normal_component = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+        }
+    }
+    if !has_normal_component
+        || candidate == workspace.join(INCLUDE_FILE)
+        || candidate == workspace.join(SYNC_LOG_FILE)
+        || is_denylisted(&candidate)
+    {
+        return None;
+    }
+
+    match fs::symlink_metadata(&candidate) {
+        // `safe_include_path` resolves symlinks, rejects non-files and enforces
+        // the same sentinels/denylist/containment policy used by export.
+        Ok(_) => safe_include_path(workspace, path).ok().map(|_| candidate),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let ancestor = candidate
+                .parent()?
+                .ancestors()
+                .find_map(|parent| parent.canonicalize().ok())?;
+            (ancestor.is_dir() && ancestor.starts_with(workspace_canon)).then_some(candidate)
+        }
+        Err(_) => None,
+    }
 }
 
 /// Locate the `openclaw.json` whose agent set this workspace belongs to.
@@ -108,6 +192,63 @@ mod tests {
     }
 
     #[test]
+    fn tracked_inputs_get_the_tracked_channel_and_leave_workspace_untracked() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes/selected.md"), "selected").unwrap();
+        fs::write(
+            ws.join(alf_core::include::INCLUDE_FILE),
+            r#"{"files":[
+                {"path":"notes/selected.md","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
+                {"path":"notes/later.md","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
+                {"path":"../outside.md","added_at":"2026-01-01T00:00:00Z","external":false,"verified":true},
+                {"path":"AGENTS.md","added_at":"2026-01-01T00:00:00Z","external":true,"source":"/etc/proj/AGENTS.md","verified":true}
+            ]}"#,
+        )
+        .unwrap();
+
+        let specs = watch_paths(ws);
+        let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
+        assert!(tracked.tracked);
+        assert!(tracked.resurface, "optional roots must refresh the surface");
+        assert!(tracked.roots.contains(&ws.join("notes/selected.md")));
+        assert!(tracked.roots.contains(&ws.join("notes/later.md")));
+        assert!(
+            !tracked
+                .roots
+                .iter()
+                .any(|root| root.ends_with("outside.md")),
+            "an escaping include entry must not create a watch root"
+        );
+        assert!(
+            !tracked
+                .roots
+                .contains(&PathBuf::from("/etc/proj/AGENTS.md")),
+            "OpenClaw does not export external entries, so it must not watch them"
+        );
+
+        let controls = by_id(&specs, "tracked-controls").expect("tracked controls");
+        assert!(controls.tracked);
+        assert!(controls.resurface);
+        assert_eq!(
+            controls.roots,
+            vec![
+                ws.join(alf_core::include::INCLUDE_FILE),
+                ws.join(alf_core::include::SYNC_LOG_FILE),
+            ]
+        );
+
+        let workspace = by_id(&specs, "workspace").expect("workspace spec");
+        for root in tracked.roots.iter().chain(&controls.roots) {
+            assert!(
+                workspace.exclude.contains(root),
+                "the broad workspace spec must not also dirty {root:?}"
+            );
+        }
+    }
+
+    #[test]
     fn watch_paths_includes_out_of_workspace_openclaw_json() {
         // A workspace nested under an install root holding openclaw.json: the
         // walk-up resolves the config, and it is watched as its own file spec.
@@ -124,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn externals_never_yield_a_tracked_spec() {
+    fn externals_never_become_openclaw_tracked_roots() {
         // The openclaw export never packs external entries (`alf add
         // --external` refuses this runtime), so externals — however they got
         // into the list (restored archive, hand edit) — must not be watched:
@@ -142,7 +283,14 @@ mod tests {
         .unwrap();
 
         let specs = watch_paths(ws);
-        assert!(by_id(&specs, "tracked-files").is_none());
+        let tracked = by_id(&specs, "tracked-files").expect("in-workspace tracked spec");
+        assert!(tracked.roots.contains(&ws.join("notes.md")));
+        assert!(
+            !tracked
+                .roots
+                .contains(&PathBuf::from("/etc/proj/AGENTS.md")),
+            "OpenClaw does not export external entries, so it must not watch them"
+        );
     }
 
     #[test]
@@ -167,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_paths_no_tracked_spec_without_externals() {
+    fn in_workspace_include_entry_gets_a_tracked_spec() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         fs::write(
@@ -176,6 +324,8 @@ mod tests {
         )
         .unwrap();
         let specs = watch_paths(ws);
-        assert!(by_id(&specs, "tracked-files").is_none());
+        let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
+        assert!(tracked.tracked);
+        assert_eq!(tracked.roots, vec![ws.join("notes.md")]);
     }
 }

@@ -93,8 +93,8 @@ impl Adapter for OpenClawAdapter {
         export::resolve_agent_id_readonly(workspace)
     }
 
-    /// WP-M5: the MCP watch surface — one recursive workspace watch plus the
-    /// out-of-workspace `~/.openclaw/openclaw.json` and external tracked files.
+    /// WP-M5/RF-010: a broad workspace source, tracked-file channel, tracked
+    /// controls, and `~/.openclaw/openclaw.json` compose the MCP watch surface.
     fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
         watch::watch_paths(workspace)
     }

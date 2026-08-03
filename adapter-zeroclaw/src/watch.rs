@@ -22,7 +22,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
-use alf_core::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
+use alf_core::include::IncludeList;
 use alf_core::WatchSpec;
 
 use crate::config_parser;
@@ -112,20 +112,8 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
             });
         }
     }
-    specs.push(WatchSpec {
-        id: "tracked-controls".into(),
-        roots: vec![install.join(INCLUDE_FILE), install.join(SYNC_LOG_FILE)],
-        recursive: false,
-        exclude: Vec::new(),
-        tracked: true,
-        sqlite: false,
-        rediscover: false,
-        resurface: true, // surface-defining (manual §4.3)
-    });
-    specs.push(WatchSpec::file(
-        "export-controls",
-        install.join(".alfignore"),
-    ));
+    specs.push(WatchSpec::tracked_controls(&install));
+    specs.push(WatchSpec::export_controls([install.join(".alfignore")]));
 
     specs
 }
@@ -140,6 +128,7 @@ fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alf_core::include::{INCLUDE_FILE, SYNC_LOG_FILE};
     use std::fs;
     use tempfile::TempDir;
 

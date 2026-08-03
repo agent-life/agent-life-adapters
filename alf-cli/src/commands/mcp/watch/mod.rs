@@ -2330,9 +2330,12 @@ mod tests {
     }
 
     #[test]
-    fn rescan_marks_recursive_dir_source_on_root_mtime_change() {
-        // §4.3 backstop: a direct-child create bumps the dir's mtime, so a
-        // missed notify event is caught by the rescan.
+    fn rescan_marks_recursive_dir_source_on_direct_child_create() {
+        // §4.3 backstop: a missed notify event for a direct-child create is
+        // caught by the rescan. Note this works through the *child entry*
+        // appearing in the fingerprint, not the parent directory's mtime — a
+        // recursive dir's own size/mtime is deliberately not fingerprinted, so
+        // an excluded sibling's create cannot leak into this source.
         let dir = tempfile::tempdir().unwrap();
         let spec = WatchSpec::dir("memory", dir.path());
         let index = RootIndex::build(std::slice::from_ref(&spec));

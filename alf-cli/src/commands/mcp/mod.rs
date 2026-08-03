@@ -847,7 +847,7 @@ fn watch_set_impl(
                     );
                 }
                 Some(s) if s.tracked => anyhow::bail!(
-                    "'{id}' is the tracked-files channel — set tracked_files_interval \
+                    "'{id}' is on the tracked channel — set tracked_files_interval \
                      instead of per_source"
                 ),
                 Some(_) => {}

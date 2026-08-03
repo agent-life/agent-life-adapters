@@ -223,6 +223,50 @@ impl WatchSpec {
         }
     }
 
+    /// The two alf-managed control files (`.alf-include.json`,
+    /// `.alf-sync-log.md`), rooted at the directory that holds them — the
+    /// workspace, the install root, or a profile home.
+    ///
+    /// **Always tracked, on purpose.** `read_tracked_map` compares both files
+    /// for *every* runtime, so editing either forces a full-snapshot rollover —
+    /// exactly what `tracked_files_interval` exists to rate-limit. An adapter
+    /// that puts them on an untracked source rolls over at the delta floor
+    /// instead; that was the RF-010 defect, and it survived in a fourth adapter
+    /// precisely because this block was copied per adapter. Build it here.
+    pub fn tracked_controls(dir: &Path) -> Self {
+        Self {
+            id: "tracked-controls".into(),
+            roots: vec![
+                dir.join(crate::include::INCLUDE_FILE),
+                dir.join(crate::include::SYNC_LOG_FILE),
+            ],
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: true,
+            sqlite: false,
+            rediscover: false,
+            resurface: true,
+        }
+    }
+
+    /// Controls that change what export *selects* but are not members of
+    /// `read_tracked_map`: `.alfignore`, plus the generic runtime's
+    /// `.alf-map.json`. Untracked by construction, so they keep the normal
+    /// delta cadence. Chain [`WatchSpec::resurfacing`] when a root also defines
+    /// the watch surface — the map file does, `.alfignore` does not.
+    pub fn export_controls(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            id: "export-controls".into(),
+            roots: roots.into_iter().collect(),
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: false,
+            sqlite: false,
+            rediscover: false,
+            resurface: false,
+        }
+    }
+
     /// Mark this spec as the tracked-file channel (§6.1 rollover cadence).
     pub fn as_tracked(mut self) -> Self {
         self.tracked = true;

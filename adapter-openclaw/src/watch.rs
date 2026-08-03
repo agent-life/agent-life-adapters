@@ -20,12 +20,11 @@
 //! worth it for a bounded no-op; matching the two filters exactly is a possible
 //! future refinement, not a correctness fix.
 //!
-//! Two things the export reads live *outside* that recursive root, so they get
-//! their own specs (the whole-workspace default would silently miss them):
-//!
-//! - **`~/.openclaw/openclaw.json`** — the agent set + per-agent workspace +
-//!   version. A change here means the discovered topology moved, so it must
-//!   re-sync (and, on the CLI, be re-discovered by `alf check`).
+//! One thing the export reads lives *outside* that recursive root, so it gets
+//! its own spec (the whole-workspace default would silently miss it):
+//! **`~/.openclaw/openclaw.json`** — the agent set + per-agent workspace +
+//! version. A change here means the discovered topology moved, so it must
+//! re-sync (and, on the CLI, be re-discovered by `alf check`).
 //!
 //! External include-list entries are deliberately NOT watched: the openclaw
 //! export never packs them (`alf add --external` refuses this runtime), so a
@@ -47,17 +46,22 @@ use alf_core::WatchSpec;
 /// Build the OpenClaw watch surface for `workspace`.
 pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     let tracked_roots = tracked_roots(workspace);
-    let control_roots = vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)];
-    let export_control = workspace.join(".alfignore");
+    let tracked_controls = WatchSpec::tracked_controls(workspace);
+    let export_controls = WatchSpec::export_controls([workspace.join(".alfignore")]);
 
     // The whole workspace stays responsible for ordinary Markdown, but it must
     // not also classify explicit tracked inputs or export controls as ordinary
-    // workspace changes.
-    let mut workspace_spec =
-        WatchSpec::dir("workspace", workspace.to_path_buf()).excluding([workspace.join(".git")]);
-    workspace_spec.exclude.extend(tracked_roots.iter().cloned());
-    workspace_spec.exclude.extend(control_roots.iter().cloned());
-    workspace_spec.exclude.push(export_control.clone());
+    // workspace changes. Every root excluded here is carried by one of the
+    // specific specs below, so nothing falls out of the surface.
+    let excluded: Vec<PathBuf> = tracked_roots
+        .iter()
+        .chain(&tracked_controls.roots)
+        .chain(&export_controls.roots)
+        .cloned()
+        .collect();
+    let workspace_spec = WatchSpec::dir("workspace", workspace.to_path_buf())
+        .excluding([workspace.join(".git")])
+        .excluding(excluded);
     let mut specs = vec![workspace_spec];
 
     if !tracked_roots.is_empty() {
@@ -73,22 +77,8 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         });
     }
 
-    // The include list changes the tracked surface; the sync log is also an
-    // exported tracked input. Both follow the tracked-file cadence.
-    specs.push(WatchSpec {
-        id: "tracked-controls".into(),
-        roots: control_roots,
-        recursive: false,
-        exclude: Vec::new(),
-        tracked: true,
-        sqlite: false,
-        rediscover: false,
-        resurface: true,
-    });
-
-    // `.alfignore` changes export selection but is not a tracked-map member, so
-    // it retains the normal cadence under the cross-adapter source name.
-    specs.push(WatchSpec::file("export-controls", export_control));
+    specs.push(tracked_controls);
+    specs.push(export_controls);
 
     // Out-of-workspace: the OpenClaw config drives agent-set/workspace/version.
     if let Some(config) = openclaw_config_path(workspace) {
@@ -308,6 +298,14 @@ mod tests {
                 .roots
                 .contains(&PathBuf::from("/etc/proj/AGENTS.md")),
             "OpenClaw does not export external entries, so it must not watch them"
+        );
+        // The reachable leak is the entry's *relative* `path` being joined onto
+        // the workspace instead of its `source` being used verbatim. That is
+        // worse than a stray root: `AGENTS.md` is a ROOT_FILES member, so it
+        // would land on the tracked cadence AND be excluded from `workspace`.
+        assert!(
+            !tracked.roots.contains(&ws.join("AGENTS.md")),
+            "an external entry's relative path must not be joined onto the workspace"
         );
     }
 

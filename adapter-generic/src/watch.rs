@@ -24,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use alf_core::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
+use alf_core::include::IncludeList;
 use alf_core::WatchSpec;
 
 use crate::map::{reject_unsafe_relpath, MemoryMap, MAP_FILE};
@@ -100,31 +100,15 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
     }
 
-    // read_tracked_map compares both of these files for EVERY runtime. Their
-    // edits must take the tracked-files cadence and re-derive this surface.
-    specs.push(WatchSpec {
-        id: "tracked-controls".into(),
-        roots: vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)],
-        recursive: false,
-        exclude: Vec::new(),
-        tracked: true,
-        sqlite: false,
-        rediscover: false,
-        resurface: true, // surface-defining (manual §4.3)
-    });
+    specs.push(WatchSpec::tracked_controls(workspace));
 
-    // These controls change extraction or the watch set, but are NOT members
-    // of read_tracked_map, so they retain normal cadence.
-    specs.push(WatchSpec {
-        id: "export-controls".into(),
-        roots: vec![workspace.join(MAP_FILE), workspace.join(".alfignore")],
-        recursive: false,
-        exclude: Vec::new(),
-        tracked: false,
-        sqlite: false,
-        rediscover: false,
-        resurface: true, // surface-defining (manual §4.3)
-    });
+    // Generic is the one adapter whose export controls are also surface-defining:
+    // the map file decides which globs are watched at all, so this spec — unlike
+    // the other adapters' `.alfignore`-only one — must resurface.
+    specs.push(
+        WatchSpec::export_controls([workspace.join(MAP_FILE), workspace.join(".alfignore")])
+            .resurfacing(),
+    );
 
     specs
 }
@@ -195,6 +179,7 @@ fn glob_base_dir(workspace: &Path, glob: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alf_core::include::{INCLUDE_FILE, SYNC_LOG_FILE};
     use std::fs;
     use tempfile::TempDir;
 

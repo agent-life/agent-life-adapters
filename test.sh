@@ -241,8 +241,12 @@ for tier in "${TIERS[@]}"; do
             if have cargo; then run_tier unit cargo test --workspace
             else skip_tier unit "cargo not found"; fi ;;
         integration)
-            if have python3; then run_tier integration ./scripts/run_integration_tests.sh
-            else skip_tier integration "python3 not found"; fi ;;
+            if have python3; then
+                run_tier integration /bin/bash -lc \
+                    './scripts/run_integration_tests.sh && python3 -m unittest scripts/test_integration_fixture_tools.py'
+            else
+                skip_tier integration "python3 not found"
+            fi ;;
         installer)
             if ! have python3; then
                 skip_tier installer "python3 not found"

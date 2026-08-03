@@ -158,9 +158,9 @@ pub struct ArchiveEnumeration {
 /// (or the service, which never calls it) is affected.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchSpec {
-    /// Stable identifier — the map source id, `"tracked-files"`, `"sentinels"`,
-    /// `"brain.db"`, … Used as the scheduler's debounce/interval key and the
-    /// `alf_status` source label.
+    /// Stable identifier — the map source id, `"tracked-files"`,
+    /// `"tracked-controls"`, `"export-controls"`, `"brain.db"`, … Used as the
+    /// scheduler's debounce/interval key and the `alf_status` source label.
     pub id: String,
     /// The concrete files or directory roots whose change dirties this spec.
     pub roots: Vec<PathBuf>,

@@ -4,7 +4,7 @@
 //! The whole-workspace default the trait provides would silently miss the two
 //! things generic can track outside a single recursive root: **external**
 //! include-list entries (absolute paths under a blessed root) and the exact set
-//! of files that matter (map globs + sentinels). So generic overrides it to
+//! of files that matter (map globs + control files). So generic overrides it to
 //! yield, per design §11.1:
 //!
 //! - one spec per `memory_sources[]` entry (the glob's literal base dir, watched
@@ -13,8 +13,10 @@
 //! - a single **tracked-files** spec (§6.1 rollover channel) carrying every
 //!   in-workspace include-list path **and** every *verified* external entry's
 //!   absolute source (inert restored externals are not packed, so not watched),
-//! - a **sentinels** spec for `.alf-map.json` / `.alf-include.json` themselves
-//!   (editing them changes the watch set / extraction).
+//! - a tracked **tracked-controls** spec for `.alf-include.json` and
+//!   `.alf-sync-log.md` (both participate in tracked-file snapshot rollover),
+//! - an untracked **export-controls** spec for `.alf-map.json` and `.alfignore`
+//!   (editing either changes extraction or the watch set).
 //!
 //! `watch_paths` returns a bare `Vec` (no `Result`), so every fallible read here
 //! degrades gracefully: a missing/broken map falls back to one recursive
@@ -22,7 +24,7 @@
 
 use std::path::{Path, PathBuf};
 
-use alf_core::include::{IncludeList, INCLUDE_FILE};
+use alf_core::include::{IncludeList, INCLUDE_FILE, SYNC_LOG_FILE};
 use alf_core::WatchSpec;
 
 use crate::map::{reject_unsafe_relpath, MemoryMap, MAP_FILE};
@@ -63,8 +65,9 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
         Err(_) => {
             // No usable map — fall back to the whole workspace so the loop still
-            // reacts to changes; sentinels below let a later `alf_configure` be
-            // noticed. Exclude `.git/` (its churn would spuriously dirty).
+            // reacts to changes; control sources below let a later
+            // `alf_configure` be noticed. Exclude `.git/` (its churn would
+            // spuriously dirty).
             specs.push(
                 WatchSpec::dir("workspace", workspace.to_path_buf())
                     .excluding([workspace.join(".git")]),
@@ -97,15 +100,24 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
     }
 
-    // The control files themselves: editing them changes extraction / the watch
-    // set, so a change must re-sync (and re-derive the watch surface).
+    // read_tracked_map compares both of these files for EVERY runtime. Their
+    // edits must take the tracked-files cadence and re-derive this surface.
     specs.push(WatchSpec {
-        id: "sentinels".into(),
-        roots: vec![
-            workspace.join(MAP_FILE),
-            workspace.join(INCLUDE_FILE),
-            workspace.join(".alfignore"),
-        ],
+        id: "tracked-controls".into(),
+        roots: vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)],
+        recursive: false,
+        exclude: Vec::new(),
+        tracked: true,
+        sqlite: false,
+        rediscover: false,
+        resurface: true, // surface-defining (manual §4.3)
+    });
+
+    // These controls change extraction or the watch set, but are NOT members
+    // of read_tracked_map, so they retain normal cadence.
+    specs.push(WatchSpec {
+        id: "export-controls".into(),
+        roots: vec![workspace.join(MAP_FILE), workspace.join(".alfignore")],
         recursive: false,
         exclude: Vec::new(),
         tracked: false,
@@ -237,7 +249,7 @@ mod tests {
     }
 
     #[test]
-    fn watch_paths_covers_sources_identity_tracked_and_sentinels() {
+    fn watch_paths_covers_sources_identity_tracked_and_controls() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         write_map(
@@ -290,17 +302,23 @@ mod tests {
             "inert externals must not be watched"
         );
 
-        let sentinels = by_id("sentinels").expect("sentinels spec");
+        let tracked_controls = by_id("tracked-controls").expect("tracked controls spec");
         assert!(
-            sentinels.resurface,
-            "sentinels must be surface-defining (manual §4.3)"
+            tracked_controls.resurface,
+            "tracked controls must be surface-defining (manual §4.3)"
         );
-        assert!(!sentinels.tracked);
-        assert!(sentinels.roots.contains(&ws.join(MAP_FILE)));
-        assert!(sentinels.roots.contains(&ws.join(INCLUDE_FILE)));
+        assert!(tracked_controls.tracked);
+        assert!(tracked_controls.roots.contains(&ws.join(INCLUDE_FILE)));
+        assert!(tracked_controls.roots.contains(&ws.join(SYNC_LOG_FILE)));
+
+        let export_controls = by_id("export-controls").expect("export controls spec");
+        assert!(export_controls.resurface);
+        assert!(!export_controls.tracked);
+        assert!(export_controls.roots.contains(&ws.join(MAP_FILE)));
         // WP-E.3: editing `.alfignore` changes the export surface, so it must
         // dirty the watch loop too.
-        assert!(sentinels.roots.contains(&ws.join(".alfignore")));
+        assert!(export_controls.roots.contains(&ws.join(".alfignore")));
+        assert!(by_id("sentinels").is_none());
     }
 
     #[test]
@@ -314,8 +332,9 @@ mod tests {
             .expect("workspace fallback spec");
         // G3: the fallback recursive spec excludes `.git/`.
         assert!(workspace.exclude.contains(&ws.join(".git")));
-        // Sentinels are always present so a later configure is noticed.
-        assert!(specs.iter().any(|s| s.id == "sentinels"));
+        // Control sources are always present so a later configure is noticed.
+        assert!(specs.iter().any(|s| s.id == "tracked-controls"));
+        assert!(specs.iter().any(|s| s.id == "export-controls"));
     }
 
     #[test]

@@ -1955,8 +1955,9 @@ mod tests {
 
     #[test]
     fn compute_surface_marks_resurface_ids() {
-        // A generic workspace: the `sentinels` spec (map/include/.alfignore) is
-        // surface-defining; ordinary sources are not.
+        // A generic workspace: both control specs are surface-defining; ordinary
+        // sources are not. `tracked-controls` carries the two tracked-map
+        // inputs, while `export-controls` carries map/ignore changes.
         let ws = tempfile::tempdir().unwrap();
         std::fs::write(
             ws.path().join(".alf-map.json"),
@@ -1968,8 +1969,13 @@ mod tests {
         let agent = uuid::Uuid::from_u128(0x51);
         let surface = compute_surface("generic", ws.path(), agent).expect("generic surface");
         assert!(
-            surface.resurface_ids.contains("sentinels"),
-            "sentinels must be surface-defining: {:?}",
+            surface.resurface_ids.contains("tracked-controls"),
+            "tracked controls must be surface-defining: {:?}",
+            surface.resurface_ids
+        );
+        assert!(
+            surface.resurface_ids.contains("export-controls"),
+            "export controls must be surface-defining: {:?}",
             surface.resurface_ids
         );
         assert!(

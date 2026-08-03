@@ -316,9 +316,9 @@ A sync tick fires when: at least one source is dirty AND every dirty source is q
 
 ### 4.3 Watch surface
 
-Each adapter declares what to watch: memory-source files/globs, tracked files, sentinel files (`.alf-map.json`, `.alf-include.json`, `.alfignore` *(v1.1)*, runtime config), and — for SQLite sources — the `.db` plus `-wal`/`-shm` sidecars *(v1.1)*. Recursive directory sources also get a root-mtime poll backstop for missed notifications *(v1.1)*.
+Each adapter declares what to watch, split into channels by cadence *(v1.1)*: broad memory-source files/globs on the normal delta cadence; a **tracked** channel — `tracked-files` (include-list entries) and `tracked-controls` (`.alf-include.json`, `.alf-sync-log.md`) — on `tracked_files_interval`, because a change to any of them forces a full-snapshot rollover; and an untracked `export-controls` channel (`.alfignore`, and the `.alf-map.json` map file on the generic runtime) which changes what gets exported but is not part of that rollover comparison. For SQLite sources the `.db` plus its `-wal`/`-shm` sidecars are one unit *(v1.1)*. Recursive directory sources also get a bounded recursive polling fingerprint for missed notifications: it honors the adapter exclusions and detects nested create, delete, rename, and ordinary-file content changes even when a root directory mtime is unchanged. The scan has entry, hashed-byte, and wall-time limits; an incomplete scan is never treated as clean and is surfaced in `alf_status.watch.polling`.
 
-The surface is **refreshed without restart** when: `alf_track` or `alf_configure` succeeds, a sentinel file changes, or runtime rediscovery (e.g. a new Hermes profile) changes the mapping *(v1.1)*. New sources start dirty and catch up on the next tick.
+The surface is **refreshed without restart** when: `alf_track` or `alf_configure` succeeds, a surface-defining file changes (the tracked controls, the runtime config, or the generic `.alf-map.json`), or runtime rediscovery (e.g. a new Hermes profile) changes the mapping *(v1.1)*. New sources start dirty and catch up on the next tick. Editing `.alfignore` on openclaw/zeroclaw/hermes fires a sync but does **not** re-derive the surface — it narrows what export packs, not what is watched.
 
 ### 4.4 Interaction with the tools
 
@@ -333,9 +333,9 @@ The loop (and the CLI seams under it) write state atomically: the sync cursor, t
 
 ### 4.6 The `alf_status` watch stanza
 
-`{active, paused, parked?: {code, message, hint?}, backoff_retry_in_secs?, inactive_reason?, sources: [{source, interval_secs, tracked, dirty, dirty_count, last_fire_secs_ago?, never_quiesced_warning}]}`.
+`{active, paused, parked?: {code, message, hint?}, backoff_retry_in_secs?, inactive_reason?, notify_backend?: "active"|"rescan_only", notify_error?: {code, message}, registrations?: [{target, requested_mode, active, retry_in_secs?, last_error?: {code, message}}], polling?: {degraded_sources: [{source, code, message}]}, sources: [{source, interval_secs, tracked, dirty, dirty_count, last_fire_secs_ago?, never_quiesced_warning}]}`.
 
-`active` is true only when the loop is running, not paused, and not parked. `inactive_reason` is present when the loop never started *(v1.1)*.
+`active` is true only when the loop is running, not paused, and not parked. `inactive_reason` is present when the loop never started *(v1.1)*. An inactive registration or `rescan_only` backend remains safe through bounded polling, but is a visible operator warning; an entry in `polling.degraded_sources` means the latest fingerprint was incomplete and was not accepted as clean.
 
 ---
 

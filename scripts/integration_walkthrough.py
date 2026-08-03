@@ -173,7 +173,7 @@ class RunContext:
     root: Path           # the persistent run dir (printed; preserved interactively)
     home: Path           # isolated HOME for the CLI (holds .alf/)
     ws: Path             # the workspace the CLI syncs (the `-w` argument)
-    runtime_home: Path   # openclaw: == ws; zeroclaw: ws.parent (holds config.toml)
+    runtime_home: Path   # install root; == ws for the walkthrough's flat layouts
     restore_ws: Path     # a "fresh machine" workspace that `alf restore` populates
     alf: str             # path to the alf binary
     runtime: str
@@ -648,9 +648,19 @@ def build_run_context(cfg: Config, alf: str, agent_id: uuid.UUID = AGENT_ID) -> 
 
     if cfg.runtime == "zeroclaw":
         runtime_home = root / "zeroclaw-home"
-        ws = runtime_home / "workspace"
+        # ZeroClaw's current shared-install model discovers a logical `default`
+        # agent at agents/default/workspace while the runtime content itself
+        # lives at the install root. Keep the CLI's explicit -w target on that
+        # flat install root (the real/harness layout), and seed the discovered
+        # binding's identity pin too so discovery adopts the walkthrough UUID.
+        ws = runtime_home
         ws.mkdir(parents=True)
         (runtime_home / "config.toml").write_text(ZEROCLAW_CONFIG_TOML, encoding="utf-8")
+        mapped_ws = runtime_home / "agents" / "default" / "workspace"
+        mapped_ws.mkdir(parents=True)
+        (mapped_ws / ".alf-agent-id").write_text(
+            str(agent_id) + "\n", encoding="utf-8"
+        )
         restore_ws = root / "restore-home" / "workspace"
     else:
         ws = root / "openclaw-workspace"
@@ -696,9 +706,11 @@ def tree(path: Path, limit: int = 12) -> list[str]:
 
 # `.alf-agent-id` is the ALF agent-UUID pin. Its on-disk representation is
 # implementation-defined — `alf import` writes it without a trailing newline,
-# while the seed writes one — so it is excluded from the content hash and the
-# pin is instead verified separately by its (stripped) UUID value.
-DIGEST_EXCLUDE = (".alf-agent-id",)
+# while the seed writes one — so every such pin is excluded from the content
+# hash and the restored pin is verified separately by UUID. `.alf-include.lock`
+# is a local coordination artifact and deliberately never enters an archive.
+DIGEST_EXCLUDE = (".alf-agent-id", ".alf-include.lock")
+INTERNAL_DIGEST_BASENAMES = frozenset(DIGEST_EXCLUDE)
 
 
 def workspace_file_hashes(
@@ -712,7 +724,7 @@ def workspace_file_hashes(
         if not p.is_file():
             continue
         rel = str(p.relative_to(path))
-        if rel in exclude:
+        if rel in exclude or p.name in INTERNAL_DIGEST_BASENAMES:
             continue
         out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
     return out
@@ -1629,6 +1641,7 @@ def step_restore(cfg: Config, ctx: RunContext, s3: S3Client, db: DbClient, repor
     inspect(ctx, [
         ("list per-file SHA256 of the restored workspace",
          f"find {ctx.disp(ctx.restore_ws)} -type f ! -name .alf-agent-id "
+         f"! -name .alf-include.lock "
          f"-exec sha256sum {{}} + | sort"),
         ("compare restored vs original workspace",
          f"diff -r {ctx.disp(ctx.ws)} {ctx.disp(ctx.restore_ws)} || true"),

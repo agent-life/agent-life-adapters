@@ -1739,6 +1739,211 @@ mod tests {
     }
 
     #[test]
+    fn openclaw_surface_obeys_distinct_tracked_and_normal_intervals() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let selected = workspace.join("selected.md");
+        std::fs::write(&selected, "first").unwrap();
+        std::fs::write(
+            workspace.join(alf_core::INCLUDE_FILE),
+            r#"{"files":[{"path":"selected.md","added_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let specs: Vec<WatchSpec> = adapter_openclaw::watch::watch_paths(workspace)
+            .into_iter()
+            .filter(|spec| spec.id != "openclaw-config")
+            .collect();
+        let index = RootIndex::build(&specs);
+        assert_eq!(index.ids_for(&selected), vec!["tracked-files"]);
+        assert_eq!(
+            index.ids_for(&workspace.join("ordinary.md")),
+            vec!["workspace"]
+        );
+
+        let mut config = WatchConfig::default();
+        config.quiesce_window = Duration::ZERO;
+        config.set_default(Duration::from_secs(60));
+        config.set_tracked(Duration::from_secs(15 * 60));
+        let normal_interval = config.default_interval();
+        let tracked_interval = config.tracked_files_interval();
+        assert!(
+            tracked_interval > normal_interval,
+            "test precondition: tracked and normal intervals must differ"
+        );
+
+        let mut tracked_engine = WatchEngine::new(config.clone());
+        tracked_engine.set_sources(&specs, Duration::ZERO);
+        assert!(matches!(tracked_engine.poll(Duration::ZERO), Tick::Sync(_)));
+        tracked_engine.record_result(Duration::ZERO, Ok(()));
+        tracked_engine.mark_dirty("tracked-files", Duration::from_secs(1));
+        assert_eq!(
+            tracked_engine.poll(tracked_interval - Duration::from_millis(1)),
+            Tick::Idle,
+            "the real tracked source must not upload before its interval"
+        );
+        assert_eq!(
+            tracked_engine.poll(tracked_interval),
+            Tick::Sync(vec!["tracked-files".into()])
+        );
+        tracked_engine.record_result(tracked_interval, Ok(()));
+        assert_eq!(
+            tracked_engine.poll(tracked_interval + Duration::from_secs(1)),
+            Tick::Idle,
+            "one edit produces exactly one eligible tracked cycle"
+        );
+
+        let mut normal_engine = WatchEngine::new(config);
+        normal_engine.set_sources(&specs, Duration::ZERO);
+        assert!(matches!(normal_engine.poll(Duration::ZERO), Tick::Sync(_)));
+        normal_engine.record_result(Duration::ZERO, Ok(()));
+        normal_engine.mark_dirty("workspace", Duration::from_secs(1));
+        assert_eq!(
+            normal_engine.poll(normal_interval - Duration::from_millis(1)),
+            Tick::Idle
+        );
+        assert_eq!(
+            normal_engine.poll(normal_interval),
+            Tick::Sync(vec!["workspace".into()]),
+            "ordinary Markdown must remain on the normal interval"
+        );
+        normal_engine.record_result(normal_interval, Ok(()));
+        assert_eq!(
+            normal_engine.poll(normal_interval + Duration::from_secs(1)),
+            Tick::Idle
+        );
+    }
+
+    #[test]
+    fn openclaw_optional_tracked_root_refreshes_without_duplication() {
+        fn openclaw_surface(workspace: &Path) -> Surface {
+            let sync_specs: Vec<WatchSpec> = adapter_openclaw::watch::watch_paths(workspace)
+                .into_iter()
+                .filter(|spec| spec.id != "openclaw-config")
+                .collect();
+            Surface {
+                index: RootIndex::build(&sync_specs),
+                resurface_ids: sync_specs
+                    .iter()
+                    .filter(|spec| spec.resurface)
+                    .map(|spec| spec.id.clone())
+                    .collect(),
+                sync_specs,
+                rediscover_roots: Vec::new(),
+            }
+        }
+
+        fn assert_one_tracked_source(surface: &Surface, selected: &Path) {
+            let specs: Vec<&WatchSpec> = surface
+                .sync_specs
+                .iter()
+                .filter(|spec| spec.id == "tracked-files")
+                .collect();
+            assert_eq!(specs.len(), 1, "refresh must not duplicate the source ID");
+            assert_eq!(
+                specs[0].roots,
+                vec![selected.to_path_buf()],
+                "the optional path remains one logical root"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path();
+        let selected = workspace.join("later.md");
+        std::fs::write(
+            workspace.join(alf_core::INCLUDE_FILE),
+            r#"{"files":[{"path":"later.md","added_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let mut surface = openclaw_surface(workspace);
+        assert_one_tracked_source(&surface, &selected);
+        let handle = WatchHandle::new(WatchConfig::default());
+        {
+            let mut engine = handle.engine.lock().unwrap();
+            engine.set_sources(&surface.sync_specs, Duration::ZERO);
+            assert!(matches!(engine.poll(Duration::ZERO), Tick::Sync(_)));
+            engine.record_result(Duration::ZERO, Ok(()));
+        }
+        let mut fingerprints = FingerprintCache::new(&surface.sync_specs);
+        assert!(fingerprints.rescan(default_rescan_budget()).is_empty());
+
+        std::fs::write(&selected, "created").unwrap();
+        rescan(&handle, &surface, &mut fingerprints);
+        assert!(handle.take_resurface(), "creation requests one refresh");
+        assert!(!handle.take_resurface(), "the refresh request is one-shot");
+
+        let created_surface = openclaw_surface(workspace);
+        {
+            let mut engine = handle.engine.lock().unwrap();
+            engine.set_sources(&created_surface.sync_specs, Duration::from_secs(1));
+            let tracked = engine
+                .snapshot(Duration::from_secs(1))
+                .sources
+                .into_iter()
+                .find(|source| source.source == "tracked-files")
+                .unwrap();
+            assert!(tracked.dirty, "refresh must preserve pending tracked work");
+        }
+        assert!(
+            fingerprints
+                .reconcile(&created_surface.sync_specs)
+                .is_empty(),
+            "an unchanged logical definition preserves its polling baseline"
+        );
+        surface = created_surface;
+        assert_one_tracked_source(&surface, &selected);
+        let created_targets = desired_watch_targets(&surface.sync_specs);
+        assert_eq!(
+            created_targets.get(&selected),
+            Some(&RecursiveMode::NonRecursive),
+            "the present optional file has one effective exact registration"
+        );
+
+        std::fs::remove_file(&selected).unwrap();
+        rescan(&handle, &surface, &mut fingerprints);
+        assert!(handle.take_resurface(), "removal requests one refresh");
+        assert!(
+            !handle.take_resurface(),
+            "removal cannot start a refresh storm"
+        );
+
+        let missing_surface = openclaw_surface(workspace);
+        {
+            let mut engine = handle.engine.lock().unwrap();
+            engine.set_sources(&missing_surface.sync_specs, Duration::from_secs(2));
+            let tracked = engine
+                .snapshot(Duration::from_secs(2))
+                .sources
+                .into_iter()
+                .find(|source| source.source == "tracked-files")
+                .unwrap();
+            assert!(tracked.dirty, "removal refresh must preserve pending work");
+        }
+        assert!(
+            fingerprints
+                .reconcile(&missing_surface.sync_specs)
+                .is_empty(),
+            "the missing logical root keeps one stable polling definition"
+        );
+        surface = missing_surface;
+        assert_one_tracked_source(&surface, &selected);
+        assert!(
+            !desired_watch_targets(&surface.sync_specs).contains_key(&selected),
+            "a missing file uses the already-deduplicated ancestor registration"
+        );
+        assert_eq!(surface.index.ids_for(&selected), vec!["tracked-files"]);
+        assert!(
+            !handle
+                .snapshot()
+                .sources
+                .iter()
+                .any(|source| source.source == "workspace" && source.dirty),
+            "optional-root transitions must never dirty workspace"
+        );
+    }
+
+    #[test]
     fn build_config_defaults_for_supported_runtime() {
         let cfg = build_config("openclaw", None);
         assert_eq!(cfg.default_interval(), engine::DEFAULT_INTERVAL);

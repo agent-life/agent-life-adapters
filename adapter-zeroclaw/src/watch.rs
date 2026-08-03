@@ -16,8 +16,8 @@
 //! - **`config.toml`** at the install root.
 //! - **AIEOS `identity.json`** — path from `config.toml`; may be absolute /
 //!   outside the install.
-//! - **include-list** (in-workspace + external) on the §6.1 tracked channel,
-//!   and the **sentinels** (`.alf-include.json`, `.alf-sync-log.md`).
+//! - **include-list entries** on `tracked-files`, the include/sync controls on
+//!   `tracked-controls`, and `.alfignore` on untracked `export-controls`.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -93,7 +93,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     }
 
     // Include list: in-workspace tracked paths only, as one §6.1 rollover
-    // unit; and the sentinels themselves. No external roots: the zeroclaw
+    // unit. No external roots: the zeroclaw
     // export never packs external entries (`alf add --external` refuses this
     // runtime), so a root here would fire tracked syncs that capture nothing
     // (MAJ-4/MIN-8).
@@ -113,19 +113,19 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
     }
     specs.push(WatchSpec {
-        id: "sentinels".into(),
-        roots: vec![
-            install.join(INCLUDE_FILE),
-            install.join(SYNC_LOG_FILE),
-            install.join(".alfignore"),
-        ],
+        id: "tracked-controls".into(),
+        roots: vec![install.join(INCLUDE_FILE), install.join(SYNC_LOG_FILE)],
         recursive: false,
         exclude: Vec::new(),
-        tracked: false,
+        tracked: true,
         sqlite: false,
         rediscover: false,
         resurface: true, // surface-defining (manual §4.3)
     });
+    specs.push(WatchSpec::file(
+        "export-controls",
+        install.join(".alfignore"),
+    ));
 
     specs
 }
@@ -178,7 +178,7 @@ mod tests {
     }
 
     #[test]
-    fn root_files_and_config_and_sentinels_present() {
+    fn root_files_config_and_control_sources_have_the_right_cadence() {
         let tmp = TempDir::new().unwrap();
         let install = tmp.path();
         fs::write(install.join("config.toml"), "").unwrap();
@@ -191,11 +191,18 @@ mod tests {
         let config = by_id(&specs, "config").expect("config spec");
         assert_eq!(config.roots, vec![install.join("config.toml")]);
 
-        let sentinels = by_id(&specs, "sentinels").expect("sentinels spec");
-        assert!(sentinels.roots.contains(&install.join(INCLUDE_FILE)));
-        assert!(sentinels.roots.contains(&install.join(SYNC_LOG_FILE)));
-        // WP-E.3: `.alfignore` edits change the export surface → watched.
-        assert!(sentinels.roots.contains(&install.join(".alfignore")));
+        let tracked = by_id(&specs, "tracked-controls").expect("tracked controls");
+        assert!(tracked.tracked);
+        assert!(tracked.resurface);
+        assert_eq!(
+            tracked.roots,
+            vec![install.join(INCLUDE_FILE), install.join(SYNC_LOG_FILE)]
+        );
+
+        let export = by_id(&specs, "export-controls").expect("export controls");
+        assert!(!export.tracked);
+        assert!(!export.resurface);
+        assert_eq!(export.roots, vec![install.join(".alfignore")]);
     }
 
     #[test]

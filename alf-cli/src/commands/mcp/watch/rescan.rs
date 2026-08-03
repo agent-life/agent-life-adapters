@@ -440,12 +440,22 @@ fn scan_path(
     } else {
         None
     };
+    // A recursive directory is structural: its child entry set carries create,
+    // remove and rename information. Including directory size/mtime would leak
+    // an excluded child's create/remove back into the broad source because the
+    // parent directory metadata changes even though the child is not scanned.
+    // A non-recursive directory keeps its metadata as its only observable state.
+    let structural_dir = recursive && kind == EntryKind::Dir;
     entries.push(FingerprintEntry {
         root: root.to_path_buf(),
         relative: relative.to_path_buf(),
         kind,
-        size: metadata.len(),
-        modified: metadata.modified().ok(),
+        size: if structural_dir { 0 } else { metadata.len() },
+        modified: if structural_dir {
+            None
+        } else {
+            metadata.modified().ok()
+        },
         digest,
     });
 
@@ -554,6 +564,29 @@ mod tests {
 
         fs::write(&excluded, "second").unwrap();
         assert!(cache.rescan(budget(100)).is_empty());
+    }
+
+    #[test]
+    fn excluded_child_create_and_delete_do_not_dirty_recursive_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        let excluded = root.join("selected.md");
+
+        let spec = WatchSpec::dir("workspace", root.clone()).excluding([excluded.clone()]);
+        let mut cache = FingerprintCache::new(&[spec]);
+        assert!(cache.rescan(budget(100)).is_empty());
+
+        fs::write(&excluded, "created").unwrap();
+        assert!(
+            cache.rescan(budget(100)).is_empty(),
+            "excluded creation must not leak through the parent directory mtime"
+        );
+        fs::remove_file(&excluded).unwrap();
+        assert!(
+            cache.rescan(budget(100)).is_empty(),
+            "excluded removal must not leak through the parent directory mtime"
+        );
     }
 
     #[test]

@@ -21,9 +21,10 @@
 //! - **`profiles/`** (default profile only) — a **`rediscover`** spec: a new
 //!   `profiles/<name>/` created mid-session re-runs discovery so the new agent
 //!   surfaces in `alf_agents_list` (registration stays lazy; design §14).
-//! - **include-list** (in-workspace + *verified* external — inert restored
-//!   externals are not packed, so not watched) on the §6.1 tracked channel, and
-//!   the **sentinels** (`.alf-include.json`, `.alf-sync-log.md`).
+//! - **include-list entries** (in-workspace + *verified* external — inert
+//!   restored externals are not packed, so not watched) on `tracked-files`, the
+//!   include/sync controls on `tracked-controls`, and `.alfignore` on untracked
+//!   `export-controls`.
 
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -96,7 +97,7 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     }
 
     // Include list: in-workspace tracked paths + VERIFIED external sources,
-    // one §6.1 rollover unit; and the sentinels themselves. Inert (restored,
+    // one §6.1 rollover unit. Inert (restored,
     // unverified) externals are skipped by the export, so they must not be
     // watch roots either (MAJ-4 / D3).
     if let Ok(list) = IncludeList::load(workspace) {
@@ -119,19 +120,19 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         }
     }
     specs.push(WatchSpec {
-        id: "sentinels".into(),
-        roots: vec![
-            workspace.join(INCLUDE_FILE),
-            workspace.join(SYNC_LOG_FILE),
-            workspace.join(".alfignore"),
-        ],
+        id: "tracked-controls".into(),
+        roots: vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)],
         recursive: false,
         exclude: Vec::new(),
-        tracked: false,
+        tracked: true,
         sqlite: false,
         rediscover: false,
         resurface: true, // surface-defining (manual §4.3)
     });
+    specs.push(WatchSpec::file(
+        "export-controls",
+        workspace.join(".alfignore"),
+    ));
 
     specs
 }
@@ -261,7 +262,7 @@ mod tests {
     }
 
     #[test]
-    fn config_root_and_sentinels_present() {
+    fn config_root_and_control_sources_have_the_right_cadence() {
         let tmp = TempDir::new().unwrap();
         let home = tmp.path();
         let specs = watch_paths(home);
@@ -273,10 +274,17 @@ mod tests {
             .unwrap()
             .roots
             .contains(&home.join("SOUL.md")));
-        let sentinels = by_id(&specs, "sentinels").unwrap();
-        assert!(sentinels.roots.contains(&home.join(INCLUDE_FILE)));
-        // WP-E.3: `.alfignore` edits change the export surface → watched.
-        assert!(sentinels.roots.contains(&home.join(".alfignore")));
+        let tracked = by_id(&specs, "tracked-controls").unwrap();
+        assert!(tracked.tracked);
+        assert!(tracked.resurface);
+        assert_eq!(
+            tracked.roots,
+            vec![home.join(INCLUDE_FILE), home.join(SYNC_LOG_FILE)]
+        );
+        let export = by_id(&specs, "export-controls").unwrap();
+        assert!(!export.tracked);
+        assert!(!export.resurface);
+        assert_eq!(export.roots, vec![home.join(".alfignore")]);
     }
 
     #[test]

@@ -80,7 +80,7 @@ impl Adapter for HermesAdapter {
     }
 
     /// WP-M5: the MCP watch surface — the allowlisted content dirs, `SOUL.md`,
-    /// the `state.db` sidecar trio, `config.yaml`, the include-list/sentinels,
+    /// the `state.db` sidecar trio, `config.yaml`, tracked files/controls,
     /// and (default profile only) a `profiles/` rediscover boundary.
     fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
         watch::watch_paths(workspace)

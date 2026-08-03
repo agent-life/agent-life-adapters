@@ -96,7 +96,7 @@ impl Adapter for ZeroClawAdapter {
 
     /// WP-M5: the MCP watch surface — the `brain.db` sidecar trio, markdown
     /// `memory/`, root files, `config.toml`, the AIEOS identity file, and the
-    /// include-list/sentinels.
+    /// tracked files, tracked controls, and untracked export controls.
     fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
         watch::watch_paths(workspace)
     }

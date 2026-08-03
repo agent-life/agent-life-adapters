@@ -1,13 +1,13 @@
 //! OpenClaw `watch_paths` (design §11.1) — the watch surface the MCP loop
 //! monitors for an OpenClaw workspace.
 //!
-//! OpenClaw's export surface is essentially the *whole workspace*: `ROOT_FILES`
+//! OpenClaw's broad export surface includes `ROOT_FILES`
 //! (SOUL/IDENTITY/AGENTS/USER/TOOLS/HEARTBEAT/BOOTSTRAP/MEMORY .md), everything
-//! under `memory/`, every workspace `*.md` (the scatter-capture rule), the
-//! include-list, and the sentinels (`.alf-include.json`, `.alf-sync-log.md`).
-//! All of those live *inside* the workspace, so a single recursive workspace
-//! watch already covers them — the design's "one recursive workspace watch +
-//! the export-time exclusion filter, not per-glob watches".
+//! under `memory/`, and every workspace `*.md` (the scatter-capture rule). One
+//! recursive `workspace` source covers that ordinary Markdown surface. Files
+//! selected through the include list and the include/sync controls are split
+//! into dedicated tracked sources so their full-snapshot rollovers obey
+//! `tracked_files_interval`; `.alfignore` is a separate untracked export control.
 //!
 //! **Exclusion is coarser than export's, deliberately (review D1).** The watch
 //! prunes only top-level `.git/`; export additionally honors `.alfignore` and
@@ -48,13 +48,16 @@ use alf_core::WatchSpec;
 pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
     let tracked_roots = tracked_roots(workspace);
     let control_roots = vec![workspace.join(INCLUDE_FILE), workspace.join(SYNC_LOG_FILE)];
+    let export_control = workspace.join(".alfignore");
 
     // The whole workspace stays responsible for ordinary Markdown, but it must
-    // not also classify explicit tracked inputs as untracked.
+    // not also classify explicit tracked inputs or export controls as ordinary
+    // workspace changes.
     let mut workspace_spec =
         WatchSpec::dir("workspace", workspace.to_path_buf()).excluding([workspace.join(".git")]);
     workspace_spec.exclude.extend(tracked_roots.iter().cloned());
     workspace_spec.exclude.extend(control_roots.iter().cloned());
+    workspace_spec.exclude.push(export_control.clone());
     let mut specs = vec![workspace_spec];
 
     if !tracked_roots.is_empty() {
@@ -82,6 +85,10 @@ pub fn watch_paths(workspace: &Path) -> Vec<WatchSpec> {
         rediscover: false,
         resurface: true,
     });
+
+    // `.alfignore` changes export selection but is not a tracked-map member, so
+    // it retains the normal cadence under the cross-adapter source name.
+    specs.push(WatchSpec::file("export-controls", export_control));
 
     // Out-of-workspace: the OpenClaw config drives agent-set/workspace/version.
     if let Some(config) = openclaw_config_path(workspace) {
@@ -126,6 +133,7 @@ fn optional_tracked_root(workspace: &Path, path: &str) -> Option<PathBuf> {
     if !has_normal_component
         || candidate == workspace.join(INCLUDE_FILE)
         || candidate == workspace.join(SYNC_LOG_FILE)
+        || candidate.is_dir()
         || is_denylisted(&candidate)
     {
         return None;
@@ -239,8 +247,18 @@ mod tests {
             ]
         );
 
+        let export_controls = by_id(&specs, "export-controls").expect("untracked export controls");
+        assert!(!export_controls.tracked);
+        assert!(!export_controls.resurface);
+        assert_eq!(export_controls.roots, vec![ws.join(".alfignore")]);
+
         let workspace = by_id(&specs, "workspace").expect("workspace spec");
-        for root in tracked.roots.iter().chain(&controls.roots) {
+        for root in tracked
+            .roots
+            .iter()
+            .chain(&controls.roots)
+            .chain(&export_controls.roots)
+        {
             assert!(
                 workspace.exclude.contains(root),
                 "the broad workspace spec must not also dirty {root:?}"
@@ -327,5 +345,62 @@ mod tests {
         let tracked = by_id(&specs, "tracked-files").expect("tracked spec");
         assert!(tracked.tracked);
         assert_eq!(tracked.roots, vec![ws.join("notes.md")]);
+    }
+
+    #[test]
+    fn directory_include_entry_remains_on_the_workspace_source() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        fs::create_dir_all(ws.join("notes")).unwrap();
+        fs::write(ws.join("notes/child.md"), "child").unwrap();
+        fs::write(
+            ws.join(alf_core::include::INCLUDE_FILE),
+            r#"{"files":[{"path":"notes","added_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let specs = watch_paths(ws);
+        assert!(
+            by_id(&specs, "tracked-files").is_none(),
+            "a directory cannot become an exact tracked-file source"
+        );
+        let workspace = by_id(&specs, "workspace").unwrap();
+        assert!(
+            !workspace.exclude.contains(&ws.join("notes")),
+            "a rejected directory must not hide its descendants from workspace"
+        );
+    }
+
+    #[test]
+    fn missing_include_entry_that_becomes_a_directory_is_dropped_on_refresh() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+        fs::write(
+            ws.join(alf_core::include::INCLUDE_FILE),
+            r#"{"files":[{"path":"later","added_at":"2026-01-01T00:00:00Z"}]}"#,
+        )
+        .unwrap();
+
+        let initial = watch_paths(ws);
+        assert_eq!(
+            by_id(&initial, "tracked-files").unwrap().roots,
+            vec![ws.join("later")]
+        );
+        assert!(by_id(&initial, "workspace")
+            .unwrap()
+            .exclude
+            .contains(&ws.join("later")));
+
+        fs::create_dir_all(ws.join("later")).unwrap();
+        fs::write(ws.join("later/child.md"), "child").unwrap();
+        let refreshed = watch_paths(ws);
+        assert!(by_id(&refreshed, "tracked-files").is_none());
+        assert!(
+            !by_id(&refreshed, "workspace")
+                .unwrap()
+                .exclude
+                .contains(&ws.join("later")),
+            "refresh must return directory descendants to the broad workspace"
+        );
     }
 }

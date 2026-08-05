@@ -89,6 +89,10 @@ for variable in SCHEMA_REPOSITORY SCHEMA_COMMIT FIXTURE_ALF_FORMAT_VERSION FIXTU
     [[ -n ${!variable:-} ]] || fail "$LOCK_FILE does not define $variable."
 done
 
+actual_python_minor=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+[[ "$actual_python_minor" == "$GENERATOR_PYTHON_MINOR" ]] ||
+    fail "fixture generation requires Python $GENERATOR_PYTHON_MINOR; python3 is $(python3 --version)."
+
 REQUIREMENTS_LOCK="$REPO_ROOT/$GENERATOR_REQUIREMENTS_LOCK"
 [[ -f "$REQUIREMENTS_LOCK" ]] || fail "missing generator requirements lock: $REQUIREMENTS_LOCK"
 [[ -f "$ENV_VERIFIER" ]] || fail "missing generator environment verifier: $ENV_VERIFIER"

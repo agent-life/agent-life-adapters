@@ -71,12 +71,9 @@ while (($#)); do
 done
 
 (( CHECK && REGENERATE )) && fail "--check and --regenerate-fixture are mutually exclusive."
-if (( OFFLINE )) && [[ -z "$CHECKOUT" ]]; then
-if (( REGENERATE && GENERATE_ONLY )); then
+(( REGENERATE && GENERATE_ONLY )) &&
     fail "--regenerate-fixture cannot be combined with --generate-only."
-fi
-    fail "--offline requires --schema-dir <checkout>."
-fi
+(( OFFLINE )) && [[ -z "$CHECKOUT" ]] && fail "--offline requires --schema-dir <checkout>."
 
 require_command python3
 require_command git
@@ -137,7 +134,6 @@ mkdir -p "$REPORT_DIR"
 if [[ -n "$CHECKOUT" ]]; then
     CHECKOUT=$(cd -- "$CHECKOUT" && pwd -P)
 else
-    (( OFFLINE == 0 )) || fail "--offline requires --schema-dir <checkout>."
     CHECKOUT="$RUN_DIR/agent-life-data-format"
     echo "-> Fetching pinned schema commit $SCHEMA_COMMIT..."
     git init -q "$CHECKOUT"

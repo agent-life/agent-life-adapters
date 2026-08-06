@@ -90,6 +90,20 @@ class RunnerPreflightTests(unittest.TestCase):
             self.assertIn("modified or untracked schema files", result.stderr)
             self.assertNotIn("Generated ", result.stdout)
 
+    def test_regeneration_cannot_be_skipped_by_generate_only(self) -> None:
+        result = subprocess.run(
+            [str(RUNNER), "--regenerate-fixture", "--generate-only"],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(
+            "--regenerate-fixture cannot be combined with --generate-only.",
+            result.stderr,
+        )
+
     def test_locked_environment_matches_current_interpreter(self) -> None:
         result = subprocess.run(
             [

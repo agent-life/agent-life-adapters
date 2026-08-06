@@ -70,7 +70,7 @@ fn test_synthetic_data_validation() {
             "FAILED"
         };
         let report = format!(
-            "# ALF CLI Integration Test Report\n\n            **Adapter Commit:** {}\n            **Schema Commit:** {}\n            **Fixture ALF Format Version:** {}\n            **Fixture SHA-256:** {}\n            **Generator Python:** {}\n            **Generator Requirements Lock SHA-256:** {}\n            **JSF Version:** {}\n            **Faker Version:** {}\n            **Fixture Path:** {}\n            **Timestamp:** {}\n            **Status:** {}\n\n            ## alf validate Output\n\n{}\n\n            ## alf validate Errors\n\n{}\n",
+            "# ALF CLI Integration Test Report\n\n**Adapter Commit:** {}\n**Schema Commit:** {}\n**Fixture ALF Format Version:** {}\n**Fixture SHA-256:** {}\n**Generator Python:** {}\n**Generator Requirements Lock SHA-256:** {}\n**JSF Version:** {}\n**Faker Version:** {}\n**Fixture Path:** {}\n**Timestamp:** {}\n**Status:** {}\n\n## alf validate Output\n\n{}\n\n## alf validate Errors\n\n{}\n",
             report_value("ALF_INTEGRATION_ADAPTER_COMMIT"),
             schema_revision,
             report_value("ALF_INTEGRATION_FIXTURE_ALF_VERSION"),

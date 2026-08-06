@@ -18,9 +18,6 @@ from typing import Any
 
 from faker import Faker
 from jsf import JSF
-from jsf import parser as jsf_parser
-from jsf.schema_types import string as jsf_string
-from jsf.schema_types.string_utils.content_type import application__jwt
 from jsonschema import Draft202012Validator, FormatChecker
 
 SCHEMA_FILES = {

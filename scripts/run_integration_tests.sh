@@ -86,16 +86,39 @@ for variable in SCHEMA_REPOSITORY SCHEMA_COMMIT FIXTURE_ALF_FORMAT_VERSION FIXTU
     [[ -n ${!variable:-} ]] || fail "$LOCK_FILE does not define $variable."
 done
 
-actual_python_minor=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+PYTHON_BIN=python3
+export PYTHONHASHSEED=0
+actual_python_minor=$("$PYTHON_BIN" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 [[ "$actual_python_minor" == "$GENERATOR_PYTHON_MINOR" ]] ||
-    fail "fixture generation requires Python $GENERATOR_PYTHON_MINOR; python3 is $(python3 --version)."
+    fail "fixture generation requires Python $GENERATOR_PYTHON_MINOR; python3 is $($PYTHON_BIN --version)."
 
 REQUIREMENTS_LOCK="$REPO_ROOT/$GENERATOR_REQUIREMENTS_LOCK"
 [[ -f "$REQUIREMENTS_LOCK" ]] || fail "missing generator requirements lock: $REQUIREMENTS_LOCK"
 [[ -f "$ENV_VERIFIER" ]] || fail "missing generator environment verifier: $ENV_VERIFIER"
 
+RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/alf-integration.XXXXXX")
+ARCHIVE_STAGE=""
+REVISION_STAGE=""
+cleanup_run_dir() {
+    local status=$?
+    local stage
+    for stage in "$ARCHIVE_STAGE" "$REVISION_STAGE"; do
+        if [[ -n "$stage" ]]; then
+            rm -f -- "$stage" || echo "WARNING: could not remove staged fixture: $stage" >&2
+        fi
+    done
+    rm -rf -- "$RUN_DIR" || echo "WARNING: could not remove temporary directory: $RUN_DIR" >&2
+    return "$status"
+}
+trap cleanup_run_dir EXIT
+
+OUTPUT_ARCHIVE="$RUN_DIR/synthetic-agent.alf"
+OUTPUT_SCHEMA_REVISION="$RUN_DIR/schema_version.txt"
+REPORT_DIR="$RUN_DIR/reports"
+mkdir -p "$REPORT_DIR"
+
 verify_generator_environment() {
-    python3 "$ENV_VERIFIER" \
+    "$PYTHON_BIN" "$ENV_VERIFIER" \
         --lock "$REQUIREMENTS_LOCK" \
         --python-minor "$GENERATOR_PYTHON_MINOR"
 }
@@ -103,8 +126,12 @@ verify_generator_environment() {
 if (( OFFLINE )); then
     verify_generator_environment
 elif ! verify_generator_environment; then
+    # Do not mutate a PEP 668-managed interpreter or a caller's active virtualenv.
+    echo "-> Creating isolated generator environment..."
+    "$PYTHON_BIN" -m venv "$RUN_DIR/venv"
+    PYTHON_BIN="$RUN_DIR/venv/bin/python"
     echo "-> Installing exact generator requirements..."
-    python3 -m pip install --require-hashes -r "$REQUIREMENTS_LOCK"
+    "$PYTHON_BIN" -m pip install --require-hashes -r "$REQUIREMENTS_LOCK"
     verify_generator_environment
 fi
 
@@ -125,18 +152,6 @@ $status"
         fail "$candidate does not contain schemas/manifest.schema.json."
 }
 
-RUN_DIR=$(mktemp -d "${TMPDIR:-/tmp}/alf-integration.XXXXXX")
-OUTPUT_ARCHIVE="$RUN_DIR/synthetic-agent.alf"
-cleanup_run_dir() {
-    local status=$?
-    rm -rf -- "$RUN_DIR" || echo "WARNING: could not remove temporary directory: $RUN_DIR" >&2
-    return "$status"
-}
-trap cleanup_run_dir EXIT
-
-OUTPUT_SCHEMA_REVISION="$RUN_DIR/schema_version.txt"
-REPORT_DIR="$RUN_DIR/reports"
-mkdir -p "$REPORT_DIR"
 
 if [[ -n "$CHECKOUT" ]]; then
     CHECKOUT=$(cd -- "$CHECKOUT" && pwd -P)
@@ -153,7 +168,7 @@ verify_schema_checkout "$CHECKOUT"
 printf '%s\n' "$SCHEMA_COMMIT" > "$OUTPUT_SCHEMA_REVISION"
 
 echo "-> Generating deterministic fixture..."
-python3 "$SCRIPT_DIR/generate_synthetic_data.py" \
+"$PYTHON_BIN" "$SCRIPT_DIR/generate_synthetic_data.py" \
     --schema-dir "$CHECKOUT/schemas" \
     --output "$OUTPUT_ARCHIVE" \
     --alf-version "$FIXTURE_ALF_FORMAT_VERSION" \
@@ -163,10 +178,10 @@ python3 "$SCRIPT_DIR/generate_synthetic_data.py" \
 archive_sha=$(sha256sum "$OUTPUT_ARCHIVE" | awk '{print $1}')
 lock_sha=$(sha256sum "$REQUIREMENTS_LOCK" | awk '{print $1}')
 adapter_commit=$(git -C "$REPO_ROOT" rev-parse HEAD)
-python_version=$(python3 --version)
-jsf_version=$(python3 "$ENV_VERIFIER" --lock "$REQUIREMENTS_LOCK" \
+python_version=$("$PYTHON_BIN" --version)
+jsf_version=$("$PYTHON_BIN" "$ENV_VERIFIER" --lock "$REQUIREMENTS_LOCK" \
     --python-minor "$GENERATOR_PYTHON_MINOR" --print-version jsf)
-faker_version=$(python3 "$ENV_VERIFIER" --lock "$REQUIREMENTS_LOCK" \
+faker_version=$("$PYTHON_BIN" "$ENV_VERIFIER" --lock "$REQUIREMENTS_LOCK" \
     --python-minor "$GENERATOR_PYTHON_MINOR" --print-version faker)
 
 echo "-> Adapter commit: $adapter_commit"
@@ -215,7 +230,7 @@ export ALF_INTEGRATION_REQUIREMENTS_LOCK_SHA256="$lock_sha"
 export ALF_INTEGRATION_JSF_VERSION="$jsf_version"
 export ALF_INTEGRATION_FAKER_VERSION="$faker_version"
 
-cargo test -p alf-cli --test integration_tests
+cargo test --locked -p alf-cli --test integration_tests
 
 if (( REGENERATE )); then
     fixture_dir="$REPO_ROOT/alf-cli/fixtures"
@@ -229,12 +244,15 @@ if (( REGENERATE )); then
         echo "    old SHA-256: $(sha256sum "$tracked" | awk '{print $1}')"
         echo "    new SHA-256: $(sha256sum "$generated" | awk '{print $1}')"
     done
-    archive_stage=$(mktemp "$fixture_dir/.synthetic-agent.alf.XXXXXX")
-    revision_stage=$(mktemp "$fixture_dir/.schema_version.txt.XXXXXX")
-    cp "$OUTPUT_ARCHIVE" "$archive_stage"
-    cp "$OUTPUT_SCHEMA_REVISION" "$revision_stage"
-    mv -f "$archive_stage" "$tracked_archive"
-    mv -f "$revision_stage" "$tracked_revision"
+    ARCHIVE_STAGE=$(mktemp "$fixture_dir/.synthetic-agent.alf.XXXXXX")
+    REVISION_STAGE=$(mktemp "$fixture_dir/.schema_version.txt.XXXXXX")
+    cp "$OUTPUT_ARCHIVE" "$ARCHIVE_STAGE"
+    cp "$OUTPUT_SCHEMA_REVISION" "$REVISION_STAGE"
+    chmod 0644 "$ARCHIVE_STAGE" "$REVISION_STAGE"
+    mv -f "$ARCHIVE_STAGE" "$tracked_archive"
+    ARCHIVE_STAGE=""
+    mv -f "$REVISION_STAGE" "$tracked_revision"
+    REVISION_STAGE=""
 fi
 
 echo "=================================================="

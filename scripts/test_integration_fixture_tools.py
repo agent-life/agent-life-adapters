@@ -133,7 +133,7 @@ class RunnerPreflightTests(unittest.TestCase):
             git_wrapper = bin_dir / "git"
             git_wrapper.write_text('#!/usr/bin/env bash\ncase " $* " in\n  *" fetch "*|*" pull "*|*" clone "*|*" ls-remote "*)\n    printf "%s\\n" "git $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 91 ;;\nesac\nexec "$RUNNER_REAL_GIT" "$@"\n', encoding="utf-8")
             python_wrapper = bin_dir / "python3"
-            python_wrapper.write_text('#!/usr/bin/env bash\nif [[ ${1:-} == -m && ${2:-} == pip ]]; then\n  printf "%s\\n" "python3 $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 92\nfi\nexec "$RUNNER_REAL_PYTHON" "$@"\n', encoding="utf-8")
+            python_wrapper.write_text('#!/usr/bin/env bash\nif [[ ${PYTHONHASHSEED:-} != 0 ]]; then\n  printf "%s\\n" "PYTHONHASHSEED=${PYTHONHASHSEED:-missing}" >> "$RUNNER_FORBIDDEN_CALLS"; exit 93\nfi\nif [[ ${1:-} == -m && ${2:-} == pip ]]; then\n  printf "%s\\n" "python3 $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 92\nfi\nexec "$RUNNER_REAL_PYTHON" "$@"\n', encoding="utf-8")
             for wrapper in (git_wrapper, python_wrapper):
                 wrapper.chmod(0o755)
 

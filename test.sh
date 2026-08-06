@@ -8,7 +8,7 @@
 #   unit         cargo test --workspace                             (needs: cargo)
 #                  └ unit + per-crate cargo integration tests (cli_e2e, sync_round_trip,
 #                    adapter round-trips, the committed synthetic fixture, …)
-#   integration  scripts/run_integration_tests.sh                   (needs: python3)
+#   integration  scripts/run_integration_tests.sh                   (needs: Python 3.14; auto-selects python3.14)
 #                  └ regenerates synthetic data against the latest data-format schema,
 #                    then re-runs the alf-cli integration target
 #   installer    scripts/test_install.sh --linux --quick            (needs: docker, python3)
@@ -241,11 +241,13 @@ for tier in "${TIERS[@]}"; do
             if have cargo; then run_tier unit cargo test --workspace
             else skip_tier unit "cargo not found"; fi ;;
         integration)
-            if have python3; then
+            if have python3 || have python3.14 ||
+                { [[ -n ${ALF_INTEGRATION_PYTHON:-} ]] &&
+                    have "$ALF_INTEGRATION_PYTHON"; }; then
                 run_tier integration /bin/bash -lc \
-                    './scripts/run_integration_tests.sh && python3 -m unittest scripts/test_integration_fixture_tools.py'
+                    './scripts/run_integration_tests.sh --test-fixture-tools'
             else
-                skip_tier integration "python3 not found"
+                skip_tier integration "Python 3.14 interpreter not found"
             fi ;;
         installer)
             if ! have python3; then

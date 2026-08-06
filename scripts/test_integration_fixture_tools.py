@@ -85,6 +85,41 @@ class RunnerPreflightTests(unittest.TestCase):
         if not (SCHEMA_CHECKOUT / ".git").exists():
             raise unittest.SkipTest("sibling data-format checkout is unavailable")
 
+
+    def test_runner_prefers_versioned_python_on_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            record = root / "selected-python"
+            run_root = root / "runs"
+            bin_dir.mkdir()
+            run_root.mkdir()
+            versioned_python = bin_dir / f"python{lock_value('GENERATOR_PYTHON_MINOR')}"
+            versioned_python.write_text(
+                '#!/usr/bin/env bash\n'
+                'printf "%s\\n" "$0" >> "$RUNNER_PYTHON_RECORD"\n'
+                'exec "$RUNNER_REAL_PYTHON" "$@"\n',
+                encoding="utf-8",
+            )
+            versioned_python.chmod(0o755)
+            env = os.environ | {
+                "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+                "RUNNER_PYTHON_RECORD": str(record),
+                "RUNNER_REAL_PYTHON": sys.executable,
+                "TMPDIR": str(run_root),
+            }
+            env.pop("ALF_INTEGRATION_PYTHON", None)
+            result = subprocess.run(
+                [str(RUNNER), "--offline", "--schema-dir", str(SCHEMA_CHECKOUT), "--generate-only"],
+                cwd=REPO_ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            selected = record.read_text(encoding="utf-8").splitlines()
+            self.assertEqual(set(selected), {str(versioned_python)})
+
     def test_offline_mode_rejects_dirty_schema_checkout(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / "schema"
@@ -150,12 +185,13 @@ class RunnerPreflightTests(unittest.TestCase):
             self.assertIsNotNone(real_git)
             git_wrapper = bin_dir / "git"
             git_wrapper.write_text('#!/usr/bin/env bash\ncase " $* " in\n  *" fetch "*|*" pull "*|*" clone "*|*" ls-remote "*)\n    printf "%s\\n" "git $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 91 ;;\nesac\nexec "$RUNNER_REAL_GIT" "$@"\n', encoding="utf-8")
-            python_wrapper = bin_dir / "python3"
+            python_wrapper = bin_dir / "python3.14"
             python_wrapper.write_text('#!/usr/bin/env bash\nif [[ ${PYTHONHASHSEED:-} != 0 ]]; then\n  printf "%s\\n" "PYTHONHASHSEED=${PYTHONHASHSEED:-missing}" >> "$RUNNER_FORBIDDEN_CALLS"; exit 93\nfi\nif [[ ${1:-} == -m && ${2:-} == pip ]]; then\n  printf "%s\\n" "python3 $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 92\nfi\nexec "$RUNNER_REAL_PYTHON" "$@"\n', encoding="utf-8")
             for wrapper in (git_wrapper, python_wrapper):
                 wrapper.chmod(0o755)
 
             env = os.environ | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "RUNNER_FORBIDDEN_CALLS": str(forbidden_calls), "RUNNER_REAL_GIT": real_git, "RUNNER_REAL_PYTHON": sys.executable, "TMPDIR": str(run_root)}
+            env["ALF_INTEGRATION_PYTHON"] = str(python_wrapper)
             result = subprocess.run([str(RUNNER), "--offline", "--schema-dir", str(SCHEMA_CHECKOUT), "--generate-only"], cwd=REPO_ROOT, env=env, text=True, capture_output=True)
 
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -171,6 +207,7 @@ class RunnerPreflightTests(unittest.TestCase):
                 ["git", "clone", "--quiet", "--no-local", str(REPO_ROOT), str(checkout)],
                 check=True,
             )
+            shutil.copy2(RUNNER, checkout / "scripts/run_integration_tests.sh")
             fixture = checkout / "alf-cli/fixtures/synthetic-agent.alf"
             fixture.write_bytes(fixture.read_bytes() + b"\0")
             run_root = Path(temporary) / "runs"

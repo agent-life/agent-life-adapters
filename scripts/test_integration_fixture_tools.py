@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -89,6 +91,78 @@ class RunnerPreflightTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("modified or untracked schema files", result.stderr)
             self.assertNotIn("Generated ", result.stdout)
+
+    def test_offline_mode_rejects_wrong_schema_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "schema"
+            subprocess.run(
+                ["git", "clone", "--quiet", "--no-local", str(SCHEMA_CHECKOUT), str(checkout)],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(checkout), "checkout", "--quiet", "--detach", "HEAD^"],
+                check=True,
+            )
+            result = subprocess.run(
+                [str(RUNNER), "--offline", "--schema-dir", str(checkout), "--generate-only"],
+                cwd=REPO_ROOT,
+                text=True,
+                capture_output=True,
+            )
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("schema checkout is at", result.stderr)
+            self.assertNotIn("Generated ", result.stdout)
+
+    def test_offline_mode_makes_no_network_or_pip_calls_and_cleans_up(self) -> None:
+        tracked_paths = (
+            REPO_ROOT / "alf-cli/fixtures/synthetic-agent.alf",
+            REPO_ROOT / "alf-cli/fixtures/schema_version.txt",
+        )
+        before = {path: path.read_bytes() for path in tracked_paths}
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bin_dir = root / "bin"
+            run_root = root / "runs"
+            bin_dir.mkdir()
+            run_root.mkdir()
+            forbidden_calls = root / "forbidden-calls"
+            real_git = shutil.which("git")
+            self.assertIsNotNone(real_git)
+            git_wrapper = bin_dir / "git"
+            git_wrapper.write_text('#!/usr/bin/env bash\ncase " $* " in\n  *" fetch "*|*" pull "*|*" clone "*|*" ls-remote "*)\n    printf "%s\\n" "git $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 91 ;;\nesac\nexec "$RUNNER_REAL_GIT" "$@"\n', encoding="utf-8")
+            python_wrapper = bin_dir / "python3"
+            python_wrapper.write_text('#!/usr/bin/env bash\nif [[ ${1:-} == -m && ${2:-} == pip ]]; then\n  printf "%s\\n" "python3 $*" >> "$RUNNER_FORBIDDEN_CALLS"; exit 92\nfi\nexec "$RUNNER_REAL_PYTHON" "$@"\n', encoding="utf-8")
+            for wrapper in (git_wrapper, python_wrapper):
+                wrapper.chmod(0o755)
+
+            env = os.environ | {"PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}", "RUNNER_FORBIDDEN_CALLS": str(forbidden_calls), "RUNNER_REAL_GIT": real_git, "RUNNER_REAL_PYTHON": sys.executable, "TMPDIR": str(run_root)}
+            result = subprocess.run([str(RUNNER), "--offline", "--schema-dir", str(SCHEMA_CHECKOUT), "--generate-only"], cwd=REPO_ROOT, env=env, text=True, capture_output=True)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(forbidden_calls.exists(), forbidden_calls.read_text(encoding="utf-8") if forbidden_calls.exists() else "")
+            self.assertEqual(list(run_root.iterdir()), [])
+        for path, expected in before.items():
+            self.assertEqual(path.read_bytes(), expected)
+
+    def test_check_rejects_a_stale_fixture_without_replacing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "adapter-checkout"
+            subprocess.run(
+                ["git", "clone", "--quiet", "--no-local", str(REPO_ROOT), str(checkout)],
+                check=True,
+            )
+            fixture = checkout / "alf-cli/fixtures/synthetic-agent.alf"
+            fixture.write_bytes(fixture.read_bytes() + b"\0")
+            run_root = Path(temporary) / "runs"
+            run_root.mkdir()
+            env = os.environ | {"TMPDIR": str(run_root)}
+            result = subprocess.run([str(checkout / "scripts/run_integration_tests.sh"), "--offline", "--schema-dir", str(SCHEMA_CHECKOUT), "--generate-only", "--check"], cwd=checkout, env=env, text=True, capture_output=True)
+
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn(f"STALE: {fixture}", result.stderr)
+            self.assertIn("run --regenerate-fixture after reviewing the reported differences.", result.stderr)
 
     def test_regeneration_cannot_be_skipped_by_generate_only(self) -> None:
         result = subprocess.run(

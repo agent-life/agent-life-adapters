@@ -10,14 +10,23 @@ import sys
 import tempfile
 import unittest
 import zipfile
+from datetime import timezone
 from pathlib import Path
+from unittest.mock import call, patch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 sys.path.insert(0, str(SCRIPTS_DIR))
 
-from generate_synthetic_data import FixtureInputs, generate_fixture  # noqa: E402
+from jsf.schema_types import string as jsf_string
 
+from generate_synthetic_data import (  # noqa: E402
+    FIXED_NOW,
+    FixtureInputs,
+    generate_fixture,
+    generation_context,
+
+)
 LOCK_FILE = SCRIPTS_DIR / "integration-fixture.lock"
 RUNNER = SCRIPTS_DIR / "run_integration_tests.sh"
 ENV_VERIFIER = SCRIPTS_DIR / "verify_generator_env.py"
@@ -60,6 +69,15 @@ class DeterministicFixtureTests(unittest.TestCase):
                     self.assertEqual(info.date_time, (1980, 1, 1, 0, 0, 0))
                     self.assertEqual(info.compress_type, zipfile.ZIP_STORED)
 
+
+    def test_jsf_temporal_formats_pin_their_upper_bound(self) -> None:
+        generation_context(int(lock_value("FIXTURE_SEED")))
+        with patch.object(jsf_string.faker, "date_time", return_value=FIXED_NOW) as date_time:
+            self.assertEqual(jsf_string.format_map["date-time"](), FIXED_NOW.isoformat())
+            self.assertEqual(jsf_string.format_map["date"](), "2026-01-01")
+            self.assertEqual(jsf_string.format_map["time"](), "00:00:00+00:00")
+
+        self.assertEqual(date_time.call_args_list, [call(timezone.utc, end_datetime=FIXED_NOW)] * 3)
 
 class RunnerPreflightTests(unittest.TestCase):
     @classmethod

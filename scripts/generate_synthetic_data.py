@@ -18,6 +18,7 @@ from typing import Any
 
 from faker import Faker
 from jsf import JSF
+from jsf.schema_types import string as jsf_string
 from jsonschema import Draft202012Validator, FormatChecker
 
 SCHEMA_FILES = {
@@ -64,6 +65,21 @@ class FrozenDateTime(datetime):
         return cls.now()
 
 
+def anchored_jsf_datetime() -> datetime:
+    """Generate a temporal value from a fixed upper bound, never wall time."""
+    return jsf_string.faker.date_time(timezone.utc, end_datetime=FIXED_NOW)
+
+
+def pin_jsf_temporal_formats() -> None:
+    jsf_string.format_map.update(
+        {
+            "date-time": lambda: anchored_jsf_datetime().isoformat(),
+            "date": lambda: anchored_jsf_datetime().isoformat().split("T")[0],
+            "time": lambda: anchored_jsf_datetime().isoformat().split("T")[1],
+        }
+    )
+
+
 @dataclass(frozen=True)
 class FixtureInputs:
     schema_dir: Path
@@ -95,6 +111,8 @@ def load_schema(schema_dir: Path, filename: str) -> dict[str, Any]:
 def generation_context(seed: int) -> dict[str, Any]:
     random.seed(seed)
     Faker.seed(seed)
+    jsf_string.faker.seed_instance(seed)
+    pin_jsf_temporal_formats()
     faker = Faker()
     faker.seed_instance(seed)
     return {

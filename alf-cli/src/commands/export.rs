@@ -89,7 +89,7 @@ pub fn run(
 
     // WP1: move any legacy vault/key to the per-agent layout before export —
     // the adapter reads only the per-agent vault path (no legacy fallback).
-    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
+    crate::vault_migrate::require_migrated_locked(&config, &selected.runtime)?;
 
     let (workspace, adhoc) = selector::effective_workspace(&selected, workspace_flag);
     let workspace = workspace.as_path();

@@ -801,6 +801,19 @@ pub async fn run_loop(
         }
     }
 
+    // RF-012: migrate any legacy vault ONCE here, before the tick loop begins
+    // taking per-tick L3 guards. `run_one_agent` no longer migrates, so the
+    // watch path relies on this startup pass; doing it under a tick lock would
+    // nest/deadlock migration's own legacy→agent guards. A blocked or failed
+    // migration parks the loop (same as any other startup failure) rather than
+    // syncing a workspace whose Layer 4 cannot be trusted.
+    if let Err(e) = crate::commands::sync::migrate_before_agent_lock(&runtime) {
+        let reason = format!("watch loop not started: legacy vault migration failed: {e:#}");
+        eprintln!("alf mcp serve: {reason}");
+        handle.set_inactive_reason(reason);
+        return;
+    }
+
     // Compute the watch surface, then drop the adapter — `Box<dyn Adapter>` is
     // not `Send` and must not be held across the loop's awaits. Rediscover
     // specs (Hermes `profiles/`) are an agent-set boundary handled out of band

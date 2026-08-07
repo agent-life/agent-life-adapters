@@ -904,6 +904,15 @@ pub(crate) fn run_for_mcp(
     let with_credentials = false;
     let target = resolve_target(runtime, workspace_flag, agent)?;
 
+    // WP1 + RF-012: move any legacy vault/key to the per-agent layout BEFORE the
+    // head-restore L3 lock below. Migration takes its own legacy→agent guards, so
+    // it must not run under the restore lock (`flock` does not nest, and
+    // legacy-after-agent would deadlock a concurrent locked vault mutation).
+    // Skipped for a dry-run, which writes nothing.
+    if !dry_run {
+        vault_migrate::require_migrated_locked(&target.config, runtime)?;
+    }
+
     // L3 (manual §6): a HEAD restore rewrites the live workspace and moves the
     // sync state, so it takes the per-agent advisory lock. Previews and dry
     // runs are read-only with respect to shared state — lock-free.
@@ -932,10 +941,6 @@ pub(crate) fn run_for_mcp(
         )
         .into());
     }
-
-    // WP1: move any legacy vault/key to the per-agent layout before the adapter
-    // writes Layer 4 (skipped for a dry-run, which writes nothing).
-    vault_migrate::require_migrated(&target.config, runtime)?;
 
     let (report, latest_sequence, written_to) = perform_restore(
         &target.client,
@@ -983,6 +988,15 @@ pub fn run(
         return run_dry_run(&target.client, agent_id, adapt, at_sequence, human);
     }
 
+    // WP1 + RF-012: move any legacy vault/key to the per-agent layout BEFORE the
+    // head-restore L3 lock — otherwise the key leg is missed on the first
+    // post-upgrade restore and the legacy file survives as a shadow vault.
+    // Migration takes its own legacy→agent guards, so it must run before (never
+    // under) the restore lock: `flock` does not nest, and legacy-after-agent
+    // would deadlock a concurrent locked vault mutation. (Dry runs returned
+    // above and write nothing.)
+    vault_migrate::require_migrated_locked(&target.config, runtime)?;
+
     // L3 (MAJ-6): a CLI HEAD restore rewrites the live workspace and moves the
     // sync state — take the same cross-process advisory lock the MCP tools and
     // the watch loop hold, so a concurrent watch export can never upload a
@@ -996,12 +1010,6 @@ pub fn run(
     } else {
         None
     };
-
-    // WP1: move any legacy vault/key to the per-agent layout before the
-    // adapter writes Layer 4 — otherwise the key leg is missed on the first
-    // post-upgrade restore and the legacy file survives as a shadow vault.
-    // (After the dry-run gate: --dry-run writes nothing.)
-    vault_migrate::require_migrated(&target.config, runtime)?;
 
     if human {
         if let Some(n) = at_sequence {

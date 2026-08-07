@@ -458,6 +458,9 @@ missing or diverged. Safe and idempotent.",
         };
         call_streaming(ctx, move |sink| {
             let _permit = permit; // L2 held for the whole blocking seam
+                                  // RF-012: migrate before L3 (migration takes its own legacy→agent
+                                  // guards; nesting under the sync lock would deadlock/self-contend).
+            sync::migrate_before_agent_lock(&runtime)?;
             let _agent_lock = acquire_agent_lock(&runtime, workspace.as_deref(), agent.as_deref())?;
             let (outcome, selected) = sync::run_one_agent(
                 &runtime,
@@ -1007,11 +1010,15 @@ fn vault_add_impl(
     params: VaultAddParams,
 ) -> anyhow::Result<VaultAddResult> {
     let config = Config::load()?;
-    vault_migrate::require_migrated(&config, runtime)?;
+    // RF-012: migrate under the legacy→agent guards BEFORE taking the RMW lock
+    // below. Migration releases its guards before returning, so the RMW lock is
+    // acquired fresh — no nested flock on the same agent.
+    vault_migrate::require_migrated_locked(&config, runtime)?;
     let scope = server_vault_scope(&config, runtime, agent, workspace)?;
     // L3: two MCP servers pinned to the same agent must not interleave the
     // vault read-modify-write (manual §6). write_lock (L1) is already held.
-    let _agent_lock = scope.map(vault_agent_lock).transpose()?;
+    // Same lock file as the CLI's `alf vault add` (RF-012 shared identity).
+    let _agent_lock = lock_default_vault_mutation(scope)?;
 
     // Duplicate guard (manual §3.8): without update:true, an add whose service +
     // effective label match an existing record is rejected — a repeated
@@ -1073,7 +1080,7 @@ fn vault_list_impl(
     agent: Option<&str>,
 ) -> anyhow::Result<vault::ListResult> {
     let config = Config::load()?;
-    vault_migrate::require_migrated(&config, runtime)?;
+    vault_migrate::require_migrated_locked(&config, runtime)?;
     let scope = server_vault_scope(&config, runtime, agent, workspace)?;
     vault::list_core(None, scope)
 }
@@ -1085,10 +1092,12 @@ fn vault_delete_impl(
     params: VaultDeleteParams,
 ) -> anyhow::Result<vault::DeleteResult> {
     let config = Config::load()?;
-    vault_migrate::require_migrated(&config, runtime)?;
+    // RF-012: migrate under the legacy→agent guards before taking the RMW lock.
+    vault_migrate::require_migrated_locked(&config, runtime)?;
     let scope = server_vault_scope(&config, runtime, agent, workspace)?;
-    // L3: cross-process vault RMW protection, same as vault_add_impl.
-    let _agent_lock = scope.map(vault_agent_lock).transpose()?;
+    // L3: cross-process vault RMW protection, same lock file as vault_add_impl
+    // and the CLI's `alf vault delete` (RF-012 shared identity).
+    let _agent_lock = lock_default_vault_mutation(scope)?;
     let selector = match params.by.as_str() {
         "id" => vault::Selector {
             id: Some(params.value),
@@ -1125,9 +1134,18 @@ pub(crate) fn agent_busy(cause: &str) -> anyhow::Error {
     .into()
 }
 
-/// L3 for the vault tools: the per-agent advisory lock by known agent id.
-fn vault_agent_lock(agent_id: Uuid) -> anyhow::Result<watch::lock::AgentLock> {
-    watch::acquire_agent_lock_timeout(agent_id, Duration::from_secs(10))
+/// L3 for a canonical default-vault mutation (RF-012), shared by the CLI and
+/// the MCP vault tools so both entry points take the exact same lock file.
+/// A resolved agent uses its per-agent lock; a mapping-less install has one
+/// install-scoped legacy vault and uses the distinct stable legacy lock rather
+/// than aliasing an all-zero agent UUID (which is itself a valid agent id).
+pub(crate) fn lock_default_vault_mutation(
+    scope: Option<Uuid>,
+) -> anyhow::Result<watch::lock::AgentLock> {
+    match scope {
+        Some(agent_id) => watch::acquire_agent_lock_timeout(agent_id, Duration::from_secs(10)),
+        None => watch::acquire_legacy_vault_lock_timeout(Duration::from_secs(10)),
+    }
 }
 
 /// L3: acquire the per-agent cross-process advisory lock with a bounded wait

@@ -408,6 +408,12 @@ pub fn run(
         );
     }
 
+    // RF-012: migrate any legacy vault BEFORE the long-lived L3 lock. Migration
+    // takes its own legacy→agent guards; running it while already holding the
+    // agent lock would self-deadlock the flock and invert the legacy→agent order
+    // a concurrent `alf vault` mutation relies on.
+    migrate_before_agent_lock(runtime)?;
+
     // L3 (MAJ-6): hold the per-agent advisory lock across the whole sync — the
     // same lock the MCP server and the watch loop take — so a CLI sync cannot
     // interleave with a watch export/restore on this agent. (The lock lives
@@ -436,11 +442,25 @@ pub fn run(
     Ok(())
 }
 
+/// RF-012: move any legacy vault/key into the per-agent layout BEFORE a caller
+/// takes the long-lived per-agent sync lock. Migration acquires its own
+/// legacy→agent guards internally, so it must complete before — never under —
+/// the agent lock (`flock` does not nest, and legacy-after-agent would deadlock
+/// a concurrent `alf vault` mutation that takes legacy-then-agent). Idempotent
+/// and lock-free once migrated. Every `run_one_agent` caller (CLI `run`, the
+/// MCP `alf_sync` tool, and the watch loop's startup) invokes this before its
+/// L3 acquisition; `run_one_agent` itself no longer migrates.
+pub(crate) fn migrate_before_agent_lock(runtime: &str) -> Result<()> {
+    let config = Config::load()?;
+    crate::vault_migrate::require_migrated_locked(&config, runtime)
+}
+
 /// Sync exactly one selected agent, end to end: load config, resolve the
-/// adapter + workspace, run the selector (+ enabled gate), migrate the vault,
-/// build the API client, and drive [`sync_one`]. No stdout output — the caller
-/// renders. Extracted as the MCP `alf_sync` seam so the tool reuses the whole
-/// single-agent pipeline (never the printing `run`). `progress` routes the
+/// adapter + workspace, run the selector (+ enabled gate), build the API
+/// client, and drive [`sync_one`]. Legacy-vault migration is done by the
+/// caller before L3 (see [`migrate_before_agent_lock`]). No stdout output — the
+/// caller renders. Extracted as the MCP `alf_sync` seam so the tool reuses the
+/// whole single-agent pipeline (never the printing `run`). `progress` routes the
 /// interleaved status lines: [`Progress::stderr`] for the CLI, a callback for
 /// the MCP progress-notification bridge.
 pub(crate) fn run_one_agent(
@@ -479,14 +499,11 @@ pub(crate) fn run_one_agent(
         selector::select_current_agent(&mut config, adapt.as_ref(), runtime, &install, agent)?;
     selector::require_enabled_for_sync(&selected)?;
 
-    // Check before vault migration too: an interrupted restore must not let a
-    // manual/MCP sync perform unrelated mutation before reporting its park.
+    // An interrupted restore must not let a manual/MCP sync perform any
+    // mutation before reporting its park. This runs while the caller holds L3
+    // (the authoritative post-lock gate); legacy-vault migration already
+    // happened before L3 via [`migrate_before_agent_lock`] — see RF-012.
     ensure_sync_not_during_restore(selected.alf_agent_id, runtime, &selected.workspace)?;
-
-    // WP1: move any legacy vault/key to the per-agent layout before export —
-    // adapters read only per-agent vault paths (no legacy fallback), so an
-    // unmigrated vault would silently drop Layer 4 from the upload.
-    crate::vault_migrate::require_migrated(&config, &selected.runtime)?;
 
     let client = ApiClient::from_config(&config)?;
     let outcome = sync_one(
@@ -540,8 +557,10 @@ fn run_all(
 ) -> Result<()> {
     let selected = selector::select_all_enabled(config, adapt, runtime, install)?;
 
-    // WP1: one migration pass for the runtime before any agent exports.
-    crate::vault_migrate::require_migrated(config, runtime)?;
+    // WP1 + RF-012: one migration pass for the runtime before any agent
+    // exports — and before the per-agent L3 loop below, so migration's own
+    // legacy→agent guards never nest under a held per-agent lock.
+    crate::vault_migrate::require_migrated_locked(config, runtime)?;
 
     let client = ApiClient::from_config(config)?;
 

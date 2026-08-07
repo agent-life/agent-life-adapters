@@ -1488,6 +1488,107 @@ fn vault_add_defaults_to_per_agent_vault_path() {
     assert_eq!(doc["credentials"][0]["agent_id"], id);
 }
 
+/// RF-012 (DoD): a direct-CLI default-vault add serializes on the same
+/// per-agent flock the watch loop and MCP tools take. The test holds that exact
+/// lock (`~/.alf/state/{id}.lock`) and proves a concurrent `alf vault add`
+/// cannot proceed while it is held; once released, the add lands WITHOUT losing
+/// the record already in the vault. Uses a real subprocess and a real flock —
+/// an intra-process mutex would not prove cross-process coordination.
+#[test]
+fn concurrent_default_vault_add_blocks_on_shared_lock_and_preserves_records() {
+    use fs2::FileExt;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-1111-4111-8111-0000000000aa";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+
+    // Seed one record so we can later prove the contended RMW did not discard a
+    // pre-existing credential.
+    alf_cmd()
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "email",
+            "--label",
+            "first@example.com",
+            "--secret",
+            "one",
+        ])
+        .assert()
+        .success();
+
+    // Hold the agent's L3 lock exactly as the CLI does: an exclusive flock on
+    // the per-agent lock file under ~/.alf/state.
+    let lock_path = home.join(".alf").join("state").join(format!("{id}.lock"));
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    // A concurrent add must block on that lock rather than racing the RMW. If
+    // the CLI did NOT take the lock, this fast add would exit well under 800ms.
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_alf"))
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "slack",
+            "--label",
+            "second@example.com",
+            "--secret",
+            "two",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "vault add must block while another holder owns the per-agent lock"
+    );
+
+    // Release; the add now proceeds and commits its record.
+    fs2::FileExt::unlock(&lock_file).unwrap();
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "vault add must succeed once the lock is free"
+    );
+
+    // Both records survive — the contended RMW read the just-released state.
+    let doc: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(agent_vault(&home, id)).unwrap()).unwrap();
+    let services: Vec<&str> = doc["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["service"].as_str().unwrap())
+        .collect();
+    assert!(services.contains(&"email"), "pre-existing record preserved");
+    assert!(services.contains(&"slack"), "contended add landed");
+    assert_eq!(services.len(), 2, "exactly the two records, no loss");
+}
+
 /// E-2: the secret can arrive on stdin (no --secret flag on the argv secret
 /// surface) and round-trips through a bare decrypt.
 #[test]

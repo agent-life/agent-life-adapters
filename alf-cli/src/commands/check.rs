@@ -778,7 +778,7 @@ pub(crate) fn gather(
     // WP1: check is the natural upgrade touchpoint — perform the legacy-vault
     // migration when the target is unambiguous, report otherwise. Never a
     // hard failure.
-    match vault_migrate::ensure_migrated(&config, runtime, None) {
+    match vault_migrate::ensure_migrated_locked(&config, runtime, None) {
         Ok(MigrationOutcome::NotNeeded) => {}
         Ok(MigrationOutcome::Migrated { vault, key, agent }) => {
             if let Some(p) = vault {

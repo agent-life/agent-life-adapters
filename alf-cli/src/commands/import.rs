@@ -96,7 +96,7 @@ pub fn run(
     // WP1: move any legacy vault/key to the per-agent layout before the
     // adapter restores Layer 4 — adapters have no legacy fallback, and an
     // unmigrated legacy file would survive as a shadow vault.
-    vault_migrate::require_migrated(&config, runtime)?;
+    vault_migrate::require_migrated_locked(&config, runtime)?;
 
     let (workspace, adhoc) = match &selected {
         Some(sel) => selector::effective_workspace(sel, workspace_flag),

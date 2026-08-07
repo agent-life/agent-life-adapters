@@ -5,8 +5,8 @@
 //! rely on rmcp's echo-negotiation: the server accepts whichever known revision
 //! the client requests (2024-11-05 … 2026-07-28 RC). Feature floor is the
 //! 2025-06-18 structured-output convention — every tool declares an
-//! `outputSchema` (generated from the same serde structs the CLI prints, via
-//! `schemars`) and returns `structuredContent` **plus** the serialized-JSON
+//! `outputSchema` (a schemars-generated success branch plus the shared typed
+//! error branch) and returns `structuredContent` **plus** the serialized-JSON
 //! `TextContent` block (rmcp's [`CallToolResult::structured`] does both). All
 //! diagnostics go to **stderr**; the protocol owns stdout.
 //!
@@ -38,15 +38,17 @@ mod configure;
 mod docs;
 pub(crate) mod watch;
 
+use std::any::Any;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context as _;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
-    CallToolResult, Implementation, ProgressNotificationParam, ProtocolVersion, ServerCapabilities,
-    ServerInfo,
+    CallToolResult, Implementation, JsonObject, ProgressNotificationParam, ProtocolVersion,
+    ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext;
 use rmcp::{tool, tool_handler, tool_router, ErrorData, RoleServer, ServerHandler, ServiceExt};
@@ -377,8 +379,7 @@ impl AlfServer {
 in every session. Returns config/API-key presence, tracked agents with their last-synced \
 sequence, per-agent service reachability, and the live watch-loop stanza (active flag, per-source \
 cadence + dirty state, any backoff/parked recovery state).",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<StatusResult>()
-            .expect("StatusResult is a valid output schema")
+        output_schema = tool_output_schema::<StatusResult>(SuccessOk::Absent)
     )]
     async fn alf_status(
         &self,
@@ -410,8 +411,7 @@ cadence + dirty state, any backoff/parked recovery state).",
 resolution, resources, API key, service reachability, discovered agents, and vault parity. \
 Returns issues (error/warning/info) with suggestions. Also runs agent discovery \
 (information-only), exactly like `alf check`.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<check::CheckResult>()
-            .expect("CheckResult is a valid output schema")
+        output_schema = tool_output_schema::<check::CheckResult>(SuccessOk::Preserved)
     )]
     async fn alf_check(
         &self,
@@ -434,8 +434,7 @@ Returns issues (error/warning/info) with suggestions. Also runs agent discovery 
 memory identities, compute a delta against the last snapshot, and upload it (auto-registering the \
 agent on first sync). Pass recover:true to re-derive against cloud truth when the local base is \
 missing or diverged. Safe and idempotent.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<sync::SyncResult>()
-            .expect("SyncResult is a valid output schema")
+        output_schema = tool_output_schema::<sync::SyncResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_sync(
         &self,
@@ -487,8 +486,7 @@ updates local sync state. Pass at_sequence:N for a read-only point-in-time previ
 written to a preview directory (preview_path in the result), never into the live workspace, and \
 sync state is not moved. Pass dry_run:true to list what would be written without touching \
 anything. mode is total (default) or merge for runtimes with a mutable per-agent store.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<restore::RestoreToolResult>()
-            .expect("RestoreToolResult is a valid output schema")
+        output_schema = tool_output_schema::<restore::RestoreToolResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_restore(
         &self,
@@ -561,8 +559,7 @@ anything. mode is total (default) or merge for runtimes with a mutable per-agent
         description = "Preview the file set this agent's export would archive, without writing \
 anything. Returns the agent name, memory-record count, and the raw file list with sizes. Use it \
 to confirm the map/tracked files resolve as expected before syncing.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<export::ExportDryRunResult>()
-            .expect("ExportDryRunResult is a valid output schema")
+        output_schema = tool_output_schema::<export::ExportDryRunResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_export_dry_run(
         &self,
@@ -587,8 +584,7 @@ Workspace-relative by default. Paths matching the sensitive-path denylist (.env,
 not overridable. With external:true a file outside the workspace can be tracked, \
 but only under a pre-blessed root and never on the sensitive denylist — blessing a new root \
 stays a CLI/human ceremony.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<add::AddResult>()
-            .expect("AddResult is a valid output schema")
+        output_schema = tool_output_schema::<add::AddResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_track(
         &self,
@@ -623,8 +619,7 @@ stays a CLI/human ceremony.",
 Set operation to \"replace\" (write body as the whole map) or \"merge\" (deep-merge body into the \
 existing map); body is the map object — call alf_docs topic=\"map-file\" for its shape. Validated \
 before writing: an invalid configuration is rejected with nothing written.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<configure::ConfigureResult>()
-            .expect("ConfigureResult is a valid output schema")
+        output_schema = tool_output_schema::<configure::ConfigureResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_configure(
         &self,
@@ -658,8 +653,7 @@ ciphertext syncs; the plaintext descriptors (service, label, tags) stay visible.
 with no key resolvable, a vault key is generated (0600) and its fingerprint + path returned — \
 never the key bytes; back up that file. An add whose service+label match an existing record is \
 rejected unless update:true.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<VaultAddResult>()
-            .expect("VaultAddResult is a valid output schema")
+        output_schema = tool_output_schema::<VaultAddResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_vault_add(
         &self,
@@ -680,8 +674,7 @@ rejected unless update:true.",
         description = "List the plaintext descriptors (service, label, description, tags, \
 algorithm) of every credential in the agent's vault. Never touches ciphertext or the key — use it \
 to find a record to delete.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<vault::ListResult>()
-            .expect("vault ListResult is a valid output schema")
+        output_schema = tool_output_schema::<vault::ListResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_vault_list(
         &self,
@@ -699,8 +692,7 @@ to find a record to delete.",
 plaintext descriptors so no key is needed: set by to \"id\", \"label\", or \"service\" and value \
 to what to match (use alf_vault_list to find it). Recoverable via a point-in-time restore of an \
 earlier sequence.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<vault::DeleteResult>()
-            .expect("vault DeleteResult is a valid output schema")
+        output_schema = tool_output_schema::<vault::DeleteResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_vault_delete(
         &self,
@@ -721,8 +713,7 @@ earlier sequence.",
         description = "List the [[agents]] mapping (the agents `alf check` discovered) joined with \
 each agent's sync state: runtime, alias, alf agent id, workspace, enabled flag, last-synced \
 sequence, and whether a local snapshot exists.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<agents::ListResult>()
-            .expect("agents ListResult is a valid output schema")
+        output_schema = tool_output_schema::<agents::ListResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_agents_list(
         &self,
@@ -740,8 +731,7 @@ sequence, and whether a local snapshot exists.",
 every corner of the CLI. Topics include sync, restore, recovery, vault, rotate-key, \
 force-first-sync, purge, agents, map-file, and mcp — the routing target for the CLI/human-only \
 ceremonies that are deliberately not tools.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<docs::DocResult>()
-            .expect("DocResult is a valid output schema")
+        output_schema = tool_output_schema::<docs::DocResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_docs(
         &self,
@@ -759,8 +749,7 @@ overrides, and/or pause:true|false. Returns the effective cadence; intervals bel
 clamped (noted). If the loop is not running the tool errors and the message says why (e.g. no \
 API key, unresolved agent); a paused or parked loop is still steerable — pause:false clears a \
 park.",
-        output_schema = rmcp::handler::server::tool::schema_for_output::<WatchSetResult>()
-            .expect("WatchSetResult is a valid output schema")
+        output_schema = tool_output_schema::<WatchSetResult>(SuccessOk::ConstTrue)
     )]
     async fn alf_watch_set(
         &self,
@@ -1325,39 +1314,128 @@ fn mcp_hint(remedy: &str) -> String {
     out
 }
 
-/// Map a seam error to a **tool execution error** (isError, not a protocol
-/// error) carrying the CLI's `{ok:false, code?, error, hint}` shape as both
-/// structured content and text — so the agent can self-correct (spec 2025-11-25
-/// wants tool failures as tool errors).
-fn tool_error(err: &anyhow::Error) -> CallToolResult {
-    let mut obj = serde_json::Map::new();
-    obj.insert("ok".into(), serde_json::Value::Bool(false));
-    match err.downcast_ref::<crate::errors::CliError>() {
-        Some(cli) => {
-            obj.insert(
-                "code".into(),
-                serde_json::Value::String(cli.code.to_string()),
-            );
-            obj.insert("error".into(), serde_json::Value::String(cli.cause.clone()));
-            if !cli.remedy.is_empty() {
-                obj.insert(
-                    "hint".into(),
-                    serde_json::Value::String(mcp_hint(&cli.remedy)),
-                );
-            }
-        }
-        None => {
-            obj.insert(
-                "error".into(),
-                serde_json::Value::String(format!("{err:#}")),
-            );
-            let hint = crate::output::error_hint(err);
-            if !hint.is_empty() {
-                obj.insert("hint".into(), serde_json::Value::String(mcp_hint(&hint)));
-            }
+/// How a generated success schema uses its existing `ok` field.
+#[derive(Clone, Copy)]
+enum SuccessOk {
+    /// This result has no top-level `ok` field (`alf_status`).
+    Absent,
+    /// This result uses `ok` for its own domain status, not transport success
+    /// (`alf_check`, whose successful diagnostic can be `ok:false`).
+    Preserved,
+    /// This result uses `ok:true` as the successful tool-result discriminator.
+    ConstTrue,
+}
+
+/// Build an MCP output schema that accepts either the existing successful
+/// result or the shared recoverable tool-error result. rmcp publishes this
+/// schema but does not validate results before they reach the client.
+fn tool_output_schema<T>(ok_shape: SuccessOk) -> Arc<JsonObject>
+where
+    T: JsonSchema + Any,
+{
+    let success = rmcp::handler::server::tool::schema_for_output::<T>()
+        .unwrap_or_else(|e| panic!("failed to build MCP success output schema: {e}"));
+    tool_schema_with_error(success.as_ref(), ok_shape)
+}
+
+/// Compose a generated success schema with the single MCP tool-error branch.
+/// The original definitions remain at the document root so generated refs keep
+/// resolving after the success constraints move under `oneOf`.
+fn tool_schema_with_error(success_schema: &JsonObject, ok_shape: SuccessOk) -> Arc<JsonObject> {
+    let mut success_branch = success_schema.clone();
+    assert_eq!(
+        success_branch.remove("type"),
+        Some(serde_json::Value::String("object".into())),
+        "rmcp output schemas must keep an object root"
+    );
+
+    let has_ok = success_branch
+        .get("properties")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|properties| properties.contains_key("ok"));
+    match ok_shape {
+        SuccessOk::Absent => assert!(!has_ok, "MCP success schema unexpectedly has an ok field"),
+        SuccessOk::Preserved | SuccessOk::ConstTrue => assert!(
+            has_ok,
+            "MCP success schema is missing its expected ok field"
+        ),
+    }
+
+    let mut root = JsonObject::new();
+    for key in ["$schema", "$id", "$vocabulary", "$defs"] {
+        if let Some(value) = success_branch.remove(key) {
+            root.insert(key.into(), value);
         }
     }
-    CallToolResult::structured_error(serde_json::Value::Object(obj))
+    root.insert("type".into(), serde_json::Value::String("object".into()));
+
+    let success_branch = if matches!(ok_shape, SuccessOk::ConstTrue) {
+        serde_json::json!({
+            "allOf": [
+                serde_json::Value::Object(success_branch),
+                {
+                    "type": "object",
+                    "properties": { "ok": { "const": true } },
+                    "required": ["ok"]
+                }
+            ]
+        })
+    } else {
+        serde_json::Value::Object(success_branch)
+    };
+    let error_branch = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "ok": { "const": false },
+            "code": { "type": "string" },
+            "error": { "type": "string" },
+            "hint": { "type": "string" }
+        },
+        "required": ["ok", "error"],
+        "additionalProperties": false
+    });
+    root.insert(
+        "oneOf".into(),
+        serde_json::Value::Array(vec![success_branch, error_branch]),
+    );
+    Arc::new(root)
+}
+
+/// The uniform structured payload for every recoverable MCP tool failure.
+/// `code` is always populated by the constructor even though the advertised
+/// schema permits an omitted code for compatibility with older clients.
+#[derive(Debug, Serialize)]
+struct ToolErrorResult {
+    ok: bool,
+    code: String,
+    error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hint: Option<String>,
+}
+/// Map a seam error to a **tool execution error** (isError, not a protocol
+/// error) carrying `{ok:false, code?, error, hint}` as structured content and
+/// text so the agent can self-correct.
+fn tool_error(err: &anyhow::Error) -> CallToolResult {
+    let result = match err.downcast_ref::<crate::errors::CliError>() {
+        Some(cli) => ToolErrorResult {
+            ok: false,
+            code: cli.code.to_owned(),
+            error: cli.cause.clone(),
+            hint: (!cli.remedy.is_empty()).then(|| mcp_hint(&cli.remedy)),
+        },
+        None => {
+            let hint = crate::output::error_hint(err);
+            ToolErrorResult {
+                ok: false,
+                code: "tool_execution_failed".into(),
+                error: format!("{err:#}"),
+                hint: (!hint.is_empty()).then(|| mcp_hint(&hint)),
+            }
+        }
+    };
+    let structured = serde_json::to_value(result)
+        .expect("ToolErrorResult must serialize into JSON structured content");
+    CallToolResult::structured_error(structured)
 }
 
 /// A `spawn_blocking` task that panicked or was cancelled is an infrastructure

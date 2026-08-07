@@ -497,11 +497,11 @@
       The fix inverts every one of those: <strong>the fixture is a reviewed compatibility artifact</strong>,
       and the test command can only read it, regenerate it in a sandbox, and compare.
     </p>
-    <div class="formula" role="img" aria-label="Determinism formula: schema commit plus seed plus format version plus pinned Python environment yields the same SHA-256 every run">
+    <div class="formula" role="img" aria-label="Determinism formula: schema commit plus seed plus format version plus the locked Python environment and PYTHONHASHSEED yields the same SHA-256 every run">
       <span class="in">SCHEMA_COMMIT</span><span class="op">+</span>
       <span class="in">FIXTURE_SEED</span><span class="op">+</span>
       <span class="in">ALF&nbsp;1.0.0</span><span class="op">+</span>
-      <span class="in">pinned&nbsp;Python&nbsp;env</span>
+      <span class="in">locked&nbsp;Python&nbsp;env&nbsp;+&nbsp;hash&nbsp;seed</span>
       <span class="op">⇒</span>
       <span class="out">identical SHA-256, every run, every machine</span>
     </div>
@@ -541,7 +541,7 @@
         </div>
         <div class="keynote">
           <span class="term">GENERATOR_PYTHON_MINOR + …REQUIREMENTS_LOCK</span>
-          <span class="def">Byte-determinism holds <strong>per interpreter minor + exact wheel set</strong>. Wheels are hash-pinned and installed with <code>pip --require-hashes</code>; the env verifier refuses to run on anything else.</span>
+          <span class="def">Byte-determinism holds <strong>per interpreter minor + exact wheel set + <code>PYTHONHASHSEED=0</code></strong>. The runner accepts <code>ALF_INTEGRATION_PYTHON</code>, otherwise prefers <code>python3.14</code> before a compatible <code>python3</code>. Wheels are hash-pinned and installed with <code>pip --require-hashes</code>; the env verifier refuses any other environment.</span>
         </div>
       </div>
     </div>
@@ -627,7 +627,7 @@
           <li class="step">
             <span class="num">5</span>
             <h4>Prove it with the real binary</h4>
-            <p><code>cargo test</code> runs <code>alf validate</code> against the <em>temporary</em> fixture (path passed via env vars) and writes a report under the sandbox: adapter commit, schema commit, Python + lock SHA, fixture SHA-256, verdict.</p>
+            <p><code>cargo test</code> runs <code>alf validate</code> against the <em>temporary</em> fixture (path passed via env vars) and writes a report under the sandbox: adapter commit, schema commit, Python + lock SHA, fixture SHA-256, verdict. With <code>--test-fixture-tools</code> — used by <code>test.sh integration</code> — the fixture-tooling regressions then run in this same locked temporary environment.</p>
           </li>
         </ol>
       </div>
@@ -647,11 +647,11 @@
         </div>
         <div class="crossing allowed">
           <span class="arrow">--regenerate-fixture&nbsp;</span>
-          <span class="rest">— the <em>only</em> writer. Atomic, same-directory replace, after full validation passes.</span>
+          <span class="rest">— the <em>only</em> writer. Both files are staged and mode-normalized before replacement, after full validation passes; each same-directory replacement is atomic.</span>
         </div>
         <div class="together">
-          <strong>Invariant:</strong> the two artifacts change together or not at all.
-          A commit that updates one without the other cannot pass <code>--check</code>.
+          <strong>Review invariant:</strong> the two artifacts must be committed together.
+          A commit that updates one without the other cannot pass <code>--check</code>. The final replacements are sequential; an I/O failure between them can leave a partial worktree update for the maintainer to discard or repair.
         </div>
       </div>
     </div>
@@ -674,9 +674,9 @@
       <div class="maintcard">
         <span class="flag">--regenerate-fixture</span>
         <h3>Deliberately update the artifact</h3>
-        <p>Completes generation, schema validation, and the Cargo proof in the sandbox <em>first</em>. Only then atomically replaces both tracked files — showing changed paths and hashes — and never touches unrelated worktree changes.</p>
+        <p>Completes generation, schema validation, and the Cargo proof in the sandbox <em>first</em>. Only then stages and sequentially replaces both tracked files — showing changed paths and hashes — and never touches unrelated worktree changes.</p>
         <div class="verdicts">
-          <div class="verdict"><span class="pill pill-fail">RULE</span><span>Runs only after a lock-file change was reviewed. It is never the release gate.</span></div>
+          <div class="verdict"><span class="pill pill-fail">POLICY</span><span>Use only after a reviewed lock-file change. This is release-owner discipline, not a condition the script enforces; it is never the release gate.</span></div>
         </div>
       </div>
     </div>
@@ -710,7 +710,7 @@
   </section>
 
   <footer class="colophon">
-    RF-025 · release-findings-July-30.md · design per docs/rf-025-schema-integration-plan.md · agent-life-adapters
+    RF-025 · implemented in commits 2d05037b–256bfb1d · release-findings-July-30.md · agent-life-adapters
   </footer>
 </div>
 </body>

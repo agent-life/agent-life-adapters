@@ -321,7 +321,7 @@ fn initialize_declares_protocol_and_instructions() {
     assert_eq!(init["serverInfo"]["name"], "alf");
 }
 
-/// tools/list advertises exactly the 12 v1 tools, each with an outputSchema.
+/// tools/list advertises exactly the 13 v1 tools, each with an outputSchema.
 #[test]
 fn tools_list_advertises_the_full_v1_surface() {
     let session = run_session(&[
@@ -354,6 +354,427 @@ fn tools_list_advertises_the_full_v1_surface() {
             "{}'s outputSchema must have root type object (MCP requirement)",
             tool["name"]
         );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolSchemaScenario {
+    Status,
+    Check,
+    Sync,
+    Restore,
+    ExportDryRun,
+    Track,
+    Configure,
+    VaultAdd,
+    VaultList,
+    VaultDelete,
+    AgentsList,
+    Docs,
+    WatchSet,
+}
+
+struct ToolSchemaCase {
+    name: &'static str,
+    scenario: ToolSchemaScenario,
+}
+
+const TOOL_SCHEMA_CASES: &[ToolSchemaCase] = &[
+    ToolSchemaCase {
+        name: "alf_status",
+        scenario: ToolSchemaScenario::Status,
+    },
+    ToolSchemaCase {
+        name: "alf_check",
+        scenario: ToolSchemaScenario::Check,
+    },
+    ToolSchemaCase {
+        name: "alf_sync",
+        scenario: ToolSchemaScenario::Sync,
+    },
+    ToolSchemaCase {
+        name: "alf_restore",
+        scenario: ToolSchemaScenario::Restore,
+    },
+    ToolSchemaCase {
+        name: "alf_export_dry_run",
+        scenario: ToolSchemaScenario::ExportDryRun,
+    },
+    ToolSchemaCase {
+        name: "alf_track",
+        scenario: ToolSchemaScenario::Track,
+    },
+    ToolSchemaCase {
+        name: "alf_configure",
+        scenario: ToolSchemaScenario::Configure,
+    },
+    ToolSchemaCase {
+        name: "alf_vault_add",
+        scenario: ToolSchemaScenario::VaultAdd,
+    },
+    ToolSchemaCase {
+        name: "alf_vault_list",
+        scenario: ToolSchemaScenario::VaultList,
+    },
+    ToolSchemaCase {
+        name: "alf_vault_delete",
+        scenario: ToolSchemaScenario::VaultDelete,
+    },
+    ToolSchemaCase {
+        name: "alf_agents_list",
+        scenario: ToolSchemaScenario::AgentsList,
+    },
+    ToolSchemaCase {
+        name: "alf_docs",
+        scenario: ToolSchemaScenario::Docs,
+    },
+    ToolSchemaCase {
+        name: "alf_watch_set",
+        scenario: ToolSchemaScenario::WatchSet,
+    },
+];
+
+/// The server publishes schemas but rmcp does not validate returned tool
+/// content against them. This inventory check catches an advertised tool that
+/// bypasses the shared output-schema builder before a bespoke failure fixture
+/// exists for it.
+#[test]
+fn every_advertised_output_schema_has_the_shared_error_branch() {
+    let session = run_session(&[
+        initialize(1, "2025-11-25"),
+        initialized(),
+        json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+    ]);
+    let msgs = parse_protocol_stdout(&session.stdout);
+    let tools = response_with_id(&msgs, 2)["result"]["tools"]
+        .as_array()
+        .expect("tools array");
+
+    for tool in tools {
+        let name = tool["name"].as_str().expect("tool name");
+        let schema = tool
+            .get("outputSchema")
+            .unwrap_or_else(|| panic!("{name} must declare an outputSchema"));
+        let branch = error_schema_branch(schema, name);
+        let required = branch["required"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name} error branch must require fields"));
+        for field in ["ok", "error"] {
+            assert!(
+                required.iter().any(|value| value.as_str() == Some(field)),
+                "{name} error branch must require {field}: {branch}"
+            );
+        }
+    }
+}
+
+/// A wire-level matrix: each advertised tool has one real successful execution
+/// and one recoverable execution failure validated against its own schema.
+#[test]
+fn every_advertised_tool_schema_validates_success_and_execution_error() {
+    let mut names: Vec<&str> = TOOL_SCHEMA_CASES.iter().map(|case| case.name).collect();
+    names.sort_unstable();
+    let mut advertised = V1_TOOLS.to_vec();
+    advertised.sort_unstable();
+    assert_eq!(
+        names, advertised,
+        "the error matrix must cover every v1 tool"
+    );
+
+    for case in TOOL_SCHEMA_CASES {
+        let (success, success_schema) = run_success_schema_case(case.scenario);
+        assert_success(&success, case.name, &success_schema);
+
+        let (error, error_schema) = run_error_schema_case(case.scenario);
+        assert_eq!(
+            success_schema, error_schema,
+            "{} must advertise one stable schema for both result branches",
+            case.name
+        );
+        assert_tool_error_matches_schema(&error, case.name, &error_schema);
+
+        if case.scenario == ToolSchemaScenario::VaultAdd {
+            let encoded = serde_json::to_string(&error).expect("serialize tool error");
+            assert!(
+                !encoded.contains("rf011-secret-must-not-leak"),
+                "vault plaintext leaked into its error result: {encoded}"
+            );
+        }
+    }
+}
+
+fn error_schema_branch(schema: &Value, name: &str) -> Value {
+    let branches = schema["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name} outputSchema must contain oneOf"));
+    let mut matches = branches
+        .iter()
+        .filter(|branch| branch["properties"]["ok"]["const"] == Value::Bool(false));
+    let branch = matches
+        .next()
+        .unwrap_or_else(|| panic!("{name} outputSchema has no ok:false error branch"));
+    assert!(
+        matches.next().is_none(),
+        "{name} outputSchema has more than one ok:false error branch"
+    );
+    branch.clone()
+}
+
+fn branch_only_schema(schema: &Value, branch: &Value) -> Value {
+    let mut root = serde_json::Map::new();
+    for key in ["$schema", "$id", "$vocabulary", "$defs"] {
+        if let Some(value) = schema.get(key) {
+            root.insert(key.to_owned(), value.clone());
+        }
+    }
+    root.insert("type".into(), Value::String("object".into()));
+    root.insert("allOf".into(), Value::Array(vec![branch.clone()]));
+    Value::Object(root)
+}
+
+fn assert_tool_error_matches_schema(result: &Value, name: &str, schema: &Value) {
+    assert_tool_error(result, name);
+    let instance = &result["structuredContent"];
+    assert!(
+        instance["code"]
+            .as_str()
+            .is_some_and(|code| !code.is_empty()),
+        "{name} error must carry a stable code: {instance}"
+    );
+
+    let validator = jsonschema::validator_for(schema)
+        .unwrap_or_else(|e| panic!("{name} outputSchema is not valid JSON Schema: {e}"));
+    assert!(
+        validator.is_valid(instance),
+        "{name} error must validate against its outputSchema.\ninstance = {instance}\nschema = {schema}"
+    );
+
+    let branches = schema["oneOf"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{name} outputSchema must contain oneOf"));
+    let error_branch = error_schema_branch(schema, name);
+    let error_validator = jsonschema::validator_for(&branch_only_schema(schema, &error_branch))
+        .unwrap_or_else(|e| panic!("{name} error branch is not valid JSON Schema: {e}"));
+    assert!(
+        error_validator.is_valid(instance),
+        "{name} error must validate against the error branch: {instance}"
+    );
+    for branch in branches {
+        if branch == &error_branch {
+            continue;
+        }
+        let success_validator = jsonschema::validator_for(&branch_only_schema(schema, branch))
+            .unwrap_or_else(|e| panic!("{name} success branch is not valid JSON Schema: {e}"));
+        assert!(
+            !success_validator.is_valid(instance),
+            "{name} error must not validate against its success branch: {instance}"
+        );
+    }
+}
+
+fn tool_result_with_schema(
+    mut conv: Conversation,
+    name: &str,
+    args: Value,
+    prepare: impl FnOnce(&mut Conversation),
+) -> (Value, Value) {
+    prepare(&mut conv);
+    let schema = conv.schema_for(name);
+    let result = conv.call(100, name, args);
+    conv.finish();
+    (result, schema)
+}
+
+fn run_success_schema_case(scenario: ToolSchemaScenario) -> (Value, Value) {
+    match scenario {
+        ToolSchemaScenario::Status => {
+            tool_result_with_schema(Conversation::start(), "alf_status", json!({}), |_| {})
+        }
+        ToolSchemaScenario::Check => {
+            tool_result_with_schema(Conversation::start(), "alf_check", json!({}), |_| {})
+        }
+        ToolSchemaScenario::Sync => {
+            let backend = common::MockBackend::start();
+            tool_result_with_schema(
+                Conversation::start_with_backend(&backend.url()),
+                "alf_sync",
+                json!({}),
+                |_| {},
+            )
+        }
+        ToolSchemaScenario::Restore => {
+            let backend = common::MockBackend::start();
+            tool_result_with_schema(
+                Conversation::start_with_backend(&backend.url()),
+                "alf_restore",
+                json!({}),
+                |conv| {
+                    let synced = conv.call(3, "alf_sync", json!({}));
+                    assert_success(&synced, "alf_sync", &conv.schema_for("alf_sync"));
+                },
+            )
+        }
+        ToolSchemaScenario::ExportDryRun => tool_result_with_schema(
+            Conversation::start(),
+            "alf_export_dry_run",
+            json!({}),
+            |_| {},
+        ),
+        ToolSchemaScenario::Track => tool_result_with_schema(
+            Conversation::start(),
+            "alf_track",
+            json!({"path":"IDENTITY.md"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::Configure => tool_result_with_schema(
+            Conversation::start(),
+            "alf_configure",
+            json!({"operation":"merge","body":{"framework":"rf011"}}),
+            |_| {},
+        ),
+        ToolSchemaScenario::VaultAdd => tool_result_with_schema(
+            Conversation::start(),
+            "alf_vault_add",
+            json!({"service":"rf011","secret":"rf011-success","label":"success"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::VaultList => {
+            tool_result_with_schema(Conversation::start(), "alf_vault_list", json!({}), |conv| {
+                let added = conv.call(
+                    3,
+                    "alf_vault_add",
+                    json!({"service":"rf011","secret":"rf011-list","label":"list"}),
+                );
+                assert_success(&added, "alf_vault_add", &conv.schema_for("alf_vault_add"));
+            })
+        }
+        ToolSchemaScenario::VaultDelete => tool_result_with_schema(
+            Conversation::start(),
+            "alf_vault_delete",
+            json!({"by":"label","value":"delete"}),
+            |conv| {
+                let added = conv.call(
+                    3,
+                    "alf_vault_add",
+                    json!({"service":"rf011","secret":"rf011-delete","label":"delete"}),
+                );
+                assert_success(&added, "alf_vault_add", &conv.schema_for("alf_vault_add"));
+            },
+        ),
+        ToolSchemaScenario::AgentsList => tool_result_with_schema(
+            Conversation::start(),
+            "alf_agents_list",
+            json!({}),
+            |conv| {
+                let checked = conv.call(3, "alf_check", json!({}));
+                assert_success(&checked, "alf_check", &conv.schema_for("alf_check"));
+            },
+        ),
+        ToolSchemaScenario::Docs => tool_result_with_schema(
+            Conversation::start(),
+            "alf_docs",
+            json!({"topic":"recovery"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::WatchSet => {
+            let backend = common::MockBackend::start();
+            tool_result_with_schema(
+                Conversation::start_with_backend(&backend.url()),
+                "alf_watch_set",
+                json!({"default_interval":"20m"}),
+                |_| {},
+            )
+        }
+    }
+}
+
+fn run_error_schema_case(scenario: ToolSchemaScenario) -> (Value, Value) {
+    match scenario {
+        ToolSchemaScenario::Status => {
+            tool_result_with_schema(Conversation::start(), "alf_status", json!({}), |conv| {
+                let alf = conv.home.path().join(".alf");
+                std::fs::create_dir_all(&alf).unwrap();
+                std::fs::write(alf.join("config.toml"), "not valid toml = = =\n[").unwrap();
+            })
+        }
+        ToolSchemaScenario::Check => {
+            tool_result_with_schema(Conversation::start(), "alf_check", json!({}), |conv| {
+                let alf = conv.home.path().join(".alf");
+                std::fs::create_dir_all(&alf).unwrap();
+                std::fs::write(alf.join("config.toml"), "not valid toml = = =\n[").unwrap();
+            })
+        }
+        ToolSchemaScenario::Sync => {
+            tool_result_with_schema(Conversation::start(), "alf_sync", json!({}), |_| {})
+        }
+        ToolSchemaScenario::Restore => {
+            tool_result_with_schema(Conversation::start(), "alf_restore", json!({}), |_| {})
+        }
+        ToolSchemaScenario::ExportDryRun => tool_result_with_schema(
+            Conversation::start(),
+            "alf_export_dry_run",
+            json!({}),
+            |conv| {
+                std::fs::write(conv.workspace.path().join(".alf-map.json"), "{").unwrap();
+            },
+        ),
+        ToolSchemaScenario::Track => tool_result_with_schema(
+            Conversation::start(),
+            "alf_track",
+            json!({"path":"missing-rf011-file"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::Configure => tool_result_with_schema(
+            Conversation::start(),
+            "alf_configure",
+            json!({"operation":"invalid-rf011-operation","body":{}}),
+            |_| {},
+        ),
+        ToolSchemaScenario::VaultAdd => tool_result_with_schema(
+            Conversation::start(),
+            "alf_vault_add",
+            json!({"service":"rf011","secret":"rf011-secret-must-not-leak","label":"duplicate"}),
+            |conv| {
+                let added = conv.call(
+                    3,
+                    "alf_vault_add",
+                    json!({"service":"rf011","secret":"rf011-first","label":"duplicate"}),
+                );
+                assert_success(&added, "alf_vault_add", &conv.schema_for("alf_vault_add"));
+            },
+        ),
+        ToolSchemaScenario::VaultList => {
+            tool_result_with_schema(Conversation::start(), "alf_vault_list", json!({}), |conv| {
+                let legacy = conv.home.path().join(".alf").join("vault");
+                std::fs::create_dir_all(&legacy).unwrap();
+                std::fs::write(legacy.join("credentials.json"), r#"{"credentials":[]}"#).unwrap();
+            })
+        }
+        ToolSchemaScenario::VaultDelete => tool_result_with_schema(
+            Conversation::start(),
+            "alf_vault_delete",
+            json!({"by":"label","value":"missing-rf011-record"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::AgentsList => tool_result_with_schema(
+            Conversation::start(),
+            "alf_agents_list",
+            json!({}),
+            |conv| {
+                let alf = conv.home.path().join(".alf");
+                std::fs::create_dir_all(&alf).unwrap();
+                std::fs::write(alf.join("config.toml"), "not valid toml = = =\n[").unwrap();
+            },
+        ),
+        ToolSchemaScenario::Docs => tool_result_with_schema(
+            Conversation::start(),
+            "alf_docs",
+            json!({"topic":"not-a-real-rf011-topic"}),
+            |_| {},
+        ),
+        ToolSchemaScenario::WatchSet => {
+            tool_result_with_schema(Conversation::start(), "alf_watch_set", json!({}), |_| {})
+        }
     }
 }
 

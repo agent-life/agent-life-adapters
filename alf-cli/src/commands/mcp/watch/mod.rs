@@ -648,6 +648,13 @@ pub(crate) fn lock_path(agent_id: uuid::Uuid) -> anyhow::Result<PathBuf> {
     Ok(crate::state::AgentState::state_dir()?.join(format!("{agent_id}.lock")))
 }
 
+/// The lock for the one pre-multi-agent, install-scoped vault. It deliberately
+/// has a named identity rather than using the nil UUID, which remains a valid
+/// agent identifier in user-controlled metadata.
+pub(crate) fn legacy_vault_lock_path() -> anyhow::Result<PathBuf> {
+    Ok(crate::state::AgentState::state_dir()?.join("vault-legacy.lock"))
+}
+
 /// Acquire the per-agent advisory lock (L3) at `lock_file` with a bounded
 /// wait. `agent_busy` when another ALF process holds it past `timeout`; a
 /// filesystem that cannot take the lock at all errors immediately with
@@ -679,6 +686,19 @@ pub(crate) fn acquire_agent_lock_timeout(
     timeout: Duration,
 ) -> anyhow::Result<lock::AgentLock> {
     let lock_file = lock_path(agent_id)?;
+    if let Some(dir) = lock_file.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    acquire_lock_file_timeout(&lock_file, timeout)
+}
+
+/// Acquire the install-scoped legacy-vault lock with the same timeout and
+/// failure semantics as an agent lock. This is used only while a legacy vault
+/// or key can still be moved into canonical per-agent state.
+pub(crate) fn acquire_legacy_vault_lock_timeout(
+    timeout: Duration,
+) -> anyhow::Result<lock::AgentLock> {
+    let lock_file = legacy_vault_lock_path()?;
     if let Some(dir) = lock_file.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

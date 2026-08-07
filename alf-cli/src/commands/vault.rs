@@ -1287,7 +1287,7 @@ pub fn migrate(
         return Ok(());
     }
 
-    match vault_migrate::ensure_migrated(config, runtime, explicit)? {
+    match vault_migrate::ensure_migrated_locked(config, runtime, explicit)? {
         MigrationOutcome::NotNeeded => {
             print_migrate(&MigrateResult {
                 ok: true,

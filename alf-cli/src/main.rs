@@ -973,7 +973,7 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
         } => {
             // encrypt only prints a record (no vault file) — lenient scope.
             let (config, scope) = vault_scope(&runtime, agent, /* strict: */ false)?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
             commands::vault::encrypt(
                 input.as_deref(),
                 &service,
@@ -1006,7 +1006,13 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             key,
         } => {
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
+            // Default-vault RMWs share the watch/MCP advisory lock. Explicit
+            // --in targets remain caller-owned and lock-free.
+            let _vault_lock = input
+                .is_none()
+                .then(|| lock_default_vault_mutation(scope))
+                .transpose()?;
             commands::vault::add(
                 input.as_deref(),
                 &service,
@@ -1036,7 +1042,7 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             key,
         } => {
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
             commands::vault::decrypt(
                 input.as_deref(),
                 &commands::vault::Selector { id, label, service },
@@ -1048,7 +1054,7 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
         }
         VaultCommand::List { input, runtime } => {
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
             commands::vault::list(input.as_deref(), scope)
         }
         VaultCommand::Delete {
@@ -1060,7 +1066,12 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             runtime,
         } => {
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
+            // Only delete's default input + default output mutates canonical
+            // shared state. An explicit --in/--out is caller-owned.
+            let _vault_lock = (input.is_none() && out.is_none())
+                .then(|| lock_default_vault_mutation(scope))
+                .transpose()?;
             commands::vault::delete(
                 input.as_deref(),
                 &commands::vault::Selector { id, label, service },
@@ -1077,7 +1088,11 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             key,
         } => {
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
-            vault_migrate::require_migrated(&config, &runtime)?;
+            vault_migrate::require_migrated_locked(&config, &runtime)?;
+            let _vault_lock = input
+                .is_none()
+                .then(|| lock_default_vault_mutation(scope))
+                .transpose()?;
             commands::vault::rotate_key(
                 input.as_deref(),
                 new_key_file.as_deref(),
@@ -1101,6 +1116,23 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
 /// default-file key step then simply won't resolve). The scope also supplies
 /// the credential record's `agent_id` default — an explicit `--agent-id` only
 /// overrides the record's metadata field, never the paths.
+/// Lock the canonical default vault for an agent. A mapping-less install has
+/// one legacy install-scoped vault, so it uses a distinct stable legacy lock
+/// rather than accidentally aliasing an all-zero agent UUID.
+fn lock_default_vault_mutation(
+    scope: Option<uuid::Uuid>,
+) -> anyhow::Result<commands::mcp::watch::lock::AgentLock> {
+    match scope {
+        Some(agent_id) => commands::mcp::watch::acquire_agent_lock_timeout(
+            agent_id,
+            std::time::Duration::from_secs(10),
+        ),
+        None => commands::mcp::watch::acquire_legacy_vault_lock_timeout(
+            std::time::Duration::from_secs(10),
+        ),
+    }
+}
+
 fn vault_scope(
     runtime: &str,
     agent: Option<&str>,

@@ -58,16 +58,11 @@ pub(crate) enum MigrationPlan {
     },
 }
 
-/// Idempotent legacy-vault migration. Call after selector resolution, before
-/// any per-agent vault/key path use. `explicit_target` is set only by
-/// `alf vault migrate --agent` (bypasses the ambiguity blocks, never the
-/// diverged-pair block).
-pub fn ensure_migrated(
-    config: &Config,
-    runtime: &str,
-    explicit_target: Option<Uuid>,
-) -> Result<MigrationOutcome> {
-    match plan_migration(config, runtime, explicit_target)? {
+/// Execute an already-computed migration plan. Callers that need
+/// cross-process serialization must acquire the legacy and target-agent guards
+/// before reaching this seam.
+fn execute_plan(plan: MigrationPlan) -> Result<MigrationOutcome> {
+    match plan {
         MigrationPlan::NotNeeded => Ok(MigrationOutcome::NotNeeded),
         MigrationPlan::Blocked(err) => Ok(MigrationOutcome::Blocked(err)),
         MigrationPlan::Move { agent, vault, key } => {
@@ -94,11 +89,44 @@ pub fn ensure_migrated(
     }
 }
 
-/// Hard-error wrapper used by every trigger except `alf check` and
-/// `alf vault migrate`: `Blocked` becomes the coded error, `Migrated` prints
-/// progress lines.
-pub fn require_migrated(config: &Config, runtime: &str) -> Result<()> {
-    match ensure_migrated(config, runtime, None)? {
+/// Idempotent legacy-vault migration without cross-process serialization.
+/// This remains for callers that already prove serialization at a higher layer;
+/// new command entry points should use [`ensure_migrated_locked`].
+pub fn ensure_migrated(
+    config: &Config,
+    runtime: &str,
+    explicit_target: Option<Uuid>,
+) -> Result<MigrationOutcome> {
+    execute_plan(plan_migration(config, runtime, explicit_target)?)
+}
+
+/// Idempotent legacy-vault migration under the shared advisory locks. The
+/// first plan is read-only; a real move takes the install-scoped legacy lock
+/// before the target agent lock, replans while both are held, and only then
+/// renames either file. This prevents two processes from moving one legacy
+/// source into different per-agent destinations.
+pub fn ensure_migrated_locked(
+    config: &Config,
+    runtime: &str,
+    explicit_target: Option<Uuid>,
+) -> Result<MigrationOutcome> {
+    let initial = plan_migration(config, runtime, explicit_target)?;
+    let MigrationPlan::Move { agent, .. } = initial else {
+        return execute_plan(initial);
+    };
+
+    let _legacy_lock = crate::commands::mcp::watch::acquire_legacy_vault_lock_timeout(
+        std::time::Duration::from_secs(10),
+    )?;
+    let _agent_lock = crate::commands::mcp::watch::acquire_agent_lock_timeout(
+        agent,
+        std::time::Duration::from_secs(10),
+    )?;
+    execute_plan(plan_migration(config, runtime, explicit_target)?)
+}
+
+fn require_outcome(outcome: MigrationOutcome) -> Result<()> {
+    match outcome {
         MigrationOutcome::NotNeeded => Ok(()),
         MigrationOutcome::Blocked(err) => Err(err.into()),
         MigrationOutcome::Migrated { vault, key, agent } => {
@@ -117,6 +145,19 @@ pub fn require_migrated(config: &Config, runtime: &str) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Hard-error wrapper used by every trigger except `alf check` and
+/// `alf vault migrate`: `Blocked` becomes the coded error, `Migrated` prints
+/// progress lines.
+pub fn require_migrated(config: &Config, runtime: &str) -> Result<()> {
+    require_outcome(ensure_migrated(config, runtime, None)?)
+}
+
+/// Locked counterpart to [`require_migrated`]. Use this before a command takes
+/// a longer-lived per-agent guard; it never nests flock on the same agent.
+pub fn require_migrated_locked(config: &Config, runtime: &str) -> Result<()> {
+    require_outcome(ensure_migrated_locked(config, runtime, None)?)
 }
 
 /// Decide what a migration run would do, without writing anything.

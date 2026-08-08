@@ -158,25 +158,30 @@ pub fn disable(runtime_filter: Option<&str>, agent: &str) -> Result<()> {
 fn toggle(runtime_filter: Option<&str>, agent: &str, enabled: bool) -> Result<()> {
     let mut config = Config::load()?;
 
-    let row = match runtime_filter {
-        Some(r) => {
-            if config.find_agent(r, agent).is_none() {
-                return Err(selector::agent_not_found(r, agent, &config).into());
+    // Resolve + flip under the cross-process config lock so a concurrent
+    // `alf agents`/discovery writer can't lose this toggle (RF-013). The closure
+    // re-resolves against the freshly reloaded config.
+    let row = config.update_locked(|c| {
+        let row = match runtime_filter {
+            Some(r) => {
+                if c.find_agent(r, agent).is_none() {
+                    return Err(selector::agent_not_found(r, agent, c).into());
+                }
+                c.set_agent_enabled(r, agent, enabled)?
             }
-            config.set_agent_enabled(r, agent, enabled)?
-        }
-        None => {
-            let id = resolve_any_runtime(&config, agent)?;
-            let row = config
-                .agents
-                .iter_mut()
-                .find(|a| a.alf_agent_id == id)
-                .expect("row found above");
-            row.enabled = enabled;
-            row.clone()
-        }
-    };
-    config.save()?;
+            None => {
+                let id = resolve_any_runtime(c, agent)?;
+                let row = c
+                    .agents
+                    .iter_mut()
+                    .find(|a| a.alf_agent_id == id)
+                    .expect("row found above");
+                row.enabled = enabled;
+                row.clone()
+            }
+        };
+        Ok(row)
+    })?;
 
     let note = enabled.then_some(
         "Registration is lazy: this agent registers with the service on its first alf sync.",

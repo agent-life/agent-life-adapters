@@ -274,7 +274,7 @@ fn lazy_init(
     }
     let outcome = discovery::discover_and_reconcile(config, adapter, runtime, install)?;
     if install.is_dir() {
-        discovery::persist(config, &outcome)?;
+        discovery::persist_first_contact(config, &outcome, runtime)?;
     } else {
         for row in &outcome.rows {
             if row.status == discovery::RowStatus::New {

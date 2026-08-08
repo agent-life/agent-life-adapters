@@ -42,6 +42,10 @@ pub mod codes {
     // permanent-failure classes the watch loop must park on instead of
     // retrying forever.
     pub const AGENT_BUSY: &str = "agent_busy";
+    /// Another `alf` process held the cross-process config lock past the wait
+    /// (RF-013). The `config.toml` read-modify-write was not attempted, so the
+    /// file is unchanged; retrying is safe.
+    pub const CONFIG_BUSY: &str = "config_busy";
     pub const AUTH_FAILED: &str = "auth_failed";
     pub const SUBSCRIPTION_DENIED: &str = "subscription_denied";
     pub const SYNC_BASE_UNREADABLE: &str = "sync_base_unreadable";

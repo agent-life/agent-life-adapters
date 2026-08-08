@@ -114,21 +114,38 @@ SHIM
     chmod +x "$_mshim_dir/uname"
 }
 
-# patch_checksum_url: write a copy of install.sh to <dst> with <query> appended
-# to the .sha256 download URL, so the mock server's checksum flags can be driven
-# (bad_checksum / missing-checksum / empty-checksum). Python handles the
-# substitution reliably — no shell quoting issues with the $ in the pattern.
-patch_checksum_url() {
-    _pcu_dst="$1"; _pcu_query="$2"
-    python3 - "$INSTALL_SH" "$_pcu_dst" "$_pcu_query" <<'PYEOF'
-import sys
-src, dst, query = sys.argv[1], sys.argv[2], sys.argv[3]
-old = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"'
-new = 'checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256?%s"' % query
-code = open(src).read().replace(old, new)
-open(dst, 'w').write(code)
+# patch_url_query: copy install.sh from <src> to <dst>, appending "?<query>" to
+# the URL assigned to shell variable <var> (e.g. github_sum_url, backup_sum_url).
+# Drives the mock server's checksum flags per source. Fails loudly if <var> is
+# not found, so a variable rename in install.sh cannot silently no-op a test.
+patch_url_query() {
+    _puq_src="$1"; _puq_dst="$2"; _puq_var="$3"; _puq_query="$4"
+    python3 - "$_puq_src" "$_puq_dst" "$_puq_var" "$_puq_query" <<'PYEOF'
+import sys, re
+src, dst, var, query = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+code = open(src).read()
+pat = re.compile(r'(?m)^(?P<indent>[ \t]*)' + re.escape(var) + r'="(?P<url>[^"]*)"')
+new, n = pat.subn(lambda m: '%s%s="%s?%s"' % (m.group('indent'), var, m.group('url'), query), code, count=1)
+if n != 1:
+    sys.stderr.write("patch_url_query: expected exactly 1 match for %s, got %d\n" % (var, n))
+    sys.exit(1)
+open(dst, 'w').write(new)
 PYEOF
-    chmod +x "$_pcu_dst"
+    chmod +x "$_puq_dst"
+}
+
+# patch_checksum_url: back-compat wrapper — patch the GitHub checksum URL only.
+patch_checksum_url() {
+    patch_url_query "$INSTALL_SH" "$1" github_sum_url "$2"
+}
+
+# patch_both_checksum_urls: patch the same query onto BOTH the GitHub and backup
+# checksum URLs, so no source can supply a usable checksum.
+patch_both_checksum_urls() {
+    _pbc_dst="$1"; _pbc_query="$2"; _pbc_stage="$1.stage1"
+    patch_url_query "$INSTALL_SH" "$_pbc_stage" github_sum_url "$_pbc_query"
+    patch_url_query "$_pbc_stage" "$_pbc_dst" backup_sum_url "$_pbc_query"
+    rm -f "$_pbc_stage"
 }
 
 # --------------------------------------------------------------------------
@@ -264,8 +281,11 @@ test_checksum_unavailable() {
     echo "=== Checksum file unavailable (fail closed / opt-out) ==="
     tmpdir=$(mktemp -d)
 
-    # Mock server 404s the .sha256 → "checksum file unavailable" verification failure
-    patch_checksum_url "$tmpdir/install.sh" "missing-checksum=1"
+    # Both sources 404 the .sha256 → no origin can supply a checksum, so the
+    # atomic-pair logic exhausts every source and fails "checksum file
+    # unavailable". (A GitHub-only outage correctly falls through to the backup
+    # pair; RF-015 covers that case.)
+    patch_both_checksum_urls "$tmpdir/install.sh" "missing-checksum=1"
 
     # Default: fail closed, exit 4, nothing installed
     check_exit "missing checksum fails closed (exit 4)" 4 \
@@ -291,8 +311,9 @@ test_checksum_empty() {
     echo "=== Empty checksum file (fail closed) ==="
     tmpdir=$(mktemp -d)
 
-    # Mock server returns a 200 with an empty body for the .sha256
-    patch_checksum_url "$tmpdir/install.sh" "empty-checksum=1"
+    # Both sources return a 200 with an empty body for the .sha256, so no origin
+    # yields a usable checksum and the install fails closed.
+    patch_both_checksum_urls "$tmpdir/install.sh" "empty-checksum=1"
 
     check_exit "empty checksum fails closed (exit 4)" 4 \
         env ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/bin" sh "$tmpdir/install.sh"
@@ -454,6 +475,73 @@ test_linux_platform_detection() {
     rm -rf "$shim_dir" "$tmpdir"
 }
 
+# RF-015: the binary and its checksum must always come from the same origin.
+# A backup binary is never verified against the GitHub checksum, and a checksum
+# mismatch on a complete pair fails closed without trying another mirror.
+test_source_pairing() {
+    echo ""
+    echo "=== RF-015: atomic source pairing (binary + checksum same origin) ==="
+    tmpdir=$(mktemp -d)
+
+    # 1. GitHub pair succeeds; backup points at a dead URL to prove it is unused.
+    out=$(ALF_RELEASE_URL="$MOCK_BASE" \
+          ALF_BACKUP_URL="$MOCK_BASE/NONEXISTENT" \
+          ALF_VERSION="v0.0.0-test" \
+          ALF_INSTALL_DIR="$tmpdir/p1" \
+          sh "$INSTALL_SH" 2>/dev/null) || true
+    check "github pair installs" test -x "$tmpdir/p1/alf"
+    check "github pair verified (backup unused)" \
+        sh -c "printf '%s' '$out' | grep -q '\"checksum_verified\":true'"
+
+    # 2. GitHub binary 404s; the backup binary is verified against the BACKUP
+    #    checksum. The old code verified the backup binary against the GitHub
+    #    checksum (v999 → 404) and failed this case.
+    out=$(ALF_RELEASE_URL="$MOCK_BASE" \
+          ALF_BACKUP_URL="$MOCK_BASE/releases" \
+          ALF_VERSION="v999.999.999" \
+          ALF_INSTALL_DIR="$tmpdir/p2" \
+          sh "$INSTALL_SH" 2>/dev/null) || true
+    check "backup pair installs when github binary 404s" test -x "$tmpdir/p2/alf"
+    check "backup pair verified against backup checksum" \
+        sh -c "printf '%s' '$out' | grep -q '\"checksum_verified\":true'"
+
+    # 3. GitHub binary + checksum download but the checksum mismatches while a
+    #    valid backup exists: fail closed immediately, install nothing.
+    patch_url_query "$INSTALL_SH" "$tmpdir/gh-mismatch.sh" github_sum_url "bad_checksum=1"
+    check_exit "github mismatch fails closed even with valid backup (exit 4)" 4 \
+        env ALF_RELEASE_URL="$MOCK_BASE" ALF_BACKUP_URL="$MOCK_BASE/releases" \
+            ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/p3" sh "$tmpdir/gh-mismatch.sh"
+    check "github mismatch installs nothing" sh -c "! test -e '$tmpdir/p3/alf'"
+
+    # 4. GitHub binary 404s → backup pair used, but the backup checksum
+    #    mismatches: exit 4, nothing installed.
+    patch_url_query "$INSTALL_SH" "$tmpdir/bk-mismatch.sh" backup_sum_url "bad_checksum=1"
+    check_exit "backup mismatch fails closed (exit 4)" 4 \
+        env ALF_RELEASE_URL="$MOCK_BASE" ALF_BACKUP_URL="$MOCK_BASE/releases" \
+            ALF_VERSION="v999.999.999" ALF_INSTALL_DIR="$tmpdir/p4" sh "$tmpdir/bk-mismatch.sh"
+    check "backup mismatch installs nothing" sh -c "! test -e '$tmpdir/p4/alf'"
+
+    # 5. Backup binary downloads but its same-origin checksum is unavailable and
+    #    GitHub has no binary → do not install.
+    patch_url_query "$INSTALL_SH" "$tmpdir/bk-missing.sh" backup_sum_url "missing-checksum=1"
+    check_exit "same-origin checksum unavailable fails closed (exit 4)" 4 \
+        env ALF_RELEASE_URL="$MOCK_BASE" ALF_BACKUP_URL="$MOCK_BASE/releases" \
+            ALF_VERSION="v999.999.999" ALF_INSTALL_DIR="$tmpdir/p5" sh "$tmpdir/bk-missing.sh"
+    check "unavailable same-origin checksum installs nothing" sh -c "! test -e '$tmpdir/p5/alf'"
+
+    # 6. Checksum file lists multiple entries for the platform binary → ambiguous
+    #    and rejected on every source → fail closed.
+    patch_both_checksum_urls "$tmpdir/ambiguous.sh" "dup-checksum=1"
+    check_exit "ambiguous checksum fails closed (exit 4)" 4 \
+        env ALF_RELEASE_URL="$MOCK_BASE" ALF_BACKUP_URL="$MOCK_BASE/releases" \
+            ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/p6" sh "$tmpdir/ambiguous.sh"
+    check_stdout "ambiguous checksum reported" "ambiguous" \
+        env ALF_RELEASE_URL="$MOCK_BASE" ALF_BACKUP_URL="$MOCK_BASE/releases" \
+            ALF_VERSION="v0.0.0-test" ALF_INSTALL_DIR="$tmpdir/p6b" sh "$tmpdir/ambiguous.sh"
+
+    rm -rf "$tmpdir"
+}
+
 # --------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------
@@ -483,6 +571,7 @@ if command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1; th
     test_checksum_mismatch
     test_checksum_unavailable
     test_checksum_empty
+    test_source_pairing
     test_json_stdout
     test_stderr_progress
     test_quiet_mode

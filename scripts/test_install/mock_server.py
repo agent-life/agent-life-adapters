@@ -12,8 +12,11 @@ URL patterns served:
   GET /releases/latest/<filename>
       → serve file from <fixtures_dir>/<filename>
       → if ?bad_checksum=1 on .sha256 requests, return a wrong hash
+        (with the correct platform filename, so it reads as a genuine mismatch)
       → if ?missing-checksum=1 on .sha256 requests, return 404
       → if ?empty-checksum=1 on .sha256 requests, return an empty body
+      → if ?dup-checksum=1 on .sha256 requests, return two lines that both name
+        the platform binary (ambiguous / unusable)
 
 Any other path or file not found → 404.
 
@@ -54,8 +57,11 @@ def main():
             self.wfile.write(body)
 
         def send_file(self, filepath, bad_checksum=False,
-                      missing_checksum=False, empty_checksum=False):
+                      missing_checksum=False, empty_checksum=False,
+                      dup_checksum=False):
             is_checksum = filepath.endswith(".sha256")
+            # The binary filename this checksum file is for (e.g. alf-linux-amd64).
+            bin_name = os.path.basename(filepath)[: -len(".sha256")] if is_checksum else ""
 
             # Simulate a missing .sha256: 404 even though the fixture exists.
             if is_checksum and missing_checksum:
@@ -79,8 +85,21 @@ def main():
                 return
 
             if is_checksum and bad_checksum:
-                # Return a deliberately wrong hash
-                body = b"0000000000000000000000000000000000000000000000000000000000000000  fake\n"
+                # Deliberately wrong hash, but with the correct platform filename
+                # so the installer reads it as a genuine mismatch (not a
+                # wrong-file rejection).
+                body = ("0" * 64 + "  " + bin_name + "\n").encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+
+            if is_checksum and dup_checksum:
+                # Two lines both naming the platform binary → ambiguous.
+                body = ("a" * 64 + "  " + bin_name + "\n"
+                        + "b" * 64 + "  " + bin_name + "\n").encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain")
                 self.send_header("Content-Length", str(len(body)))
@@ -103,6 +122,7 @@ def main():
             bad_checksum = "bad_checksum" in qs and qs["bad_checksum"][0] == "1"
             missing_checksum = "missing-checksum" in qs and qs["missing-checksum"][0] == "1"
             empty_checksum = "empty-checksum" in qs and qs["empty-checksum"][0] == "1"
+            dup_checksum = "dup-checksum" in qs and qs["dup-checksum"][0] == "1"
 
             # GitHub API: GET /repos/{owner}/{repo}/releases/latest
             if re.match(r"^/repos/[^/]+/[^/]+/releases/latest$", path):
@@ -120,7 +140,7 @@ def main():
                     self.wfile.write(f"No release found for tag {tag}".encode())
                     return
                 self.send_file(os.path.join(fixtures_dir, filename), bad_checksum,
-                               missing_checksum, empty_checksum)
+                               missing_checksum, empty_checksum, dup_checksum)
                 return
 
             # Alternative path: /releases/latest/<filename>  (used by some scripts)
@@ -128,7 +148,7 @@ def main():
             if m:
                 filename = m.group(1)
                 self.send_file(os.path.join(fixtures_dir, filename), bad_checksum,
-                               missing_checksum, empty_checksum)
+                               missing_checksum, empty_checksum, dup_checksum)
                 return
 
             self.send_response(404)

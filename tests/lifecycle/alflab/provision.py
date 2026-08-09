@@ -62,6 +62,10 @@ class Manifest:
     runtime_id: str = ""
     alf_api_url: str = ""
     llm_model_id: str = ""
+    # RF-024 identity trio — binds this manifest to the candidate that made it.
+    source_commit: str = ""
+    dirty: bool = False
+    binary_sha256: str = ""
     lifecycle_agents: list = field(default_factory=list)
     teardown: dict = field(default_factory=dict)   # rung -> "ok"|"skipped"|error text
 

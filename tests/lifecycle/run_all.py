@@ -34,7 +34,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -163,7 +163,7 @@ def run_tier(tier: Tier, extra: list[str]) -> Outcome:
     return Outcome(tier.name, status, detail.strip(), dur, fields, run_dir)
 
 
-def summarize(outcomes: list[Outcome]) -> int:
+def summarize(outcomes: list[Outcome], release_evidence: bool | None = None) -> int:
     print("\n\033[1m═══════ lifecycle summary ═══════\033[0m")
     width = max((len(o.tier) for o in outcomes), default=10)
     for o in outcomes:
@@ -181,9 +181,15 @@ def summarize(outcomes: list[Outcome]) -> int:
     for o in ran:
         if o.fields.get("isolation") not in (None, "clean"):
             isolation = o.fields["isolation"]
+    ev = ""
+    if release_evidence is not None:
+        ev = f" release_evidence={'true' if release_evidence else 'false'}"
     print(f"<!-- LIFECYCLE-RUN tiers={len(outcomes)} passed={len(ran) - len(failed)}/{len(ran)}"
           f" failed={len(failed)} skipped={len(skipped)} isolation={isolation}"
-          f" duration={total_s:.0f}s -->")
+          f" duration={total_s:.0f}s{ev} -->")
+    if release_evidence is False:
+        print("\033[33m⚠ NON-RELEASE EVIDENCE\033[0m — this run is not reproducible "
+              "from a clean candidate (see provenance in --json summary)")
     if failed:
         print(f"\033[31m{len(failed)} tier(s) failed\033[0m: "
               f"{', '.join(o.tier for o in failed)}")
@@ -195,6 +201,17 @@ def summarize(outcomes: list[Outcome]) -> int:
     return 0
 
 
+def _alf_bin_from_extra(extra: list) -> str | None:
+    """Honor a passed-through `--alf-bin PATH` / `--alf-bin=PATH` so the combined
+    run stamps the same binary the driver will actually exercise."""
+    for i, a in enumerate(extra):
+        if a == "--alf-bin" and i + 1 < len(extra):
+            return extra[i + 1]
+        if a.startswith("--alf-bin="):
+            return a.split("=", 1)[1]
+    return None
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="run_all.py", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -204,7 +221,12 @@ def main(argv=None) -> int:
                    help="required to run any live tier: they mint a runtime key, "
                         "create cloud agents and drive a real LLM")
     p.add_argument("--strict", action="store_true",
-                   help="a missing prerequisite is a FAILURE, not a skip")
+                   help="a missing prerequisite is a FAILURE, not a skip; also a "
+                        "hard release gate — refuses a dirty tree / unknown commit / "
+                        "missing binary digest before any tier runs (RF-024)")
+    p.add_argument("--allow-dirty", action="store_true",
+                   help="with --strict, downgrade the release gate to a labelled "
+                        "non-release run for local development instead of refusing")
     p.add_argument("--list", action="store_true", help="print the set and exit")
     p.add_argument("--json", type=Path, default=None, metavar="PATH",
                    help="also write the summary as JSON")
@@ -225,6 +247,40 @@ def main(argv=None) -> int:
         for t in tiers:
             print(f"{t.name:<20} {'[live]' if t.needs_live else '[offline]':<10} {t.note}")
         return 0
+
+    # RF-024: one provenance capture for the whole combined run — every tier in
+    # this invocation runs the same binary + checkout, so one capture is correct.
+    from alflab.provenance import capture
+    from alflab.runner import find_alf_binary
+    try:
+        binary = find_alf_binary(_alf_bin_from_extra(args.extra))
+    except SystemExit:
+        binary = None   # no binary resolvable ⇒ missing digest ⇒ non-release
+    prov_backend = "real" if any(t.needs_live for t in tiers) else "none"
+    service_repo = Path(os.environ.get(
+        "ALF_SERVICE_REPO", REPO.parent / "agent-life-service"))
+    prov = capture(REPO, binary, prov_backend, service_repo)
+
+    # Reject-or-label gate: strict is a hard release gate. A dirty tree, an
+    # unknown commit, or a missing binary digest cannot be release evidence, so
+    # refuse BEFORE any tier runs — unless --allow-dirty downgrades it to a
+    # labelled non-release run for local development.
+    if args.strict and not args.allow_dirty:
+        problems = []
+        if prov.adapters_dirty:
+            problems.append("adapters working tree is dirty (source_commit not clean)")
+        if prov.adapters_commit in ("", "unknown"):
+            problems.append("adapters commit is unknown (git unavailable)")
+        if not prov.binary_sha256:
+            problems.append("binary digest missing (no alf binary resolved)")
+        if problems:
+            print("refusing strict release run — not reproducible evidence:",
+                  file=sys.stderr)
+            for pr in problems:
+                print(f"  - {pr}", file=sys.stderr)
+            print("  release runs come from a clean checkout of the candidate; for a "
+                  "labelled local run add --allow-dirty.", file=sys.stderr)
+            return 2
 
     docker_ok, docker_why = docker_ready()
     live_ok, live_why = live_ready()
@@ -250,11 +306,16 @@ def main(argv=None) -> int:
             continue
         outcomes.append(run_tier(tier, args.extra))
 
-    code = summarize(outcomes)
+    code = summarize(outcomes, release_evidence=prov.release_evidence)
     if args.json:
-        args.json.write_text(json.dumps(
-            {"tiers": [o.__dict__ for o in outcomes], "exit_code": code}, indent=2),
-            encoding="utf-8")
+        from alflab.redact import redact_obj
+        payload = redact_obj({
+            "tiers": [o.__dict__ for o in outcomes],
+            "exit_code": code,
+            "provenance": asdict(prov),
+            "release_evidence": prov.release_evidence,
+        })
+        args.json.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(f"summary written to {args.json}")
     return code
 

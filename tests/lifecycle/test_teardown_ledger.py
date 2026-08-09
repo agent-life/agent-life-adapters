@@ -23,6 +23,7 @@ from alflab import provision
 
 A = "aaaaaaaa-0000-0000-0000-000000000001"
 B = "bbbbbbbb-0000-0000-0000-000000000002"
+SEED = "cccccccc-0000-0000-0000-000000000003"
 
 
 class _Proc:
@@ -100,6 +101,47 @@ class TeardownLedgerNamesEveryAgentTest(unittest.TestCase):
         led = self._run(_Container({}), _Api({}), agents=())
         self.assertNotEqual(led["rung3-verify-404"], "ok")
         self.assertIn("none were registered", led["rung3-verify-404"])
+
+
+class Rung4bDirectScavengeTest(unittest.TestCase):
+    """rung4b (`api is None` fallback) is the ONLY rung whose failure is a REAL
+    leak: the lifecycle agents are invisible to batch scavenge. It must name
+    every agent and never overwrite A's failure with B's success (RF-024 A4)."""
+
+    def _fake_scavenge(self, service_repo, args, env=None):
+        # rung4 seed-scavenge, rung4b per-agent, and rung5 dry-run all land here.
+        # Only the A/B lifecycle-agent deletes drive the assertion; everything
+        # else (the seed delete, the empty-args dry-run) succeeds.
+        if "--agent" in args:
+            agent = args[args.index("--agent") + 1]
+            if agent == A:
+                return _Proc(1, stderr="scavenge boom for A")
+        return _Proc(0)
+
+    def test_rung4b_names_every_agent_and_keeps_a_failure(self):
+        tmp = Path(tempfile.mkdtemp())
+        m = provision.Manifest(framework="t", created_at="now", backend="real",
+                               llm="proxy", seed_agent_id=SEED,
+                               lifecycle_agents=[A, B])
+        path = tmp / "run-manifest.json"
+        orig = provision._scavenge
+        provision._scavenge = self._fake_scavenge
+        try:
+            # api=None forces the rung4b fallback; container=None skips rung1.
+            ok = provision.teardown_ladder(m, path, None, None, tmp, "hermes", env={})
+        finally:
+            provision._scavenge = orig
+        line = m.teardown["rung4b-scavenge-lifecycle"]
+        # BOTH agents named, A's failure retained, B's success not erased.
+        self.assertIn(A, line)
+        self.assertIn(B, line)
+        self.assertIn("FAILED", line)
+        self.assertIn("scavenge boom for A", line)
+        self.assertIn(f"{B}: ok", line)
+        # rung4 seed-scavenge succeeded, so only rung4b drives the verdict.
+        self.assertEqual(m.teardown["rung4-scavenge-seed"], "ok")
+        # A real leak ⇒ the whole ladder reports non-clean.
+        self.assertFalse(ok)
 
 
 if __name__ == "__main__":

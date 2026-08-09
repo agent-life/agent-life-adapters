@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from . import events, models, provision, stages, ui
+from . import events, models, provenance, provision, stages, ui
 from .config import HarnessConfig
 from .contract import KitEnv, SkipStage
 from .dockerctl import (
@@ -286,10 +286,13 @@ def main(argv=None) -> int:
     _install_viz(run_dir)
 
     stage_ids = stages.STAGE_IDS if args.full else parse_stage_selection(args.stages)
+    # RF-024: one provenance capture per run, bound into report + manifest + the
+    # run_start event so every artifact carries the source + binary identity.
+    prov = provenance.capture(REPO_ROOT, run.alf_binary, run.backend, cfg.service_repo)
     run.report = RunReport(
         framework=args.framework, tier=f"{run.llm}/{run.backend}",
         stages_requested=stage_ids, run_dir=str(run_dir),
-        alf_version=run.expected_alf_version,
+        alf_version=run.expected_alf_version, provenance=prov,
     )
 
     container_name = f"alf-lifecycle-{args.framework}-{ts.lower()}"
@@ -297,7 +300,10 @@ def main(argv=None) -> int:
                     else RichNarrator(interactive, container_name))
     run.manifest = Manifest(framework=args.framework, created_at=ts,
                             backend=run.backend, llm=run.llm,
-                            container_name=container_name)
+                            container_name=container_name,
+                            source_commit=prov.adapters_commit,
+                            dirty=prov.adapters_dirty,
+                            binary_sha256=prov.binary_sha256)
 
     ui.banner(f"agent-life lifecycle — {args.framework} · tier {run.llm}/{run.backend}"
               f" · stages {','.join(s.upper() for s in stage_ids)}")
@@ -310,6 +316,8 @@ def main(argv=None) -> int:
         stages_requested=stage_ids,
         alf_version=run.expected_alf_version,
         run_dir=str(run_dir),
+        adapters_commit=prov.adapters_commit,
+        binary_sha256=prov.binary_sha256,
     )
     # Viz server before any stage work so operators can open the page and watch
     # events arrive live (mint / docker build / Z01…).

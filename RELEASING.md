@@ -151,7 +151,7 @@ In `agent-life-adapters`:
     cargo test --workspace
     cargo clippy --workspace --all-targets --all-features -- -D warnings   # --all-features lints the fault-injection seam
     cargo fmt --check
-    ./scripts/test_install.sh --quick                                       # install-script suite (mock GitHub Releases)
+    ./scripts/test_install.sh --quick                                       # install-script suite (mock GitHub Releases); runs the canonical Ubuntu Docker lane — confirm the "Execution plan: 1 lane(s): linux/ubuntu" line in the log
 
 Zero-secret lifecycle CI tiers (no backend; the MCP generic kit is here):
 

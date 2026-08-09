@@ -15,6 +15,15 @@ on:
   workflow_dispatch:
 
 jobs:
+  lane-selection:
+    name: Lane selection (arg parsing)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify lane resolution
+        run: ./scripts/test_install/test_lane_selection.sh
+
   linux:
     name: Linux (Docker)
     runs-on: ubuntu-latest

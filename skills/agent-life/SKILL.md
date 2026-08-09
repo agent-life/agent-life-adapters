@@ -37,7 +37,7 @@ metadata:
 
 # Agent Life — Backup, Sync, and Restore
 
-The `alf` CLI backs up, syncs, and restores a precise allowlist of your agent's memory, identity, and configuration files to the agent-life.ai cloud using the open Agent Life Format (ALF). Credential secrets are encrypted client-side with an offline vault key before they leave your machine — agent-life.ai sees only ciphertext. You can preview exactly what will be uploaded with `--dry-run` and further restrict the set with a workspace-local `.alfignore` file. All commands output JSON to stdout. Progress goes to stderr. See <https://agent-life.ai>
+The `alf` CLI backs up, syncs, and restores your agent's memory, identity, and configuration files to the agent-life.ai cloud using the open Agent Life Format (ALF). The set is broader than a fixed list of named files — it includes every Markdown file in the workspace and any files you opt in with `alf add` (see *Data and Privacy* below for the exact rules). Credential secrets are encrypted client-side with an offline vault key before they leave your machine — agent-life.ai sees only ciphertext. **Always preview exactly what will be uploaded with `--dry-run` before the first sync**, and further restrict the set with a workspace-local `.alfignore` file. All commands output JSON to stdout. Progress goes to stderr. See <https://agent-life.ai>
 
 ## Install
 
@@ -56,13 +56,15 @@ Install script source: <https://github.com/agent-life/agent-life-adapters/blob/m
 
 The install script detects your platform, downloads the binary from GitHub Releases, **requires a successful SHA256 checksum verification**, and installs to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). Stdout is JSON:
 
-    {"ok":true,"version":"v0.1.9","installed_version":"alf 0.1.9","path":"/usr/local/bin/alf","checksum_verified":true}
+    {"ok":true,"version":"v1.1.0","installed_version":"alf 1.1.0","path":"/usr/local/bin/alf","checksum_verified":true}
 
 **Checksum verification is mandatory by default.** A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed at all — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case only (not recommended), in which case `checksum_verified` is `false` and a `warnings` array in the output JSON records the reason.
 
 For production use, pin to a specific release:
 
-    ALF_VERSION=v0.1.9 sh install-alf.sh
+    ALF_VERSION=v1.1.0 sh install-alf.sh
+
+Pin only to a release you have validated, and **never below `v1.0.0`** — earlier `v0.1.x` binaries carry a vault-handling defect. Downgrading past it risks your local credential vault.
 
 Verify: `alf --version`
 
@@ -120,11 +122,11 @@ Before the first backup or any sensitive change, list the exact files that would
 
     alf export -r openclaw -w <workspace> --dry-run
 
-Output:
+Output (note that Markdown files outside the core set, like `notes/scratch.md`, are captured too):
 
-    {"ok":true,"dry_run":true,"agent_name":"Atlas","memory_records":47,"files":[{"path":"SOUL.md","size":2048},{"path":"IDENTITY.md","size":1024},{"path":"memory/2026-01-15.md","size":4096}],"excluded_by_alfignore":3,"total_size":102400}
+    {"ok":true,"dry_run":true,"agent_name":"Atlas","memory_records":47,"files":[{"path":"SOUL.md","size":2048},{"path":"IDENTITY.md","size":1024},{"path":"memory/2026-01-15.md","size":4096},{"path":"notes/scratch.md","size":512}],"excluded_by_alfignore":3,"total_size":102400}
 
-Use this to confirm the inclusion set matches your expectations before any data leaves the machine.
+**Read the full `files[]` list before the first sync.** Because export walks every Markdown file in the workspace (see *Data and Privacy*), it may include notes, drafts, or anything ending in `.md` that you did not expect. Call out any path outside `SOUL.md`/`IDENTITY.md`/`AGENTS.md`/`USER.md`/`TOOLS.md`/`HEARTBEAT.md`/`BOOTSTRAP.md`/`MEMORY.md`/`memory/` to the user, and get explicit confirmation before any data leaves the machine. Exclude anything unwanted with `.alfignore` and re-run the dry run.
 
 ### First-time backup
 
@@ -221,7 +223,7 @@ Output:
 
 ## Controlling What's Uploaded — `.alfignore`
 
-By default, `alf export` includes a fixed allowlist of workspace files (see *Data and Privacy* below). To narrow the set further, drop a `.alfignore` file at the workspace root. The syntax is the same as `.gitignore`:
+By default, `alf export` includes the core identity files, everything under `memory/`, and every other Markdown file in the workspace (see *Data and Privacy* below for the exact rules). To narrow that set, drop a `.alfignore` file at the workspace root. The syntax is the same as `.gitignore`:
 
     # Exclude an entire subdirectory of memory/
     memory/private/
@@ -238,7 +240,7 @@ Rules:
 - Lines starting with `#` are comments; blank lines are ignored.
 - Negation (`!pattern`) re-includes a previously-excluded path.
 - `.alfignore` itself is never uploaded.
-- The agent's vault file at `~/.alf/vault/credentials.json` is outside the workspace and is **not** affected by `.alfignore`. Use `alf vault` to control vault contents.
+- The agent's vault file at `~/.alf/vault/<agent_id>/credentials.json` is outside the workspace and is **not** affected by `.alfignore`. Use `alf vault` to control vault contents.
 
 Inspect the effect with `alf export --dry-run` — the `excluded_by_alfignore` count and the `files[]` list reflect the filtered set.
 
@@ -279,32 +281,28 @@ This skill uploads agent data to the agent-life.ai cloud service. The set is pre
 
 ### Exactly what is uploaded
 
-From the workspace root, an exact allowlist of 8 files (each only if present):
+The upload set for the OpenClaw runtime is:
 
-- `SOUL.md`
-- `IDENTITY.md`
-- `AGENTS.md`
-- `USER.md`
-- `TOOLS.md`
-- `HEARTBEAT.md`
-- `BOOTSTRAP.md`
-- `MEMORY.md`
+1. **Core identity/config files at the workspace root** (each only if present): `SOUL.md`, `IDENTITY.md`, `AGENTS.md`, `USER.md`, `TOOLS.md`, `HEARTBEAT.md`, `BOOTSTRAP.md`, `MEMORY.md`.
+2. **The workspace's `memory/` directory, recursively.** Symlinks inside `memory/` are not followed, so files outside the workspace cannot be pulled in through a link.
+3. **Every other Markdown (`.md`) file anywhere in the workspace.** OpenClaw agents store memory in agent-chosen locations whose names vary (e.g. `procedures/deploy.md`, `procedural_memory/*.md`, and — if you keep them — files like `secrets/notes.md`), so export walks the whole workspace tree and includes all Markdown files, not just the named ones above. Non-Markdown operational files (`*.json` state, `state/`, `sessions/*.jsonl`) are not included. **If you keep secrets or private notes in `.md` files, exclude them with `.alfignore` — they are otherwise uploaded.**
+4. **Files you explicitly opt in with `alf add`.** These can be any file type (not just Markdown) and are stored verbatim. ALF never auto-discovers them — only paths you tracked yourself.
+5. **Two control files**, so your sync config travels with the archive: `.alf-include.json` (the `alf add` list) and `.alf-sync-log.md` (removal history).
+6. **The agent's ALF vault** at `~/.alf/vault/<agent_id>/credentials.json` (when present). Vault records are encrypted client-side; only ciphertext leaves the machine.
 
-Plus the workspace's `memory/` directory, recursively. Symlinks inside `memory/` are not followed, so files outside the workspace cannot be pulled in through a link.
-
-Plus the agent's ALF vault at `~/.alf/vault/credentials.json` (when present). Vault records are encrypted client-side; only ciphertext leaves the machine.
-
-A `.alfignore` file at the workspace root, if present, removes paths from this set. Run `alf export --dry-run` to confirm the final list.
+A `.alfignore` file at the workspace root removes paths from items 1–5. **Always run `alf export --dry-run` to confirm the final list before the first sync** — it is the only authoritative preview.
 
 ### Exactly what is NOT uploaded
 
 - Your vault key — never leaves your machine, never transmitted, never derivable from anything we send.
 - Plaintext credential secrets — encrypted client-side before any network call.
-- Files outside the allowlist (any workspace file other than the 8 named root files or contents of `memory/`).
+- Non-Markdown workspace files, unless you opt them in with `alf add` — `*.json` workspace state, `state/`, and `sessions/*.jsonl` are never auto-included.
 - Files reachable only via symlinks pointing outside the workspace.
 - Runtime keystores (e.g. OpenClaw `auth-profiles.json`).
 - Session transcripts and chat history.
 - The `.alfignore` file itself.
+
+Note the boundary: **any `.md` file in the workspace *is* uploaded** (item 3 above) unless you exclude it with `.alfignore`. "Not uploaded" covers non-Markdown files and untracked paths — not Markdown.
 
 ### Credential encryption (end-to-end)
 
@@ -326,19 +324,21 @@ Nothing is uploaded until you explicitly run `alf sync`.
 
 ### Files read on your machine
 
-The `alf` CLI reads the following local files. No other files on the filesystem are read.
+The `alf` CLI reads the following local files. Outside these, it does not read unrelated files elsewhere on the filesystem.
 
 **Under your home directory**:
 
 - `~/.alf/config.toml` — the CLI's own config (API key, API URL, defaults).
 - `~/.alf/state/{agent_id}.toml` — local sync cursor. Read on every sync, never uploaded.
 - `~/.alf/state/{agent_id}-snapshot.alf` — last snapshot, used to compute deltas. Read on every sync, never uploaded.
-- `~/.alf/vault/credentials.json` — the encrypted credential vault. Read during export; only ciphertext leaves the machine (see *Credential encryption* above).
+- `~/.alf/vault/<agent_id>/credentials.json` — the encrypted credential vault (per-agent). Read during export; only ciphertext leaves the machine (see *Credential encryption* above).
 - `~/.openclaw/openclaw.json` — read to auto-discover the workspace path for OpenClaw runtimes.
 
-**Inside the workspace**:
+**Inside the workspace** (see *Exactly what is uploaded* above for the full set):
 
-- The 8 root files in the upload allowlist plus `memory/` recursively (see *Exactly what is uploaded* above).
+- The core root files plus `memory/` recursively.
+- Every other Markdown (`.md`) file in the workspace tree.
+- Any files you tracked with `alf add`, plus the `.alf-include.json` / `.alf-sync-log.md` control files.
 - `.alfignore` at the workspace root, if present — read to filter the export set; never uploaded.
 
 The `requires.config` metadata in this skill's frontmatter declares only the two preexisting config files the skill expects (`~/.alf/config.toml` and `~/.openclaw/openclaw.json`); the state and vault paths are managed by `alf` itself and are created on first use.
@@ -382,5 +382,5 @@ The `ALF_API_KEY` authenticates to your agent-life.ai account. It can only acces
 | `~/.alf/config.toml` | API key, API URL, default runtime and workspace |
 | `~/.alf/state/{agent_id}.toml` | Sync cursor (last sequence, timestamp) |
 | `~/.alf/state/{agent_id}-snapshot.alf` | Last snapshot for delta computation |
-| `~/.alf/vault/credentials.json` | Encrypted credential vault (ciphertext only; key stays offline) |
+| `~/.alf/vault/<agent_id>/credentials.json` | Encrypted credential vault, per agent (ciphertext only; key stays offline) |
 | `<workspace>/.alfignore` | Optional gitignore-style patterns to exclude workspace paths from export |

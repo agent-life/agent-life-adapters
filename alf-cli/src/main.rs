@@ -1005,6 +1005,21 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
             runtime,
             key,
         } => {
+            // All caller-owned input, especially a bare stdin prompt, completes
+            // before the default-vault L3 guard. An unattended TTY must not keep
+            // the watch loop or other MCP tools agent_busy indefinitely.
+            let prepared = input
+                .is_none()
+                .then(|| {
+                    commands::vault::prepare_add_input(
+                        username.as_deref(),
+                        secret.as_deref(),
+                        secret_file.as_deref(),
+                        secret_json.as_deref(),
+                        &fields,
+                    )
+                })
+                .transpose()?;
             let (config, scope) = vault_scope(&runtime, agent, input.is_none())?;
             vault_migrate::require_migrated_locked(&config, &runtime)?;
             // Default-vault RMWs share the watch/MCP advisory lock. Explicit
@@ -1013,24 +1028,40 @@ fn dispatch_vault(cmd: VaultCommand, agent: Option<&str>) -> anyhow::Result<()> 
                 .is_none()
                 .then(|| commands::mcp::lock_default_vault_mutation(scope))
                 .transpose()?;
-            commands::vault::add(
-                input.as_deref(),
-                &service,
-                &credential_type,
-                username.as_deref(),
-                secret.as_deref(),
-                secret_file.as_deref(),
-                secret_json.as_deref(),
-                label.as_deref(),
-                description.as_deref(),
-                &tags,
-                &fields,
-                agent_id.as_deref(),
-                scope,
-                update,
-                &key.to_args(),
-                &runtime,
-            )
+            match prepared {
+                Some(prepared) => commands::vault::add_prepared(
+                    None,
+                    &service,
+                    &credential_type,
+                    prepared,
+                    label.as_deref(),
+                    description.as_deref(),
+                    &tags,
+                    agent_id.as_deref(),
+                    scope,
+                    update,
+                    &key.to_args(),
+                    &runtime,
+                ),
+                None => commands::vault::add(
+                    input.as_deref(),
+                    &service,
+                    &credential_type,
+                    username.as_deref(),
+                    secret.as_deref(),
+                    secret_file.as_deref(),
+                    secret_json.as_deref(),
+                    label.as_deref(),
+                    description.as_deref(),
+                    &tags,
+                    &fields,
+                    agent_id.as_deref(),
+                    scope,
+                    update,
+                    &key.to_args(),
+                    &runtime,
+                ),
+            }
         }
         VaultCommand::Decrypt {
             input,

@@ -1502,6 +1502,118 @@ fn concurrent_first_vault_add_uses_one_key_and_keeps_both() {
     conv.finish();
 }
 
+/// RF-012 (DoD): a direct CLI add and an MCP add both wait on the exact same
+/// per-agent flock. Holding that real lock externally keeps *both* processes
+/// from writing; after release their independent process boundaries preserve
+/// both records.
+#[test]
+fn cli_and_mcp_vault_add_share_the_default_vault_lock() {
+    use fs2::FileExt;
+    use std::time::Duration;
+
+    let mut conv = Conversation::start();
+    let alf_dir = conv.home.path().join(".alf");
+    std::fs::create_dir_all(&alf_dir).unwrap();
+    std::fs::write(
+        alf_dir.join("config.toml"),
+        format!(
+            "[[agents]]
+runtime = \"generic\"
+runtime_agent = \"main\"
+\
+             alf_agent_id = \"{TOY_AGENT_ID}\"
+workspace = \"{}\"
+enabled = true
+",
+            conv.workspace.path().display(),
+        ),
+    )
+    .unwrap();
+
+    // The direct generic CLI needs an explicit key path; the MCP server's
+    // default generic key path is this same file.
+    let key_path = alf_dir
+        .join("vault-keys")
+        .join(format!("{TOY_AGENT_ID}.key"));
+    let mut keygen = Command::new(env!("CARGO_BIN_EXE_alf"));
+    keygen
+        .args(["vault", "keygen", "--out"])
+        .arg(&key_path)
+        .env("ALF_HOME", conv.home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    clean_alf_env(&mut keygen);
+    assert!(keygen.status().unwrap().success(), "seed generic vault key");
+
+    let lock_path = alf_dir.join("state").join(format!("{TOY_AGENT_ID}.lock"));
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    let mut cli = Command::new(env!("CARGO_BIN_EXE_alf"));
+    cli.args(["vault", "add", "-r", "generic", "--vault-key-file"])
+        .arg(&key_path)
+        .args([
+            "--service",
+            "cli-service",
+            "--label",
+            "cli-record",
+            "--secret",
+            "cli-secret",
+        ])
+        .env("ALF_HOME", conv.home.path())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    clean_alf_env(&mut cli);
+    let mut cli = cli.spawn().unwrap();
+
+    // Queue the MCP mutation through a real stdio server while the direct CLI
+    // is waiting. No response is read yet: rmcp runs it on its own worker.
+    conv.send(&call(
+        73,
+        "alf_vault_add",
+        json!({"service": "mcp-service", "secret": "mcp-secret", "label": "mcp-record"}),
+    ));
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        cli.try_wait().unwrap().is_none(),
+        "CLI add must wait for L3"
+    );
+    assert!(
+        !alf_dir
+            .join("vault")
+            .join(TOY_AGENT_ID)
+            .join("credentials.json")
+            .exists(),
+        "MCP add bypassed the shared L3 while an external owner held it"
+    );
+
+    fs2::FileExt::unlock(&lock_file).unwrap();
+    assert!(
+        cli.wait().unwrap().success(),
+        "CLI add must finish after release"
+    );
+    let added = conv.recv_id(73);
+    assert_eq!(added["result"]["isError"], false, "MCP add: {added}");
+    let listed = conv.call(74, "alf_vault_list", json!({}));
+    assert_eq!(listed["structuredContent"]["count"], 2, "both adds survive");
+    let labels: Vec<_> = listed["structuredContent"]["credentials"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|record| record["label"].as_str())
+        .collect();
+    assert!(labels.contains(&"cli-record"));
+    assert!(labels.contains(&"mcp-record"));
+    conv.finish();
+}
+
 /// Review E1: two concurrent `alf_configure` writes must never leave a torn map —
 /// the unique temp suffix + serialized RMW + atomic rename yield a whole, valid
 /// JSON file (last-writer-wins, never corrupt).

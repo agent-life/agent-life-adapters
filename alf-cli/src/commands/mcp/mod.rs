@@ -940,7 +940,7 @@ fn server_default_key_path(runtime: &str, scope: Option<Uuid>) -> anyhow::Result
 /// none resolves. Resolution order (design §6, brief task 6): explicit
 /// ALF_VAULT_KEY env / server key file → the default key path (existing) → a
 /// freshly generated key at that path. Returns the args to pass through the
-/// existing [`vault::add_core`] key seam, plus keygen descriptors when it
+/// existing [`vault::add_prepared_core`] key seam, plus keygen descriptors when it
 /// generated (fingerprint + path only, never bytes).
 fn resolve_or_generate_vault_key(
     runtime: &str,
@@ -948,7 +948,7 @@ fn resolve_or_generate_vault_key(
 ) -> anyhow::Result<(VaultKeyArgs, Option<KeyGenInfo>)> {
     let base = VaultKeyArgs::default();
     // A key already resolves (explicit env, or a per-runtime default file that
-    // exists) → pass the args through unchanged; add_core re-resolves identically.
+    // exists) → pass the args through unchanged; add_prepared_core re-resolves identically.
     if vault_key::resolve(&base, runtime, scope)?.is_some() {
         return Ok((base, None));
     }
@@ -1009,6 +1009,16 @@ fn vault_add_impl(
     agent: Option<&str>,
     params: VaultAddParams,
 ) -> anyhow::Result<VaultAddResult> {
+    // Collect and validate the MCP request before any L3 is acquired. MCP
+    // supplies the secret in-memory today, but keeping this at the same seam as
+    // CLI input makes the no-user-input-under-lock invariant explicit.
+    let prepared = vault::prepare_add_input(
+        params.username.as_deref(),
+        Some(&params.secret),
+        None,
+        None,
+        &params.fields,
+    )?;
     let config = Config::load()?;
     // RF-012: migrate under the legacy→agent guards BEFORE taking the RMW lock
     // below. Migration releases its guards before returning, so the RMW lock is
@@ -1052,18 +1062,14 @@ fn vault_add_impl(
 
     let (key_args, key_generated) = resolve_or_generate_vault_key(runtime, scope)?;
 
-    let add = vault::add_core(
+    let add = vault::add_prepared_core(
         None, // input: the agent's default vault path for this scope
         &params.service,
         "account", // credential_type default (matches `alf vault add`)
-        params.username.as_deref(),
-        Some(&params.secret),
-        None, // secret_file
-        None, // secret_json
+        prepared,
         params.label.as_deref(),
         params.description.as_deref(),
         &params.tags,
-        &params.fields,
         None, // agent_id metadata defaults to the scope
         scope,
         params.update.unwrap_or(false),

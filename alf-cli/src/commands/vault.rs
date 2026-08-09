@@ -236,53 +236,24 @@ const SECRET_JSON_USERNAME_KEYS: &[&str] = &["username", "user", "email", "bot_u
 /// Keys in a `--secret-json` object treated as the account secret.
 const SECRET_JSON_SECRET_KEYS: &[&str] = &["secret", "password", "token", "bot_token", "api_key"];
 
-/// Add an account credential to the agent's vault.
-///
-/// Encrypts the secret under the resolved vault key and appends a
-/// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
-/// `CredentialsDocument`. The default target is the agent's vault at
-/// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
-/// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
-/// merge into the archive's Layer 4 on the next `alf sync`.
-/// Encrypt and upsert a credential, returning the result — no stdout. Shared by
-/// the CLI [`add`] (which prints it) and the MCP `alf_vault_add` tool.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn add_core(
-    input: Option<&Path>,
-    service: &str,
-    credential_type: &str,
+/// Caller-supplied credential material, fully collected before a canonical
+/// vault mutation takes L3. This deliberately contains plaintext only while a
+/// request is executing; callers must not log it or retain it after the add.
+pub(crate) struct PreparedAddInput {
+    payload: VaultPayload,
+}
+
+/// Read and validate caller-owned credential input without touching the vault
+/// or key. Default-vault callers must run this before acquiring the advisory
+/// lock so a TTY prompt, FIFO, or slow caller-owned file cannot starve sync,
+/// restore, or other MCP tools that need the agent lock.
+pub(crate) fn prepare_add_input(
     username: Option<&str>,
     secret: Option<&str>,
     secret_file: Option<&Path>,
     secret_json: Option<&Path>,
-    label: Option<&str>,
-    description: Option<&str>,
-    tags: &[String],
     fields: &[String],
-    agent_id: Option<&str>,
-    scope: Option<Uuid>,
-    update: bool,
-    key_args: &VaultKeyArgs,
-    runtime: &str,
-) -> Result<AddResult> {
-    // 1. Resolve the target vault file.
-    let target: PathBuf = match input {
-        Some(p) => p.to_path_buf(),
-        None => vault_key::default_vault_path(scope)?,
-    };
-    if target
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("alf"))
-        .unwrap_or(false)
-    {
-        bail!(
-            "Cannot add a credential into a .alf archive in place. \
-             Pass --in PATH to a credentials.json file."
-        );
-    }
-
-    // 2. Assemble the plaintext payload.
+) -> Result<PreparedAddInput> {
     let mut payload_username = username.map(str::to_string);
     let mut secret_value: Option<String> = None;
     let mut extra: std::collections::HashMap<String, serde_json::Value> =
@@ -324,7 +295,9 @@ pub(crate) fn add_core(
             fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
         secret_value = Some(raw.trim().to_string());
     } else if secret_value.is_none() {
-        // Last resort: read the secret from stdin.
+        // Last resort: read the secret from stdin. This is intentionally before
+        // L3 for default-vault callers; an unattended prompt must not block the
+        // watch loop or every other MCP mutation for this agent.
         let buf = read_input(None)?;
         let s = String::from_utf8(buf)
             .map_err(|_| anyhow!("Secret read from stdin is not UTF-8 text"))?;
@@ -351,15 +324,101 @@ pub(crate) fn add_core(
     } else {
         "api_key"
     };
-    let payload = VaultPayload {
-        vault_payload_version: alf_core::VAULT_PAYLOAD_VERSION,
-        kind: kind.to_string(),
-        username: payload_username.clone(),
-        secret: secret_value,
-        extra,
-    };
+    Ok(PreparedAddInput {
+        payload: VaultPayload {
+            vault_payload_version: alf_core::VAULT_PAYLOAD_VERSION,
+            kind: kind.to_string(),
+            username: payload_username,
+            secret: secret_value,
+            extra,
+        },
+    })
+}
 
-    // 3. Encrypt under the resolved key.
+/// Add an account credential to the agent's vault.
+///
+/// Encrypts the secret under the resolved vault key and appends a
+/// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
+/// `CredentialsDocument`. The default target is the agent's vault at
+/// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
+/// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
+/// merge into the archive's Layer 4 on the next `alf sync`.
+/// Test-only compatibility seam that prepares caller input and then encrypts
+/// and upserts it without writing stdout. Production callers use
+/// [`prepare_add_input`] before L3 and [`add_prepared_core`] while holding it.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_core(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    username: Option<&str>,
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    secret_json: Option<&Path>,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    fields: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<AddResult> {
+    let prepared = prepare_add_input(username, secret, secret_file, secret_json, fields)?;
+    add_prepared_core(
+        input,
+        service,
+        credential_type,
+        prepared,
+        label,
+        description,
+        tags,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )
+}
+
+/// Add a credential whose caller-owned input has already been prepared. For a
+/// default target, callers hold the shared L3 guard before entering here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_prepared_core(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    prepared: PreparedAddInput,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<AddResult> {
+    // 1. Resolve the target vault file.
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    if target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("alf"))
+        .unwrap_or(false)
+    {
+        bail!(
+            "Cannot add a credential into a .alf archive in place. \
+             Pass --in PATH to a credentials.json file."
+        );
+    }
+
+    // 2. Encrypt under the resolved key.
+    let payload = prepared.payload;
     let (key, source) = vault_key::resolve_required(key_args, runtime, scope)?;
     output::progress(&format!(
         "Encrypting with key from {} (fingerprint {})",
@@ -377,7 +436,7 @@ pub(crate) fn add_core(
     };
     let record_label = label
         .map(str::to_string)
-        .or_else(|| payload_username.clone());
+        .or_else(|| payload.username.clone());
 
     // Every agent-added record carries `alf-vault` — the discriminator the
     // OpenClaw adapter uses to route records back to this file on import.
@@ -404,7 +463,7 @@ pub(crate) fn add_core(
         extra: std::collections::HashMap::new(),
     };
 
-    // 4. Load the existing document (empty when the file is absent) and upsert.
+    // 3. Load the existing document (empty when the file is absent) and upsert.
     let mut doc = if target.is_file() {
         load_credentials_document(&target)?
     } else {
@@ -442,7 +501,7 @@ pub(crate) fn add_core(
         doc.credentials.push(record.clone());
     }
 
-    // 5. Write back atomically with owner-only permissions (the file holds
+    // 4. Write back atomically with owner-only permissions (the file holds
     //    ciphertext, but tightening to 0600 matches the vault key file; the
     //    atomic temp+rename means a crash can never truncate the vault).
     if let Some(parent) = target.parent() {
@@ -487,18 +546,60 @@ pub fn add(
     key_args: &VaultKeyArgs,
     runtime: &str,
 ) -> Result<()> {
-    let result = add_core(
+    // Preserve the caller-owned archive rejection before falling back to stdin:
+    // an invalid --in must not unexpectedly wait for a secret prompt.
+    if input.is_some_and(|path| {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("alf"))
+    }) {
+        bail!(
+            "Cannot add a credential into a .alf archive in place. \
+             Pass --in PATH to a credentials.json file."
+        );
+    }
+    let prepared = prepare_add_input(username, secret, secret_file, secret_json, fields)?;
+    add_prepared(
         input,
         service,
         credential_type,
-        username,
-        secret,
-        secret_file,
-        secret_json,
+        prepared,
         label,
         description,
         tags,
-        fields,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )
+}
+
+/// Print the result of adding already-prepared caller input. Direct CLI default
+/// actions call this only after they have acquired L3.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_prepared(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    prepared: PreparedAddInput,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    let result = add_prepared_core(
+        input,
+        service,
+        credential_type,
+        prepared,
+        label,
+        description,
+        tags,
         agent_id,
         scope,
         update,

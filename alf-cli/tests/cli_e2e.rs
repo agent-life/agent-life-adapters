@@ -1589,6 +1589,201 @@ fn concurrent_default_vault_add_blocks_on_shared_lock_and_preserves_records() {
     assert_eq!(services.len(), 2, "exactly the two records, no loss");
 }
 
+/// RF-012 (DoD): rotation and add contend on the same real process lock. The
+/// winner is intentionally unspecified; whichever runs second must re-read the
+/// final key/vault state, leaving both records decryptable with the one default
+/// key and no abandoned staged key.
+#[test]
+fn concurrent_default_vault_rotation_and_add_leave_a_coherent_vault() {
+    use fs2::FileExt;
+    use std::process::{Command as StdCommand, Stdio};
+    use std::time::Duration;
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-1111-4111-8111-0000000000ab";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+
+    alf_cmd()
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "email",
+            "--label",
+            "before-rotation",
+            "--secret",
+            "old-secret",
+        ])
+        .assert()
+        .success();
+
+    let lock_path = home.join(".alf").join("state").join(format!("{id}.lock"));
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    let mut rotate = StdCommand::new(env!("CARGO_BIN_EXE_alf"))
+        .env("HOME", &home)
+        .args(["vault", "rotate-key", "-r", "openclaw"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut add = StdCommand::new(env!("CARGO_BIN_EXE_alf"))
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "slack",
+            "--label",
+            "during-rotation",
+            "--secret",
+            "new-secret",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    std::thread::sleep(Duration::from_millis(800));
+    assert!(
+        rotate.try_wait().unwrap().is_none(),
+        "rotation must wait for L3"
+    );
+    assert!(add.try_wait().unwrap().is_none(), "add must wait for L3");
+    fs2::FileExt::unlock(&lock_file).unwrap();
+    assert!(rotate.wait().unwrap().success(), "rotation must complete");
+    assert!(add.wait().unwrap().success(), "add must complete");
+
+    for (label, expected) in [
+        ("before-rotation", "old-secret"),
+        ("during-rotation", "new-secret"),
+    ] {
+        let assert = alf_cmd()
+            .env("HOME", &home)
+            .args([
+                "vault",
+                "decrypt",
+                "-r",
+                "openclaw",
+                "--label",
+                label,
+                "--yes-insecure",
+            ])
+            .assert()
+            .success();
+        assert_eq!(json_stdout(&assert)["payload"]["secret"], expected);
+    }
+    assert!(
+        !agent_key(&home, id)
+            .with_file_name(".alf-vault-key.new")
+            .exists(),
+        "a normal contended rotation must not leave an unreconciled staged key"
+    );
+}
+
+/// RF-012 (DoD): a real default-vault mutation that outlives the production
+/// bounded wait reports `agent_busy` and leaves both canonical vault and key
+/// bytes exactly unchanged. The production timeout is deliberately exercised
+/// here; no release-only timeout override weakens the contract.
+#[test]
+fn default_vault_lock_timeout_leaves_canonical_bytes_unchanged() {
+    use fs2::FileExt;
+    use std::process::Command as StdCommand;
+    use std::time::{Duration, Instant};
+
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    let id = "cfef1150-1111-4111-8111-0000000000ac";
+    write_config(&home, false, None, &[("main", id, &ws, true)]);
+    keygen_at(&home, &agent_key(&home, id));
+    alf_cmd()
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "email",
+            "--label",
+            "before-timeout",
+            "--secret",
+            "stable",
+        ])
+        .assert()
+        .success();
+
+    let vault_path = agent_vault(&home, id);
+    let key_path = agent_key(&home, id);
+    let vault_before = fs::read(&vault_path).unwrap();
+    let key_before = fs::read(&key_path).unwrap();
+    let lock_path = home.join(".alf").join("state").join(format!("{id}.lock"));
+    fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    lock_file.lock_exclusive().unwrap();
+
+    let started = Instant::now();
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_alf"))
+        .env("HOME", &home)
+        .args([
+            "vault",
+            "add",
+            "-r",
+            "openclaw",
+            "--service",
+            "slack",
+            "--label",
+            "must-not-write",
+            "--secret",
+            "new-value",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        started.elapsed() >= Duration::from_secs(9),
+        "the mutation must wait for the bounded L3 acquisition before failing"
+    );
+    assert!(!output.status.success(), "held L3 must reject the mutation");
+    let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["code"], "agent_busy", "lock timeout must stay coded");
+    assert_eq!(
+        fs::read(&vault_path).unwrap(),
+        vault_before,
+        "vault changed on timeout"
+    );
+    assert_eq!(
+        fs::read(&key_path).unwrap(),
+        key_before,
+        "key changed on timeout"
+    );
+    fs2::FileExt::unlock(&lock_file).unwrap();
+}
+
 /// E-2: the secret can arrive on stdin (no --secret flag on the argv secret
 /// surface) and round-trips through a bare decrypt.
 #[test]

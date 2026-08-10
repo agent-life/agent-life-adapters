@@ -88,19 +88,57 @@ pub fn import(
     // tree over B's files (mirrors `ensure_workspace_agent_id` / the
     // `import_agent` fail-closed check, which the direct `restore.rs` call path
     // would otherwise skip).
+    //
+    // RF-017: only a genuinely absent pin (NotFound) counts as unpinned. An
+    // unreadable, non-regular (directory/symlink/dangling-symlink), or
+    // malformed pin must fail closed here — never collapse to "absent" and let
+    // the overlay proceed, which would erase the corrupted guard behind a fresh
+    // valid pin and hide that identity verification never happened.
     let id_file = workspace.join(alf_core::AGENT_ID_FILE);
-    if let Some(existing) = fs::read_to_string(&id_file)
-        .ok()
-        .and_then(|s| Uuid::parse_str(s.trim()).ok())
-    {
-        if existing != agent_id {
-            anyhow::bail!(
-                "Agent identity drift: {} is pinned to {existing} but the archive \
-                 belongs to {agent_id}. Refusing to overlay a different agent's data. \
-                 To deliberately re-home this workspace: echo {agent_id} > {}",
-                id_file.display(),
-                id_file.display()
-            );
+    match fs::symlink_metadata(&id_file) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Genuinely absent: unpinned workspace. The pin is written after a
+            // successful overlay, below.
+        }
+        Err(e) => {
+            return Err(anyhow::Error::new(e))
+                .with_context(|| format!("Failed to read agent pin {}", id_file.display()));
+        }
+        Ok(meta) => {
+            let ft = meta.file_type();
+            if !ft.is_file() {
+                let kind = if ft.is_symlink() {
+                    "a symlink"
+                } else if ft.is_dir() {
+                    "a directory"
+                } else {
+                    "a special file"
+                };
+                anyhow::bail!(
+                    "Agent pin {} is {kind}, not a regular file. Refusing to overlay \
+                     a different agent's data behind an unverifiable identity guard. \
+                     Repair or remove it, then restore again.",
+                    id_file.display()
+                );
+            }
+            let raw = fs::read_to_string(&id_file)
+                .with_context(|| format!("Failed to read agent pin {}", id_file.display()))?;
+            let existing = Uuid::parse_str(raw.trim()).with_context(|| {
+                format!(
+                    "Agent pin {} is not a valid UUID. Refusing to overlay behind a \
+                     malformed identity guard.",
+                    id_file.display()
+                )
+            })?;
+            if existing != agent_id {
+                anyhow::bail!(
+                    "Agent identity drift: {} is pinned to {existing} but the archive \
+                     belongs to {agent_id}. Refusing to overlay a different agent's data. \
+                     To deliberately re-home this workspace: echo {agent_id} > {}",
+                    id_file.display(),
+                    id_file.display()
+                );
+            }
         }
     }
 

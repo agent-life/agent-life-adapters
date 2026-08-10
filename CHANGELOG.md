@@ -1,6 +1,6 @@
 ## [1.1.0] — 2026-07-08
 
-First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additive throughout — no wire-format, backend, or web changes. The openclaw/zeroclaw/hermes export/import/sync happy paths and the archive bytes they produce are unchanged (goal c); a handful of CLI behaviors changed deliberately alongside the train — see **Changed** below. See `docs/alf-mcp-server-design.md`.
+First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additive on the wire — no wire-format, backend, or web changes; the openclaw/zeroclaw/hermes export/import/sync happy paths and the archive bytes they produce are unchanged (goal c). **Not additive at every contract**: a handful of CLI behaviors and error codes changed deliberately — most as security fixes carried under the documented security exception in `RELEASING.md` — see **Changed** below and the Rust source-compatibility note under **Version bumps**. See `docs/alf-mcp-server-design.md`.
 
 > ### ⚠️ Read this first if you have ever run `alf restore --at-sequence N`
 >
@@ -47,6 +47,7 @@ First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additiv
 ### Version bumps
 
 - `alf-core` 1.0.0 → 1.1.0 (`chunk` module; `Adapter::watch_paths`), `adapter-openclaw` / `adapter-zeroclaw` / `adapter-hermes` 1.0.0 → 1.1.0 (`watch_paths` impls), **`adapter-generic` 1.1.0** (new crate, versioned with the train), `alf-cli` 1.0.0 → 1.1.0 (`mcp` module: rmcp 2.1 + schemars 1 + notify 6 + fs2, the watch loop, doc embedding). New optional build feature `fault-injection` (test-only crash seam; compiles out of the default/release binary).
+- **Rust source compatibility (release-owner decision, RF-014, 2026-08-09: breaks accepted and documented — the train stays 1.1.0).** Three source-level breaks exist for git-dependency consumers of the 1.0 crates: `ImportOptions` gained the `pub preview: bool` field (exhaustive 1.0 struct literals stop compiling; `..Default::default()` literals are unaffected), the public OpenClaw/Hermes/ZeroClaw `import` free functions gained a positional `preview` argument, and `IncludeList`/`IncludeEntry` gained a `pub extra` unknown-field passthrough. These crates are not published to any registry; the only known downstream (`agent-life-service`) pins `alf-core` tag `v0.1.10`, which none of these changes affect, and that pin is deliberately not bumped by this train (see the `alf-core` bullet under **Added**). The `preview` plumbing carries this release's preview-containment security fixes (see the vault warning above) and falls under the `RELEASING.md` security exception — reverting it for source compatibility would re-open that surface. Third-party `Adapter` implementors compiling against 1.1 should audit their preview handling explicitly: a preview-unaware import path must fail closed, never fall through to a live import.
 
 ## [1.0.0] — 2026-07-03
 

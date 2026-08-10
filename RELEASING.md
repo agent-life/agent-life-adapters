@@ -30,6 +30,7 @@ Since 1.0.0 (the format spec and the JSON output contract are committed):
 - **patch** (`1.1.0` → `1.1.1`): bug fixes, internal refactors, no contract change.
 - **minor** (`1.1.x` → `1.2.0`): additive features — new commands, flags, JSON fields, MCP tools. Existing callers keep working.
 - **major** (`1.x` → `2.0.0`): a breaking change to CLI flags, exit codes, the JSON output contract, or the archive format.
+- **Security exception (documented, release-owner-approved):** when existing behavior is itself a security or data-loss defect, the fix may change behavior, error codes, or (for these unpublished crates) Rust source compatibility inside a **minor** release instead of forcing a major — restoring bug-compatibility is never required. Each exception must be called out in the CHANGELOG's **Changed** / **Version bumps** entries with migration notes, and recorded with the release evidence. (First applied: 1.1.0 — the `restore --at-sequence` preview-containment train and its `ImportOptions.preview` plumbing; decision RF-014, 2026-08-09.)
 
 ### Skill (`agent-life` on ClawHub)
 

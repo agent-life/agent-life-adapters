@@ -585,6 +585,26 @@ fn tool_result_with_schema(
     (result, schema)
 }
 
+/// Wait (bounded) until the watch loop reports active. `serve()` spawns
+/// `run_loop` CONCURRENTLY with the protocol handler and installs no readiness
+/// barrier, so on a slow/contended host (CI) the loop may not have reached
+/// `set_active(true)` by the time the first tool call lands — `alf_watch_set`
+/// would then tool-error with "unknown startup failure" (its `is_active()` gate,
+/// with no recorded `inactive_reason` because startup had neither finished nor
+/// bailed). The success-path assertion must gate on the same condition the tool
+/// checks: `alf_status` surfaces `handle.is_active()` as `watch.active` (its
+/// stanza uses the default inactive shape until the handle is active).
+fn wait_for_watch_active(conv: &mut Conversation) {
+    for _ in 0..200 {
+        let status = conv.call(50, "alf_status", json!({}));
+        if status["structuredContent"]["watch"]["active"] == json!(true) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("watch loop never became active within the readiness timeout");
+}
+
 fn run_success_schema_case(scenario: ToolSchemaScenario) -> (Value, Value) {
     match scenario {
         ToolSchemaScenario::Status => {
@@ -682,7 +702,9 @@ fn run_success_schema_case(scenario: ToolSchemaScenario) -> (Value, Value) {
                 Conversation::start_with_backend(&backend.url()),
                 "alf_watch_set",
                 json!({"default_interval":"20m"}),
-                |_| {},
+                // The watch loop starts asynchronously; steer it only once it is
+                // active, or the success assertion races startup (CI flake).
+                wait_for_watch_active,
             )
         }
     }

@@ -6,7 +6,7 @@
 //! 1. `--vault-key-file PATH`           (explicit file)
 //! 2. `--vault-key-env VAR` / `ALF_VAULT_KEY` env (base64 key)
 //! 3. Default file for the runtime + agent scope
-//!    (`~/.{openclaw|zeroclaw}/state/{alf_agent_id}/.alf-vault-key`, or the
+//!    (`~/.{openclaw|zeroclaw|hermes}/state/{alf_agent_id}/.alf-vault-key`, or the
 //!    legacy `~/.{rt}/state/.alf-vault-key` when no agent scope applies)
 //!
 //! Modules outside this file must never read the key bytes directly —
@@ -128,7 +128,7 @@ fn load_from_file(path: &Path) -> Result<VaultKey> {
 
 /// Path of the default vault key file for a runtime + agent scope.
 ///
-/// `(openclaw|zeroclaw, Some(id))` → `~/.{rt}/state/{id}/.alf-vault-key`;
+/// `(openclaw|zeroclaw|hermes, Some(id))` → `~/.{rt}/state/{id}/.alf-vault-key`;
 /// `(.., None)` → the legacy `~/.{rt}/state/.alf-vault-key`. Returns
 /// `Ok(None)` for unknown runtimes (no default file applies).
 pub fn default_key_path(runtime: &str, agent: Option<Uuid>) -> Result<Option<PathBuf>> {

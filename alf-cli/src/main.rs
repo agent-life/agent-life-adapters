@@ -60,7 +60,7 @@ enum Command {
         long_about = "Export reads the agent workspace (SOUL.md, config, principals, etc.) \
         and writes a single .alf archive. Reads from the workspace path; writes to the given \
         output file or ./<agent-name>.alf by default.\n\n\
-        Layer 4 (credentials) is the agent's explicit ALF vault (~/.alf/vault/credentials.json), \
+        Layer 4 (credentials) is the agent's explicit ALF vault (~/.alf/vault/<alf-agent-id>/credentials.json), \
         already AEAD-encrypted by `alf vault add` — export never reads a vault key.\n\n\
         Example: alf export -r openclaw -w ./my-agent -o backup.alf"
     )]
@@ -85,8 +85,10 @@ enum Command {
     /// Track an arbitrary workspace file so sync includes it
     #[command(
         long_about = "Add records a workspace file in the agent's include list \
-        (.alf-include.json) so the next `alf sync` includes it under raw/openclaw/. \
-        ALF does not auto-discover arbitrary files — the agent opts each one in \
+        (.alf-include.json) so the next `alf sync` includes it under raw/<runtime>/. \
+        Beyond each adapter's built-in collection (the OpenClaw adapter also captures \
+        every workspace .md file automatically; .alfignore applies), ALF does not \
+        auto-discover arbitrary files — the agent opts each one in \
         explicitly. The path is interpreted relative to the workspace.\n\n\
         Deleting the file and running `alf sync` removes it from the include list \
         and appends a note to .alf-sync-log.md.\n\n\
@@ -202,7 +204,7 @@ enum Command {
         #[arg(long, conflicts_with = "agent")]
         all: bool,
 
-        /// Pull cloud snapshot + deltas to repair a missing local base snapshot
+        /// Pull cloud snapshot + deltas to repair a missing or diverged local base snapshot
         #[arg(long)]
         recover: bool,
 
@@ -303,7 +305,7 @@ enum Command {
 
     /// Check the runtime environment and report readiness to sync
     #[command(
-        long_about = "Check inspects the OpenClaw (or ZeroClaw) environment and reports \
+        long_about = "Check inspects the runtime environment (openclaw, zeroclaw, hermes, generic) and reports \
         whether alf can find the workspace, memory files, API key, and service. \
         Use this before sync to diagnose configuration issues.\n\n\
         Check also discovers the install's agents and records them in the [[agents]] \
@@ -346,7 +348,7 @@ enum Command {
     /// Show help (overview, status, files, troubleshoot, or per-command)
     #[command(
         long_about = "Topics: overview (default), status, files, troubleshoot, or a command name \
-        (export, import, sync, restore, purge, validate, login, check). \
+        (export, import, sync, restore, purge, validate, vault, login, check, agents). \
         Status output is JSON by default; use --human for text."
     )]
     Help {
@@ -509,7 +511,7 @@ enum VaultCommand {
         --label me@agent-life.run --tag agent-provisioned --update"
     )]
     Add {
-        /// Vault file to append to [default: ~/.alf/vault/credentials.json]
+        /// Vault file to append to [default: the agent's vault at ~/.alf/vault/<alf-agent-id>/credentials.json]
         #[arg(short = 'i', long = "in")]
         input: Option<PathBuf>,
 
@@ -561,7 +563,7 @@ enum VaultCommand {
         #[arg(long)]
         update: bool,
 
-        /// Runtime for default key + vault path resolution (openclaw, zeroclaw, hermes).
+        /// Runtime for default key + vault path resolution (openclaw, zeroclaw, hermes, generic).
         #[arg(short, long, default_value = "openclaw")]
         runtime: String,
 

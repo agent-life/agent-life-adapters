@@ -3,13 +3,14 @@
 //!
 //! Stored as `<workspace>/.alf-include.json` and itself preserved in
 //! `raw/{runtime}/`, so the list (the agent's sync config) and the sync log
-//! travel on restore. ALF never auto-discovers arbitrary files — the agent
-//! declares intent explicitly.
+//! travel on restore. Outside each adapter's built-in collection (OpenClaw
+//! also auto-captures every workspace `.md`), ALF never auto-discovers
+//! arbitrary files — the agent declares intent explicitly.
 //!
 //! This module is runtime-agnostic: it deals only in workspace-relative paths
 //! and two sentinel file names, with no knowledge of any framework's layout.
 //! It lives in `alf-core` so every adapter (and the CLI) can share one
-//! implementation — see the OpenClaw and ZeroClaw adapters' `export`.
+//! implementation — see the adapters' `export` (openclaw, zeroclaw, hermes, generic).
 
 use std::collections::HashMap;
 use std::fs;

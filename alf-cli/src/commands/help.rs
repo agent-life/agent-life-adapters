@@ -79,15 +79,18 @@ fn print_overview() -> Result<()> {
     println!("  Portable backup, sync, and migration for AI agents.");
     println!();
     println!("Commands:");
+    println!("  check      Check the runtime environment and report readiness to sync");
     println!("  export     Export an agent workspace to an .alf archive");
+    println!("  add        Track an arbitrary workspace file so sync includes it");
     println!("  import     Import an .alf archive into an agent workspace");
     println!("  validate   Validate an .alf archive against the ALF specification");
-    println!("  vault      Layer 4 credentials: keygen, encrypt, decrypt, list, delete");
+    println!("  vault      Layer 4 credentials: keygen, encrypt, add, decrypt, list, delete, rotate-key, migrate");
     println!("  sync       Incremental sync to the cloud");
     println!("  restore    Download and restore from the cloud");
     println!("  agents     List discovered agents and enable/disable them for sync");
     println!("  purge      Remove cloud sync data and agent registration");
     println!("  login      Authenticate with the agent-life service");
+    println!("  mcp        Run an MCP (Model Context Protocol) server over stdio");
     println!("  help       Show this help (alf help [topic])");
     println!();
     println!("Where alf stores data:");
@@ -276,6 +279,14 @@ fn print_files() -> Result<()> {
         "  {}/state/{{agent-id}}-snapshot.alf   Last exported snapshot (delta base)",
         status.config_dir.display()
     );
+    println!(
+        "  {}/vault/{{agent-id}}/credentials.json   Encrypted credentials vault (ciphertext only)",
+        status.config_dir.display()
+    );
+    println!(
+        "  {}/preview/{{agent-id}}/seq-{{N}}/   Point-in-time restore previews (3 newest kept)",
+        status.config_dir.display()
+    );
     println!();
     println!("Config and state are created when you run 'alf login' and 'alf sync'.");
     Ok(())
@@ -297,7 +308,7 @@ fn print_troubleshoot() -> Result<()> {
     println!("    Ensure the path exists and is the agent workspace (e.g. contains SOUL.md or config.toml).");
     println!();
     println!("  Unknown runtime");
-    println!("    Supported runtimes: openclaw, zeroclaw.");
+    println!("    Supported runtimes: openclaw, zeroclaw, hermes, generic.");
     Ok(())
 }
 

@@ -64,7 +64,7 @@ For production use, pin to a specific release:
 
     ALF_VERSION=v1.1.0 sh install-alf.sh
 
-Pin only to a release you have validated, and **never below `v1.0.0`** — earlier `v0.1.x` binaries carry a vault-handling defect. Downgrading past it risks your local credential vault.
+Pin only to a release you have validated, and **never below `v1.1.0`** — `v0.1.x` binaries carry a vault-handling defect, and on `v1.0.x` a point-in-time preview (`--at-sequence`) could overwrite the live credentials vault (see the CHANGELOG's 1.1.0 warning). Downgrading past `v1.1.0` risks your local credential vault.
 
 Verify: `alf --version`
 
@@ -137,7 +137,7 @@ Export creates a local `.alf` archive, then sync uploads it to the cloud:
 
 Export output:
 
-    {"ok":true,"output":"agent-export.alf","agent_name":"Atlas","alf_version":"1.0.0-rc.1","memory_records":47,"file_size":102400,"excluded_by_alfignore":0}
+    {"ok":true,"output":"agent-export.alf","agent_name":"Atlas","alf_version":"1.0.0","memory_records":47,"file_size":102400,"excluded_by_alfignore":0}
 
 Sync output (first sync — full snapshot):
 
@@ -184,6 +184,8 @@ Output lists the files that would be written, without creating them:
 **Option 2: Point-in-time preview** — fetch a specific historical sequence and inspect it without updating local sync state. `~/.alf/state` is not touched, so a later regular `alf sync` is unaffected:
 
     alf restore -r openclaw -w <workspace> --at-sequence 5
+
+The preview materializes into `~/.alf/preview/<agent-id>/seq-5/` (the JSON result's `preview_path`), **not** into the `-w` workspace — inspect that directory.
 
 **Option 3: Restore to a fresh path first** — restore to a scratch directory, inspect it, then promote it:
 

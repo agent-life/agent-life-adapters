@@ -659,7 +659,7 @@ fn build_suggestions(result: &CheckResult) -> Vec<String> {
         ));
     } else {
         if result.issues.iter().any(|i| i.code == "no_api_key") {
-            suggestions.push("Get an API key at https://agent-life.ai/settings/api-keys".into());
+            suggestions.push("Get an API key at https://agent-life.ai/agents/api-keys".into());
         }
         if result
             .issues

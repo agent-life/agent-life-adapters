@@ -72,12 +72,12 @@ fn login_interactive() -> Result<()> {
         println!();
         println!("    alf login --key <your-api-key>");
         println!();
-        println!("  To get an API key, visit: https://agent-life.ai/settings/api-keys");
+        println!("  To get an API key, visit: https://agent-life.ai/agents/api-keys");
     } else {
         output::json(&serde_json::json!({
             "ok": false,
             "error": "Interactive login not yet implemented. Use: alf login --key <your-api-key>",
-            "hint": "Get an API key at https://agent-life.ai/settings/api-keys"
+            "hint": "Get an API key at https://agent-life.ai/agents/api-keys"
         }));
     }
 

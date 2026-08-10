@@ -7,6 +7,8 @@
 
 This repository contains the ALF core library and framework-specific adapters for the [agent-life](https://agent-life.ai) project. It produces the `alf` command-line tool — a single binary that can export, import, and sync AI agent data across frameworks using the [Agent Life Format (ALF)](https://github.com/agent-life/agent-life-data-format).
 
+> **Security disclosure.** Found a security vulnerability? Email **[info@agent-life.ai](mailto:info@agent-life.ai)** — please **do not open a public issue**. This project's premise is zero-knowledge credential encryption, so we take reports seriously and aim to respond promptly. Machine-readable contact: [`/.well-known/security.txt`](https://agent-life.ai/.well-known/security.txt).
+
 ---
 
 ## Project Overview

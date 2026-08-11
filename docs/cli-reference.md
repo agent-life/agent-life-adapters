@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 1.0.0 | Updated: 2026-07-03
+> Version: 1.1.0 | Updated: 2026-08-09
 > HTML: <https://agent-life.ai/docs/cli>
 > Markdown: <https://agent-life.ai/docs/cli.md>
 
@@ -15,7 +15,7 @@
 | `--human` | `ALF_HUMAN=1` | off | Switch stdout from JSON to human-readable text |
 | `--agent ALIAS_OR_ID` | `ALF_AGENT` | sole enabled agent | Select the agent to operate on (see [Agent selection](#agent-selection)) |
 
-All commands output structured JSON to stdout by default. Progress messages go to stderr.
+All commands output structured JSON to stdout by default (`alf help`'s prose topics — overview/files/troubleshoot — are the one exception; `alf help status` is JSON). Progress messages go to stderr.
 Use `--human` (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
 
 ### Agent selection
@@ -24,7 +24,7 @@ An install can host several agents. `alf check` discovers them and records one
 `[[agents]]` row per agent in `~/.alf/config.toml` (each row carries a stable
 `alf_agent_id`, the runtime alias, the workspace, and an `enabled` flag — the only
 field users edit). Agent-scoped commands (`sync`, `export`, `import`, `add`,
-`restore`, `purge`, `vault add`/`encrypt`) pick the current agent by precedence:
+`restore`, `purge`, the `vault` subcommands, and `mcp serve`) pick the current agent by precedence:
 
 1. `--agent <alias-or-id>` (global flag; long-only)
 2. non-empty `ALF_AGENT` environment variable
@@ -41,10 +41,11 @@ tracked agent in `~/.alf/state/`.
 
 | Variable | Effect |
 |---|---|
-| `ALF_HOME` | Overrides the home base alf derives its paths from. When set, `~/.alf` (config, sync state, vault) and `~/.openclaw` / `~/.zeroclaw` are resolved under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts the config at `/data/.alf/config.toml`. Use it when the agent's `$HOME` is unstable. Unset ⇒ falls back to `$HOME` (`%USERPROFILE%` on Windows), i.e. the original behavior. |
+| `ALF_HOME` | Overrides the home base alf derives its paths from. When set, `~/.alf` (config, sync state, vault) and the runtime homes (`~/.openclaw` / `~/.zeroclaw` / `~/.hermes`) are resolved under `$ALF_HOME` instead of `$HOME` — e.g. `ALF_HOME=/data` puts the config at `/data/.alf/config.toml`. Use it when the agent's `$HOME` is unstable. Unset ⇒ falls back to `$HOME` (`%USERPROFILE%` on Windows), i.e. the original behavior. |
 | `ALF_HUMAN` | `1` switches stdout from JSON to human-readable text (same as `--human`). |
 | `ALF_AGENT` | Agent alias-or-id used when `--agent` is omitted (see [Agent selection](#agent-selection)). |
 | `ALF_API_KEY` | API key, used when `service.api_key` is absent from `~/.alf/config.toml`. |
+| `ALF_API_URL` | Service URL fallback, used when `service.api_url` is absent from `~/.alf/config.toml` (a URL in the config file wins). |
 | `ALF_VAULT_KEY` | Default env var name for a base64 vault key (see [Vault key flags](#vault-key-flags)). |
 
 ## Runtime and workspace defaults
@@ -63,7 +64,10 @@ additionally falls back to `~/.openclaw/openclaw.json` then `~/.openclaw/workspa
 Because of this, the per-command "Required" columns mark `-r`/`-w` as **No**: they are mandatory
 on the command line only when no config default is set.
 
-Supported runtimes are `openclaw`, `zeroclaw`, and `hermes`. For `hermes` the workspace *is* the
+Supported runtimes are `openclaw`, `zeroclaw`, `hermes`, and `generic`. The `generic` runtime has
+no auto-discovery — it is driven by a `.alf-map.json` at the workspace root (see
+[The generic runtime map file](#the-generic-runtime-map-file-alf-mapjson)) and requires an explicit
+workspace. For `hermes` the workspace *is* the
 profile home (`HERMES_HOME`, default `~/.hermes`; named profiles under `~/.hermes/profiles/<name>/`),
 and `alf check` defaults `-w` to `$HERMES_HOME` or `~/.hermes`. One profile is one agent — one `.alf`.
 
@@ -81,8 +85,9 @@ and `alf check` defaults `-w` to `$HERMES_HOME` or `~/.hermes`. One profile is o
 | `alf purge` | Delete cloud sync data and agent registration | Yes |
 | `alf import` | .alf archive → workspace | No |
 | `alf validate` | Validate .alf archive | No |
-| `alf vault` | Layer 4 vault: keygen, add/encrypt/decrypt/list/delete credentials | No (add/encrypt/decrypt need a key) |
+| `alf vault` | Layer 4 vault: keygen, add/encrypt/decrypt/list/delete, rotate-key, migrate | No (add/encrypt/decrypt/rotate-key need a key) |
 | `alf help` | Help topics and status | No |
+| `alf mcp serve` | Run the stdio MCP server (13 tools + background watch loop) | Yes (for the sync/restore tools) |
 
 ### Vault key flags
 
@@ -99,7 +104,7 @@ ciphertext, so export/sync copy it verbatim (see [`alf vault`](#alf-vault)).
 | `--vault-key-file PATH` | File with base64-encoded 32-byte key |
 | `--vault-key-env VAR` | Env var name holding base64 key (default var: `ALF_VAULT_KEY`) |
 
-Default key file if none of the above apply: `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` for the selected agent (openclaw/zeroclaw; hermes has no default key path yet), falling back to the legacy install-scoped `~/.<runtime>/state/.alf-vault-key` only when no agent is mapped.
+Default key file if none of the above apply: `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` for the selected agent (openclaw/zeroclaw/hermes), falling back to the legacy install-scoped `~/.<runtime>/state/.alf-vault-key` only when no agent is mapped. The `generic` runtime has no default key path for plain CLI vault commands (pass `--vault-key-file` or `ALF_VAULT_KEY`); `alf mcp serve` auto-generates `~/.alf/vault-keys/<alf-agent-id>.key` when no key resolves.
 
 ---
 
@@ -116,23 +121,28 @@ Run this first before any other command — it tells you whether sync will work 
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Workspace path (auto-discovered if omitted) |
 
 ### Workspace Auto-Discovery
 
-When `-w` is omitted, the workspace is resolved in this order:
+When `-w` is omitted, the workspace is resolved per runtime. For **openclaw**:
 
 1. `defaults.workspace` in `~/.alf/config.toml`
 2. `agents.defaults.workspace` in `~/.openclaw/openclaw.json`
 3. `~/.openclaw/workspace` (default)
 
-The `workspace.source` field in the output reports which method was used: `"flag"`, `"alf_config"`, `"openclaw.json"`, or `"default"`.
+For **zeroclaw**: `workspace_dir` in `~/.zeroclaw/config.toml`, then `~/.zeroclaw`.
+For **hermes**: `$HERMES_HOME`, then `~/.hermes`. The **generic** runtime never
+auto-discovers — without `-w` (or `[defaults] workspace`) it reports `"unresolved"`.
+
+The `workspace.source` field in the output reports which method was used: `"flag"`, `"alf_config"`, `"openclaw.json"`, `"zeroclaw_config"`, `"hermes_env"`, `"default"`, or `"unresolved"`.
 
 ### JSON Output (success)
 
     {
       "ok": true,
+      "version": "1.1.0",
       "runtime": "openclaw",
       "ready_to_sync": true,
       "workspace": {
@@ -172,7 +182,7 @@ The `workspace.source` field in the output reports which method was used: `"flag
         "alf_vault_key_set": false
       },
       "vault": {
-        "path": "/home/user/.alf/vault/credentials.json",
+        "path": "/home/user/.alf/vault/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/credentials.json",
         "exists": true,
         "credential_count": 3,
         "server_credential_count": 3,
@@ -185,8 +195,9 @@ The `workspace.source` field in the output reports which method was used: `"flag
 Field notes:
 
 - `version` — the `alf` CLI version (`CARGO_PKG_VERSION`), distinct from the archive's `alf_version` format version.
-- `env` — `home`, `alf_home`, and `alf_human` are omitted when the corresponding variable is unset. The three `*_set` booleans report **presence only**; secret values are never included in the output.
-- `vault` — `path` honors `ALF_HOME`; `credential_count` is omitted when the vault file is absent or unparseable (`exists` still reflects the file's presence). `server_credential_count` is the service's delta-folded count from `GET /v1/agents/:id`, and `parity_ok` is whether it matches the local count — both omitted when the service is unreachable or no agent is tracked. When `parity_ok` is `false`, a `vault_not_synced` warning is added to `issues[]` whose suggestion is `alf sync --recover` (the credential self-heal). Counts/ids only — no plaintext leaves the machine.
+- `env` — `home`, `alf_home`, and `alf_human` are omitted when the corresponding variable is unset. The `*_set` booleans (`alf_api_key_set`, `alf_vault_key_set`) report **presence only**; secret values are never included in the output.
+- Not shown above: an `alfignore` object (`{"present": bool}`) is always emitted, and for supported runtimes an `agents` section reports WP0 discovery (`first_run`, the discovered agent rows, `new`/`removed`/`drift` counts) — this is where the `[[agents]]` mapping recording described under [Agent selection](#agent-selection) surfaces.
+- `vault` — `path` is the selected agent's vault (`~/.alf/vault/{alf_agent_id}/credentials.json`; mapping-less hosts still report the legacy install-scoped `~/.alf/vault/credentials.json`) and honors `ALF_HOME`; `credential_count` is omitted when the vault file is absent or unparseable (`exists` still reflects the file's presence). `server_credential_count` is the service's delta-folded count from `GET /v1/agents/:id`, and `parity_ok` is whether it matches the local count — both omitted when the service is unreachable or no agent is tracked. When `parity_ok` is `false`, a `vault_not_synced` warning is added to `issues[]` whose suggestion is `alf sync --recover` (the credential self-heal). Counts/ids only — no plaintext leaves the machine.
 - `alf.last_synced_at` / `last_synced_sequence` — omitted when the agent has never synced.
 
 ### JSON Output (issues found)
@@ -202,7 +213,7 @@ Field notes:
         { "severity": "error", "code": "workspace_not_found", "message": "Workspace directory not found at ...", "suggestion": "Pass the correct workspace path: alf check -r openclaw -w /path/to/workspace" },
         { "severity": "error", "code": "no_api_key", "message": "No API key configured", "suggestion": "Run: alf login --key <your-api-key>" }
       ],
-      "suggestions": ["Get an API key at https://agent-life.ai/settings/api-keys"]
+      "suggestions": ["Get an API key at https://agent-life.ai/agents/api-keys"]
     }
 
 ### Issue Codes
@@ -219,6 +230,14 @@ Field notes:
 | `service_unreachable` | error | API endpoint not responding | Check network, API URL |
 | `openclaw_config_not_found` | info | `~/.openclaw/openclaw.json` not found | OpenClaw may not be installed |
 | `workspace_mismatch` | warning | `-w` path differs from `openclaw.json` configured path | May be intentional |
+| `agent_discovered_new` | info | Discovery found a new agent (recorded disabled) | Enable with `alf agents enable` |
+| `agent_removed` | warning | A mapped agent is no longer present in the install | Row is kept; disable or clean up manually |
+| `agent_identity_drift` | warning | Workspace `.alf-agent-id` disagrees with the mapping | Investigate before syncing (sync fails closed) |
+| `agent_id_not_persisted` | warning | The agent id could not be written to the workspace | Check workspace permissions |
+| `agents_mapping_skipped_flag_workspace` | info | `-w` pointed outside the install; discovery skipped | Run without `-w` to record the mapping |
+| `agent_discovery_failed` | warning | The adapter's agent discovery errored | See message; check install layout |
+| `vault_migration_failed` | warning | Legacy→per-agent vault migration failed | See message; `alf vault migrate` |
+| `vault_not_synced` | warning | Local vault count ≠ service count | `alf sync --recover` (credential self-heal) |
 
 ---
 
@@ -249,7 +268,7 @@ Store an API key for the agent-life sync service.
     {
       "ok": false,
       "error": "Interactive login not yet implemented. Use: alf login --key <your-api-key>",
-      "hint": "Get an API key at https://agent-life.ai/settings/api-keys"
+      "hint": "Get an API key at https://agent-life.ai/agents/api-keys"
     }
 
 ---
@@ -258,7 +277,7 @@ Store an API key for the agent-life sync service.
 
 Export an agent's complete state from a framework workspace to an `.alf` archive.
 
-**Credentials (Layer 4):** The archive's Layer 4 is the agent's ALF vault — `~/.alf/vault/credentials.json`, already AEAD-encrypted by [`alf vault add`](#alf-vault) — copied in verbatim. `export` reads no vault key and never decrypts or re-encrypts. ALF does not capture any runtime keystore.
+**Credentials (Layer 4):** The archive's Layer 4 is the agent's ALF vault — `~/.alf/vault/<alf-agent-id>/credentials.json` (legacy mapping-less installs: `~/.alf/vault/credentials.json`), already AEAD-encrypted by [`alf vault add`](#alf-vault) — copied in verbatim. `export` reads no vault key and never decrypts or re-encrypts. ALF does not capture any runtime keystore.
 
 ### Usage
 
@@ -268,9 +287,10 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
 | `--output` | `-o` | No | Output file path (default: auto-generated in current directory) |
+| `--dry-run` | | No | Preview the files that would be archived without writing anything |
 
 ### JSON Output (success)
 
@@ -278,9 +298,10 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
       "ok": true,
       "output": "/home/user/agent-export-2026-03-14.alf",
       "agent_name": "Atlas",
-      "alf_version": "1.0.0-rc.2",
+      "alf_version": "1.0.0",
       "memory_records": 47,
       "file_size": 102400,
+      "excluded_by_alfignore": 0,
       "warnings": ["2 key(s) in ~/.hermes/.env are not backed up in the ALF vault …"]
     }
 
@@ -290,7 +311,7 @@ Export an agent's complete state from a framework workspace to an `.alf` archive
 
 ## alf add
 
-Track an arbitrary workspace file so `alf sync` includes it. Known files (SOUL.md, IDENTITY.md, `memory/`…) are always covered; `alf add` extends coverage to anything else — a report, a CSV — without ALF ever auto-walking or slurping the whole workspace.
+Track an arbitrary workspace file so `alf sync` includes it. Known files (SOUL.md, IDENTITY.md, `memory/`…) are always covered; `alf add` extends coverage to anything else — a report, a CSV. Beyond each adapter's documented collection set (note: the OpenClaw adapter automatically captures **every** workspace `.md` file; `.alfignore` applies), ALF does not walk the workspace for arbitrary files — the agent opts each one in.
 
 The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synced, so it travels on restore). Tracked files are preserved byte-identically under `raw/{runtime}/` and written back on restore. Deleting a tracked file and running `alf sync` prunes it from the list and appends a note to **`.alf-sync-log.md`**.
 
@@ -303,9 +324,9 @@ The tracked set is recorded in **`<workspace>/.alf-include.json`** (itself synce
 | Flag | Short | Required | Description |
 |---|---|---|---|
 | `<path>` | | No | Path to the file to track (workspace-relative, or any path with `--external`) |
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory |
-| `--external` | | No | Track a file **outside** the workspace (e.g. a project `AGENTS.md`). Currently supported for `hermes`. |
+| `--external` | | No | Track a file **outside** the workspace (e.g. a project `AGENTS.md`). Currently supported for the `hermes` and `generic` runtimes. |
 | `--allow-root <dir>` | | No | Bless a directory as an allowed root for `--external` adds (host-local policy, never archived). Usable on its own. |
 | `--yes-external` | | No | Skip the interactive confirm for an `--external` add (only honored when the target is already under a pre-blessed root). |
 
@@ -352,7 +373,7 @@ The branching is driven by exactly two inputs: `last_synced_sequence` from `~/.a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory (default: the selected agent's mapped workspace) |
 | `--agent` | | No | Alias-or-id of the agent to sync (global flag; falls back to `ALF_AGENT`, then the sole enabled agent — see [Agent selection](#agent-selection)). Syncing a disabled agent is refused (`agent_disabled`). |
 | `--all` | | No | Sync every enabled agent sequentially, collecting per-agent results (never fail-fast). Conflicts with `--agent`. Emits one JSON object `{"ok":…,"all":true,"results":[…]}` and exits 1 when any agent failed. |
@@ -390,11 +411,13 @@ or `sole_enabled`). `changes.creates/updates/deletes` count **memory** records. 
       "ok": true,
       "sequence": 5,
       "delta": false,
-      "changes": null,
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
       "no_changes": true,
-      "recovered": false
+      "recovered": false,
+      "agent": { "runtime_agent": "main", "alf_agent_id": "a1b2c3d4-…", "source": "sole_enabled" }
     }
+
+(`changes` is omitted entirely when there is no delta — it is never `null`.)
 
 ### JSON Output (success — recovered)
 
@@ -407,7 +430,8 @@ When `--recover` ran — a missing **or** diverged base was re-pulled from the c
       "changes": { "creates": 0, "updates": 0, "deletes": 0 },
       "snapshot_path": "/home/user/.alf/state/a1b2c3d4-snapshot.alf",
       "no_changes": false,
-      "recovered": true
+      "recovered": true,
+      "agent": { "runtime_agent": "main", "alf_agent_id": "a1b2c3d4-…", "source": "sole_enabled" }
     }
 
 ### JSON Output (error — sequence conflict)
@@ -442,11 +466,19 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
 | Code | HTTP | Meaning | Fix |
 |---|---|---|---|
-| `conflict` | 409 | Base sequence mismatch | `alf restore` first, then sync again |
-| `missing_local_base` | — | State file present but `{agent_id}-snapshot.alf` is absent | `alf sync --recover` to repair the base from the cloud |
-| `agent_already_exists` | — | First sync attempted but the cloud already has this agent | `alf restore` first, or `alf sync --force-first-sync` to overwrite cloud |
-| `unauthorized` | 401 | Bad or revoked API key | `alf login --key <new-key>` |
-| `agent_limit` | 402 | Subscription agent limit reached | Upgrade at agent-life.ai |
+| `auth_failed` | 401/403 | Bad or revoked API key rejected by the service | `alf login --key <new-key>` |
+| `subscription_denied` | 402 | Subscription/agent limit reached at registration | Upgrade at agent-life.ai |
+| `sync_base_unreadable` | — | Local base snapshot exists but cannot be read | `alf sync --recover` to re-pull the base from the cloud |
+| `workspace_missing` | — | The `-w` workspace path does not exist | Pass the correct workspace path |
+| `agent_busy` | — | Another process (MCP server / watch loop) holds the agent lock | Retry after the concurrent operation finishes |
+| `agent_id_drift` | — | Workspace `.alf-agent-id` disagrees with the mapping (fails closed, pre-network) | Investigate; see [Agent selection](#agent-selection) |
+| `agent_selection_ambiguous` / `no_agents` / `agent_not_found` / `agent_disabled` | — | Agent-selection failures | Pass `--agent <alias-or-id>`; see `alf agents` |
+| `registration_failed` | — | First-sync agent registration failed | See the error message |
+| `sync_upload_failed` | — | Other upload failures (catch-all) | See the error message |
+
+Errors without a matching class (e.g. the sequence-conflict and
+already-registered messages above) keep the two-field `{error, hint}` shape —
+see [Error JSON](#error-json) for the full `code` registry.
 
 ---
 
@@ -454,7 +486,7 @@ When a first sync (no local state) is attempted but `register_agent` returns 409
 
 Download a snapshot (plus uncompacted deltas) from the service and import into a workspace.
 
-**Credentials:** Records the agent added with `alf vault add` are restored to the ALF vault (`~/.alf/vault/credentials.json`) as-is — encrypted, no key needed. A vault key is needed only to decrypt **legacy** archives whose Layer 4 came from a runtime keystore; see [Vault key flags](#vault-key-flags).
+**Credentials:** Records the agent added with `alf vault add` are restored to the ALF vault (`~/.alf/vault/<alf-agent-id>/credentials.json`) as-is — encrypted, no key needed. A vault key is needed only to decrypt **legacy** archives whose Layer 4 came from a runtime keystore; see [Vault key flags](#vault-key-flags).
 
 ### Usage
 
@@ -472,11 +504,13 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the target workspace directory (default: the selected agent's mapped workspace) |
 | `--agent` | | No | Alias-or-id (global flag; the `-a` short form was removed). An unmapped UUID is used verbatim; see [Agent selection](#agent-selection). |
 | `--with-credentials` | | No | Point-in-time previews only: also decrypt Layer 4 into the preview directory. Off by default. The live vault is never written by a preview either way. |
 | `--at-sequence` |  | No | Restore at point-in-time sequence `N`. Read-only preview; `~/.alf/state/` is not modified. |
+| `--dry-run` | | No | Preview the files that would be written; touches neither the workspace nor `~/.alf/state/` |
+| `--mode` | | No | Memory restore mode for a live per-agent store (ZeroClaw brain.db): `total` (exact, default) or `merge` (keep local-only rows) |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags); needed only to decrypt legacy archives into the runtime |
 | `--vault-key-env` | | No | |
 
@@ -503,9 +537,10 @@ Download a snapshot (plus uncompacted deltas) from the service and import into a
       "sequence": 3,
       "runtime": "openclaw",
       "memory_records": 42,
-      "workspace": "/home/user/preview-workspace",
+      "workspace": "/home/user/.alf/preview/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/seq-3",
       "preview": true,
       "at_sequence": 3,
+      "preview_path": "/home/user/.alf/preview/a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d/seq-3",
       "warnings": []
     }
 
@@ -566,7 +601,7 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the agent workspace directory (validated; not modified) |
 | `--agent` | | No | Alias-or-id (global flag; the `-a` short form was removed). See [Agent selection](#agent-selection). |
 
@@ -585,7 +620,7 @@ Remove all cloud-backed snapshot and delta blobs for an agent and delete the age
 
 Import an `.alf` archive into a framework workspace.
 
-**Credentials:** Records tagged `alf-vault` (added via `alf vault add`) are written to `~/.alf/vault/credentials.json` as-is — encrypted, no key needed; inspect them later with `alf vault list` / `decrypt`. A vault key decrypts **legacy** archives whose Layer 4 came from a runtime keystore and writes those secrets into runtime auth storage; without it, those rows are reported in `warnings`. Metadata-only (`<not-exported>`) rows are skipped.
+**Credentials:** Records tagged `alf-vault` (added via `alf vault add`) are written to `~/.alf/vault/<alf-agent-id>/credentials.json` as-is — encrypted, no key needed; inspect them later with `alf vault list` / `decrypt`. A vault key decrypts **legacy** archives whose Layer 4 came from a runtime keystore and writes those secrets into runtime auth storage; without it, those rows are reported in `warnings`. Metadata-only (`<not-exported>`) rows are skipped.
 
 ### Usage
 
@@ -595,8 +630,9 @@ Import an `.alf` archive into a framework workspace.
 
 | Flag | Short | Required | Description |
 |---|---|---|---|
-| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, or `hermes` |
+| `--runtime` | `-r` | No | `openclaw`, `zeroclaw`, `hermes`, or `generic` |
 | `--workspace` | `-w` | No | Path to the target workspace directory |
+| `--mode` | | No | Memory restore mode for a live per-agent store (ZeroClaw brain.db): `total` (exact, default) or `merge` (keep local-only rows) |
 | `--vault-key-file` | | No | See [Vault key flags](#vault-key-flags) |
 | `--vault-key-env` | | No | |
 
@@ -674,7 +710,8 @@ Manage the agent's **ALF vault** — a runtime-neutral `CredentialsDocument` of 
 | File | Path |
 |---|---|
 | Vault | `~/.alf/vault/<alf-agent-id>/credentials.json` |
-| Default key (openclaw/zeroclaw) | `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` |
+| Default key (openclaw/zeroclaw/hermes) | `~/.<runtime>/state/<alf-agent-id>/.alf-vault-key` |
+| Key (generic — auto-generated by `alf mcp serve`, no plain-CLI default) | `~/.alf/vault-keys/<alf-agent-id>.key` |
 
 The agent scope resolves like every other command: `--agent <alias-or-id>` → `ALF_AGENT` → the sole enabled `[[agents]]` row. Commands that consult a default vault path **stop and ask** (`agent_selection_ambiguous`) when several agents are enabled; commands given an explicit `--in` don't. Hosts with an empty mapping keep the legacy install-scoped paths (`~/.alf/vault/credentials.json`, `~/.<runtime>/state/.alf-vault-key`).
 
@@ -759,6 +796,7 @@ Show explorable help topics and environment status.
 | `status` | Full environment and service reachability (JSON by default) |
 | `files` | Directory layout and file locations |
 | `troubleshoot` | Common issues and fixes |
+| *(command name)* | Delegated per-command help: `export`, `import`, `sync`, `restore`, `purge`, `validate`, `vault`, `login`, `check`, `agents` |
 
 The `--json` flag on `alf help status` is still accepted for backward compatibility but is a no-op (JSON is already the default).
 
@@ -832,7 +870,7 @@ Secrets and identity are set in the server's environment **before the model runs
 
 | Variable | Required | Purpose |
 |---|---|---|
-| `ALF_API_KEY` | yes¹ | Service API key. `alf login` writes it to `~/.alf/config.toml`; the env var overrides. |
+| `ALF_API_KEY` | yes¹ | Service API key. `alf login` writes it to `~/.alf/config.toml`; the env var is the **fallback** when the config file has no key (a key in the file wins). |
 | `ALF_API_URL` | yes¹ | Service base URL (or `[service] api_url` in the config). |
 | `ALF_AGENT` | **strongly** | Pins the agent (selector precedence `--agent` ≻ `ALF_AGENT` ≻ sole-enabled). A long-lived server **must** pin explicitly — "sole-enabled" silently breaks the moment a second agent is enabled. |
 | `ALF_HOME` | no | Overrides the `~/.alf` base (config, state, vault) and `~/.{runtime}` — a stable anchor when the host rewrites `$HOME`. |
@@ -884,7 +922,7 @@ mcp_servers:
       ALF_AGENT: kleo-a1b2     # so declare every variable explicitly in the block
       ALF_API_KEY: "alf_..."
       ALF_API_URL: "https://api.agent-life.example/v1"
-      ALF_HOME: "/home/agent/.alf"
+      ALF_HOME: "/home/agent"     # the HOME BASE — alf appends .alf itself; do NOT point at ~/.alf
 ```
 
 Tools surface as `mcp_alf_*` (`mcp_alf_alf_sync`). Because Hermes strips the environment, the variables above are **required in the block** — an inherited `ALF_API_KEY` will not reach the child.
@@ -1041,7 +1079,8 @@ The same error is also written to stderr for human visibility.
 - vault (1.0.0): `vault_key_unresolved`, `vault_rotate_failed`,
   `vault_rotate_no_destination`, `vault_migration_blocked`
 - v1.1: `agent_busy`, `auth_failed`, `subscription_denied`,
-  `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`, `path_denylisted` — the first
+  `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`, `path_denylisted`,
+  `config_busy` — the first
   six are emitted by plain CLI `alf sync`/`alf restore` too, not only the MCP
   tools
 
@@ -1074,6 +1113,11 @@ Errors without a matching class keep the two-field shape.
 | Variable | Used By | Description |
 |---|---|---|
 | `ALF_HUMAN` | CLI | Set to `1` for human-readable output on stdout |
+| `ALF_HOME` | CLI | Override the home base for `~/.alf` and the runtime homes (see [Environment variables](#environment-variables)) |
+| `ALF_AGENT` | CLI | Agent alias-or-id when `--agent` is omitted |
+| `ALF_API_KEY` | CLI | API key fallback when `service.api_key` is unset |
+| `ALF_API_URL` | CLI | Service URL fallback when `service.api_url` is unset |
+| `ALF_VAULT_KEY` | CLI | Base64 vault key (default env var for [Vault key flags](#vault-key-flags)) |
 | `ALF_INSTALL_DIR` | install.sh | Override install directory |
 | `ALF_VERSION` | install.sh | Pin to a specific release tag |
 | `ALF_RELEASE_URL` | install.sh | Override GitHub release base URL (for testing) |
@@ -1088,7 +1132,7 @@ Errors without a matching class keep the two-field shape.
 
 The install script outputs JSON to stdout on completion:
 
-    {"ok":true,"version":"v0.2.0","installed_version":"alf 0.2.0","path":"/usr/local/bin/alf","checksum_verified":true}
+    {"ok":true,"version":"v1.1.0","installed_version":"alf 1.1.0","path":"/usr/local/bin/alf","checksum_verified":true}
 
 Exit codes: 0 success, 2 unsupported platform, 3 download failed, 4 checksum mismatch, 5 post-install verification failed.
 
@@ -1097,7 +1141,19 @@ Exit codes: 0 success, 2 unsupported platform, 3 download failed, 4 checksum mis
 ## File Layout
 
     ~/.alf/
-    ├── config.toml                         # API key, URL, defaults
+    ├── config.toml                         # API key, URL, defaults, [[agents]] mapping
+    ├── config.lock                         # Cross-process config write lock
+    ├── vault/
+    │   ├── {alf_agent_id}/credentials.json # Per-agent encrypted vault (legacy installs: vault/credentials.json)
+    │   └── ...
+    ├── vault-keys/
+    │   └── {alf_agent_id}.key              # Generic-runtime key, auto-generated by `alf mcp serve`
+    ├── preview/
+    │   └── {agent_id}/seq-{N}/             # Point-in-time restore previews (3 newest kept)
     └── state/
         ├── {agent_id}.toml                 # Sync cursor per agent
         └── {agent_id}-snapshot.alf         # Last snapshot (delta base)
+
+Per-agent vault keys for the supported runtimes live outside `~/.alf`, at
+`~/.{openclaw|zeroclaw|hermes}/state/{alf_agent_id}/.alf-vault-key`
+(the legacy install-scoped key was `~/.{runtime}/state/.alf-vault-key`).

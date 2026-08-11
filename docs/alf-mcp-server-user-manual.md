@@ -151,7 +151,7 @@ preview also never *decrypts*; the human CLI can opt in with
 `alf restore --at-sequence N --with-credentials`. Previews are pruned to the 3
 newest per agent, expire after 24 h, and `alf purge` removes them all.
 
-**Failures (coded).** `agent_busy` (head only); `auth_failed`; `invalid mode` (uncoded, self-describing); backend/network errors with hints. Vault-encrypted credentials restore only when a vault key resolves (`ALF_VAULT_KEY` or the runtime's default key file); otherwise credentials are skipped with a warning.
+**Failures (coded).** `agent_busy` (head only); `auth_failed`; `invalid mode` (uncoded, self-describing); backend/network errors with hints. Records the agent added via `alf_vault_add` / `alf vault add` (tagged `alf-vault`) are restored to the agent's vault as-is — encrypted, **no key needed**. A vault key (`ALF_VAULT_KEY` or the runtime's default key file) matters only for *legacy* archives whose Layer 4 came from a runtime keystore; without one, those legacy rows are skipped with a warning.
 
 ### 3.5 `alf_export_dry_run`
 
@@ -198,7 +198,7 @@ Tracked files sync as **RAW BYTES** — no memory-record parsing — and any cha
 - Timestamps accept RFC3339, SQLite's default `YYYY-MM-DD HH:MM:SS` (read as UTC), or integer epoch seconds; anything else falls back to the file mtime with one warning per source *(v1.1)*.
 - The reader waits up to 5 s for a busy database (`busy_timeout`) *(v1.1)*.
 - Any extraction failure (locked, corrupt, schema drift) **fails the whole export/sync** with the marker `sqlite extraction failed` — it never degrades to zero records, so it can never mass-delete cloud history *(v1.1)*. The watch loop retries with backoff.
-- The `.db` and its `-wal`/`-shm` sidecars are captured together as one consistent unit and all three are watched for changes *(v1.1)*.
+- The `.db` and its `-wal`/`-shm` sidecars are captured together as one byte-preserving unit — a raw file copy taken after the quiesce window, near-consistent, with **no transactional-snapshot guarantee** — and all three are watched for changes *(v1.1)*. (This raw capture is separate from the row extraction above; v1 never uses `VACUUM INTO`, which is reserved for the v2 row-extraction path.)
 
 ### 3.8 `alf_vault_add`
 
@@ -349,7 +349,7 @@ Every tool failure is a **tool error** (`isError: true`), never a protocol error
 
 Protocol errors are reserved for infrastructure failure (a panicked worker). Agents should branch on `code` when present and follow `hint` otherwise.
 
-**Machine-readable codes** (`errors.rs::codes`): `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`, `no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`, `vault_key_unresolved`, `vault_rotate_failed`, `vault_rotate_no_destination`, `vault_migration_blocked`, plus *(v1.1)* `agent_busy`, `auth_failed`, `subscription_denied`, `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`.
+**Machine-readable codes** (`errors.rs::codes`): `agent_selection_ambiguous`, `agent_not_found`, `agent_disabled`, `no_agents`, `agent_id_drift`, `registration_failed`, `sync_upload_failed`, `vault_key_unresolved`, `vault_rotate_failed`, `vault_rotate_no_destination`, `vault_migration_blocked`, plus *(v1.1)* `agent_busy`, `auth_failed`, `subscription_denied`, `sync_base_unreadable`, `restore_incomplete`, `workspace_missing`, `path_denylisted`, `config_busy`.
 
 **Hints speak tool language** *(v1.1)*. A hint reaching the MCP wire names tools (`alf_sync with recover:true`, `the alf_check tool`), not CLI flags. Where the remedy is a CLI-only ceremony, the hint labels it explicitly as a human-terminal step and names the `alf_docs` topic to read (e.g. `rotate-key`, `force-first-sync`).
 
@@ -375,7 +375,7 @@ Three lock levels; agents only ever observe the outcomes described here.
 
 ## 7. Security model
 
-**Vault zero-knowledge.** Credentials are encrypted client-side (ChaCha20-Poly1305 / AES-GCM, Argon2 KDF). The service sees ciphertext and plaintext descriptors only. The vault key: lives in a 0600 file (or `ALF_VAULT_KEY`); is generated race-safe on first `alf_vault_add` if absent; **never appears in any tool result, log line, or error message** — only its fingerprint and file path. There is no key-export tool; rotation and decryption are CLI ceremonies. Losing the key file means the ciphertext is unrecoverable — by design.
+**Vault zero-knowledge.** Credentials are encrypted client-side (XChaCha20-Poly1305, or AES-256-GCM). Vault keys are **key-only** — 256-bit random values; there is no passphrase mode and no key derivation. The service sees ciphertext and plaintext descriptors only. The vault key: lives in a 0600 file (or `ALF_VAULT_KEY`); is generated race-safe on first `alf_vault_add` if absent; **never appears in any tool result, log line, or error message** — only its fingerprint and file path. There is no key-export tool; rotation and decryption are CLI ceremonies. Losing the key file means the ciphertext is unrecoverable — by design.
 
 **Secrets on the wire.** `alf_vault_add.secret` transits model context by necessity (the agent supplies it). It is never echoed back in results or logged to stderr.
 

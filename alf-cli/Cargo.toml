@@ -50,7 +50,8 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 # kqueue/Windows — audited for the 5 release triples in the handoff). `fs2` gives
 # the per-agent advisory lock (flock) — the first lock in alf-cli. `rusqlite`
 # (bundled, same version the zeroclaw/hermes adapters already link) backs the
-# SQLite-safe capture (`VACUUM INTO`); it adds no new native build.
+# `VACUUM INTO` capture module reserved for v2 — the v1 watch loop captures
+# SQLite stores as raw byte copies by design; it adds no new native build.
 notify = "6"
 fs2 = "0.4"
 rusqlite = { version = "0.31", features = ["bundled"] }

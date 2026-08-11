@@ -1,7 +1,7 @@
-# Lifecycle harness (`tests/lifecycle/`) — real-install Z1–Z13 driver
+# Lifecycle harness (`tests/lifecycle/`) — real-install Z1–Z17 driver
 
 The WP2 test foundation: ONE harness that runs the multi-agent release's
-Z1–Z13 lifecycle against a **real framework install** (official installer,
+Z1–Z17 lifecycle against a **real framework install** (official installer,
 hardened version pin) in Docker, with the **locally built alf-under-test**
 injected, four-valued checks (PASS / FAIL / SKIP / **XFAIL**), backend
 inspection lanes (⊙), and an `--interactive` mode that supersedes the retired

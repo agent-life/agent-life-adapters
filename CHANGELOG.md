@@ -1,4 +1,4 @@
-## [1.1.0] — Unreleased
+## [1.1.0] — 2026-08-10
 
 First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additive on the wire — no wire-format, backend, or web changes; the openclaw/zeroclaw/hermes export/import/sync happy paths and the archive bytes they produce are unchanged (goal c). **Not additive at every contract**: a handful of CLI behaviors and error codes changed deliberately — most as security fixes carried under the documented security exception in `RELEASING.md` — see **Changed** below and the Rust source-compatibility note under **Version bumps**. See `docs/alf-mcp-server-design.md`.
 

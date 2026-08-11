@@ -409,8 +409,9 @@ cadence + dirty state, any backoff/parked recovery state).",
         name = "alf_check",
         description = "Run a full pre-flight diagnostic for this runtime + workspace: workspace \
 resolution, resources, API key, service reachability, discovered agents, and vault parity. \
-Returns issues (error/warning/info) with suggestions. Also runs agent discovery \
-(information-only), exactly like `alf check`.",
+Returns issues (error/warning/info) with suggestions. Also runs agent discovery and \
+persists newly discovered agents as `[[agents]]` rows in `~/.alf/config.toml`, \
+exactly like `alf check`.",
         output_schema = tool_output_schema::<check::CheckResult>(SuccessOk::Preserved)
     )]
     async fn alf_check(

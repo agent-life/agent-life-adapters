@@ -52,11 +52,12 @@ const RESCAN_MAX_TICK: Duration = Duration::from_millis(250);
 const WATCH_RETRY_INITIAL: Duration = Duration::from_secs(5);
 const WATCH_RETRY_MAX: Duration = Duration::from_secs(300);
 
-/// TEST-ONLY: `ALF_WATCH_TICK_MS` (whole ms) lowers the 5 s poll/rescan cadence so
-/// the Z16 watch test can react to ~3 s-spaced mutations. Unset (production, every
-/// unit test) ⇒ [`TICK_PERIOD`]. Mirrors the engine's env-gated timing knobs:
-/// validated and clamped (min 100 ms) so a zero/malformed override can never
-/// panic `tokio::time::interval`.
+/// Env override, intended for tests but honored wherever it is set:
+/// `ALF_WATCH_TICK_MS` (whole ms) lowers the 5 s poll/rescan cadence so the Z16
+/// watch test can react to ~3 s-spaced mutations. Unset (production default,
+/// every unit test) ⇒ [`TICK_PERIOD`]. Mirrors the engine's env-gated timing
+/// knobs: validated and clamped (min 100 ms) so a zero/malformed override can
+/// never panic `tokio::time::interval`.
 fn tick_period() -> Duration {
     engine::env_ms_clamped("ALF_WATCH_TICK_MS", TICK_PERIOD, Duration::from_millis(100))
 }

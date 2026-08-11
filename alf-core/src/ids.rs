@@ -82,9 +82,12 @@ pub fn memory_record_id(
     )
 }
 
-/// Lowercase hex SHA-256 of `bytes`. Shared by the content-addressed id scheme
-/// and reconcile's collision re-mint.
-pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
+/// Lowercase hex SHA-256 of `bytes`. Shared by the content-addressed id scheme,
+/// reconcile's collision re-mint, and test gates that fingerprint record content.
+///
+/// Note: [`memory_record_id`] hashes `content.trim_end()`, not raw content —
+/// callers fingerprinting raw bytes get a different digest than the id preimage.
+pub fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
@@ -132,5 +135,62 @@ mod tests {
         assert_ne!(profile_id(pid), pid);
         assert_ne!(principal_id(agent, "human"), principal_id(agent, "system"));
         assert_ne!(identity_id(agent), identity_id(Uuid::from_u128(0x5678)));
+    }
+
+    /// Preimage discipline for [`memory_record_id`] — the birth-id minter for
+    /// every text-source path (generic map sources, openclaw chunks, zeroclaw
+    /// markdown). Each row of the table varies exactly ONE discriminating
+    /// dimension and must change the id; the identical tuple must not. A
+    /// dimension missing from the preimage collides records that agree on all
+    /// the others (the class behind the v1.1.0 pre-release sqlite BLK-1 bug —
+    /// its file-path dimension was omitted).
+    #[test]
+    fn memory_record_id_discriminates_every_preimage_dimension() {
+        let ns_a = Uuid::from_u128(0xaaaa);
+        let ns_b = Uuid::from_u128(0xbbbb);
+        let agent_a = Uuid::from_u128(0x1234);
+        let agent_b = Uuid::from_u128(0x5678);
+        let base = || memory_record_id(&ns_a, agent_a, "notes/a.md", "## A\nbody", 0);
+
+        // Stability: the identical tuple mints the identical id.
+        assert_eq!(base(), base());
+
+        // Injectivity: one dimension varied at a time.
+        let twins = [
+            (
+                "runtime namespace",
+                memory_record_id(&ns_b, agent_a, "notes/a.md", "## A\nbody", 0),
+            ),
+            (
+                "agent id",
+                memory_record_id(&ns_a, agent_b, "notes/a.md", "## A\nbody", 0),
+            ),
+            (
+                "origin file",
+                memory_record_id(&ns_a, agent_a, "notes/b.md", "## A\nbody", 0),
+            ),
+            (
+                "content",
+                memory_record_id(&ns_a, agent_a, "notes/a.md", "## A\nbody v2", 0),
+            ),
+            (
+                "occurrence",
+                memory_record_id(&ns_a, agent_a, "notes/a.md", "## A\nbody", 1),
+            ),
+        ];
+        for (dimension, twin) in twins {
+            assert_ne!(
+                base(),
+                twin,
+                "{dimension} must discriminate memory record ids"
+            );
+        }
+
+        // Documented exception: trailing whitespace is layout, not identity —
+        // moving a section to or from the end of a file keeps its id.
+        assert_eq!(
+            base(),
+            memory_record_id(&ns_a, agent_a, "notes/a.md", "## A\nbody\n\n", 0)
+        );
     }
 }

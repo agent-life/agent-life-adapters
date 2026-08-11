@@ -25,12 +25,31 @@
 #         --variant <v>                provision variant (default openclaw)
 #     -h, --help
 #
-# Requires: docker, and the sibling agent-life-service checkout (provisioner).
+# Requires: docker, and the sibling agent-life-service checkout (for the e2e
+# mint/scavenge binaries only — all config comes from adapters/.env).
 # ============================================================================
 set -uo pipefail   # NOT -e: we handle step failures and ALWAYS run cleanup.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+# SERVICE is the location of the e2e mint/scavenge BINARIES only — its .env is
+# never read. All config comes from adapters/.env, loaded just below.
 SERVICE="${ALF_SERVICE_REPO:-$ROOT/../agent-life-service}"
+
+# adapters/.env is the ONLY config source. Export the keys the e2e mint/scavenge
+# bins read (NEON_DATABASE_URL, S3_BUCKET_NAME, AWS_*, LLM_PROXY_URL, ALF_API_URL)
+# so the bins — invoked directly, NOT via the service .env-loading wrappers —
+# see this repo's values.
+if [ -f "$ROOT/.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|\#*) continue;; esac
+    [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"; value="${BASH_REMATCH[2]}"
+    value="${value%\"}"; value="${value#\"}"; value="${value%\'}"; value="${value#\'}"
+    export "$key=$value"
+  done < "$ROOT/.env"
+fi
+# The mint bin echoes ALF_API_URL; map it from API_BASE_URL when unset.
+[ -z "${ALF_API_URL:-}" ] && [ -n "${API_BASE_URL:-}" ] && export ALF_API_URL="$API_BASE_URL"
 FRAMEWORKS_ALL="openclaw zeroclaw hermes"
 FRAMEWORKS="$FRAMEWORKS_ALL"
 VARIANT="openclaw"
@@ -110,7 +129,7 @@ cleanup(){
     warn "--keep-agent: leaving test agent $AGENT_ID"
   elif [ -n "$AGENT_ID" ]; then
     say "  deprovisioning test agent $AGENT_ID …"
-    if ( cd "$SERVICE" && bash scripts/scavenge-test-runtimes.sh test --agent "$AGENT_ID" --delete ) >>"$LOG" 2>&1
+    if ( cd "$SERVICE" && cargo run -q -p e2e --bin scavenge_test_runtimes -- --agent "$AGENT_ID" --delete ) >>"$LOG" 2>&1
       then ok "deprovisioned (DB + S3 cascaded)"; else warn "deprovision failed — see $LOG (agent $AGENT_ID)"; fi
   fi
   [ -n "$ENVFILE" ] && rm -f "$ENVFILE" && ok "removed temp credentials"
@@ -125,8 +144,8 @@ cd "$ROOT"
 # ---- Step: preflight ----
 step "Preflight"
 command -v docker >/dev/null 2>&1 && ok "docker present" || { err "docker not found"; exit 1; }
-[ -f "$SERVICE/scripts/provision-test-runtime.sh" ] && ok "service provisioner: $SERVICE" \
-  || { err "provision-test-runtime.sh not found (set ALF_SERVICE_REPO)"; exit 1; }
+[ -f "$SERVICE/tests/e2e/Cargo.toml" ] && ok "service e2e crate (mint/scavenge bins): $SERVICE" \
+  || { err "service e2e crate not found (set ALF_SERVICE_REPO)"; exit 1; }
 for fw in $FRAMEWORKS; do [ -x "adapter-$fw/testkit/converse.sh" ] || { err "adapter-$fw/testkit/converse.sh missing"; exit 1; }; done
 say "  frameworks: $FRAMEWORKS   mode: $INTERACTIVE"
 pause
@@ -160,7 +179,7 @@ pause
 # ---- Step: mint credentials ----
 step "Mint runtime credentials (only runtime keys can reach the LLM proxy)"
 ENVFILE="$(mktemp)"; chmod 600 "$ENVFILE"; provout="$(mktemp)"
-if ! ( cd "$SERVICE" && bash scripts/provision-test-runtime.sh test --variant "$VARIANT" ) >"$provout" 2>&1; then
+if ! ( cd "$SERVICE" && cargo run -q -p e2e --bin provision_test_runtime -- --variant "$VARIANT" ) >"$provout" 2>&1; then
   err "mint failed:"; tail -n 20 "$provout" | tee -a "$LOG"; rm -f "$provout"; exit 1; fi
 AGENT_ID="$(python3 - "$provout" "$ENVFILE" <<'PY'
 import re,sys,os

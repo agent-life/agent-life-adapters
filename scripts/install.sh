@@ -6,6 +6,9 @@
 #
 # Binaries are downloaded from GitHub Releases first; if that fails, from
 # https://agent-life.ai/releases/latest/ as a backup (works when GitHub is down).
+# Each source is an atomic pair: the binary and its SHA256 checksum are always
+# fetched from the SAME origin, so a backup binary is never verified against the
+# GitHub checksum (and vice versa).
 #
 # Environment variables:
 #   ALF_VERSION      Pin a specific release (e.g. ALF_VERSION=v0.1.0). Default: latest.
@@ -67,45 +70,119 @@ on_failure() {
 main() {
     detect_platform
     resolve_version
-    download_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}"
-    checksum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"
-    backup_url="${BACKUP_BASE}/latest/${BIN_NAME}"
+
+    # Each candidate source is a self-consistent (binary, checksum) pair from a
+    # single trusted origin. Verification always binds an artifact to metadata
+    # from the same source (RF-015).
+    github_bin_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}"
+    github_sum_url="${GITHUB_RELEASE_BASE}/${VERSION}/${BIN_NAME}.sha256"
+    backup_bin_url="${BACKUP_BASE}/latest/${BIN_NAME}"
+    backup_sum_url="${BACKUP_BASE}/latest/${BIN_NAME}.sha256"
 
     log "Installing $BINARY_NAME $VERSION ($BIN_NAME)..."
 
     tmpdir=$(mktemp -d)
     trap 'rm -rf "$tmpdir"' EXIT
 
-    downloaded=0
+    # Ordered list of sources to try. When the GitHub API was unavailable the
+    # pinned tag is unknown, so only the backup origin is usable.
     if [ "$VERSION" = "latest" ]; then
-        # GitHub API was unavailable; use agent-life.ai only
         log "Using $BACKUP_BASE (GitHub API unavailable)"
-        if download "$backup_url" "$tmpdir/$BINARY_NAME"; then
-            downloaded=1
-        fi
+        sources="backup"
     else
-        if download "$download_url" "$tmpdir/$BINARY_NAME"; then
-            downloaded=1
-        else
-            log "  GitHub download failed, trying $BACKUP_BASE/latest/..."
-            if download "$backup_url" "$tmpdir/$BINARY_NAME"; then
-                downloaded=1
-            fi
+        sources="github backup"
+    fi
+
+    # Detect a hashing tool once. Without one, no source can be verified.
+    hash_tool=""
+    if command -v sha256sum >/dev/null 2>&1; then
+        hash_tool="sha256sum"
+    elif command -v shasum >/dev/null 2>&1; then
+        hash_tool="shasum"
+    fi
+
+    staged=""          # first binary we managed to fetch (for opt-out install)
+    verified_bin=""    # a binary bound to its same-origin checksum
+    verified_source=""
+    fail_reason="download failed from all sources"
+
+    for src in $sources; do
+        eval "bin_url=\$${src}_bin_url"
+        eval "sum_url=\$${src}_sum_url"
+        src_label=$(source_label "$src")
+
+        cand="$tmpdir/candidate"
+        if ! download "$bin_url" "$cand"; then
+            log "  binary download failed from $src_label"
+            continue
         fi
+
+        # Remember the first binary in case the operator opts out of verification.
+        if [ -z "$staged" ]; then
+            staged="$tmpdir/staged"
+            cp "$cand" "$staged"
+        fi
+
+        # Without a hashing tool no source can be verified — stop trying.
+        if [ -z "$hash_tool" ]; then
+            fail_reason="no sha256sum or shasum tool available"
+            break
+        fi
+
+        sum_file="$tmpdir/candidate.sha256"
+        if ! download "$sum_url" "$sum_file" 2>/dev/null; then
+            log "  checksum unavailable from $src_label; discarding this source"
+            fail_reason="checksum file unavailable"
+            continue
+        fi
+
+        parse_status=0
+        expected=$(parse_checksum "$sum_file") || parse_status=$?
+        if [ "$parse_status" -eq 2 ]; then
+            log "  checksum from $src_label lists multiple entries for $BIN_NAME"
+            fail_reason="checksum file ambiguous for $BIN_NAME"
+            continue
+        fi
+        if [ -z "$expected" ]; then
+            log "  checksum from $src_label is empty or malformed"
+            fail_reason="checksum file empty or malformed"
+            continue
+        fi
+
+        actual=$(compute_hash "$cand")
+        if [ "$expected" = "$actual" ]; then
+            verified_bin="$tmpdir/$BINARY_NAME"
+            mv "$cand" "$verified_bin"
+            verified_source="$src_label"
+            CHECKSUM_VERIFIED="true"
+            break
+        fi
+
+        # A complete pair whose checksum does not match is possible tampering:
+        # fail closed immediately and do NOT fall through to another mirror, so
+        # alternate bytes are never installed in the same invocation.
+        log "  ✗ Checksum mismatch from $src_label"
+        on_failure 4 "checksum mismatch"
+    done
+
+    if [ -n "$verified_bin" ]; then
+        log "  ✓ Checksum verified (source: $verified_source)"
+        selected_bin="$verified_bin"
+    else
+        if [ -z "$staged" ]; then
+            on_failure 3 "download failed from all sources"
+        fi
+        # Bytes downloaded but not bound to a same-origin checksum. Fatal unless
+        # ALF_ALLOW_UNVERIFIED=1, in which case verification_failed returns.
+        verification_failed "$fail_reason"
+        selected_bin="$staged"
     fi
 
-    if [ "$downloaded" -eq 0 ]; then
-        on_failure 3 "download failed from all sources"
-    fi
-
-    chmod +x "$tmpdir/$BINARY_NAME"
-
-    # Checksum verification (fatal unless ALF_ALLOW_UNVERIFIED=1)
-    verify_checksum "$tmpdir/$BINARY_NAME" "$checksum_url"
+    chmod +x "$selected_bin"
 
     install_dir=$(resolve_install_dir)
     mkdir -p "$install_dir"
-    mv "$tmpdir/$BINARY_NAME" "$install_dir/$BINARY_NAME"
+    mv "$selected_bin" "$install_dir/$BINARY_NAME"
 
     # Verify the installed binary works
     if ! "$install_dir/$BINARY_NAME" --version >/dev/null 2>&1; then
@@ -240,37 +317,48 @@ verification_failed() {
     on_failure 4 "$reason"
 }
 
-verify_checksum() {
-    binary_path="$1"
-    checksum_url="$2"
-    checksum_file="$tmpdir/checksum.sha256"
+# source_label: friendly name for a source id, used in messages so URLs (which
+# may embed tokens) are not printed.
+source_label() {
+    case "$1" in
+        github) printf 'GitHub' ;;
+        backup) printf 'agent-life.ai' ;;
+        *)      printf '%s' "$1" ;;
+    esac
+}
 
-    if ! download "$checksum_url" "$checksum_file" 2>/dev/null; then
-        verification_failed "checksum file unavailable"
-        return 0
-    fi
-
-    expected=$(awk '{print $1}' "$checksum_file")
-    if [ -z "$expected" ]; then
-        verification_failed "checksum file empty or malformed"
-        return 0
-    fi
-
-    if command -v sha256sum >/dev/null 2>&1; then
-        actual=$(sha256sum "$binary_path" | awk '{print $1}')
-    elif command -v shasum >/dev/null 2>&1; then
-        actual=$(shasum -a 256 "$binary_path" | awk '{print $1}')
+# compute_hash: print the SHA-256 hex of a file using the detected tool.
+compute_hash() {
+    if [ "$hash_tool" = "sha256sum" ]; then
+        sha256sum "$1" | awk '{print $1}'
     else
-        verification_failed "no sha256sum or shasum tool available"
-        return 0
+        shasum -a 256 "$1" | awk '{print $1}'
     fi
+}
 
-    if [ "$expected" != "$actual" ]; then
-        on_failure 4 "checksum mismatch"
-    fi
-
-    log "  ✓ Checksum verified"
-    CHECKSUM_VERIFIED="true"
+# parse_checksum: print the SHA-256 hex for $BIN_NAME from a checksum file.
+# Selects the line whose filename field matches the expected platform binary.
+# Exit 0 + hash on a unique match; exit 2 if multiple lines match $BIN_NAME
+# (ambiguous); exit 1 (no output) if the file is empty or has no usable line.
+parse_checksum() {
+    awk -v want="$BIN_NAME" '
+        {
+            h = $1
+            n = $2
+            sub(/^\*/, "", n)       # strip GNU binary-mode marker
+            if (h == "") next
+            if (n == "") { bare++; bare_h = h; next }
+            if (n == want) { match_n++; match_h = h }
+        }
+        END {
+            if (match_n == 1) { print match_h; exit 0 }
+            if (match_n > 1)  { exit 2 }
+            # No filename match: accept a single bare-hash line (single-artifact
+            # .sha256 with no filename column).
+            if (bare == 1 && NR == 1) { print bare_h; exit 0 }
+            exit 1
+        }
+    ' "$1"
 }
 
 main

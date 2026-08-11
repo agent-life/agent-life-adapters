@@ -6,4 +6,5 @@ members = [
     "adapter-openclaw",
     "adapter-zeroclaw",
     "adapter-hermes",
+    "adapter-generic",
 ]

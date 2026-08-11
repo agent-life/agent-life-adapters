@@ -6,3 +6,6 @@
 /.env
 /integration_vault_report.md
 /integration_workspace_report.md
+
+# ./test.sh run artifacts (per-run logs + report.md)
+/test-reports/

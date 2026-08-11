@@ -19,9 +19,12 @@ pub mod memory;
 
 pub mod adapter;
 pub mod archive;
+pub mod chunk;
 pub mod credentials;
 pub mod crypto;
 pub mod delta;
+pub mod extract;
+pub mod fs_atomic;
 pub mod identity;
 pub mod ids;
 pub mod include;
@@ -35,7 +38,7 @@ pub mod validation;
 
 pub use adapter::{
     ensure_workspace_agent_id, verify_archive_agent, Adapter, AgentBinding, ArchiveEnumeration,
-    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode,
+    ExportReport, FileEntry, ImportOptions, ImportReport, MemorySource, RestoreMode, WatchSpec,
     WorkspaceEnumeration, AGENT_ID_FILE,
 };
 pub use archive::{
@@ -51,10 +54,12 @@ pub use delta::{
     apply_delta, apply_deltas, compute_delta, diff_credentials, diff_principals, identity_changed,
     CredentialsDiff, PrincipalsDiff,
 };
+pub use extract::{write_extracted_file, write_private_extracted_target, ExtractWriteMode};
+pub use fs_atomic::write_atomic;
 pub use identity::*;
 pub use include::{
-    normalize_include_path, prune_and_log_missing, IncludeEntry, IncludeList, INCLUDE_FILE,
-    SYNC_LOG_FILE,
+    mark_external_inert, normalize_include_path, prune_and_log_missing, IncludeEntry, IncludeList,
+    INCLUDE_FILE, SYNC_LOG_FILE,
 };
 pub use manifest::*;
 pub use memory::*;

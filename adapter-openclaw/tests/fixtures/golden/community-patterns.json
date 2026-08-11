@@ -1,0 +1,24 @@
+[
+  {
+    "origin_file": "memory/2026-02-01.md",
+    "id": "e53c9471-5c54-53ba-8fee-433f28be9b85",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content_sha256": "2d0147bff8933fe65eec7ecfb59544bb84dbb7a49a023ca853c26b21364b4599",
+    "line_start": 1,
+    "line_end": 2,
+    "heading": "Decision [decision|i=0.9]",
+    "observed_at": "2026-02-01T00:00:00+00:00"
+  },
+  {
+    "origin_file": "memory/active-context.md",
+    "id": "4075329f-500f-5c16-87ec-e9b75c778c9a",
+    "memory_type": "summary",
+    "namespace": "active-context",
+    "content_sha256": "95b4599a2b404934603daa2070ad4c9e8ab8fa5ce319e6cab80efadedb829272",
+    "line_start": 1,
+    "line_end": 1,
+    "heading": null,
+    "observed_at": null
+  }
+]

@@ -12,7 +12,7 @@
 //! is allowed to gate behaviour on it. A CI grep guard enforces this.
 
 use crate::config::Config;
-use crate::fs_private::write_private;
+use crate::fs_private::write_private_atomic;
 
 use anyhow::bail;
 use anyhow::{Context, Result};
@@ -93,7 +93,12 @@ impl AgentState {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize state")?;
-        write_private(path, &content)
+        // Atomic temp+rename (WP-M3 review B1): the watch loop makes autonomous
+        // syncs reachable, and the host may SIGKILL `alf mcp serve` at any moment
+        // (design §5.3 treats this as normal). A truncating write could leave a
+        // torn `state.toml`; the atomic rename guarantees the reader sees either
+        // the old or the new file, never a partial mix.
+        write_private_atomic(path, &content)
             .with_context(|| format!("Failed to write state to {}", path.display()))?;
         Ok(())
     }
@@ -333,6 +338,9 @@ snapshot_path = "/tmp/legacy-snapshot.alf"
 
     #[test]
     fn local_base_path_format() {
+        // HOME_LOCK: the path derives from ALF_HOME/HOME, which other tests
+        // mutate under this lock — read-side must serialize too.
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
         let id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
         let base = local_base_path(id).unwrap();
         assert!(base.ends_with(format!("{id}-snapshot.alf")));
@@ -363,6 +371,9 @@ snapshot_path = "/tmp/legacy-snapshot.alf"
 
     #[test]
     fn state_file_and_local_base_paths_share_state_dir() {
+        // HOME_LOCK: both calls re-read ALF_HOME/HOME; without the lock a
+        // concurrent env-mutating test can flip the home between them.
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
         let id = Uuid::new_v4();
         let s = state_file_path(id).unwrap();
         let b = local_base_path(id).unwrap();
@@ -465,4 +476,116 @@ snapshot_path = "/tmp/legacy-snapshot.alf"
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
+}
+/// A durable guard for a head restore that has begun changing the live
+/// workspace but has not yet committed its matching local sync base and
+/// cursor. While this record exists, sync must not derive or upload a delta.
+///
+/// The record deliberately contains only identifiers, paths, sequences, and
+/// digests — never archive bytes or credential material.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct RestoreInflight {
+    pub version: u8,
+    pub agent_id: Uuid,
+    pub runtime: String,
+    pub workspace: PathBuf,
+    pub target_sequence: u64,
+    pub staged_archive_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_base_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub previous_state_sha256: Option<String>,
+    pub phase: RestoreInflightPhase,
+}
+
+/// The restore transaction phase represented by [`RestoreInflight`].
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RestoreInflightPhase {
+    /// The marker is durable and the adapter may be modifying the workspace.
+    Importing,
+    /// The adapter returned success; only base/cursor persistence remains.
+    Imported,
+}
+
+impl RestoreInflight {
+    pub(crate) const VERSION: u8 = 1;
+}
+/// Path to the durable guard for a head restore in progress.
+pub(crate) fn restore_inflight_path(agent_id: Uuid) -> Result<PathBuf> {
+    Ok(AgentState::state_dir()?.join(format!("{agent_id}.restore-inflight.json")))
+}
+
+/// Load a restore-in-flight record, if one exists.
+///
+/// Callers must treat any error — including malformed JSON, an unknown
+/// version, or a mismatched embedded agent ID — as an in-progress restore and
+/// fail closed. The explicit validation keeps a copied or hand-edited marker
+/// from being mistaken for trustworthy state.
+pub(crate) fn load_restore_inflight(agent_id: Uuid) -> Result<Option<RestoreInflight>> {
+    let path = restore_inflight_path(agent_id)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "Failed to read restore-in-flight record at {}",
+            path.display()
+        )
+    })?;
+    let record: RestoreInflight = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse restore-in-flight record at {}",
+            path.display()
+        )
+    })?;
+    if record.version != RestoreInflight::VERSION {
+        bail!(
+            "Unsupported restore-in-flight record version {} at {}",
+            record.version,
+            path.display()
+        );
+    }
+    if record.agent_id != agent_id {
+        bail!(
+            "Restore-in-flight record at {} belongs to agent {}, not {}",
+            path.display(),
+            record.agent_id,
+            agent_id
+        );
+    }
+    Ok(Some(record))
+}
+
+/// Atomically persist a restore-in-flight record with owner-only permissions.
+pub(crate) fn save_restore_inflight(record: &RestoreInflight) -> Result<()> {
+    let path = restore_inflight_path(record.agent_id)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create state directory {}", parent.display()))?;
+    }
+    let content = serde_json::to_string_pretty(record)
+        .context("Failed to serialize restore-in-flight record")?;
+    write_private_atomic(&path, &content).with_context(|| {
+        format!(
+            "Failed to write restore-in-flight record at {}",
+            path.display()
+        )
+    })
+}
+
+/// Remove a completed restore's guard. This is intentionally not best-effort:
+/// a caller must report failure and leave the record in place if it cannot
+/// clear it, so sync remains parked rather than trusting an ambiguous state.
+pub(crate) fn clear_restore_inflight(agent_id: Uuid) -> Result<()> {
+    let path = restore_inflight_path(agent_id)?;
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "Failed to clear restore-in-flight record at {}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }

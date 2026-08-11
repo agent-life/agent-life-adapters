@@ -31,8 +31,12 @@ fn login_with_key(api_key: &str) -> Result<()> {
 
     let config_path = Config::path()?;
     let mut config = Config::load_from(&config_path)?;
-    config.service.api_key = trimmed.to_string();
-    config.save_to(&config_path)?;
+    // Serialize the api-key write against any concurrent config writer (RF-013)
+    // so an in-flight discovery/agents-toggle save can't drop the new key.
+    config.update_locked(|c| {
+        c.service.api_key = trimmed.to_string();
+        Ok(())
+    })?;
 
     let masked = mask_key(trimmed);
 
@@ -68,12 +72,12 @@ fn login_interactive() -> Result<()> {
         println!();
         println!("    alf login --key <your-api-key>");
         println!();
-        println!("  To get an API key, visit: https://agent-life.ai/settings/api-keys");
+        println!("  To get an API key, visit: https://agent-life.ai/agents/api-keys");
     } else {
         output::json(&serde_json::json!({
             "ok": false,
             "error": "Interactive login not yet implemented. Use: alf login --key <your-api-key>",
-            "hint": "Get an API key at https://agent-life.ai/settings/api-keys"
+            "hint": "Get an API key at https://agent-life.ai/agents/api-keys"
         }));
     }
 

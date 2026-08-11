@@ -7,15 +7,51 @@
 //! 2. **Cross-runtime migration**: reconstruct workspace files from ALF
 //!    structured data (identity prose, principals prose, memory records).
 
-use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
 use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, VaultKey};
+mod structured_import;
 
 use crate::ImportReport;
+
+/// The only permitted destination for reconstructed OpenClaw native auth.
+///
+/// Preview imports receive a CLI-created, private sandbox as `workspace`; all
+/// preview artifacts must stay there. Head restores retain the native OpenClaw
+/// auth target (with the existing workspace-local fallback when HOME is not
+/// available).
+enum NativeAuthTarget {
+    PreviewSandbox(PathBuf),
+    HeadRestore(PathBuf),
+}
+
+impl NativeAuthTarget {
+    fn for_import(workspace: &Path, preview: bool) -> Self {
+        if preview {
+            return Self::PreviewSandbox(workspace.join(".alf-restored-auth-profiles.json"));
+        }
+
+        let target = alf_core::home_dir()
+            .map(|home| {
+                home.join(".openclaw")
+                    .join("agents")
+                    .join("main")
+                    .join("agent")
+                    .join("auth-profiles.json")
+            })
+            .unwrap_or_else(|| workspace.join(".alf-restored-auth-profiles.json"));
+        Self::HeadRestore(target)
+    }
+
+    fn path(self) -> PathBuf {
+        match self {
+            Self::PreviewSandbox(path) | Self::HeadRestore(path) => path,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Import entry point
@@ -27,13 +63,15 @@ use crate::ImportReport;
 /// files when available (lossless restore). Falls back to reconstructing
 /// workspace files from structured ALF data (cross-runtime migration).
 ///
-/// `vault_key`, when supplied, decrypts `CredentialRecord` payloads and
-/// writes a fresh `auth-profiles.json` next to the workspace. When
-/// absent, credentials are reported but not restored.
+/// `vault_key`, when supplied, decrypts `CredentialRecord` payloads. A head
+/// restore writes native auth to OpenClaw's live `auth-profiles.json`; a
+/// preview writes the inspection copy inside its supplied preview sandbox.
+/// When absent, credentials are reported but not restored.
 pub fn import(
     alf_file: &Path,
     workspace: &Path,
     vault_key: Option<&VaultKey>,
+    preview: bool,
 ) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -46,30 +84,51 @@ pub fn import(
 
     let mut warnings = Vec::new();
 
-    // Ensure workspace directory exists
-    fs::create_dir_all(workspace)?;
-    fs::create_dir_all(workspace.join("memory"))?;
-
-    // Check if raw/openclaw/ sources are available
+    // Check if raw/openclaw/ sources are available.
     let file_names = alf.file_names();
     let raw_prefix = "raw/openclaw/";
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
-
+    let structured_plan = if has_raw {
+        None
+    } else {
+        Some(structured_import::build(&mut alf, workspace)?)
+    };
+    // A structured archive is fully parsed and its paths validated before this
+    // first destination mutation. Raw entries receive their own shared writer.
+    fs::create_dir_all(workspace)?;
+    fs::create_dir_all(workspace.join("memory"))?;
     if has_raw {
-        // Path 1: Raw source restore (lossless)
         restore_raw_sources(&mut alf, workspace, raw_prefix, &file_names)?;
     } else {
-        // Path 2: Cross-runtime migration
         warnings.push(
             "No raw/openclaw/ sources in archive — reconstructing from structured data."
                 .to_string(),
         );
-        reconstruct_from_structured(&mut alf, workspace, &mut warnings)?;
+        structured_plan
+            .expect("structured plan exists when raw sources are absent")
+            .apply(workspace, &mut warnings)?;
+    }
+
+    // Inert-on-restore (security design §3.5, manual §7): external include
+    // entries arriving in an archive come back unverified — a hostile archive
+    // must never conscript this machine into packing files outside the
+    // workspace. In-workspace entries are untouched.
+    match alf_core::include::mark_external_inert(workspace) {
+        Ok(0) => {}
+        Ok(n) => warnings.push(format!(
+            "{n} external file entry(ies) imported as inert; re-add with \
+             `alf add --external` to include them in sync."
+        )),
+        Err(e) => warnings.push(format!("could not mark external entries inert: {e}")),
     }
 
     // Write the agent ID for future exports
-    let id_file = workspace.join(".alf-agent-id");
-    fs::write(&id_file, agent_id.to_string())?;
+    alf_core::write_extracted_file(
+        workspace,
+        ".alf-agent-id",
+        agent_id.to_string().as_bytes(),
+        alf_core::ExtractWriteMode::Normal,
+    )?;
 
     // Credentials: decrypt and restore when a key is supplied; otherwise
     // emit the legacy "re-authenticate" warning.
@@ -91,7 +150,8 @@ pub fn import(
                 .into_iter()
                 .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
 
-            let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
+            let vaulted =
+                restore_agent_vault(vault_records, doc_extra, agent_id, workspace, preview)?;
             if vaulted > 0 {
                 warnings.push(format!(
                     "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -106,8 +166,12 @@ pub fn import(
                 };
                 match vault_key {
                     Some(key) => {
-                        let restored =
-                            restore_credentials(&auth_doc, key, workspace, &mut warnings)?;
+                        let restored = restore_credentials(
+                            &auth_doc,
+                            key,
+                            NativeAuthTarget::for_import(workspace, preview),
+                            &mut warnings,
+                        )?;
                         warnings.push(format!(
                             "Restored {restored} credential(s) from the vault. \
                              Verify with OpenClaw."
@@ -232,7 +296,7 @@ pub fn enumerate_archive(alf_file: &Path) -> Result<ArchiveEnumeration> {
 fn restore_credentials(
     doc: &alf_core::CredentialsDocument,
     key: &VaultKey,
-    workspace: &Path,
+    target: NativeAuthTarget,
     warnings: &mut Vec<String>,
 ) -> Result<usize> {
     use serde_json::{Map, Value};
@@ -300,27 +364,9 @@ fn restore_credentials(
         return Ok(0);
     }
 
-    // Write to ~/.openclaw/agents/main/agent/auth-profiles.json if HOME
-    // exists; otherwise drop a copy at workspace/.alf-restored-auth-profiles.json
-    // so the user can move it manually.
-    let openclaw_target = alf_core::home_dir().map(|h| {
-        h.join(".openclaw")
-            .join("agents")
-            .join("main")
-            .join("agent")
-            .join("auth-profiles.json")
-    });
-
     let serialized = serde_json::to_string_pretty(&Value::Object(profiles))?;
-
-    let target = match openclaw_target {
-        Some(p) => p,
-        None => workspace.join(".alf-restored-auth-profiles.json"),
-    };
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&target, serialized)
+    let target = target.path();
+    alf_core::write_private_extracted_target(&target, serialized.as_bytes())
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(restored)
@@ -341,6 +387,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     workspace: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -354,16 +401,24 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        workspace.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
+    };
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let serialized = serde_json::to_string_pretty(&doc)?;
-    fs::write(&target, serialized)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    alf_core::write_private_extracted_target(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(count)
 }
@@ -392,9 +447,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
         // Reject path-traversal / absolute entry names before any write —
         // a hostile or compromised-server archive must not escape the
         // workspace (Zip Slip; see threat model A4.1/A1.1).
-        let target = alf_core::safe_extract_path(workspace, relative)
-            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
-
         // Bound decompression to defend against zip bombs.
         let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
         total_bytes = total_bytes.saturating_add(data.len() as u64);
@@ -405,11 +457,13 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             );
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            workspace,
+            relative,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -417,150 +471,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 // Path 2: Cross-runtime reconstruction
 // ---------------------------------------------------------------------------
-
-/// Reconstruct OpenClaw workspace files from structured ALF data.
-fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
-    alf: &mut AlfReader<R>,
-    workspace: &Path,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    // Identity → SOUL.md
-    if let Some(identity) = alf.read_identity()? {
-        if let Some(ref prose) = identity.prose {
-            if let Some(ref soul) = prose.soul {
-                fs::write(workspace.join("SOUL.md"), soul)?;
-            }
-            if let Some(ref profile) = prose.identity_profile {
-                fs::write(workspace.join("IDENTITY.md"), profile)?;
-            }
-            if let Some(ref instructions) = prose.operating_instructions {
-                fs::write(workspace.join("AGENTS.md"), instructions)?;
-            }
-        } else if let Some(ref structured) = identity.structured {
-            // Synthesize a minimal SOUL.md from structured data
-            let name = structured
-                .names
-                .as_ref()
-                .map(|n| n.primary.as_str())
-                .unwrap_or("Agent");
-            let role = structured.role.as_deref().unwrap_or("AI Assistant");
-            let soul = format!("# {name}\n\n{role}\n");
-            fs::write(workspace.join("SOUL.md"), soul)?;
-        }
-    }
-
-    // Principals → USER.md
-    if let Some(principals) = alf.read_principals()? {
-        if let Some(principal) = principals.principals.first() {
-            if let Some(ref prose) = principal.profile.prose {
-                if let Some(ref user_profile) = prose.user_profile {
-                    fs::write(workspace.join("USER.md"), user_profile)?;
-                }
-            } else if let Some(ref structured) = principal.profile.structured {
-                // Synthesize minimal USER.md
-                let name = structured.name.as_deref().unwrap_or("User");
-                let mut content = format!("# {name}\n");
-                if let Some(ref tz) = structured.timezone {
-                    content.push_str(&format!("\n## Timezone\n\n{tz}\n"));
-                }
-                fs::write(workspace.join("USER.md"), content)?;
-            }
-        }
-    }
-
-    // Memory records → MEMORY.md + memory/YYYY-MM-DD.md
-    let all_records = alf.read_all_memory()?;
-    if all_records.is_empty() {
-        return Ok(());
-    }
-
-    // Separate by namespace
-    let mut curated_sections: Vec<String> = Vec::new();
-    let mut daily_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for record in &all_records {
-        // Skip tombstones/replaced records: a Superseded record's replacement
-        // is already in this set, and a Deleted record is gone — materializing
-        // either would resurrect content the agent removed (WP4.1 §8.1). This
-        // only affects the structured fallback; a same-runtime restore prefers
-        // the verbatim raw tree and never reaches here.
-        if !record.status.is_materialized() {
-            continue;
-        }
-        let origin_file = record.source.origin_file.as_deref().unwrap_or("");
-
-        match record.namespace.as_str() {
-            "curated" => {
-                curated_sections.push(record.content.clone());
-            }
-            "daily" => {
-                // Group by origin file or by observed_at date
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else if let Some(observed) = record.temporal.observed_at {
-                    format!("memory/{}.md", observed.format("%Y-%m-%d"))
-                } else {
-                    format!(
-                        "memory/{}.md",
-                        record.temporal.created_at.format("%Y-%m-%d")
-                    )
-                };
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            _ => {
-                // Use origin_file if available, otherwise namespace-based path
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    format!("memory/{}.md", record.namespace)
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-        }
-    }
-
-    // Write MEMORY.md
-    if !curated_sections.is_empty() {
-        let content = curated_sections.join("\n\n");
-        fs::write(workspace.join("MEMORY.md"), content)?;
-    }
-
-    // Write daily log files
-    for (file_path, sections) in &daily_groups {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    // Write other memory files
-    for (file_path, sections) in &other_files {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    if !all_records.is_empty() {
-        warnings.push(format!(
-            "Reconstructed {} memory record(s) from structured data.",
-            all_records.len()
-        ));
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -571,7 +481,7 @@ mod tests {
     use super::*;
     use crate::export;
     use std::fs;
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
 
     fn create_workspace(files: &[(&str, &str)]) -> TempDir {
@@ -599,6 +509,91 @@ mod tests {
         });
     }
 
+    fn native_auth_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn live_auth_path(home: &Path) -> std::path::PathBuf {
+        home.join(".openclaw")
+            .join("agents")
+            .join("main")
+            .join("agent")
+            .join("auth-profiles.json")
+    }
+
+    fn native_auth_archive(root: &TempDir, key: &alf_core::VaultKey) -> std::path::PathBuf {
+        let agent_id = uuid::Uuid::new_v4();
+        let mut payload = alf_core::VaultPayload::login("archived@example.test", "archived-secret");
+        payload.extra.insert(
+            "openclaw_profile".to_string(),
+            serde_json::json!({
+                "provider": "openai",
+                "token": "archived-native-token",
+            }),
+        );
+        let encrypted = alf_core::encrypt_payload(
+            &payload.to_json_bytes(),
+            key,
+            alf_core::Algorithm::XChaCha20Poly1305,
+        )
+        .unwrap();
+        let encryption = encrypted.to_encryption_metadata();
+        let credentials = alf_core::CredentialsDocument {
+            credentials: vec![alf_core::CredentialRecord {
+                id: uuid::Uuid::new_v4(),
+                agent_id,
+                service: "openai".to_string(),
+                credential_type: alf_core::CredentialType::ApiKey,
+                encrypted_payload: encrypted.ciphertext_b64,
+                encryption,
+                created_at: chrono::Utc::now(),
+                label: Some("archived-profile".to_string()),
+                description: None,
+                capabilities_granted: Vec::new(),
+                updated_at: None,
+                last_rotated_at: None,
+                expires_at: None,
+                tags: Vec::new(),
+                extra: Default::default(),
+            }],
+            extra: Default::default(),
+        };
+        let manifest = alf_core::Manifest {
+            alf_version: "1.0.0".to_string(),
+            created_at: chrono::Utc::now(),
+            agent: alf_core::AgentMetadata {
+                id: agent_id,
+                name: "Archived OpenClaw agent".to_string(),
+                source_runtime: "openclaw".to_string(),
+                source_runtime_version: None,
+                extra: Default::default(),
+            },
+            layers: alf_core::LayerInventory {
+                identity: None,
+                principals: None,
+                credentials: None,
+                memory: None,
+                attachments: None,
+                extra: Default::default(),
+            },
+            runtime_hints: None,
+            sync: None,
+            raw_sources: Vec::new(),
+            checksum: None,
+            extra: Default::default(),
+        };
+        let archive = root.path().join("native-auth.alf");
+        let mut writer = alf_core::AlfWriter::new(
+            std::io::BufWriter::new(fs::File::create(&archive).unwrap()),
+            manifest,
+        )
+        .unwrap();
+        writer.set_credentials(&credentials).unwrap();
+        writer.finish().unwrap();
+        archive
+    }
+
     /// Minimal vault document JSON: one `alf-vault`-tagged record, optionally
     /// carrying an unknown doc-level extra field.
     fn vault_doc(agent_id: &str, label: &str, with_extra: bool) -> String {
@@ -617,6 +612,107 @@ mod tests {
                 "label":"{label}","tags":["alf-vault"]
             }}]{extra}}}"#
         )
+    }
+
+    #[test]
+    fn preview_with_credentials_keeps_live_openclaw_auth_byte_identical() {
+        let _guard = native_auth_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        isolate_home();
+
+        let home = alf_core::home_dir().unwrap();
+        let live_auth = live_auth_path(&home);
+        fs::create_dir_all(live_auth.parent().unwrap()).unwrap();
+        let live_bytes = br#"{"current-only":{"provider":"openai","token":"current-token"}}
+"#
+        .to_vec();
+        fs::write(&live_auth, &live_bytes).unwrap();
+
+        let fixture = TempDir::new().unwrap();
+        let key = alf_core::VaultKey::generate();
+        let archive = native_auth_archive(&fixture, &key);
+        let preview = home
+            .join(".alf")
+            .join("preview")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("seq-7");
+        alf_core::fs_atomic::create_dir_private(&preview).unwrap();
+
+        import(&archive, &preview, Some(&key), true).unwrap();
+
+        assert_eq!(
+            fs::read(&live_auth).unwrap(),
+            live_bytes,
+            "a preview must leave live native auth byte-identical"
+        );
+        let inspection = preview.join(".alf-restored-auth-profiles.json");
+        assert!(
+            inspection.starts_with(&preview) && inspection.is_file(),
+            "native auth inspection file must stay inside the preview sandbox"
+        );
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&inspection).unwrap()).unwrap();
+        assert_eq!(
+            restored["archived-profile"]["token"],
+            serde_json::json!("archived-native-token")
+        );
+        assert!(
+            restored.get("current-only").is_none(),
+            "the preview must contain historical profiles only"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&inspection).unwrap().permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "native auth inspection file must be owner-only"
+            );
+        }
+    }
+
+    #[test]
+    fn head_restore_with_credentials_still_targets_live_openclaw_auth() {
+        let _guard = native_auth_test_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        isolate_home();
+
+        let home = alf_core::home_dir().unwrap();
+        let live_auth = live_auth_path(&home);
+        fs::create_dir_all(live_auth.parent().unwrap()).unwrap();
+        fs::write(
+            &live_auth,
+            br#"{"current-only":{"provider":"openai","token":"current-token"}}
+"#,
+        )
+        .unwrap();
+
+        let fixture = TempDir::new().unwrap();
+        let key = alf_core::VaultKey::generate();
+        let archive = native_auth_archive(&fixture, &key);
+        let workspace = TempDir::new().unwrap();
+
+        import(&archive, workspace.path(), Some(&key), false).unwrap();
+
+        let restored: serde_json::Value =
+            serde_json::from_slice(&fs::read(&live_auth).unwrap()).unwrap();
+        assert_eq!(
+            restored["archived-profile"]["token"],
+            serde_json::json!("archived-native-token")
+        );
+        assert!(
+            restored.get("current-only").is_none(),
+            "head restore keeps the current full-overwrite auth behavior"
+        );
+        assert!(
+            !workspace
+                .path()
+                .join(".alf-restored-auth-profiles.json")
+                .exists(),
+            "a head restore must not fall back to the workspace while HOME is available"
+        );
     }
 
     /// A-1 (WP1): export reads ONLY the exporting agent's per-agent vault —
@@ -649,6 +745,57 @@ mod tests {
         assert_eq!(doc.credentials[0].label.as_deref(), Some("mine"));
     }
 
+    /// MIN-12 regression: a PREVIEW import must not touch the live vault.
+    /// Restore is a full overwrite (D6), so writing a historical Layer 4 to
+    /// `~/.alf/vault/{id}/` would silently drop every credential added since
+    /// that sequence — from `alf restore --at-sequence N`, which is documented
+    /// as a read-only preview. The restored document belongs in the preview
+    /// tree instead.
+    #[test]
+    fn preview_import_never_writes_the_live_vault() {
+        isolate_home();
+        let ws = create_workspace(&[
+            ("SOUL.md", "# Bot\n\nhi"),
+            ("IDENTITY.md", "# Identity\n\nName: Bot"),
+        ]);
+        let my_id = "cfef1150-aaaa-4aaa-8aaa-0000000000a7";
+        fs::write(ws.path().join(".alf-agent-id"), my_id).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let vault = alf_core::agent_vault_path(&home, my_id.parse().unwrap());
+        fs::create_dir_all(vault.parent().unwrap()).unwrap();
+        // The archive carries the OLD credential…
+        fs::write(&vault, vault_doc(my_id, "historical", true)).unwrap();
+        let alf_file = ws.path().join("export.alf");
+        export::export(ws.path(), &alf_file).unwrap();
+        // …while the live vault has moved on (a credential added since, or a
+        // rotation). This is what a preview must not destroy.
+        fs::write(&vault, vault_doc(my_id, "current-live", false)).unwrap();
+
+        let preview = TempDir::new().unwrap();
+        import(&alf_file, preview.path(), None, /* preview: */ true).unwrap();
+
+        let live: alf_core::CredentialsDocument =
+            serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
+        assert_eq!(
+            live.credentials[0].label.as_deref(),
+            Some("current-live"),
+            "a preview must leave the live vault exactly as it was"
+        );
+        // The historical document is materialized inside the preview instead.
+        let sandboxed = preview.path().join(".alf-restored-credentials.json");
+        assert!(sandboxed.is_file(), "preview vault copy missing");
+        let copy: alf_core::CredentialsDocument =
+            serde_json::from_str(&fs::read_to_string(&sandboxed).unwrap()).unwrap();
+        assert_eq!(copy.credentials[0].label.as_deref(), Some("historical"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&sandboxed).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "restored vault must be owner-only (MIN-14)");
+        }
+    }
+
     /// A-2 (WP1): import restores alf-vault records to the archive agent's
     /// own per-agent vault path, fully overwriting a stale local vault (D6)
     /// while preserving the archive doc's unknown extra fields.
@@ -674,7 +821,7 @@ mod tests {
         fs::write(&vault, vault_doc(my_id, "stale-local", false)).unwrap();
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -706,7 +853,7 @@ mod tests {
 
         // Import into fresh workspace
         let target = TempDir::new().unwrap();
-        let import_report = import(&alf_file, target.path(), None).unwrap();
+        let import_report = import(&alf_file, target.path(), None, false).unwrap();
 
         assert_eq!(import_report.agent_name, "Clawd");
         assert!(import_report.identity_imported);
@@ -743,7 +890,7 @@ mod tests {
 
         let target = TempDir::new().unwrap();
         let deep_path = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep_path, None).unwrap();
+        let report = import(&alf_file, &deep_path, None, false).unwrap();
         assert_eq!(report.agent_name, "Bot");
         assert!(deep_path.is_dir());
     }
@@ -785,7 +932,7 @@ mod tests {
         // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
         let escaped = root.path().join("PWNED.txt");
 
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, false);
         assert!(
             result.is_err(),
             "import must reject a path-traversal archive"
@@ -808,7 +955,7 @@ mod tests {
         let (_keep, alf_file) = archive_with_malicious_entry(&entry);
 
         let workspace = root.path().join("ws");
-        let result = import(&alf_file, &workspace, None);
+        let result = import(&alf_file, &workspace, None, false);
         assert!(
             result.is_err(),
             "import must reject an absolute-path archive entry"

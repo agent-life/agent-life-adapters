@@ -37,11 +37,12 @@ These two stores are decoupled. The workspace can be mutated freely between sync
 
 ## 4. Layout of `~/.alf/state/`
 
-For each agent, exactly two files:
+For each agent, two steady-state files and, only while a head restore is incomplete, one private transaction record:
 
 ```
-~/.alf/state/{agent_id}.toml             ← state file
-~/.alf/state/{agent_id}-snapshot.alf     ← local base snapshot
+~/.alf/state/{agent_id}.toml                   ← state file
+~/.alf/state/{agent_id}-snapshot.alf           ← local base snapshot
+~/.alf/state/{agent_id}.restore-inflight.json  ← temporary head-restore guard
 ```
 
 A typical state file:
@@ -55,6 +56,8 @@ last_synced_at = "2026-05-09T18:42:11Z"
 `last_synced_sequence` is the sole sync-control variable. `last_synced_at` is **informational metadata**: written on every save, displayed by `alf help status`, and propagated into delta manifests as `base_timestamp`. It is **not read by any control flow** and exists only for human audit trails.
 
 If the state file does not exist, the agent has never completed a sync (sequence is `None`). If the state file exists but the `-snapshot.alf` next to it is missing, the local base is incomplete — `alf sync` will refuse to push a delta until the base is reconstructed; see [`--recover`](#9-what---recover-does-and-does-not).
+
+If `{agent_id}.restore-inflight.json` exists, a head restore began after staging a cloud archive but did not finish atomically pairing the live workspace with its new base and cursor. `alf sync` and `alf sync --recover` both fail closed with `restore_incomplete`; neither may export or upload from that uncertain workspace. Re-run the **head** restore against the workspace named in the record. The record moves from `importing` to `imported` after the adapter returns, then disappears only after the base and state file are durable. A restore invoked for a different workspace is refused: it cannot clear an interrupted restore elsewhere.
 
 ## 5. The happy path
 
@@ -265,7 +268,7 @@ The recovery emits a distinct human-readable progress line and includes `"recove
 
 ## 10. Point-in-time restore (preview mode)
 
-`alf restore --at-sequence N` reconstructs the workspace as it looked after sequence `N` was applied, without touching `~/.alf/state/`. The cloud invariants that make this safe:
+`alf restore --at-sequence N` reconstructs the agent's files as they looked after sequence `N` was applied — into a preview directory, touching neither the live workspace nor `~/.alf/state/`. The cloud invariants that make this safe:
 
 - **Append-only history**: every delta is written to S3 once with sequence `K` and never rewritten. `deltas.compacted_into` exists in the schema for future compaction, but is not exercised today.
 - **Snapshot rows are preserved**: the `snapshots` table retains every row ever inserted. The service picks the largest snapshot with `sequence <= N` and applies non-compacted deltas in `(snap.sequence, N]`.
@@ -276,7 +279,7 @@ PIT is a deliberate read-only branch:
 
 - `~/.alf/state/{id}.toml` and `~/.alf/state/{id}-snapshot.alf` are **not modified**.
 - `last_synced_sequence` continues to point at head, so a subsequent `alf sync` is unaffected and will run against the head base — exactly as if the preview never happened.
-- The workspace, however, is overwritten with the merged archive at sequence `N`. If you want a non-destructive preview, point `--workspace` at an empty directory.
+- The live workspace is **not touched either** (since v1.1.0): the merged archive at sequence `N` is materialized into `~/.alf/preview/{agent_id}/seq-N/` (the three newest previews are kept; the JSON result carries `preview_path`). Before v1.1.0 the workspace itself was overwritten — runbooks written against that behavior must read the preview directory instead.
 
 ### Why preview-only
 
@@ -284,7 +287,7 @@ PIT is a deliberate read-only branch:
 
 ### Recovering from an accidental destructive sync
 
-PIT also serves as the audit trail for sync mishaps: if `alf sync` is ever pointed at the wrong workspace and propagates unintended deletes, every prior delta still exists in S3 and Neon indexed by sequence. Recovery is `alf restore --at-sequence <last-good-N>` to inspect, then plain `alf restore` (head) to materialise the merged state and resume normal sync.
+PIT also serves as the audit trail for sync mishaps: if `alf sync` is ever pointed at the wrong workspace and propagates unintended deletes, every prior delta still exists in S3 and Neon indexed by sequence. Recovery is `alf restore --at-sequence <last-good-N>` to inspect (the materialized tree lands in the preview directory), then plain `alf restore` (head) to rewrite the live workspace with the merged state and resume normal sync.
 
 ### Failure modes
 

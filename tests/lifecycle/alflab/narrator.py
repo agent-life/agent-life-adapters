@@ -6,7 +6,7 @@ keeping the container up and printing attach/cleanup commands)."""
 
 from __future__ import annotations
 
-from . import ui
+from . import events, ui
 
 
 class InteractiveAbort(Exception):
@@ -17,19 +17,20 @@ class NullNarrator:
     interactive = False
 
     def stage_start(self, stage_id: str, title: str):
+        events.emit("stage_start", stage_id=stage_id, title=title)
         ui.section(stage_id.upper(), title)
 
     def explain(self, text: str):        # rendered only by RichNarrator
         pass
 
     def flow(self, arrows: str):
-        pass
+        events.emit("flow", arrows=arrows)
 
     def show_diff(self, label: str, text: str):
         pass
 
     def show_data(self, label: str, data):
-        pass
+        events.emit("data", label=label, data=data)
 
     def inspect(self, run_dir, items):
         pass
@@ -45,6 +46,7 @@ class NullNarrator:
 
     # check-level rendering is shared — every mode shows verdict lines
     def check(self, status: str, name: str, detail: str = ""):
+        events.emit("check", name=name, status=status, detail=detail or "")
         msg = f"{name}" + (f" — {detail}" if detail else "")
         if status == "PASS":
             ui.ok(msg)
@@ -67,6 +69,7 @@ class RichNarrator(NullNarrator):
         ui.explain(text)
 
     def flow(self, arrows: str):
+        super().flow(arrows)
         ui.flow(arrows)
 
     def show_diff(self, label: str, text: str):
@@ -82,6 +85,7 @@ class RichNarrator(NullNarrator):
         ui.emit()
 
     def show_data(self, label: str, data):
+        super().show_data(label, data)
         ui.show_data(label, data)
 
     def inspect(self, run_dir, items):

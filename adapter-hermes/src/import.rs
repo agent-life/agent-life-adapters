@@ -23,7 +23,12 @@ const RAW_PREFIX: &str = "raw/hermes/";
 const SCHEMA_SIDECAR: &str = ".alf-state-db-schema.json";
 
 /// Import an `.alf` archive into a Hermes home.
-pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Result<ImportReport> {
+pub fn import(
+    alf_file: &Path,
+    home: &Path,
+    vault_key: Option<&VaultKey>,
+    preview: bool,
+) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
     let mut alf = AlfReader::new(std::io::BufReader::new(file))?;
@@ -54,7 +59,7 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
     // Inert-on-restore (D3): external include entries come back unverified, so a
     // hostile/compromised archive's external entries are not packed on the next
     // sync until the local user re-confirms them with `alf add --external`.
-    match mark_external_inert(home) {
+    match alf_core::include::mark_external_inert(home) {
         Ok(0) => {}
         Ok(n) => warnings.push(format!(
             "{n} external file entry(ies) imported as inert; re-add with \
@@ -105,7 +110,7 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
             .credentials
             .into_iter()
             .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
-        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, home)?;
+        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, home, preview)?;
         if vaulted > 0 {
             warnings.push(format!(
                 "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -133,27 +138,6 @@ pub fn import(alf_file: &Path, home: &Path, vault_key: Option<&VaultKey>) -> Res
         credentials_count,
         warnings,
     })
-}
-
-/// Flip restored external include entries to `verified = false` (inert). Returns
-/// the count changed.
-fn mark_external_inert(home: &Path) -> Result<usize> {
-    let path = home.join(alf_core::include::INCLUDE_FILE);
-    if !path.is_file() {
-        return Ok(0);
-    }
-    let mut list = alf_core::include::IncludeList::load(home)?;
-    let mut changed = 0;
-    for e in list.files.iter_mut() {
-        if e.external && e.verified {
-            e.verified = false;
-            changed += 1;
-        }
-    }
-    if changed > 0 {
-        list.save(home)?;
-    }
-    Ok(changed)
 }
 
 fn is_session_record(r: &MemoryRecord) -> bool {
@@ -204,14 +188,14 @@ fn restore_skill_artifacts<R: std::io::Read + std::io::Seek>(
             continue;
         };
         // Sanitize against Zip Slip (the source_path is attacker-influenceable).
-        let target = alf_core::safe_extract_path(home, &att.source_path)
-            .with_context(|| format!("refusing to extract artifact {}", att.source_path))?;
         let data = alf.read_raw_entry_capped(&archive_path, alf_core::MAX_RAW_ENTRY_BYTES)?;
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            home,
+            &att.source_path,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract artifact {}", att.source_path))?;
         n += 1;
     }
     Ok(n)
@@ -324,8 +308,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             continue;
         }
         // Reject path traversal / absolute names (Zip Slip — threat model A4.1).
-        let target = alf_core::safe_extract_path(home, relative)
-            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
         let data = alf.read_raw_entry_capped(name, alf_core::MAX_RAW_ENTRY_BYTES)?;
         total_bytes = total_bytes.saturating_add(data.len() as u64);
         if total_bytes > alf_core::MAX_RAW_TOTAL_BYTES {
@@ -334,11 +316,8 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
                 alf_core::MAX_RAW_TOTAL_BYTES
             );
         }
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(home, relative, &data, alf_core::ExtractWriteMode::Normal)
+            .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -351,6 +330,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     home: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -360,14 +340,23 @@ fn restore_agent_vault(
         credentials: records,
         extra: doc_extra,
     };
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| home.join(".alf-restored-credentials.json"));
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(&target, serde_json::to_string_pretty(&doc)?)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        home.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| home.join(".alf-restored-credentials.json"))
+    };
+    alf_core::write_private_extracted_target(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
     Ok(count)
 }
 
@@ -533,7 +522,7 @@ mod tests {
         fs::write(&vault, vault_doc(my_id, "stale-local", false)).unwrap();
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -589,7 +578,7 @@ mod tests {
         export::export(src.path(), &alf_file).unwrap();
 
         let target = TempDir::new().unwrap();
-        let report = import(&alf_file, target.path(), None).unwrap();
+        let report = import(&alf_file, target.path(), None, false).unwrap();
         assert_eq!(report.agent_name, "Atlas");
         assert!(report.identity_imported);
         assert_eq!(report.principals_count, 1);
@@ -643,7 +632,7 @@ mod tests {
         );
 
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
         assert!(target
             .path()
             .join("skills/custom/deploy/SKILL.md")
@@ -690,7 +679,7 @@ mod tests {
 
         // Import restores it and marks the entry inert (verified=false).
         let target = TempDir::new().unwrap();
-        import(&alf_file, target.path(), None).unwrap();
+        import(&alf_file, target.path(), None, false).unwrap();
         let restored = alf_core::include::IncludeList::load(target.path()).unwrap();
         let ext = restored
             .externals()
@@ -707,7 +696,7 @@ mod tests {
         export::export(src.path(), &alf_file).unwrap();
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/.hermes");
-        let report = import(&alf_file, &deep, None).unwrap();
+        let report = import(&alf_file, &deep, None, false).unwrap();
         assert_eq!(report.agent_name, "Atlas");
         assert!(deep.is_dir());
     }
@@ -739,7 +728,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let home = root.path().join("a/.hermes");
         let escaped = root.path().join("PWNED.txt");
-        assert!(import(&alf_file, &home, None).is_err());
+        assert!(import(&alf_file, &home, None, false).is_err());
         assert!(!escaped.exists(), "Zip Slip escaped: {}", escaped.display());
     }
 }

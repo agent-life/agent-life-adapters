@@ -58,16 +58,11 @@ pub(crate) enum MigrationPlan {
     },
 }
 
-/// Idempotent legacy-vault migration. Call after selector resolution, before
-/// any per-agent vault/key path use. `explicit_target` is set only by
-/// `alf vault migrate --agent` (bypasses the ambiguity blocks, never the
-/// diverged-pair block).
-pub fn ensure_migrated(
-    config: &Config,
-    runtime: &str,
-    explicit_target: Option<Uuid>,
-) -> Result<MigrationOutcome> {
-    match plan_migration(config, runtime, explicit_target)? {
+/// Execute an already-computed migration plan. Callers that need
+/// cross-process serialization must acquire the legacy and target-agent guards
+/// before reaching this seam.
+fn execute_plan(plan: MigrationPlan) -> Result<MigrationOutcome> {
+    match plan {
         MigrationPlan::NotNeeded => Ok(MigrationOutcome::NotNeeded),
         MigrationPlan::Blocked(err) => Ok(MigrationOutcome::Blocked(err)),
         MigrationPlan::Move { agent, vault, key } => {
@@ -94,11 +89,48 @@ pub fn ensure_migrated(
     }
 }
 
-/// Hard-error wrapper used by every trigger except `alf check` and
-/// `alf vault migrate`: `Blocked` becomes the coded error, `Migrated` prints
-/// progress lines.
-pub fn require_migrated(config: &Config, runtime: &str) -> Result<()> {
-    match ensure_migrated(config, runtime, None)? {
+/// Idempotent legacy-vault migration without cross-process serialization. This
+/// is the lock-free primitive: [`ensure_migrated_locked`] calls it to replan
+/// and execute while the shared guards are held, and the unit tests exercise
+/// the plan/move logic through it directly.
+pub fn ensure_migrated(
+    config: &Config,
+    runtime: &str,
+    explicit_target: Option<Uuid>,
+) -> Result<MigrationOutcome> {
+    execute_plan(plan_migration(config, runtime, explicit_target)?)
+}
+
+/// Idempotent legacy-vault migration under the shared advisory locks. The
+/// first plan is read-only; a real move takes the install-scoped legacy lock
+/// before the target agent lock (fixed order — never agent-then-legacy), then
+/// replans and executes while both are held. This prevents two processes from
+/// moving one legacy source into different per-agent destinations, and closes
+/// the preflight-to-rename race. `NotNeeded`/`Blocked` take no lock.
+pub fn ensure_migrated_locked(
+    config: &Config,
+    runtime: &str,
+    explicit_target: Option<Uuid>,
+) -> Result<MigrationOutcome> {
+    let initial = plan_migration(config, runtime, explicit_target)?;
+    let MigrationPlan::Move { agent, .. } = initial else {
+        return execute_plan(initial);
+    };
+
+    let _legacy_lock = crate::commands::mcp::watch::acquire_legacy_vault_lock_timeout(
+        std::time::Duration::from_secs(10),
+    )?;
+    let _agent_lock = crate::commands::mcp::watch::acquire_agent_lock_timeout(
+        agent,
+        std::time::Duration::from_secs(10),
+    )?;
+    // Replan under the guards and execute — a competing migration that already
+    // moved the legacy source is observed here as `NotNeeded`.
+    ensure_migrated(config, runtime, explicit_target)
+}
+
+fn require_outcome(outcome: MigrationOutcome) -> Result<()> {
+    match outcome {
         MigrationOutcome::NotNeeded => Ok(()),
         MigrationOutcome::Blocked(err) => Err(err.into()),
         MigrationOutcome::Migrated { vault, key, agent } => {
@@ -117,6 +149,15 @@ pub fn require_migrated(config: &Config, runtime: &str) -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Hard-error wrapper used by every migration trigger except `alf check` and
+/// `alf vault migrate` (which surface `Blocked` differently): `Blocked` becomes
+/// the coded error, `Migrated` prints progress lines. Runs under the shared
+/// legacy→agent guards, so it must complete before a caller takes a longer-lived
+/// per-agent guard — it never nests flock on the same agent.
+pub fn require_migrated_locked(config: &Config, runtime: &str) -> Result<()> {
+    require_outcome(ensure_migrated_locked(config, runtime, None)?)
 }
 
 /// Decide what a migration run would do, without writing anything.
@@ -756,5 +797,79 @@ mod tests {
             }
             _ => panic!("expected Migrated"),
         }
+    }
+
+    /// RF-012: the LOCKED migration path moves both legs through its
+    /// legacy→agent guards and is idempotent. The idempotent second run is also
+    /// a real release proof: if the guarded move had leaked either flock, the
+    /// second acquisition (a fresh fd on the same path) would contend and stall
+    /// for the full timeout instead of returning `NotNeeded` promptly.
+    #[test]
+    fn locked_migration_moves_both_legs_and_is_idempotent() {
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        let (legacy_vault, legacy_key) = seed_home(&tmp, true, true);
+
+        let config = config_with(vec![entry("openclaw", "main", uuid(1), true)]);
+        let outcome = ensure_migrated_locked(&config, "openclaw", None).unwrap();
+        let (vault, key, agent) = match outcome {
+            MigrationOutcome::Migrated { vault, key, agent } => (vault, key, agent),
+            _ => panic!("expected Migrated from the locked path"),
+        };
+        assert_eq!(agent, uuid(1));
+        assert!(!legacy_vault.exists(), "legacy vault must be gone");
+        assert!(!legacy_key.exists(), "legacy key must be gone");
+        assert_eq!(vault.unwrap(), agent_vault_path(tmp.path(), uuid(1)));
+        assert!(key
+            .unwrap()
+            .to_string_lossy()
+            .contains(&uuid(1).to_string()));
+
+        // Second locked run: guards were released, so this returns immediately.
+        assert!(matches!(
+            ensure_migrated_locked(&config, "openclaw", None).unwrap(),
+            MigrationOutcome::NotNeeded
+        ));
+    }
+
+    /// RF-012: the mapping-less legacy-vault lock is a distinct, stable, non-UUID
+    /// identity that serializes itself and is independent of any per-agent lock.
+    /// A real agent id must never silently collide with the global legacy doc.
+    #[test]
+    fn legacy_vault_lock_is_distinct_stable_and_independent() {
+        use crate::commands::mcp::watch::{legacy_vault_lock_path, lock, lock_path};
+
+        let _guard = HOME_LOCK.lock().unwrap();
+        let _restore = RestoreEnv::snapshot();
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("ALF_HOME", tmp.path());
+        std::fs::create_dir_all(crate::state::AgentState::state_dir().unwrap()).unwrap();
+
+        let legacy = legacy_vault_lock_path().unwrap();
+        // Stable, non-UUID basename — cannot alias `{agent-id}.lock` (even nil).
+        let stem = legacy.file_stem().unwrap().to_string_lossy();
+        assert!(
+            Uuid::parse_str(&stem).is_err(),
+            "legacy lock stem `{stem}` must not parse as a UUID"
+        );
+        // Distinct from any agent's lock file, including the nil UUID.
+        assert_ne!(legacy, lock_path(uuid(1)).unwrap());
+        assert_ne!(legacy, lock_path(Uuid::nil()).unwrap());
+
+        // Holding the legacy lock contends a second legacy acquire (self-
+        // serialization) but leaves a per-agent lock free (independence).
+        let held = lock::try_acquire(&legacy).unwrap();
+        assert!(held.is_some(), "first legacy acquire succeeds");
+        assert!(
+            lock::try_acquire(&legacy).unwrap().is_none(),
+            "second legacy acquire is contended while the first is held"
+        );
+        let agent_guard = lock::try_acquire(&lock_path(uuid(1)).unwrap()).unwrap();
+        assert!(
+            agent_guard.is_some(),
+            "an agent lock is independent of the held legacy lock"
+        );
     }
 }

@@ -5,10 +5,10 @@ agent-life Vault Integration Walkthrough
 
 Teaches new engineers how the zero-knowledge credentials vault fits into the
 sync pipeline: what the vault is and where it lives
-(`~/.alf/vault/credentials.json` — runtime-neutral, ciphertext only), what a
-vault record looks like field by field, what lands **in the cloud** (opaque S3
-blob + Postgres metadata only), and how the vault travels inside an `.alf`
-snapshot as the Layer 4 `credentials.json`.
+(`~/.alf/vault/<agent-id>/credentials.json` — runtime-neutral, ciphertext
+only), what a vault record looks like field by field, what lands **in the
+cloud** (opaque S3 blob + Postgres metadata only), and how the vault travels
+inside an `.alf` snapshot as the Layer 4 `credentials.json`.
 
 Follows the same UX as `integration_walkthrough.py` (banner, steps, pauses,
 markdown report).
@@ -99,7 +99,7 @@ def build_vault_credentials_document(agent_id_str: str) -> dict:
     """Two realistic `alf vault add` records — an email account and a Telegram account.
 
     The shapes match exactly what `alf vault add` writes into
-    `~/.alf/vault/credentials.json`: real-looking AEAD ciphertext, plaintext
+    `~/.alf/vault/<agent-id>/credentials.json`: real-looking AEAD ciphertext, plaintext
     descriptors (service / label / description / tags), and the `alf-vault` tag
     every agent-added record carries.
     """
@@ -229,8 +229,9 @@ def step_vault_zero_knowledge(cfg: iw.Config, report: iw.Report):
     iw.section(1, "Zero-Knowledge Boundary (Concept)")
     iw.explain(
         """
-        The **vault** is a local file — `~/.alf/vault/credentials.json` — holding
-        Layer 4 credentials **client-encrypted** before they ever reach the API.
+        The **vault** is a local per-agent file under
+        `~/.alf/vault/<agent-id>/credentials.json`, holding Layer 4 credentials
+        **client-encrypted** before they ever reach the API.
         The agent fills it explicitly with `alf vault add`; ALF never scrapes a
         runtime's own keystore.
 
@@ -262,9 +263,9 @@ def step_on_disk_layout(cfg: iw.Config, report: iw.Report):
     iw.section(2, "The Vault On Disk — Location, Neutrality, Anatomy")
     iw.explain(
         """
-        The ALF vault is one file:
+        Each agent's ALF vault is one file:
 
-            ~/.alf/vault/credentials.json
+            ~/.alf/vault/<agent-id>/credentials.json
 
         It is **runtime-neutral** — the same path whether the agent runs on
         OpenClaw or ZeroClaw. It lives under ALF's own home (`~/.alf/`, beside
@@ -293,7 +294,7 @@ def step_on_disk_layout(cfg: iw.Config, report: iw.Report):
 
     # Show what a vault record actually looks like.
     cred_doc = build_vault_credentials_document(str(VAULT_AGENT_ID))
-    print(f"  {iw.c('yellow', '~/.alf/vault/credentials.json (redacted)')}:")
+    print(f"  {iw.c('yellow', '~/.alf/vault/<agent-id>/credentials.json (redacted)')}:")
     print(json.dumps(redact_credentials_for_display(cred_doc), indent=4))
     print()
     iw.explain(
@@ -321,7 +322,7 @@ def step_on_disk_layout(cfg: iw.Config, report: iw.Report):
             "Vault on disk",
             True,
             0,
-            "Location (~/.alf/vault/credentials.json), runtime-neutrality, record anatomy",
+            "Per-agent location, runtime-neutrality, record anatomy",
         )
     )
     iw.pause(cfg)
@@ -548,7 +549,7 @@ def step_surgical_delete_concept(cfg: iw.Config, report: iw.Report):
     iw.explain(
         """
         The `alf vault` command family: `keygen` mints a key; `add` encrypts a
-        credential into `~/.alf/vault/credentials.json`; `list` and `delete`
+        credential into `~/.alf/vault/<agent-id>/credentials.json`; `list` and `delete`
         work on plaintext descriptors only; `decrypt` reads one secret back.
         `add` and `decrypt` need the vault key — `list` and `delete` do not.
 
@@ -667,7 +668,7 @@ def step_dry_run_upload_preview(cfg: iw.Config, report: iw.Report):
         Note the boundary this draws with the vault:
 
           • `.alfignore` scopes WORKSPACE files only.
-          • The vault file `~/.alf/vault/credentials.json` lives OUTSIDE the
+          • The per-agent vault file under `~/.alf/vault/<agent-id>/` lives OUTSIDE the
             workspace and is never affected by `.alfignore` — use `alf vault`
             to control its contents.
 
@@ -693,11 +694,17 @@ def step_dry_run_upload_preview(cfg: iw.Config, report: iw.Report):
     print()
 
     def run_dry_run(ws: Path) -> dict:
+        isolated_home = ws.parent / "home"
+        isolated_home.mkdir(exist_ok=True)
+        env = {**os.environ, "HOME": str(isolated_home)}
+        env.pop("ALF_AGENT", None)
+        env.pop("ALF_HUMAN", None)
         proc = subprocess.run(
             [alf, "export", "-r", "openclaw", "-w", str(ws), "--dry-run"],
             capture_output=True,
             text=True,
             timeout=60,
+            env=env,
         )
         if proc.returncode != 0:
             raise RuntimeError(
@@ -769,10 +776,12 @@ def step_dry_run_upload_preview(cfg: iw.Config, report: iw.Report):
 
 
 def _write_vault(ctx, creds: list) -> None:
-    """Write `credentials.json` directly to the CLI's isolated vault path. Layer 4
-    is already ciphertext, so this is exactly what lands after `alf vault add` —
-    no vault key needed for `sync`/`check` to read it."""
-    vault_path = ctx.alf_home / "vault" / "credentials.json"
+    """Write directly to this agent's isolated per-agent vault path. Layer 4 is
+    already ciphertext, so this is exactly what lands after `alf vault add` —
+    no vault key is needed for `sync`/`check` to read it."""
+    vault_path = (
+        ctx.alf_home / "vault" / str(ctx.agent_id) / "credentials.json"
+    )
     vault_path.parent.mkdir(parents=True, exist_ok=True)
     vault_path.write_text(
         json.dumps({"credentials": creds}, indent=2), encoding="utf-8"

@@ -1,0 +1,91 @@
+{
+  "_comment": "OpenClaw memory-DTO golden (WP-M4 task 3): the structural fingerprint of GET /v1/agents/:id/memory (MemoryRecordDto), captured OFFLINE from an OpenClaw alf-export archive. The generic runtime archive must project to this same shape (design F2: the indexer is runtime-blind). Regenerate with tools/gen_dto_golden.py.",
+  "captured_from": "scripts/fixtures/openclaw-workspace (alf export -r openclaw)",
+  "profile": {
+    "dto_keys": [
+      "id",
+      "memory_type",
+      "namespace",
+      "content",
+      "observed_at",
+      "created_at_alf",
+      "updated_at_alf",
+      "tags",
+      "source",
+      "raw_source_format"
+    ],
+    "field_types": {
+      "id": [
+        "str"
+      ],
+      "memory_type": [
+        "str"
+      ],
+      "namespace": [
+        "str"
+      ],
+      "content": [
+        "str"
+      ],
+      "observed_at": [
+        "str"
+      ],
+      "created_at_alf": [
+        "str"
+      ],
+      "updated_at_alf": [
+        "str"
+      ],
+      "tags": [
+        "list"
+      ],
+      "source": [
+        "dict"
+      ],
+      "raw_source_format": [
+        "dict"
+      ]
+    },
+    "source_keys": [
+      "extraction_method",
+      "origin",
+      "origin_file",
+      "runtime"
+    ],
+    "raw_source_format_keys": [
+      "heading",
+      "line_end",
+      "line_start"
+    ]
+  },
+  "sample_dto": {
+    "id": "b6973f0f-14c3-5e24-9a20-783413ae0332",
+    "memory_type": "episodic",
+    "namespace": "daily",
+    "content": "## Morning standup\n\nDiscussed the Redis cluster migration timeline. Agreed to start with the\nstaging environment next week. [decision|i=0.8] Moving to Redis 7.2 for\nthe new Stream consumer groups feature.\n",
+    "observed_at": "2026-01-15T00:00:00Z",
+    "created_at_alf": "2026-01-15T00:00:00Z",
+    "updated_at_alf": "2026-05-24T06:12:00.739017780Z",
+    "tags": [
+      "daily",
+      "decision"
+    ],
+    "source": {
+      "runtime": "openclaw",
+      "origin": "workspace",
+      "origin_file": "memory/2026-01-15.md",
+      "extraction_method": "agent_written"
+    },
+    "raw_source_format": {
+      "heading": "Morning standup",
+      "line_end": 6,
+      "line_start": 1
+    }
+  },
+  "validity_issues": [
+    "d1784e49-4542-5beb-a1a8-f99a22f78cb2: non-chip namespace 'active-context'",
+    "4f6e13af-ae22-5ce8-a2fb-784f5a9baafb: non-chip namespace 'project'",
+    "dadd235d-a0b2-5063-ad56-4fe50eef4392: non-chip namespace 'project'",
+    "2cb3a8de-65e5-5bce-b6b0-838ccc9620ce: non-chip namespace 'project'"
+  ]
+}

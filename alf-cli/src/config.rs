@@ -1,12 +1,18 @@
 //! Configuration management for `~/.alf/config.toml`.
 
-use crate::fs_private::write_private;
+use crate::fs_private::write_private_atomic;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use uuid::Uuid;
+
+/// Bounded wait for the cross-process config lock, matching the per-agent lock
+/// timeout so a contended writer fails uniformly rather than blocking forever.
+const CONFIG_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+const CONFIG_LOCK_POLL: Duration = Duration::from_millis(250);
 
 /// Top-level config file structure.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -99,6 +105,12 @@ impl Config {
         Ok(Self::dir()?.join("config.toml"))
     }
 
+    /// Path to the single cross-process config lock (`~/.alf/config.lock`) that
+    /// serializes every `config.toml` read-modify-write (RF-013).
+    pub fn lock_path() -> Result<PathBuf> {
+        Ok(Self::dir()?.join("config.lock"))
+    }
+
     /// Resolve the runtime: the CLI flag if given, else `[defaults] runtime`
     /// (which itself defaults to `"openclaw"`). Never fails.
     pub fn resolve_runtime(&self, flag: Option<String>) -> String {
@@ -126,7 +138,8 @@ impl Config {
 
     /// Load config from disk, or return defaults if the file doesn't exist.
     ///
-    /// Does not create the file if missing — call [`save`](Config::save)
+    /// Does not create the file if missing — call
+    /// [`update_locked`](Config::update_locked) (or [`save_to`](Config::save_to))
     /// explicitly if you want to persist defaults.
     pub fn load() -> Result<Self> {
         let path = Self::path()?;
@@ -169,13 +182,6 @@ impl Config {
         }
 
         Ok(config)
-    }
-
-    /// Save the config to `~/.alf/config.toml`, creating the directory
-    /// if needed.
-    pub fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        self.save_to(&path)
     }
 
     /// Rows of the `[[agents]]` mapping that belong to `runtime` (row runtime
@@ -241,10 +247,98 @@ impl Config {
                 .with_context(|| format!("Failed to create directory {}", parent.display()))?;
         }
         let content = toml::to_string_pretty(self).context("Failed to serialize config")?;
-        write_private(path, &content)
+        // Atomic temp+rename (WP-M5 review A1): the long-running MCP server is now
+        // a `config.toml` writer (`run_rediscovery`), and the tools read it on
+        // parallel threads with no shared lock. A non-atomic truncate+write would
+        // let a reader land on an empty file — and since every field is
+        // `#[serde(default)]`, that parses as an empty `[[agents]]` mapping, so
+        // `alf_agents_list` would momentarily report zero agents. Rename makes
+        // every reader see either the whole old or the whole new config.
+        write_private_atomic(path, &content)
             .with_context(|| format!("Failed to write config to {}", path.display()))?;
         Ok(())
     }
+
+    /// Serialized cross-process read-modify-write of `config.toml` (RF-013).
+    ///
+    /// [`save_to`](Config::save_to) makes an individual write crash-safe, but it
+    /// does not make a load→mutate→save span atomic: two `alf` processes (e.g. a
+    /// CLI command and a running `mcp serve` watch loop) can each read version A,
+    /// make disjoint edits, and save B then C — silently dropping B. This is the
+    /// only correct way to mutate the shared document when more than one process
+    /// can run.
+    ///
+    /// It acquires the config flock (`~/.alf/config.lock`), **reloads** the
+    /// latest config from disk into `self` — so `f` rebases onto whatever a
+    /// concurrent writer committed, rather than clobbering it — runs `f`,
+    /// atomically saves, and releases. Any edits made to `self` *before* calling
+    /// this are discarded by the reload; express every mutation inside `f`.
+    ///
+    /// LOCK ORDER: the config lock is acquired ABOVE the per-agent lock. Never
+    /// call this while holding a per-agent lock (see
+    /// `commands::mcp::watch::lock` hierarchy).
+    pub fn update_locked<T>(&mut self, f: impl FnOnce(&mut Config) -> Result<T>) -> Result<T> {
+        let path = Self::path()?;
+        let lock_path = Self::lock_path()?;
+        Self::update_locked_at(self, &path, &lock_path, f)
+    }
+
+    /// [`update_locked`](Config::update_locked) against explicit paths — for
+    /// tests that point `HOME`/`ALF_HOME` at a temp directory or drive two
+    /// processes against the same config.
+    pub fn update_locked_at<T>(
+        config: &mut Config,
+        path: &Path,
+        lock_path: &Path,
+        f: impl FnOnce(&mut Config) -> Result<T>,
+    ) -> Result<T> {
+        Self::update_locked_with(
+            config,
+            path,
+            lock_path,
+            CONFIG_LOCK_TIMEOUT,
+            CONFIG_LOCK_POLL,
+            f,
+        )
+    }
+
+    /// The lock-acquire → reload → mutate → save core, with an explicit wait
+    /// budget so tests can force the contended `config_busy` path without the
+    /// 10 s production timeout.
+    fn update_locked_with<T>(
+        config: &mut Config,
+        path: &Path,
+        lock_path: &Path,
+        timeout: Duration,
+        poll: Duration,
+        f: impl FnOnce(&mut Config) -> Result<T>,
+    ) -> Result<T> {
+        // The lock file (and thus the config dir) must exist before we can flock
+        // it. Creating the lock file is not itself the critical section.
+        if let Some(parent) = lock_path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory {}", parent.display()))?;
+        }
+        let _guard = crate::commands::mcp::watch::lock::acquire_timeout(lock_path, timeout, poll)
+            .with_context(|| format!("config lock unusable at {}", lock_path.display()))?
+            .ok_or_else(config_busy)?;
+
+        *config = Self::load_from(path)?;
+        let out = f(config)?;
+        config.save_to(path)?;
+        Ok(out)
+    }
+}
+
+/// The `config_busy` error for a config-lock acquisition that timed out — the
+/// `config.toml` RMW was not attempted, so the file is unchanged.
+fn config_busy() -> anyhow::Error {
+    crate::errors::CliError {
+        code: crate::errors::codes::CONFIG_BUSY,
+        cause: "another alf process is updating the configuration".to_string(),
+        remedy: "retry shortly".to_string(),
+    }
+    .into()
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +348,10 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::mcp::watch::lock;
     use crate::context::tests::HOME_LOCK;
+    use crate::errors::{codes, CliError};
+    use std::sync::{Arc, Barrier};
     use tempfile::TempDir;
 
     #[test]
@@ -407,6 +504,84 @@ mod tests {
         Config::default().save_to(&path).unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn save_to_is_atomic_and_leaves_no_temp() {
+        // WP-M5 review A1: an overwriting save must not leave a torn/partial file
+        // or a `.tmp` sibling — a concurrent reader (an MCP tool's `Config::load`)
+        // always sees a whole config.
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+
+        let mut first = Config::default();
+        first.agents.push(AgentEntry {
+            runtime: Some("hermes".into()),
+            runtime_agent: "scout".into(),
+            runtime_agent_id: None,
+            alf_agent_id: uuid::Uuid::nil(),
+            workspace: "/ws".into(),
+            enabled: true,
+            extra: Default::default(),
+        });
+        first.save_to(&path).unwrap();
+        // Overwrite; the file must remain fully parseable throughout.
+        Config::default().save_to(&path).unwrap();
+
+        let reloaded = Config::load_from(&path).unwrap();
+        assert!(reloaded.agents.is_empty(), "second whole config won");
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "no torn .tmp sibling survives a save");
+    }
+
+    #[test]
+    fn concurrent_saves_never_expose_an_empty_agent_mapping() {
+        // WP-M5 review A1 DoD guard: with the MCP server (or a CLI) repeatedly
+        // saving config.toml, a concurrent reader (`alf_agents_list` →
+        // `Config::load`) must always see a whole file — never the truncate window
+        // that would parse as an empty `[[agents]]` mapping. Atomic temp+rename
+        // guarantees it; the pre-A1 in-place truncate+write did not.
+        use std::sync::Arc;
+        let dir = Arc::new(TempDir::new().unwrap());
+        let path = dir.path().join("config.toml");
+
+        let mut seeded = Config::default();
+        seeded.agents.push(AgentEntry {
+            runtime: Some("hermes".into()),
+            runtime_agent: "scout".into(),
+            runtime_agent_id: None,
+            alf_agent_id: uuid::Uuid::nil(),
+            workspace: "/ws".into(),
+            enabled: true,
+            extra: Default::default(),
+        });
+        seeded.save_to(&path).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..3 {
+            let (p, cfg) = (path.clone(), seeded.clone());
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..40 {
+                    cfg.save_to(&p).unwrap();
+                }
+            }));
+        }
+        for _ in 0..3 {
+            let p = path.clone();
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..80 {
+                    let c = Config::load_from(&p).expect("config always parseable");
+                    assert_eq!(c.agents.len(), 1, "reader never sees a torn/empty config");
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     #[test]
@@ -572,5 +747,235 @@ mod tests {
         let row = config.set_agent_enabled("openclaw", "main", false).unwrap();
         assert!(!row.enabled);
         assert!(config.set_agent_enabled("openclaw", "ghost", true).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // RF-013 — cross-process config read-modify-write serialization.
+    //
+    // These use `update_locked_at`/`update_locked_with` against explicit paths
+    // so they need no `HOME`/`ALF_HOME` and stay deterministic. `flock` is
+    // per-open-file-description, so two separate opens of the same lock path in
+    // the same process contend exactly as two processes would — the same
+    // property the `lock.rs` unit tests rely on.
+    // -----------------------------------------------------------------------
+
+    fn uuid_n(n: u8) -> String {
+        format!("00000000-0000-0000-0000-0000000000{n:02}")
+    }
+
+    /// Two writers that both start from the same (empty) config each add a
+    /// DIFFERENT agent. Under the lock, the second writer reloads and sees the
+    /// first's row, so both survive. This is the fixed behavior.
+    #[test]
+    fn concurrent_config_update_preserves_disjoint_agent_adds() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let lock_path = dir.path().join("config.lock");
+        Config::default().save_to(&path).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (1u8..=2)
+            .map(|i| {
+                let (path, lock_path, barrier) = (path.clone(), lock_path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    // Both read version A before either writes — the classic
+                    // lost-update window.
+                    let mut cfg = Config::load_from(&path).unwrap();
+                    barrier.wait();
+                    Config::update_locked_at(&mut cfg, &path, &lock_path, |c| {
+                        c.upsert_agent(agent_entry(
+                            &format!("agent-{i}"),
+                            &uuid_n(i),
+                            &format!("/ws-{i}"),
+                            true,
+                        ));
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            final_cfg.agents.len(),
+            2,
+            "both disjoint agent adds must survive the serialized RMW"
+        );
+    }
+
+    /// The bug the lock fixes: the pre-RF-013 pattern (load → mutate in memory →
+    /// `save_to`, no lock, no reload) drops one update when both writers start
+    /// from the same version. Proves the harness actually reproduces the race
+    /// the fixed test above defeats.
+    #[test]
+    fn concurrent_config_update_naive_save_loses_one() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        Config::default().save_to(&path).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (1u8..=2)
+            .map(|i| {
+                let (path, barrier) = (path.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    let mut cfg = Config::load_from(&path).unwrap();
+                    barrier.wait();
+                    cfg.upsert_agent(agent_entry(
+                        &format!("agent-{i}"),
+                        &uuid_n(i),
+                        &format!("/ws-{i}"),
+                        true,
+                    ));
+                    cfg.save_to(&path).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            final_cfg.agents.len(),
+            1,
+            "the unserialized load-mutate-save loses one of the two adds"
+        );
+    }
+
+    /// Disjoint fields (an api-key write racing an agent add) must both survive
+    /// — the corrected form of RF-013's "change an interval and add an agent"
+    /// case (watch cadence is in-memory only, so a persisted field stands in).
+    #[test]
+    fn concurrent_config_update_disjoint_fields_survive() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let lock_path = dir.path().join("config.lock");
+        Config::default().save_to(&path).unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        let key_thread = {
+            let (path, lock_path, barrier) = (path.clone(), lock_path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let mut cfg = Config::load_from(&path).unwrap();
+                barrier.wait();
+                Config::update_locked_at(&mut cfg, &path, &lock_path, |c| {
+                    c.service.api_key = "sk-live-key".into();
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        let agent_thread = {
+            let (path, lock_path, barrier) = (path.clone(), lock_path.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                let mut cfg = Config::load_from(&path).unwrap();
+                barrier.wait();
+                Config::update_locked_at(&mut cfg, &path, &lock_path, |c| {
+                    c.upsert_agent(agent_entry("agent-1", &uuid_n(1), "/ws-1", true));
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        key_thread.join().unwrap();
+        agent_thread.join().unwrap();
+
+        let final_cfg = Config::load_from(&path).unwrap();
+        assert_eq!(
+            final_cfg.service.api_key, "sk-live-key",
+            "api-key write kept"
+        );
+        assert_eq!(final_cfg.agents.len(), 1, "agent add kept");
+    }
+
+    /// A held config lock makes an update time out with `config_busy` and leaves
+    /// `config.toml` byte-for-byte unchanged (the RMW is never attempted). Uses
+    /// a short wait budget so the test does not sit on the 10 s production
+    /// timeout.
+    #[test]
+    fn config_lock_held_times_out_leaving_bytes_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        let lock_path = dir.path().join("config.lock");
+
+        let mut seeded = Config::default();
+        seeded.service.api_key = "seed-key".into();
+        seeded.save_to(&path).unwrap();
+        let before = fs::read(&path).unwrap();
+
+        // Hold the config lock exclusively from a separate fd.
+        let held = lock::acquire_blocking(&lock_path).unwrap();
+
+        let mut cfg = Config::load_from(&path).unwrap();
+        let err = Config::update_locked_with(
+            &mut cfg,
+            &path,
+            &lock_path,
+            Duration::from_millis(200),
+            Duration::from_millis(25),
+            |c| {
+                c.service.api_key = "should-not-persist".into();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err.downcast_ref::<CliError>().map(|e| e.code),
+            Some(codes::CONFIG_BUSY),
+            "a contended config lock surfaces config_busy"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "a timed-out RMW leaves config.toml byte-identical"
+        );
+        drop(held);
+    }
+
+    /// Lock-order guard (RF-013 §3): config lock is always taken before the
+    /// per-agent lock. Two threads take them in that order and both complete —
+    /// a future inversion would deadlock and hang this test.
+    #[test]
+    fn config_lock_ordering_config_then_agent_no_deadlock() {
+        let dir = TempDir::new().unwrap();
+        let config_lock = dir.path().join("config.lock");
+        let agent_lock = dir.path().join("agent.lock");
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let (config_lock, agent_lock, barrier) =
+                    (config_lock.clone(), agent_lock.clone(), barrier.clone());
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let cfg_guard = lock::acquire_timeout(
+                        &config_lock,
+                        Duration::from_secs(5),
+                        Duration::from_millis(10),
+                    )
+                    .unwrap()
+                    .expect("config lock acquired within budget");
+                    let agent_guard = lock::acquire_timeout(
+                        &agent_lock,
+                        Duration::from_secs(5),
+                        Duration::from_millis(10),
+                    )
+                    .unwrap()
+                    .expect("agent lock acquired within budget");
+                    // Trivial critical section; drop in reverse order.
+                    drop(agent_guard);
+                    drop(cfg_guard);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join()
+                .expect("no deadlock — consistent config→agent order");
+        }
     }
 }

@@ -70,7 +70,7 @@ Each agent's backup contains **only that agent's data**. Even though ZeroClaw ke
 
 ALF does **not** back up ZeroClaw's operational databases (session bookkeeping, scheduled jobs, hygiene state) — only your agents' memory.
 
-One honest note: ALF backs up your agent's memory **as-is**. If your agent chose to remember a secret in ZeroClaw's memory, that secret is in the backup like any other memory — ALF doesn't inspect or filter what your agent remembers. For secrets, use the vault below instead: it's encrypted end-to-end, and only your machine holds the key.
+ALF does not filter what your agent remembers. Memory is captured as written — not inspected, classified, or redacted — so a credential recorded in ZeroClaw's memory is included like any other memory, and is readable wherever that backup reaches: the archive, any restore of it, and the dashboard. Keep credentials in the encrypted vault instead (below); vault entries are encrypted on your machine, and the service never receives the key.
 
 ---
 

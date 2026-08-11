@@ -29,7 +29,8 @@ prints:
 
 Prerequisites:
   pip install requests psycopg2-binary boto3 python-dotenv
-  A built `alf` binary (PATH, or target/{release,debug}/alf in this repo).
+  A built `alf` binary. This checkout's `target/debug/alf` is preferred; set
+  `ALF_BIN=/path/to/alf` to override it.
 
 Environment (.env or exported):
   API_BASE_URL      — e.g. https://agent-life-api-test.halimede.one
@@ -61,6 +62,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -138,7 +140,10 @@ class Config:
 
     @classmethod
     def from_env(cls, interactive: bool = True) -> "Config":
-        dotenv.load_dotenv()
+        # adapters/.env is the authoritative (and only) config source — load it
+        # explicitly rather than let dotenv walk up the tree into another repo,
+        # and override ambient shell values.
+        dotenv.load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=True)
         missing = []
         for var in ("API_BASE_URL", "API_KEY", "NEON_DATABASE_URL", "S3_BUCKET_NAME"):
             if not os.environ.get(var):
@@ -168,7 +173,7 @@ class RunContext:
     root: Path           # the persistent run dir (printed; preserved interactively)
     home: Path           # isolated HOME for the CLI (holds .alf/)
     ws: Path             # the workspace the CLI syncs (the `-w` argument)
-    runtime_home: Path   # openclaw: == ws; zeroclaw: ws.parent (holds config.toml)
+    runtime_home: Path   # install root; == ws for the walkthrough's flat layouts
     restore_ws: Path     # a "fresh machine" workspace that `alf restore` populates
     alf: str             # path to the alf binary
     runtime: str
@@ -461,16 +466,38 @@ class S3Client:
 # ---------------------------------------------------------------------------
 
 def find_alf_binary() -> Optional[str]:
-    """Locate the `alf` CLI: PATH first, then this repo's target/ build dirs."""
-    found = shutil.which("alf")
-    if found:
-        return found
+    """Locate the CLI for this source checkout.
+
+    An explicit `ALF_BIN` wins. Otherwise prefer the locally built debug/release
+    binary over PATH: a globally installed `alf` can predate features exercised
+    by this walkthrough (notably `alf mcp serve`).
+    """
+    configured = os.environ.get("ALF_BIN")
+    if configured:
+        candidate = shutil.which(configured) or configured
+        return candidate if Path(candidate).is_file() else None
+
     repo_root = Path(__file__).resolve().parent.parent
-    for profile in ("release", "debug"):
+    for profile in ("debug", "release"):
         candidate = repo_root / "target" / profile / "alf"
         if candidate.is_file():
             return str(candidate)
-    return None
+    return shutil.which("alf")
+
+
+def supports_mcp(binary: str) -> bool:
+    """Whether `binary` implements the server used by the RF-008 stage."""
+    try:
+        result = subprocess.run(
+            [binary, "mcp", "--help"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def run_cli(ctx: RunContext, argv: list[str], *, timeout: int = 180,
@@ -511,6 +538,73 @@ def run_cli(ctx: RunContext, argv: list[str], *, timeout: int = 180,
                 print(f"    {c('red', err[:220])}")
         print()
     return proc, parsed
+
+
+def start_watch_server(ctx: RunContext) -> tuple[subprocess.Popen, list[str], threading.Thread]:
+    """Start a persistent MCP server with a test-only short watch cadence.
+
+    The server needs no MCP request to start watching; keeping stdin open gives
+    the loop the same lifetime as a real MCP host session. Stderr is drained in
+    a background thread so watch diagnostics cannot block the child. Stdout is
+    the JSON-RPC protocol stream and is unused by this walkthrough.
+    """
+    env = {
+        **os.environ,
+        "HOME": str(ctx.home),
+        "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+        "ALF_WATCH_QUIESCE_MS": "1000",
+        "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+        "ALF_WATCH_TICK_MS": "1000",
+    }
+    env.pop("ALF_HUMAN", None)
+    env.pop("ALF_AGENT", None)
+    proc = subprocess.Popen(
+        [ctx.alf, "mcp", "serve", "-r", ctx.runtime, "-w", str(ctx.ws)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    stderr_lines: list[str] = []
+
+    def drain_stderr():
+        if proc.stderr is None:
+            return
+        for line in proc.stderr:
+            stderr_lines.append(line)
+
+    drainer = threading.Thread(target=drain_stderr, daemon=True)
+    drainer.start()
+    return proc, stderr_lines, drainer
+
+
+def stop_watch_server(proc: subprocess.Popen, drainer: threading.Thread) -> None:
+    """End the stdio session cleanly, then terminate only if it ignores EOF."""
+    if proc.stdin is not None and not proc.stdin.closed:
+        proc.stdin.close()
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+    drainer.join(timeout=3)
+
+
+def wait_for(predicate, *, timeout: float, interval: float = 0.25) -> bool:
+    """Poll a local/API predicate with a bounded integration-test wait."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if predicate():
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------------------
@@ -554,9 +648,19 @@ def build_run_context(cfg: Config, alf: str, agent_id: uuid.UUID = AGENT_ID) -> 
 
     if cfg.runtime == "zeroclaw":
         runtime_home = root / "zeroclaw-home"
-        ws = runtime_home / "workspace"
+        # ZeroClaw's current shared-install model discovers a logical `default`
+        # agent at agents/default/workspace while the runtime content itself
+        # lives at the install root. Keep the CLI's explicit -w target on that
+        # flat install root (the real/harness layout), and seed the discovered
+        # binding's identity pin too so discovery adopts the walkthrough UUID.
+        ws = runtime_home
         ws.mkdir(parents=True)
         (runtime_home / "config.toml").write_text(ZEROCLAW_CONFIG_TOML, encoding="utf-8")
+        mapped_ws = runtime_home / "agents" / "default" / "workspace"
+        mapped_ws.mkdir(parents=True)
+        (mapped_ws / ".alf-agent-id").write_text(
+            str(agent_id) + "\n", encoding="utf-8"
+        )
         restore_ws = root / "restore-home" / "workspace"
     else:
         ws = root / "openclaw-workspace"
@@ -602,9 +706,11 @@ def tree(path: Path, limit: int = 12) -> list[str]:
 
 # `.alf-agent-id` is the ALF agent-UUID pin. Its on-disk representation is
 # implementation-defined — `alf import` writes it without a trailing newline,
-# while the seed writes one — so it is excluded from the content hash and the
-# pin is instead verified separately by its (stripped) UUID value.
-DIGEST_EXCLUDE = (".alf-agent-id",)
+# while the seed writes one — so every such pin is excluded from the content
+# hash and the restored pin is verified separately by UUID. `.alf-include.lock`
+# is a local coordination artifact and deliberately never enters an archive.
+DIGEST_EXCLUDE = (".alf-agent-id", ".alf-include.lock")
+INTERNAL_DIGEST_BASENAMES = frozenset(DIGEST_EXCLUDE)
 
 
 def workspace_file_hashes(
@@ -618,7 +724,7 @@ def workspace_file_hashes(
         if not p.is_file():
             continue
         rel = str(p.relative_to(path))
-        if rel in exclude:
+        if rel in exclude or p.name in INTERNAL_DIGEST_BASENAMES:
             continue
         out[rel] = hashlib.sha256(p.read_bytes()).hexdigest()
     return out
@@ -1098,6 +1204,213 @@ def step_identity_principals_delta(cfg: Config, ctx: RunContext, report: Report)
     pause(cfg)
 
 
+def step_lazy_content_root_watch(cfg: Config, ctx: RunContext, db: DbClient,
+                                 report: Report):
+    """RF-008 regression: create an allowlisted content root after the MCP
+    watcher starts, then prove a later descendant edit is auto-synced too."""
+    if ctx.runtime not in {"hermes", "zeroclaw"}:
+        return
+
+    section("5b", "Lazy Content Root — Watch Refresh + Auto-sync")
+    if ctx.runtime == "hermes":
+        root = ctx.ws / "memories"
+        probe_rel = Path("memories") / "rf008" / "probe.md"
+        marker_prefix = "RF008-HERMES"
+        probe_base = ctx.ws
+    else:
+        # ZeroClaw resolves the install from config.toml, so its markdown root
+        # is at the install root, not the legacy workspace child.
+        root = ctx.runtime_home / "memory"
+        probe_rel = Path("memory") / "rf008" / "probe.md"
+        marker_prefix = "RF008-ZEROCLAW"
+        probe_base = ctx.runtime_home
+
+    explain(f"""
+        RF-008 regression: {ctx.runtime} must watch an allowlisted content root
+        that does not exist when `alf mcp serve` starts. We first remove only
+        `{root.name}/` and commit that deletion as a manual baseline. Then a
+        persistent watcher creates `{probe_rel}` and later appends to the same
+        already-existing file. The cloud sequence must advance once for creation
+        and again for the nested edit; a read-only restore preview must contain
+        both markers.
+    """)
+    flow(f"absent {root.name}/ ──mcp serve──▶ parent creation watch ──refresh──▶ recursive {root.name}/ watch")
+
+    t0 = time.time()
+    stderr_path = ctx.root / f"rf008-{ctx.runtime}-watch-stderr.log"
+    server: Optional[subprocess.Popen] = None
+    drainer: Optional[threading.Thread] = None
+    stderr_lines: list[str] = []
+    s0: Optional[int] = None
+    s1: Optional[int] = None
+    s2: Optional[int] = None
+    preview_path: Optional[Path] = None
+    token = uuid.uuid4().hex[:12]
+    create_marker = f"{marker_prefix}-CREATE-{token}"
+    nested_marker = f"{marker_prefix}-NESTED-{token}"
+    probe = probe_base / probe_rel
+    failure = ""
+
+    def latest_sequence() -> Optional[int]:
+        row = db.query_one(
+            "SELECT latest_sequence FROM agents WHERE id = %s", (str(ctx.agent_id),)
+        )
+        return int(row["latest_sequence"]) if row is not None else None
+
+    def advanced(past: int) -> bool:
+        current = latest_sequence()
+        return current is not None and current > past
+
+    def diagnostics() -> str:
+        return "".join(stderr_lines[-30:]).strip() or "no server stderr captured"
+
+    try:
+        if root.is_dir():
+            shutil.rmtree(root)
+        elif root.exists():
+            root.unlink()
+        root_absent = not root.exists()
+        (ok if root_absent else fail)(f"precondition: {ctx.disp(root)} is absent = {root_absent}")
+        if not root_absent:
+            raise RuntimeError(f"could not remove logical root {root}")
+
+        # Commit the deliberate deletion before starting the server. The later
+        # automatic advances therefore cannot be a delayed removal upload.
+        proc, baseline = run_cli(ctx, ["sync", "-r", ctx.runtime, "-w", str(ctx.ws)])
+        if proc.returncode != 0 or not baseline:
+            raise RuntimeError((proc.stderr or proc.stdout or "baseline sync failed")[:500])
+        s0 = latest_sequence()
+        if s0 is None:
+            raise RuntimeError("baseline sync completed but Neon has no latest_sequence")
+        ok(f"manual baseline after root removal → sequence {s0}")
+
+        print()
+        cli_header()
+        print(f"    $ alf mcp serve -r {ctx.runtime} -w {ctx.disp(ctx.ws)}")
+        print(c("dim", "      persistent MCP session; all watch timings are 1 s for this test"))
+        print()
+        server, stderr_lines, drainer = start_watch_server(ctx)
+        active = wait_for(
+            lambda: any("watch loop active" in line for line in stderr_lines)
+            or server.poll() is not None,
+            timeout=12,
+        )
+        if (not active or server.poll() is not None
+                or not any("watch loop active" in line for line in stderr_lines)):
+            raise RuntimeError(f"watch server did not become active: {diagnostics()}")
+        ok("persistent watch loop is active while the logical root is absent")
+
+        # `watch loop active` is emitted just before OS registrations. Give the
+        # watcher a bounded moment to report a resource failure, so an exhausted
+        # inotify quota fails with an actionable cause rather than a later sync
+        # timeout. For this direct child root, its parent is the temporary target.
+        wait_for(
+            lambda: any("cannot watch" in line or "filesystem watcher unavailable" in line
+                        for line in stderr_lines),
+            timeout=1, interval=0.05,
+        )
+        parent_watch_error = next(
+            (line.strip() for line in stderr_lines
+             if f"cannot watch {root.parent} (" in line),
+            None,
+        )
+        if parent_watch_error:
+            raise RuntimeError(
+                f"temporary parent watch could not register: {parent_watch_error}. "
+                "Release existing file watchers or raise fs.inotify.max_user_watches, "
+                "then rerun this notify-dependent regression."
+            )
+        if any("filesystem watcher unavailable" in line for line in stderr_lines):
+            raise RuntimeError(
+                "filesystem watcher unavailable; this regression requires notify to "
+                "observe the post-refresh descendant edit"
+            )
+
+        probe.parent.mkdir(parents=True)
+        probe.write_text(f"# RF-008 watch probe\n\n{create_marker}\n", encoding="utf-8")
+        ok(f"created {ctx.disp(probe)} with {create_marker}")
+        if not wait_for(lambda: advanced(s0), timeout=25):
+            raise RuntimeError(f"root creation did not advance sequence above {s0}: {diagnostics()}")
+        s1 = latest_sequence()
+        if s1 is None:
+            raise RuntimeError("sequence disappeared after root creation")
+        refreshed = wait_for(
+            lambda: any("watch surface refreshed" in line for line in stderr_lines),
+            timeout=5,
+        )
+        (ok if refreshed else fail)(f"surface refresh observed after root creation = {refreshed}")
+        if not refreshed:
+            raise RuntimeError(f"no surface refresh after root creation: {diagnostics()}")
+        root_watch_error = next(
+            (line.strip() for line in stderr_lines
+             if f"cannot watch {root} (" in line),
+            None,
+        )
+        if root_watch_error:
+            raise RuntimeError(
+                f"recursive content-root watch could not register: {root_watch_error}. "
+                "Release existing file watchers or raise fs.inotify.max_user_watches, "
+                "then rerun this notify-dependent regression."
+            )
+        ok(f"cloud sequence advanced from {s0} to {s1} after root creation")
+
+        with probe.open("a", encoding="utf-8") as handle:
+            handle.write(f"{nested_marker}\n")
+        ok(f"appended nested marker to the already-existing {ctx.disp(probe)}")
+        if not wait_for(lambda: advanced(s1), timeout=25):
+            raise RuntimeError(f"nested edit did not advance sequence above {s1}: {diagnostics()}")
+        s2 = latest_sequence()
+        if s2 is None:
+            raise RuntimeError("sequence disappeared after nested edit")
+        ok(f"cloud sequence advanced from {s1} to {s2} after nested edit")
+    except Exception as exc:  # noqa: BLE001 - retain live-walkthrough diagnostics
+        failure = f"{type(exc).__name__}: {exc}"
+    finally:
+        if server is not None and drainer is not None:
+            stop_watch_server(server, drainer)
+        stderr_path.write_text("".join(stderr_lines), encoding="utf-8")
+
+    if not failure and s2 is not None:
+        # The public point-in-time preview reads the reconstructed cloud head
+        # without changing the live workspace or local sync state.
+        proc, preview = run_cli(ctx, [
+            "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws),
+            "--agent", str(ctx.agent_id), "--at-sequence", str(s2),
+        ])
+        raw_preview = (preview or {}).get("preview_path")
+        if proc.returncode != 0 or not raw_preview:
+            failure = (proc.stderr or proc.stdout or "restore preview failed")[:500]
+        else:
+            preview_path = Path(raw_preview)
+            restored_probe = preview_path / probe_rel
+            restored_text = restored_probe.read_text(encoding="utf-8") if restored_probe.is_file() else ""
+            markers_restored = create_marker in restored_text and nested_marker in restored_text
+            (ok if markers_restored else fail)(
+                f"read-only cloud preview contains both RF-008 markers = {markers_restored}")
+            if not markers_restored:
+                failure = f"preview {restored_probe} is missing one or both RF-008 markers"
+
+    duration = (time.time() - t0) * 1000
+    passed = not failure and s0 is not None and s1 is not None and s2 is not None
+    preview_display = str(preview_path) if preview_path is not None else "not-created"
+    detail = f"root={root.name}; S0={s0}; S1={s1}; S2={s2}; preview={preview_display}"
+    if passed:
+        print()
+        api_header()
+        ok(f"RF-008 watch walkthrough proved S0 < S1 < S2 ({s0} < {s1} < {s2})")
+        inspect(ctx, [
+            ("the two local probe markers", f"cat {ctx.disp(probe)}"),
+            ("the persistent server diagnostics", f"tail -60 {ctx.disp(stderr_path)}"),
+            ("the preview materialized from cloud history", f"cat {ctx.disp(preview_path / probe_rel)}"),
+        ])
+        report.add(StepResult("RF-008 lazy content-root watch", True, duration, detail))
+    else:
+        fail("RF-008 lazy content-root watch walkthrough failed")
+        report.add(StepResult("RF-008 lazy content-root watch", False, duration,
+                              error=f"{failure}\n{diagnostics()}"[:2000]))
+    pause(cfg)
+
+
 def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
     section(6, "Pull Deltas (API-only lane)")
     explain("""
@@ -1128,11 +1441,13 @@ def step_pull_deltas(cfg: Config, api: ApiClient, report: Report):
     pause(cfg)
 
 
-# For Hermes, two restored files are intentionally NOT byte-equal: config.yaml
-# is redacted, and state.db is rebuilt from records. They are excluded from the
-# byte-equality digest and verified separately by hermes_restore_proof.
+# For Hermes, config.yaml is redacted and state.db is rebuilt from records.
+# `.alf-include.lock` is a local coordination artifact, not archive content.
+# All three are excluded from the byte-equality digest and verified separately
+# where applicable by hermes_restore_proof.
 HERMES_REBUILT_EXCLUDE = (
-    ".alf-agent-id", "state.db", "state.db-wal", "state.db-shm", "config.yaml", ".env",
+    ".alf-agent-id", ".alf-include.lock", "state.db", "state.db-wal", "state.db-shm",
+    "config.yaml", ".env",
 )
 
 
@@ -1269,7 +1584,7 @@ def step_restore(cfg: Config, ctx: RunContext, s3: S3Client, db: DbClient, repor
 
     t0 = time.time()
     proc, res = run_cli(ctx, [
-        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "--agent", str(AGENT_ID),
     ])
     duration = (time.time() - t0) * 1000
     if proc.returncode != 0 or not res:
@@ -1326,6 +1641,7 @@ def step_restore(cfg: Config, ctx: RunContext, s3: S3Client, db: DbClient, repor
     inspect(ctx, [
         ("list per-file SHA256 of the restored workspace",
          f"find {ctx.disp(ctx.restore_ws)} -type f ! -name .alf-agent-id "
+         f"! -name .alf-include.lock "
          f"-exec sha256sum {{}} + | sort"),
         ("compare restored vs original workspace",
          f"diff -r {ctx.disp(ctx.ws)} {ctx.disp(ctx.restore_ws)} || true"),
@@ -1350,14 +1666,14 @@ def step_point_in_time(cfg: Config, ctx: RunContext, api: ApiClient, report: Rep
 
     t0 = time.time()
     proc0, res0 = run_cli(ctx, [
-        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "--agent", str(AGENT_ID),
         "--at-sequence", "0", "--dry-run",
     ])
     if proc0.returncode == 0 and res0:
         ok(f"preview @0 → would write {len(res0.get('would_write', []))} file(s) "
            f"(snapshot only), state untouched")
     proc1, res1 = run_cli(ctx, [
-        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "--agent", str(AGENT_ID),
         "--at-sequence", "1", "--dry-run",
     ])
     if proc1.returncode == 0 and res1:
@@ -1402,7 +1718,7 @@ def step_data_loss(cfg: Config, ctx: RunContext, report: Report):
 
     t0 = time.time()
     proc, res = run_cli(ctx, [
-        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "-a", str(AGENT_ID),
+        "restore", "-r", ctx.runtime, "-w", str(ctx.restore_ws), "--agent", str(AGENT_ID),
     ])
     duration = (time.time() - t0) * 1000
     if proc.returncode != 0 or not res:
@@ -1508,7 +1824,7 @@ def step_cleanup(cfg: Config, ctx: RunContext, db: DbClient,
     flow("alf purge  ──▶  DELETE /agents/:id  ──▶  Neon CASCADE + S3 emptied + local state removed")
 
     t0 = time.time()
-    proc, _ = run_cli(ctx, ["purge", "-r", ctx.runtime, "-w", str(ctx.ws), "-a", str(AGENT_ID)])
+    proc, _ = run_cli(ctx, ["purge", "-r", ctx.runtime, "-w", str(ctx.ws), "--agent", str(AGENT_ID)])
     duration = (time.time() - t0) * 1000
     if proc.returncode != 0:
         report.add(StepResult("Cleanup", False, duration,
@@ -1562,8 +1878,12 @@ def main():
 
     alf = find_alf_binary()
     if not alf:
-        print(c("red", "  `alf` binary not found on PATH or in target/{release,debug}/."))
-        print(c("dim", "  Build it first:  cargo build -p alf-cli   (or cargo build -p alf-cli --release)"))
+        print(c("red", "  `alf` binary not found via ALF_BIN, target/{debug,release}/, or PATH."))
+        print(c("dim", "  Build it first: cargo build -p alf-cli (or set ALF_BIN=/path/to/alf)."))
+        sys.exit(1)
+    if runtime in {"hermes", "zeroclaw"} and not supports_mcp(alf):
+        print(c("red", f"  Selected alf binary does not support `mcp`: {alf}"))
+        print(c("dim", "  Build this checkout with `cargo build -p alf-cli`, or set ALF_BIN to an MCP-capable binary."))
         sys.exit(1)
 
     api = ApiClient(cfg)
@@ -1612,6 +1932,7 @@ def main():
         step_delta(cfg, ctx, db, s3, report, 2, "2026-01-17.md",
                    "## Results\n\nLoad test: p99 5ms on Redis 7.2.\n")
         step_identity_principals_delta(cfg, ctx, report)
+        step_lazy_content_root_watch(cfg, ctx, db, report)
         step_pull_deltas(cfg, api, report)
         step_restore(cfg, ctx, s3, db, report)
         step_point_in_time(cfg, ctx, api, report)

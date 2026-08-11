@@ -72,6 +72,34 @@ def memory_records(path: Path) -> list[dict]:
     return records
 
 
+def record_identity(path: Path) -> dict:
+    """Identity-integrity oracle: `{'total', 'unique', 'duplicates': {id: n}}`.
+
+    Record ids must be unique across the whole archive — a duplicate is an
+    adapter id-preimage collision (the v1.1.0 pre-release BLK-1 class): every
+    by-id consumer (reconcile, the indexer, the dashboard) silently keeps one
+    record and drops the rest. This is an EXTERNAL oracle on purpose: a
+    deterministic collision is self-consistent, so the round-trip and Z13'
+    byte-equality checks can never see it."""
+    counts: dict[str, int] = {}
+    for r in memory_records(path):
+        rid = str(r.get("id", "(missing)"))
+        counts[rid] = counts.get(rid, 0) + 1
+    return {
+        "total": sum(counts.values()),
+        "unique": len(counts),
+        "duplicates": {rid: n for rid, n in counts.items() if n > 1},
+    }
+
+
+def marker_record_counts(path: Path, probes: list[str]) -> dict:
+    """{probe: number of memory RECORDS whose content contains it} — pairs the
+    kit's seeded store rows/sections 1:1 with structured records (0 = the row
+    was lost to shadowing/extraction; 2+ = it was multiply minted)."""
+    recs = memory_records(path)
+    return {p: sum(1 for r in recs if p in str(r.get("content", ""))) for p in probes}
+
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

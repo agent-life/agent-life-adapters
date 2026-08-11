@@ -1,0 +1,4 @@
+# Pin LF for the toy fixture + golden so exports are byte-deterministic across
+# checkouts (Z13' determinism / the committed DTO golden), matching the
+# adapter-generic toy fixture's convention.
+* text eol=lf

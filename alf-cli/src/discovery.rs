@@ -59,7 +59,7 @@ pub struct ReconciledRow {
 }
 
 /// Warn-only identity-drift report (DoD 4).
-#[derive(Serialize)]
+#[derive(Serialize, schemars::JsonSchema)]
 pub struct DriftWarning {
     pub runtime_agent: String,
     pub message: String,
@@ -348,11 +348,10 @@ pub fn discover_and_reconcile(
     Ok(reconcile(&existing, &discovered, runtime, &ctx))
 }
 
-/// Persist a reconcile outcome: upsert New rows, refresh matched rows, never
-/// touch Removed/Drift rows, and save only when something changed. Then write
-/// the row id into any live workspace still missing its `.alf-agent-id` (same
-/// write export does, just earlier); a write failure is a warning, not fatal.
-pub fn persist(config: &mut Config, outcome: &ReconcileOutcome) -> Result<bool> {
+/// Apply a reconcile outcome to `config` in memory: upsert New rows, refresh
+/// changed matched rows, never touch Removed/Drift rows. Returns whether the
+/// mapping changed. Pure (no I/O), so it can run inside the config-lock closure.
+fn apply_reconcile(config: &mut Config, outcome: &ReconcileOutcome) -> bool {
     let mut dirty = false;
     for row in &outcome.rows {
         match row.status {
@@ -373,10 +372,62 @@ pub fn persist(config: &mut Config, outcome: &ReconcileOutcome) -> Result<bool> 
             RowStatus::Removed | RowStatus::Drift => {}
         }
     }
-    if dirty {
-        config.save()?;
-    }
+    dirty
+}
 
+/// Persist a reconcile outcome: upsert New rows, refresh matched rows, never
+/// touch Removed/Drift rows, and save only when something changed. Then write
+/// the row id into any live workspace still missing its `.alf-agent-id` (same
+/// write export does, just earlier); a write failure is a warning, not fatal.
+///
+/// The mapping mutation runs under the cross-process config lock (RF-013) so a
+/// concurrent config writer (another CLI, or the watch loop's rediscovery)
+/// cannot lose this update. Discovery is the slow part and stays OUTSIDE the
+/// lock — the caller has already computed `outcome`; here we only apply the
+/// narrow mutation, rebased onto the latest on-disk config. The common no-op
+/// case (nothing new to write) skips the lock and the rewrite entirely, and is
+/// safe because discovery never needs to fight a concurrent removal.
+pub fn persist(config: &mut Config, outcome: &ReconcileOutcome) -> Result<bool> {
+    let dirty = if apply_reconcile(&mut config.clone(), outcome) {
+        config.update_locked(|c| Ok(apply_reconcile(c, outcome)))?
+    } else {
+        false
+    };
+
+    write_missing_agent_id_files(outcome);
+    Ok(dirty)
+}
+
+/// First-contact seed (selector lazy init): apply `outcome` only if `runtime`
+/// still has no rows AFTER reloading under the config lock. The emptiness guard
+/// and the seed must be atomic — otherwise two concurrent first-contact
+/// processes each see an empty mapping and both seed, duplicating rows (an
+/// RF-013 lost-update inverse the pre-lock code masked by clobbering). Returns
+/// whether a seed was written; writes missing `.alf-agent-id` files only then.
+pub fn persist_first_contact(
+    config: &mut Config,
+    outcome: &ReconcileOutcome,
+    runtime: &str,
+) -> Result<bool> {
+    let seeded = config.update_locked(|c| {
+        Ok(if c.agents_for_runtime(runtime).is_empty() {
+            apply_reconcile(c, outcome)
+        } else {
+            false
+        })
+    })?;
+
+    if seeded {
+        write_missing_agent_id_files(outcome);
+    }
+    Ok(seeded)
+}
+
+/// Write the row id into any live workspace still missing its `.alf-agent-id`
+/// (the same write export does, just earlier); a write failure is a warning,
+/// not fatal. This is a lock-free filesystem side effect, kept outside the
+/// config lock.
+fn write_missing_agent_id_files(outcome: &ReconcileOutcome) {
     for row in &outcome.rows {
         if !matches!(row.status, RowStatus::New | RowStatus::Existing) {
             continue;
@@ -392,8 +443,6 @@ pub fn persist(config: &mut Config, outcome: &ReconcileOutcome) -> Result<bool> 
             }
         }
     }
-
-    Ok(dirty)
 }
 
 /// Read `{workspace}/.alf-agent-id` if present and parseable.

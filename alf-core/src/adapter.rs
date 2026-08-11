@@ -88,6 +88,19 @@ pub enum RestoreMode {
 pub struct ImportOptions<'a> {
     pub vault_key: Option<&'a VaultKey>,
     pub mode: RestoreMode,
+    /// **Sandboxed import**: nothing outside `workspace` may be written.
+    ///
+    /// Set by point-in-time previews (`alf restore --at-sequence N`), which
+    /// materialize a historical archive into `~/.alf/preview/…` and promise
+    /// the live agent is untouched. Layer 4 is the trap: the vault lives at
+    /// `~/.alf/vault/{agent_id}/` — *outside* the workspace — so an ordinary
+    /// import overwrites the LIVE vault with the historical document (full
+    /// overwrite, D6), silently dropping credentials added since that
+    /// sequence and reinstating pre-rotation ciphertext. Under `preview` the
+    /// adapter must keep the restored vault inside `workspace` instead.
+    ///
+    /// Default `false` — a head restore/import intends the live write.
+    pub preview: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +134,170 @@ pub struct WorkspaceEnumeration {
 pub struct ArchiveEnumeration {
     pub files: Vec<FileEntry>,
     pub warnings: Vec<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Watch surface (WP-M3)
+// ---------------------------------------------------------------------------
+
+/// One logical "dirty unit" the MCP watch loop should monitor (design §11.1).
+///
+/// A change to **any** path in [`roots`](WatchSpec::roots) marks the whole spec
+/// dirty. This is how a SQLite `db` + `-wal` + `-shm` sidecar trio is expressed
+/// as a single unit: the three sidecars share one spec, so a WAL-only write
+/// (which touches only `-wal`) still dirties the store.
+///
+/// Roots may be **absolute** (out-of-workspace tracked files, an external
+/// identity file such as ZeroClaw's AIEOS `identity.json`, or
+/// `~/.openclaw/openclaw.json`) or inside the workspace. A directory root with
+/// `recursive: true` is watched recursively with the `exclude` prefixes pruned;
+/// a file root is watched as itself.
+///
+/// The trait method returning these — [`Adapter::watch_paths`] — is additive
+/// with a default of "the whole workspace, recursively", so no existing adapter
+/// (or the service, which never calls it) is affected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchSpec {
+    /// Stable identifier — the map source id, `"tracked-files"`,
+    /// `"tracked-controls"`, `"export-controls"`, `"brain.db"`, … Used as the
+    /// scheduler's debounce/interval key and the `alf_status` source label.
+    pub id: String,
+    /// The concrete files or directory roots whose change dirties this spec.
+    pub roots: Vec<PathBuf>,
+    /// When true, `roots` are directory roots watched recursively.
+    pub recursive: bool,
+    /// Path prefixes under a recursive root to ignore (e.g. `.git/`).
+    pub exclude: Vec<PathBuf>,
+    /// This spec is the §6.1 **tracked-file channel** — a change here triggers a
+    /// full-snapshot rollover, so the scheduler governs it with
+    /// `tracked_files_interval` (floor 15 min) rather than the 1-minute delta
+    /// floor.
+    pub tracked: bool,
+    /// Informational hint that this spec's roots are (or may become) a SQLite
+    /// store. **Inert in v1** (WP-M3 review A2): it does NOT bypass the quiesce
+    /// gate — a live raw `.db` is captured by a plain single-file read, so it must
+    /// wait for quiescence like any file rather than ship torn bytes. Reserved for
+    /// the v2 consistent-capture / DB-row-extraction path (design §10).
+    pub sqlite: bool,
+    /// A change under these roots means the *agent set* may have changed, not just
+    /// one agent's memory — so the watch loop must re-run discovery before syncing
+    /// (WP-M5). The Hermes adapter sets this on the `profiles/` directory so a new
+    /// `profiles/<name>/` created mid-session persists a new `[[agents]]` row and
+    /// surfaces in `alf_agents_list` (design §14, §11.1). Default `false`: an
+    /// ordinary source change only dirties that source.
+    pub rediscover: bool,
+    /// A change to this spec invalidates the watch SURFACE itself (manual §4.3):
+    /// the map / include list / runtime config define what to watch, so the loop
+    /// re-derives `watch_paths` and re-registers watches when one changes.
+    /// Default `false`: an ordinary source change only dirties that source.
+    pub resurface: bool,
+}
+
+impl WatchSpec {
+    /// A single non-recursive file spec (the common case: one tracked file,
+    /// a sentinel, an external identity file).
+    pub fn file(id: impl Into<String>, path: impl Into<PathBuf>) -> Self {
+        Self {
+            id: id.into(),
+            roots: vec![path.into()],
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: false,
+            sqlite: false,
+            rediscover: false,
+            resurface: false,
+        }
+    }
+
+    /// A recursive directory spec.
+    pub fn dir(id: impl Into<String>, root: impl Into<PathBuf>) -> Self {
+        Self {
+            id: id.into(),
+            roots: vec![root.into()],
+            recursive: true,
+            exclude: Vec::new(),
+            tracked: false,
+            sqlite: false,
+            rediscover: false,
+            resurface: false,
+        }
+    }
+
+    /// The two alf-managed control files (`.alf-include.json`,
+    /// `.alf-sync-log.md`), rooted at the directory that holds them — the
+    /// workspace, the install root, or a profile home.
+    ///
+    /// **Always tracked, on purpose.** `read_tracked_map` compares both files
+    /// for *every* runtime, so editing either forces a full-snapshot rollover —
+    /// exactly what `tracked_files_interval` exists to rate-limit. An adapter
+    /// that puts them on an untracked source rolls over at the delta floor
+    /// instead; that was the RF-010 defect, and it survived in a fourth adapter
+    /// precisely because this block was copied per adapter. Build it here.
+    pub fn tracked_controls(dir: &Path) -> Self {
+        Self {
+            id: "tracked-controls".into(),
+            roots: vec![
+                dir.join(crate::include::INCLUDE_FILE),
+                dir.join(crate::include::SYNC_LOG_FILE),
+            ],
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: true,
+            sqlite: false,
+            rediscover: false,
+            resurface: true,
+        }
+    }
+
+    /// Controls that change what export *selects* but are not members of
+    /// `read_tracked_map`: `.alfignore`, plus the generic runtime's
+    /// `.alf-map.json`. Untracked by construction, so they keep the normal
+    /// delta cadence. Chain [`WatchSpec::resurfacing`] when a root also defines
+    /// the watch surface — the map file does, `.alfignore` does not.
+    pub fn export_controls(roots: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self {
+            id: "export-controls".into(),
+            roots: roots.into_iter().collect(),
+            recursive: false,
+            exclude: Vec::new(),
+            tracked: false,
+            sqlite: false,
+            rediscover: false,
+            resurface: false,
+        }
+    }
+
+    /// Mark this spec as the tracked-file channel (§6.1 rollover cadence).
+    pub fn as_tracked(mut self) -> Self {
+        self.tracked = true;
+        self
+    }
+
+    /// Mark this spec as a SQLite store (structural hint; inert in v1).
+    pub fn as_sqlite(mut self) -> Self {
+        self.sqlite = true;
+        self
+    }
+
+    /// Mark this spec as an agent-set boundary: a change here re-runs discovery
+    /// before the next sync (WP-M5 — Hermes `profiles/`).
+    pub fn rediscovering(mut self) -> Self {
+        self.rediscover = true;
+        self
+    }
+
+    /// Mark this spec as surface-defining: a change to it re-derives the watch
+    /// surface (manual §4.3 — map/include/config sentinels).
+    pub fn resurfacing(mut self) -> Self {
+        self.resurface = true;
+        self
+    }
+
+    /// Add exclusion prefixes to a recursive spec.
+    pub fn excluding(mut self, prefixes: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.exclude.extend(prefixes);
+        self
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +441,18 @@ pub trait Adapter {
     /// this; the default rejects the call so the CLI surfaces a clear error.
     fn enumerate_archive(&self, _alf_file: &Path) -> Result<ArchiveEnumeration> {
         bail!("dry-run not supported for this runtime")
+    }
+
+    /// The filesystem surface the MCP watch loop should monitor (design §11.1).
+    ///
+    /// Default: watch the whole workspace recursively as one spec. Adapters that
+    /// track files **outside** the workspace (generic's external include-list
+    /// roots, ZeroClaw's AIEOS `identity.json`, OpenClaw's `~/.openclaw/…`) MUST
+    /// override this — the whole-workspace default silently misses them. Purely
+    /// additive: the default keeps every current caller (and the service, which
+    /// never calls it) unaffected.
+    fn watch_paths(&self, workspace: &Path) -> Vec<WatchSpec> {
+        vec![WatchSpec::dir("workspace", workspace.to_path_buf())]
     }
 
     /// Enumerate the agents in an install. `install` is the CLI-resolved
@@ -586,5 +775,39 @@ mod tests {
         adapter
             .import_agent(binding, uuid(12), &alf, ImportOptions::default())
             .expect("matching archive must import");
+    }
+
+    #[test]
+    fn default_watch_paths_is_the_whole_workspace() {
+        let adapter = DummyAdapter { name: "openclaw" };
+        let ws = Path::new("/tmp/ws");
+        let specs = adapter.watch_paths(ws);
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].roots, vec![ws.to_path_buf()]);
+        assert!(specs[0].recursive);
+        assert!(!specs[0].tracked);
+        assert!(!specs[0].sqlite);
+        assert!(!specs[0].rediscover);
+    }
+
+    #[test]
+    fn watch_spec_builders() {
+        let f = WatchSpec::file("sentinels", "/ws/.alf-map.json");
+        assert!(!f.recursive && !f.tracked && !f.sqlite && !f.rediscover);
+        assert_eq!(f.roots, vec![PathBuf::from("/ws/.alf-map.json")]);
+
+        let d =
+            WatchSpec::dir("memory", "/ws/memory").excluding([PathBuf::from("/ws/memory/.git")]);
+        assert!(d.recursive);
+        assert_eq!(d.exclude, vec![PathBuf::from("/ws/memory/.git")]);
+
+        let t = WatchSpec::file("tracked-files", "/ws/config.toml").as_tracked();
+        assert!(t.tracked);
+
+        let s = WatchSpec::file("brain.db", "/ws/data/brain.db").as_sqlite();
+        assert!(s.sqlite);
+
+        let r = WatchSpec::dir("profiles", "/ws/profiles").rediscovering();
+        assert!(r.rediscover);
     }
 }

@@ -1,0 +1,24 @@
+[package]
+name = "adapter-generic"
+version = "1.1.0"
+edition = "2021"
+description = "Generic map-driven adapter (.alf-map.json) for the Agent Life Format (ALF)"
+license = "MIT"
+repository = "https://github.com/agent-life/agent-life-adapters"
+
+[dependencies]
+alf-core = { path = "../alf-core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+ignore = "0.4"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
+walkdir = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"
+zip = "2.2"

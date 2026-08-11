@@ -6,6 +6,7 @@
 
 pub use alf_core::Adapter;
 
+use adapter_generic::GenericAdapter;
 use adapter_hermes::HermesAdapter;
 use adapter_openclaw::OpenClawAdapter;
 use adapter_zeroclaw::ZeroClawAdapter;
@@ -20,6 +21,7 @@ pub fn available_adapters() -> Vec<Box<dyn Adapter>> {
         Box::new(OpenClawAdapter),
         Box::new(ZeroClawAdapter),
         Box::new(HermesAdapter),
+        Box::new(GenericAdapter),
     ]
 }
 

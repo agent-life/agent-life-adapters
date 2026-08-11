@@ -1,0 +1,10 @@
+# Generic toy-runtime fixture layout at Z1 (before the Z2 seeder writes
+# memories/*.md). Drift is a soft warning; a MISSING required entry fails.
+.alf-agent-id
+.alf-include.json
+.alf-map.json
+IDENTITY.md
+config.toml
+knowledge/facts.md
+notes.txt
+procedures/deploy.md

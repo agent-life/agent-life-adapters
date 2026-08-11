@@ -36,6 +36,7 @@ pub mod principals_parser;
 pub mod session_extractor;
 pub mod session_rebuilder;
 pub mod skills;
+pub mod watch;
 
 // Dry-run enumeration entry points.
 pub use export::{enumerate, enumerate_workspace, EnumerationResult};
@@ -63,7 +64,7 @@ impl Adapter for HermesAdapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
-        import::import(alf_file, workspace, options.vault_key)
+        import::import(alf_file, workspace, options.vault_key, options.preview)
     }
 
     fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {
@@ -76,6 +77,13 @@ impl Adapter for HermesAdapter {
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
         export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP-M5: the MCP watch surface — the allowlisted content dirs, `SOUL.md`,
+    /// the `state.db` sidecar trio, `config.yaml`, tracked files/controls,
+    /// and (default profile only) a `profiles/` rediscover boundary.
+    fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
+        watch::watch_paths(workspace)
     }
 
     /// WP5: enumerate the Hermes profiles in an install — the default profile

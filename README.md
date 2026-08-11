@@ -3,9 +3,11 @@
 **Portable backup, sync, and migration for AI agents.**
 
 [License: MIT](LICENSE)
-[ALF Spec: 1.0.0-rc.2](https://github.com/agent-life/agent-life-data-format)
+[ALF Spec: 1.0.0-rc.5](https://github.com/agent-life/agent-life-data-format)
 
 This repository contains the ALF core library and framework-specific adapters for the [agent-life](https://agent-life.ai) project. It produces the `alf` command-line tool — a single binary that can export, import, and sync AI agent data across frameworks using the [Agent Life Format (ALF)](https://github.com/agent-life/agent-life-data-format).
+
+> **Security disclosure.** Found a security vulnerability? Email **[info@agent-life.ai](mailto:info@agent-life.ai)** — please **do not open a public issue**. This project's premise is zero-knowledge credential encryption, so we take reports seriously and aim to respond promptly. Machine-readable contact: [`/.well-known/security.txt`](https://agent-life.ai/.well-known/security.txt).
 
 ---
 
@@ -20,8 +22,9 @@ Main repositories:
 | ---------------------------------------------------------------------------------- | ---------------------------------------------- | ---------- |
 | **[agent-life-data-format](https://github.com/agent-life/agent-life-data-format)** | ALF specification and JSON schemas             | Public     |
 | **agent-life-adapters** (this repo)                                                | Core library, CLI tool, and framework adapters | Public     |
-| **[agent-life-service](https://github.com/agent-life/agent-life-service)**         | Hosted sync API, storage, Lambdas               | Public     |
-| **[agent-life-web](https://github.com/agent-life/agent-life-web)**                 | Marketing site and hosted CLI / format docs    | Public     |
+| **agent-life-service**                                                             | Hosted sync API, storage, Lambdas               | Private    |
+| **agent-life-web**                                                                 | Web dashboard for synced agents + marketing site and hosted CLI / format docs | Private    |
+| **[agent-life-runtimes](https://github.com/agent-life/agent-life-runtimes)**       | Docker images for cloud agent desktops         | Public     |
 
 
 ---
@@ -48,6 +51,8 @@ Main repositories:
                           │                 └────────────┘   │
                           └──────────────────────────────────┘
 ```
+
+The diagram is abridged: the workspace ships **four** adapter crates — `adapter-openclaw`, `adapter-zeroclaw`, `adapter-hermes`, and `adapter-generic` (map-file-driven, for any framework) — all feeding `alf-core` the same way.
 
 The `alf-core` crate is also imported by `agent-life-service` as a git dependency. The service uses it to validate incoming snapshots, parse manifests, extract memory records for indexing, and apply deltas during compaction. One library, two compilation targets: native binary (CLI) and Lambda ARM64 (service).
 
@@ -88,12 +93,16 @@ agent-life-adapters/
 │       ├── config.rs           # ~/.alf/config.toml management
 │       ├── context.rs          # Runtime context for help (config + state summary)
 │       ├── output.rs           # JSON-first output helpers (json, progress, human_mode)
+│       ├── selector.rs         # Current-agent selection (--agent → ALF_AGENT → sole enabled)
 │       ├── state.rs            # ~/.alf/state/{agent_id}.toml sync state
 │       ├── vault_key.rs        # Resolve vault key from flags / env / default paths
-│       └── commands/
+│       ├── vault_migrate.rs    # Legacy install-scoped vault/key → per-agent layout
+│       └── commands/           # (tree abridged — see the source for the full module list)
 │           ├── mod.rs          # Command dispatch
 │           ├── add.rs          # alf add — track an arbitrary workspace file for sync
+│           ├── agents.rs       # alf agents — list/enable/disable mapped agents
 │           ├── check.rs        # alf check — environment diagnostics, workspace auto-discovery
+│           ├── mcp/            # alf mcp serve — stdio MCP server (13 tools + watch loop)
 │           ├── export.rs       # alf export — dispatch to runtime adapter
 │           ├── help.rs         # alf help — overview, status, files, troubleshoot
 │           ├── import.rs       # alf import — dispatch to runtime adapter
@@ -102,7 +111,7 @@ agent-life-adapters/
 │           ├── restore.rs      # alf restore — download and import
 │           ├── sync.rs         # alf sync — push deltas/snapshots to sync service API
 │           ├── validate.rs     # alf validate — schema validation (--strict-crypto optional)
-│           └── vault.rs        # alf vault — keygen, add, encrypt, decrypt, list, delete
+│           └── vault.rs        # alf vault — keygen, add, encrypt, decrypt, list, delete, rotate-key, migrate
 │
 ├── adapter-openclaw/           # OpenClaw adapter crate (library)
 │   ├── Cargo.toml
@@ -140,6 +149,11 @@ agent-life-adapters/
 │       ├── session_rebuilder.rs # Rebuild state.db from records on import (FTS via triggers)
 │       └── skills.rs           # Non-bundled skills → ALF artifacts (attachments.json)
 │
+├── adapter-generic/           # Generic map-file-driven adapter crate (library)
+│   ├── Cargo.toml
+│   └── src/                    # .alf-map.json + .alf-agent-id in-workspace; per_file /
+│                               #   by_heading / sqlite_rows chunking; raw/generic/ tree
+│
 ├── scripts/
 │   ├── install.sh              # Quick-install script (curl | sh)
 │   ├── test_install.sh         # Install test runner (Docker + native)
@@ -160,8 +174,13 @@ agent-life-adapters/
 │       ├── lifecycle-nollm.yml # Lifecycle harness, no-LLM/no-backend tier (zero secrets)
 │       └── release.yml         # Build, release, upload to S3 with SHA256 checksums
 │
-└── tests/                      # Top-level integration tests (if present)
+└── tests/                      # Top-level suites: fixtures/, integration/, lifecycle/ (see Testing)
 ```
+
+The tree is abridged: modules added by the multi-agent and MCP trains
+(`alf-cli/src/discovery.rs`, `alf-core/src/{include,chunk,paths,reconcile}.rs`,
+each adapter's `watch.rs`, `adapter-zeroclaw/src/brain_db.rs`, …) are omitted —
+see each crate's `src/` for the full list.
 
 ---
 
@@ -219,11 +238,14 @@ A single binary (`alf`) that provides all end-user operations. Built with `clap`
 
 **JSON-first output.** All commands output structured JSON to stdout by default. Progress messages go to stderr. This makes the CLI directly consumable by agents and scripts — pipe stdout to `jq`, parse it in Python, or feed it to another tool. Use the global `--human` flag (or set `ALF_HUMAN=1`) to switch stdout back to human-readable colored text.
 
-**Global flag:**
+**Global flags:**
 
 ```
-alf [--human] <command> [args...]
+alf [--human] [--agent <ALIAS_OR_ID>] <command> [args...]
 ```
+
+`--agent` selects the agent to operate on when an install hosts several (falls
+back to `ALF_AGENT`, then the sole enabled `[[agents]]` row in `~/.alf/config.toml`).
 
 **Commands:**
 
@@ -231,61 +253,73 @@ alf [--human] <command> [args...]
 alf check --runtime <runtime> [--workspace <path>]
 ```
 
-Pre-flight environment diagnostic. Discovers the agent workspace (auto-detects from `~/.openclaw/openclaw.json` if `-w` is omitted), checks for expected resources (SOUL.md, memory files, etc.), verifies ALF config and API key, and reports readiness to sync. Outputs a structured `CheckResult` with issue codes and per-issue `suggestion` text (guidance, not a guaranteed shell command). This is the recommended first command for agents to run.
+Pre-flight environment diagnostic. Discovers the agent workspace per runtime when `-w` is omitted (`~/.openclaw/openclaw.json`, `~/.zeroclaw/config.toml`, `$HERMES_HOME` / `~/.hermes`; the `generic` runtime always requires `-w`), records discovered agents in the `[[agents]]` mapping in `~/.alf/config.toml`, checks for expected resources (SOUL.md, memory files, etc.), verifies ALF config and API key, and reports readiness to sync. Outputs a structured `CheckResult` with issue codes and per-issue `suggestion` text (guidance, not a guaranteed shell command). This is the recommended first command for agents to run.
 
 ```
 alf export --runtime <runtime> --workspace <path> [--output <path>]
 ```
 
-Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw, hermes). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/credentials.json`) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
+Export an agent's complete state from a framework workspace to an `.alf` file. The runtime flag selects the adapter (openclaw, zeroclaw, hermes, generic). Reads native files, translates to ALF, validates against schemas, and writes the archive. **Layer 4** is the agent's ALF vault (`~/.alf/vault/<alf-agent-id>/credentials.json`; legacy install-scoped vaults are auto-migrated) copied in verbatim — already ciphertext, so export reads no vault key. See `docs/vault-key-management.md`.
 
 ```
 alf add <path> --runtime <runtime> --workspace <path>
 ```
 
-Track an arbitrary workspace file so sync includes it. ALF never auto-walks a workspace — the agent opts each file in explicitly. The tracked set is recorded in `<workspace>/.alf-include.json` (itself synced, so it travels on restore); tracked files round-trip byte-identically under `raw/openclaw/`. Deleting a tracked file and running `alf sync` prunes it and appends a note to `.alf-sync-log.md`.
+Track an arbitrary workspace file so sync includes it. Beyond each adapter's documented collection set, ALF does not walk the workspace for arbitrary files — the agent opts each one in explicitly. (Exception: the OpenClaw adapter automatically captures **every** workspace `.md` file as raw, since Markdown is the agent's memory medium; use `.alfignore` to exclude paths.) The tracked set is recorded in `<workspace>/.alf-include.json` (itself synced, so it travels on restore); tracked files round-trip byte-identically under `raw/{runtime}/`. Deleting a tracked file and running `alf sync` prunes it and appends a note to `.alf-sync-log.md`.
 
 ```
 alf import --runtime <runtime> --workspace <path> <alf-file> [--vault-key-file …]
 ```
 
-Import an `.alf` file into a framework workspace. Creates or populates the workspace with memory, identity, principals, and artifacts translated to the target runtime's native format. **Layer 4** vault records are written back to `~/.alf/vault/credentials.json` (still encrypted); a vault key is needed only to decrypt a legacy archive's runtime-keystore credentials.
+Import an `.alf` file into a framework workspace. Creates or populates the workspace with memory, identity, principals, and artifacts translated to the target runtime's native format. **Layer 4** vault records are written back to the agent's vault (`~/.alf/vault/<alf-agent-id>/credentials.json`, still encrypted) — no key needed. A vault key is needed only to decrypt a legacy archive's runtime-keystore credentials into runtime auth storage.
 
 ```
-alf sync --runtime <runtime> --workspace <path> [--recover] [--force-first-sync]
+alf sync --runtime <runtime> --workspace <path> [--all] [--recover] [--force-first-sync]
 ```
 
-Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags. Credential (Layer 4) changes ride deltas (diffed by `id`); a change to a file tracked via `alf add` instead triggers a fresh snapshot (a non-destructive rollover), since opaque files can't ride a delta. See [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) §6.1.
+Incremental sync to the cloud. Computes a delta since the last sync point (or uploads a full snapshot on first sync), pushes it to the agent-life service API. Stores the last-synced sequence number locally in `~/.alf/state/{agent_id}.toml`. Sync carries the agent's ALF vault into the snapshot verbatim and takes no vault-key flags. Credential (Layer 4) changes ride deltas (diffed by `id`); a change to a file tracked via `alf add` instead triggers a fresh snapshot (a non-destructive rollover), since opaque files can't ride a delta. `--all` syncs every enabled agent in the `[[agents]]` mapping sequentially. See [`docs/how_alf_syncs.md`](docs/how_alf_syncs.md) §6.1.
 
 ```
-alf restore --runtime <runtime> --workspace <path> [-a|--agent <agent-id>] [--vault-key-file …]
+alf restore --runtime <runtime> --workspace <path> [--agent <alias-or-id>] [--at-sequence N] [--vault-key-file …]
 ```
 
-Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. If `--agent` is omitted and exactly one agent is tracked in `~/.alf/state/`, that agent is used. Used for disaster recovery or migration to a new machine. Same vault behavior as `alf import`.
+Download the latest snapshot (plus any uncompacted deltas) from the service and import into a workspace. The agent comes from `--agent`, then `ALF_AGENT`, then the sole enabled `[[agents]]` row; with an empty mapping, the single agent tracked in `~/.alf/state/` is used. Used for disaster recovery or migration to a new machine. Same vault behavior as `alf import`.
+
+```
+alf agents [list|enable|disable <alias-or-id>]
+```
+
+List the `[[agents]]` mapping rows that `alf check` discovery maintains, and enable/disable individual agents for sync.
+
+```
+alf mcp serve -r <runtime> -w <workspace>
+```
+
+Serve ALF to an MCP-capable agent host over stdio: 13 tools (`alf_status`, `alf_check`, `alf_sync`, `alf_restore`, `alf_export_dry_run`, `alf_track`, `alf_configure`, `alf_vault_add`/`_list`/`_delete`, `alf_agents_list`, `alf_docs`, `alf_watch_set`) plus a background watch loop that auto-syncs while the session is alive. See `docs/cli-reference.md` § `alf mcp serve`.
 
 ```
 alf vault <subcommand> …
 ```
 
-Layer 4 vault tooling: `keygen`, `add`, `encrypt`, `decrypt`, `list`, `delete`. The vault is `~/.alf/vault/credentials.json`. See `docs/cli-reference.md` and `alf vault --help`.
+Layer 4 vault tooling: `keygen`, `add`, `encrypt`, `decrypt`, `list`, `delete`, `rotate-key`, `migrate`. The vault is per-agent at `~/.alf/vault/<alf-agent-id>/credentials.json` (legacy install-scoped vaults at `~/.alf/vault/credentials.json` are migrated by `alf vault migrate`). See `docs/cli-reference.md` and `alf vault --help`.
 
 ```
-alf purge --runtime <runtime> --workspace <path> [-a|--agent <agent-id>]
+alf purge --runtime <runtime> --workspace <path> [--agent <alias-or-id>]
 ```
 
-Delete the cloud agent registration and local sync state files for that agent (does not delete workspace content by default beyond what restore/import wrote).
+Delete the cloud agent registration and local sync state files for that agent. It never deletes files under the workspace, and the local vault is kept.
 
 ```
 alf help [topic]
 ```
 
-Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status`, `files`, `troubleshoot`, or a command name (`export`, `import`, `sync`, `restore`, `purge`, `validate`, `vault`, `login`, `check`) for delegated `--help`. The hidden `--json` flag on `alf help` is a deprecated no-op (JSON is the default for `status`).
+Show explorable help. With no topic: overview (commands, where files live, current status). Topics: `status`, `files`, `troubleshoot`, or a command name (`export`, `import`, `sync`, `restore`, `purge`, `validate`, `vault`, `login`, `check`, `agents`) for delegated `--help`. The hidden `--json` flag on `alf help` is a deprecated no-op (JSON is the default for `status`).
 
 ```
 alf login [-k|--key <api-key>]
 ```
 
-Store an API key for the agent-life service in `~/.alf/config.toml`. **Interactive login** (device flow) is not implemented yet — run `alf login --key <api-key>` (get a key at https://agent-life.ai/settings/api-keys).
+Store an API key for the agent-life service in `~/.alf/config.toml`. **Interactive login** (device flow) is not implemented yet — run `alf login --key <api-key>` (get a key at https://agent-life.ai/agents/api-keys).
 
 ```
 alf validate <alf-file> [--strict-crypto]
@@ -309,7 +343,7 @@ workspace = "/home/user/.openclaw/workspace"  # used when -w is omitted
 (precedence: CLI flag › `[defaults]` › `openclaw` for runtime; workspace errors if neither is set).
 
 Set **`ALF_HOME`** to relocate alf's whole tree off `$HOME`: when set, `~/.alf` (config, sync
-state, vault) and `~/.openclaw` resolve under `$ALF_HOME` (e.g. `ALF_HOME=/data` → config at
+state, vault) and the runtime homes (`~/.openclaw` / `~/.zeroclaw` / `~/.hermes`) resolve under `$ALF_HOME` (e.g. `ALF_HOME=/data` → config at
 `/data/.alf/config.toml`). Unset falls back to `$HOME` (`%USERPROFILE%` on Windows) — the
 original behavior. Useful when an agent process rewrites `$HOME`.
 
@@ -326,12 +360,13 @@ Translates between OpenClaw's native file-based workspace and the ALF format.
 | ----------------- | ------------------------------------ | ------------------------------------------------------------------------ |
 | `SOUL.md`         | Identity (§3.2)                      | Preserved as persona prose; not the canonical display name source        |
 | `IDENTITY.md`     | Identity (§3.2)                      | `Name` / `**Name:**` sets the canonical display name; rest merged as prose |
-| `AGENTS.md`       | Identity — sub-agent roster (§3.2.4) | Each agent entry → sub-agent with name, role, delegation scope           |
+| `AGENTS.md`       | Identity (§3.2)                      | Preserved as operating-instructions prose (no structured sub-agent extraction) |
 | `USER.md`         | Principals (§3.3)                    | Parsed into primary principal with profile, preferences, work context    |
-| `MEMORY.md`       | Memory records (§3.1)                | Each entry → `MemoryRecord` with type classification, entity extraction  |
-| `logs/daily/*.md` | Memory records (§3.1)                | Daily log entries → memory records with `observed_at` from filename      |
-| Workspace files   | Artifacts (§3.1.9)                   | Classified into tiers; Tier 1–2 included in archive, Tier 3 referenced   |
-| `auth-profiles.json` (and related) | Credentials (§3.4)                   | `credential_map`: with a resolved **vault key**, API keys / tokens are encrypted into `CredentialRecord` payloads; without a key, metadata-only rows (`<not-exported>`) |
+| `MEMORY.md`       | Memory records (§3.1)                | Each entry → `MemoryRecord` with type classification                     |
+| `memory/*.md`     | Memory records (§3.1)                | Daily log entries → memory records with `observed_at` from filename      |
+| All other workspace `*.md` files | Raw (`raw/openclaw/`) | Scatter capture: every Markdown file in the workspace tree is backed up verbatim (skips already-captured files and VCS internals; `.alfignore` applies) |
+| Files tracked via `alf add` (`.alf-include.json`) | Raw (`raw/openclaw/`) | Explicit opt-in for non-Markdown files |
+| ALF vault (`~/.alf/vault/<alf-agent-id>/credentials.json`) | Credentials (§3.4) | The agent's explicit vault, built with `alf vault add`, copied in verbatim (already encrypted). ALF never reads the runtime keystore (`auth-profiles.json`); on import/restore, a resolved vault key decrypts legacy-archive credentials back into it. |
 
 
 **Import writes** the reverse mapping: ALF layers → OpenClaw workspace files.
@@ -350,12 +385,12 @@ Translates between ZeroClaw's SQLite-based storage, markdown memory files, and c
 | SQLite `memories` table                            | Memory records (§3.1) | `sqlite_extractor`: type mapping from ZeroClaw types → ALF `memory_type`, embeddings, temporal metadata               |
 | Memory markdown files (e.g. `memory/`, `archive/`) | Memory records (§3.1) | `markdown_parser`: sections → MemoryRecords with classification (session, daily, generic), observed_at from filenames |
 | `config.toml`                                      | Identity (§3.2)       | Agent name, role, capabilities; `config_parser` + `identity_parser` (AIEOS or OpenClaw format)                        |
-| `config.toml` + `auth_profiles.json` (secrets)   | Credentials (§3.4)    | `credential_map`: with a resolved **vault key**, secrets are encrypted; without a key, metadata-only placeholders |
+| ALF vault (`~/.alf/vault/<alf-agent-id>/credentials.json`) | Credentials (§3.4)    | The agent's explicit vault, packed verbatim (already encrypted). Export never reads `auth_profiles.json`; a resolved vault key only matters on import/restore of legacy archives |
 
 
 **AIEOS extensions.** ZeroClaw uses the AIEOS identity schema, which defines fields not present in ALF's core schema (e.g., `emotional_model`, `reasoning_style`). These are preserved in the `aieos_extensions` passthrough object, ensuring no information loss during round-trip. Promoted fields (name, role, capabilities) are mapped to ALF's first-class fields for cross-runtime compatibility.
 
-**Raw source preservation.** The original SQLite database file is included under `raw/zeroclaw/` for lossless recovery.
+**Raw source preservation.** `raw/zeroclaw/` holds the redacted config, a synthesized `brain.db` **schema sidecar**, ROOT_FILES, AIEOS `identity.json`, `memory/**`, and tracked files. The shared `brain.db` binary itself is never copied — memory is exported as a per-agent slice of it (WP3), and the schema sidecar lets restore rebuild the database.
 
 ### `adapter-hermes` — Hermes Framework Adapter
 
@@ -370,11 +405,15 @@ Translates between a Hermes (Nous Research) profile (`HERMES_HOME`, default `~/.
 | `SOUL.md` + `config.yaml` personalities | Identity (§3.2) | Prose identity (`identity.prose`); no structured fields fabricated |
 | `memories/USER.md` | Principals (§3.3) | Primary human principal — prose + best-effort structured fields |
 | `skills/<category>/<name>/**` | Artifacts (§3.1.9) | Non-bundled skills only (`.bundled_manifest`); `SKILL.md` + small assets in `artifacts/`, large assets by reference |
-| `~/.alf/vault` | Credentials (§3.4) | The shared ALF vault, packed verbatim; `~/.hermes/.env` keys are detected and flagged for vaulting (D4) |
+| `~/.alf/vault/<alf-agent-id>/credentials.json` | Credentials (§3.4) | The agent's ALF vault, packed verbatim; `~/.hermes/.env` keys are detected and flagged for vaulting (D4) |
 
 **Import** restores the verbatim `raw/hermes/` text and **rebuilds `state.db`** from the session records — replaying the source database's own schema and letting Hermes's triggers repopulate the FTS5 + trigram indexes, so a real Hermes opens the result. Project-local context files (`AGENTS.md`) are captured only when tracked with `alf add --external` (§3.2 operating instructions).
 
-**Raw source preservation.** `raw/hermes/` holds the durable text/config (`SOUL.md`, `memories/*.md`, redacted `config.yaml`, non-bundled `skills/`, cron). The `state.db` binary (rebuilt from records), `.env` (secrets live encrypted in Layer 4), and admin dirs (`checkpoints/`, `state-snapshots/`, `backups/`, `logs/`) are excluded.
+**Raw source preservation.** `raw/hermes/` holds the durable text/config (`SOUL.md`, `memories/*.md`, redacted `config.yaml`, `skill-bundles/`, cron). Non-bundled `skills/**` are captured as ALF **artifacts** (see the table above), not raw. The `state.db` binary (rebuilt from records), `.env` (secrets live encrypted in Layer 4), and admin dirs (`checkpoints/`, `state-snapshots/`, `backups/`, `logs/`) are excluded.
+
+### `adapter-generic` — Generic Runtime Adapter
+
+A map-file-driven adapter for any framework. A **`.alf-map.json`** at the workspace root declares which files become memory records and how they are chunked (`per_file`, fence-aware `by_heading`, or **`sqlite_rows`** — one record per row of a declared SQLite table via `table` / `id_column` / `content_column`), typed, namespaced, tagged, and dated. Agent identity comes from an in-workspace **`.alf-agent-id`** file; the raw tree is preserved under `raw/generic/`; Layer 4 is the agent's per-agent ALF vault, verbatim. There is no auto-discovery — `generic` always requires an explicit `-w`. See `docs/cli-reference.md` § "The generic runtime map file".
 
 ---
 
@@ -385,8 +424,8 @@ The `alf` binary is compiled for 5 platform targets and attached to GitHub Relea
 
 | Platform       | Target Triple                | Binary Name             |
 | -------------- | ---------------------------- | ----------------------- |
-| Linux x86_64   | `x86_64-unknown-linux-musl`  | `alf-linux-amd64`       |
-| Linux ARM64    | `aarch64-unknown-linux-musl` | `alf-linux-arm64`       |
+| Linux x86_64   | `x86_64-unknown-linux-gnu`   | `alf-linux-amd64`       |
+| Linux ARM64    | `aarch64-unknown-linux-gnu`  | `alf-linux-arm64`       |
 | macOS ARM64    | `aarch64-apple-darwin`       | `alf-darwin-arm64`      |
 | macOS x86_64   | `x86_64-apple-darwin`        | `alf-darwin-amd64`      |
 | Windows x86_64 | `x86_64-pc-windows-msvc`     | `alf-windows-amd64.exe` |
@@ -400,7 +439,7 @@ curl -sSL https://agent-life.ai/install.sh | sh
 
 The install script detects the platform and downloads the correct binary to `/usr/local/bin/alf` (or `~/.local/bin/alf` without root). SHA256 checksum verification is mandatory by default. A hash mismatch always aborts the install (exit 4) and cannot be overridden. If verification cannot be performed — the `.sha256` file is missing or empty, or no `sha256sum`/`shasum` tool is available — the script also exits 4 by default; set `ALF_ALLOW_UNVERIFIED=1` to opt out of *that* case (not recommended), which then reports `"checksum_verified":false` and a populated `warnings` array in the JSON output.
 
-**From source (requires Rust 1.75+):**
+**From source (requires Rust 1.85+):**
 
 ```bash
 cargo install --git https://github.com/agent-life/agent-life-adapters.git alf-cli
@@ -412,7 +451,7 @@ cargo install --git https://github.com/agent-life/agent-life-adapters.git alf-cl
 
 ## Building from Source
 
-**Prerequisites:** Rust 1.75+ (for async trait support), `cargo`.
+**Prerequisites:** Rust 1.85+ (the MCP dependency `rmcp` is edition-2024), `cargo`.
 
 ```bash
 git clone https://github.com/agent-life/agent-life-adapters.git
@@ -448,34 +487,30 @@ The adapter interface is a Rust trait. To add support for a new framework:
 
 ```rust
 pub trait Adapter {
+    // Required
     fn name(&self) -> &str;
     fn description(&self) -> &str;
-
-    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport> {
-        self.export_with_options(workspace, output, ExportOptions::default())
-    }
-
-    fn export_with_options(
-        &self,
-        workspace: &Path,
-        output: &Path,
-        options: ExportOptions<'_>,
-    ) -> Result<ExportReport>;
-
-    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> {
-        self.import_with_options(alf_file, workspace, ImportOptions::default())
-    }
-
+    fn export(&self, workspace: &Path, output: &Path) -> Result<ExportReport>;
     fn import_with_options(
         &self,
         alf_file: &Path,
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport>;
+    fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid>;
+
+    // Defaulted (override where the runtime needs it)
+    fn import(&self, alf_file: &Path, workspace: &Path) -> Result<ImportReport> { … }
+    fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> { … } // export --dry-run
+    fn enumerate_archive(&self, alf_file: &Path) -> Result<ArchiveEnumeration> { … }      // restore --dry-run
+    fn watch_paths(&self, workspace: &Path) -> Vec<WatchSpec> { … }                       // MCP watch surface
+    fn discover_agents(&self, install: &Path) -> Result<Vec<AgentBinding>> { … }          // multi-agent
+    fn export_agent(&self, binding: &AgentBinding, /* … */) -> Result<ExportReport> { … }
+    fn import_agent(&self, /* … */) -> Result<ImportReport> { … }
 }
 ```
 
-`ExportOptions` / `ImportOptions` carry an optional `vault_key` for Layer 4 encrypt-on-export and decrypt-on-import.
+There is deliberately **no** `export_delta` method — sync computes the delta CLI-side from a full `export`. Export takes no options and never reads a vault key: Layer 4 enters the archive verbatim from the agent's already-encrypted vault. `ImportOptions` carries an optional `vault_key` (Layer 4 decrypt-on-import of legacy archives), the memory restore `mode` (total/merge), and the preview-sandbox flag.
 
 3. Register the adapter in `alf-cli/src/adapter.rs`
 4. Add fixture workspaces and round-trip tests
@@ -488,7 +523,7 @@ See the [ALF specification](https://github.com/agent-life/agent-life-data-format
 
 **Unit tests** (`alf-core`): Writer/reader round-trip for every ALF type. Schema validation against the canonical JSON schemas. Partition logic (time-based assignment, seal status). Tier classification edge cases.
 
-**Integration tests** (adapters): Fixture-based round-trip testing when fixture workspaces are present (e.g. `fixtures/openclaw-full/`, `fixtures/zeroclaw-full/`). Each adapter can export to `.alf`, import back, and diff the resulting workspace against the original (zero information loss).
+**Integration tests** (adapters): Fixture-based round-trip testing when fixture workspaces are present (e.g. `adapter-openclaw/tests/fixtures/golden/`, `adapter-generic/tests/fixtures/toy/`). Each adapter can export to `.alf`, import back, and diff the resulting workspace against the original (zero information loss).
 
 **Synthetic Integration test**: To test against perfectly valid randomized schema data, generate the synthetic test data first before running tests:
 
@@ -530,7 +565,7 @@ This validates that the CLI and service advance sequences correctly and that del
 1. Ensure at least one agent is synced (e.g. run the sync sequence above).
 2. Restore to a new directory:  
    `alf restore -r openclaw -w /tmp/restored-openclaw`  
-   If multiple agents are tracked, pass `-a <agent-id>`. Use `alf help status` to list agent IDs.
+   If multiple agents are tracked, pass `--agent <alias-or-id>`. Use `alf help status` to list agent IDs.
 3. Confirm output reports “Restore complete” and the restored agent name, memory count, and sequence.
 4. Verify the restored workspace: check that `SOUL.md`, `MEMORY.md`, `memory/*.md`, and other expected files exist under the restore path and that content matches what was in the synced workspace (or diff key files).
 
@@ -540,7 +575,7 @@ You can repeat restore to a fresh directory to simulate disaster recovery or mig
 
 **Schema compliance**: Every `.alf` file produced by any adapter is validated against the JSON schemas before the test passes.
 
-**CI**: `cargo test` + `cargo clippy` + `cargo fmt --check` on every push. Cross-compilation smoke test on release tags (build all 5 targets, verify binaries are non-zero size).
+**CI**: `.github/workflows/build.yml` runs `cargo test --workspace` (plus a fault-injection test job) on pushes to main and PRs. Release tags cross-compile all 5 targets and attach binaries + SHA256 checksums (`release.yml`). Clippy/rustfmt are release gates run locally (see `RELEASING.md`), not CI jobs.
 
 ### Install Script Tests
 
@@ -592,17 +627,17 @@ python3 scripts/test_install/mock_server.py 18432 scripts/test_install/fixtures 
 INSTALL_SH=scripts/install.sh sh scripts/test_install/run_tests.sh 18432 localhost
 ```
 
-**CI:** `.github/workflows/test-install.yml` runs on every push or PR touching `scripts/install.sh`, `scripts/test_install.sh`, or `scripts/test_install/**`. Two parallel jobs: Linux (Docker, ubuntu-latest) and macOS (native, macos-latest).
+**CI:** `.github/workflows/test-install.yml` runs on every push or PR touching `scripts/install.sh`, `scripts/test_install.sh`, or `scripts/test_install/**`. Three jobs: lane selection (ubuntu-latest), Linux (Docker, ubuntu-latest), and macOS (native, macos-latest).
 
 ### Integration walkthroughs
 
-**Main pipeline** (`scripts/integration_walkthrough.py`) is both an end-to-end functional test and an educational tool for new contributors. It walks through the complete agent lifecycle — connectivity, create agent, snapshot, deltas, restore, point-in-time restore, simulated data loss, recovery, and cleanup — with explanations at each step of what is happening and where data lives (API, Neon, S3).
+**Main pipeline** (`scripts/integration_walkthrough.py`) is both an end-to-end functional test and an educational tool for new contributors. It walks through the complete agent lifecycle — connectivity, create agent, snapshot, deltas, restore, point-in-time restore, simulated data loss, recovery, and cleanup — with explanations at each step of what is happening and where data lives (API, Neon, S3). For Hermes and ZeroClaw it also keeps a real `alf mcp serve` session open while the allowlisted content root is absent, then proves root creation and a later nested edit each auto-sync to the cloud and survive a read-only restore preview.
 
 **Vault-focused** (`scripts/integration_walkthrough_for_vault.py`) covers Layer 4: zero-knowledge boundary, on-disk vs cloud representation, snapshot upload with `credentials.json`, optional `alf vault list`, and cleanup. Same `.env` variables as the main script.
 
-**Workspace coverage** (`scripts/integration_walkthrough_for_workspace.py`) covers Layer 5 (WP3 — `alf add`): how an agent explicitly opts arbitrary files into sync (ALF never auto-walks a workspace), where the tracked-file whitelist and removal log live (`.alf-include.json` / `.alf-sync-log.md`, both synced so they travel on restore), and how a change to a tracked file triggers a fresh snapshot (a non-destructive rollover) while memory-only changes still ride deltas. Drives the real `alf` CLI against the live service and verifies each effect in Neon + S3. Same `.env` variables as the main script.
+**Workspace coverage** (`scripts/integration_walkthrough_for_workspace.py`) covers Layer 5 (WP3 — `alf add`): how an agent explicitly opts arbitrary files into sync (beyond the adapter's built-in collection, ALF does not walk the workspace for arbitrary files), where the tracked-file whitelist and removal log live (`.alf-include.json` / `.alf-sync-log.md`, both synced so they travel on restore), and how a change to a tracked file triggers a fresh snapshot (a non-destructive rollover) while memory-only changes still ride deltas. Drives the real `alf` CLI against the live service and verifies each effect in Neon + S3. Same `.env` variables as the main script.
 
-**Real-install lifecycle harness** (`tests/lifecycle/driver.py`) supersedes the retired memory walkthrough: it runs the Z1–Z13 lifecycle against a **real framework install** (official installer, hardened version pin) in Docker with the locally built `alf` injected, in automated and `--interactive` modes, with backend inspection (⊙ API/S3/Neon) and a no-LLM seeding tier that runs with zero secrets in CI. See [tests/lifecycle/README.md](tests/lifecycle/README.md) for the runbook.
+**Real-install lifecycle harness** (`tests/lifecycle/driver.py`) supersedes the retired memory walkthrough: it runs the Z1–Z17 lifecycle against a **real framework install** (official installer, hardened version pin) in Docker with the locally built `alf` injected, in automated and `--interactive` modes, with backend inspection (⊙ API/S3/Neon) and a no-LLM seeding tier that runs with zero secrets in CI. See [tests/lifecycle/README.md](tests/lifecycle/README.md) for the runbook.
 
 Unlike the Rust E2E tests (which verify API contracts), the service-backed walkthroughs also query Neon and S3 directly at each step, so you can see the actual database rows and blob objects that the Lambdas create.
 

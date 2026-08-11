@@ -3,14 +3,16 @@
 //!
 //! Stored as `<workspace>/.alf-include.json` and itself preserved in
 //! `raw/{runtime}/`, so the list (the agent's sync config) and the sync log
-//! travel on restore. ALF never auto-discovers arbitrary files — the agent
-//! declares intent explicitly.
+//! travel on restore. Outside each adapter's built-in collection (OpenClaw
+//! also auto-captures every workspace `.md`), ALF never auto-discovers
+//! arbitrary files — the agent declares intent explicitly.
 //!
 //! This module is runtime-agnostic: it deals only in workspace-relative paths
 //! and two sentinel file names, with no knowledge of any framework's layout.
 //! It lives in `alf-core` so every adapter (and the CLI) can share one
-//! implementation — see the OpenClaw and ZeroClaw adapters' `export`.
+//! implementation — see the adapters' `export` (openclaw, zeroclaw, hermes, generic).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -25,10 +27,22 @@ pub const INCLUDE_FILE: &str = ".alf-include.json";
 pub const SYNC_LOG_FILE: &str = ".alf-sync-log.md";
 
 /// The agent-managed whitelist of extra files to sync.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// **Forward compatible (MIN-7).** This file is rewritten in place by routine
+/// operations — `mark_external_inert` on every restore/import,
+/// `prune_and_log_missing` on every sync — and it travels inside the archive,
+/// so an older binary's rewrite propagates to the cloud and to every other
+/// machine. Mixed versions are routine (a runtime image bakes `alf` at build
+/// time and lags the user's laptop), so unknown fields written by a newer alf
+/// are preserved verbatim rather than silently dropped, matching the
+/// `Manifest`/`AgentMetadata` discipline (spec §8.2).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct IncludeList {
     #[serde(default)]
     pub files: Vec<IncludeEntry>,
+    /// Unknown document-level fields preserved for forward compatibility.
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// One tracked file in the include list.
@@ -39,7 +53,7 @@ pub struct IncludeList {
 /// provenance + re-validation, and use `verified` for inert-on-restore: a
 /// `false` value means "restored from an archive, do not pack until the local
 /// user re-confirms" (so a hostile archive's external entries do nothing).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct IncludeEntry {
     /// For in-workspace entries: the workspace-relative, forward-slashed path.
     /// For external entries: the sanitized archive name under `external/`.
@@ -59,6 +73,9 @@ pub struct IncludeEntry {
     /// archive is imported `false` (inert) until the local user re-confirms.
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub verified: bool,
+    /// Unknown entry-level fields preserved for forward compatibility (MIN-7).
+    #[serde(flatten, default, skip_serializing_if = "HashMap::is_empty")]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -85,11 +102,13 @@ impl IncludeList {
         serde_json::from_str(&content).with_context(|| format!("{INCLUDE_FILE} is not valid JSON"))
     }
 
-    /// Persist to `<workspace>/.alf-include.json` (pretty JSON).
+    /// Persist to `<workspace>/.alf-include.json` (pretty JSON, atomic — a
+    /// crash mid-save can never leave a torn include list).
     pub fn save(&self, workspace: &Path) -> Result<()> {
         let path = workspace.join(INCLUDE_FILE);
         let json = serde_json::to_string_pretty(self)?;
-        fs::write(&path, json).with_context(|| format!("Failed to write {}", path.display()))?;
+        crate::fs_atomic::write_atomic(&path, json.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
         Ok(())
     }
 
@@ -109,6 +128,7 @@ impl IncludeList {
             external: false,
             source: None,
             verified: true,
+            extra: HashMap::new(),
         });
         true
     }
@@ -127,6 +147,7 @@ impl IncludeList {
             external: true,
             source: Some(source_abs.to_string()),
             verified: true,
+            extra: HashMap::new(),
         });
         true
     }
@@ -134,6 +155,16 @@ impl IncludeList {
     /// The external entries (verified or not).
     pub fn externals(&self) -> impl Iterator<Item = &IncludeEntry> {
         self.files.iter().filter(|e| e.external)
+    }
+
+    /// External entries verified on THIS host — the only externals export
+    /// packs (`external_entries_for_export`) and therefore the only ones a
+    /// watch surface may root. A restored archive's externals come back
+    /// inert (`verified: false`, D3 — "a hostile archive's externals do
+    /// nothing"): watching them would fire tracked syncs that capture nothing
+    /// and let a crafted archive choose filesystem watch roots.
+    pub fn verified_externals(&self) -> impl Iterator<Item = &IncludeEntry> {
+        self.externals().filter(|e| e.verified)
     }
 
     /// Remove a workspace-relative path. Returns true if it was present.
@@ -215,6 +246,33 @@ fn append_sync_log(workspace: &Path, removed: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Flip restored external include entries to `verified = false` (inert). Returns
+/// the count changed.
+///
+/// Called by adapter imports right after the raw tree (which carries
+/// `.alf-include.json`) is restored: a hostile/compromised archive's external
+/// entries must do nothing on the next sync until the local user re-confirms
+/// them with `alf add --external` (D3 inert-on-restore). In-workspace entries
+/// are untouched; idempotent (already-inert entries stay inert).
+pub fn mark_external_inert(workspace: &Path) -> Result<usize> {
+    let path = workspace.join(INCLUDE_FILE);
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut list = IncludeList::load(workspace)?;
+    let mut changed = 0;
+    for e in list.files.iter_mut() {
+        if e.external && e.verified {
+            e.verified = false;
+            changed += 1;
+        }
+    }
+    if changed > 0 {
+        list.save(workspace)?;
+    }
+    Ok(changed)
+}
+
 /// Resolve a user-supplied path to a workspace-relative, forward-slashed path
 /// for `alf add`. The path is interpreted relative to the workspace (absolute
 /// paths are accepted if they resolve inside it). Rejects paths that escape the
@@ -282,6 +340,16 @@ pub fn safe_include_path(workspace: &Path, rel: &str) -> Result<PathBuf> {
     if rel_str == INCLUDE_FILE || rel_str == SYNC_LOG_FILE {
         bail!("{rel_str} is managed by alf and cannot be tracked");
     }
+    // MAJ-7: the sensitive-path denylist applies to stored in-workspace
+    // entries too — `alf add` refuses them up front, but the list can be
+    // restored from an archive or hand-edited, so export must re-check here
+    // (callers skip+warn, same as the other rejections).
+    if is_denylisted(&abs) {
+        bail!(
+            "tracked path {rel} matches the sensitive-path denylist — not packed \
+             (secrets belong in the encrypted vault: alf vault add)"
+        );
+    }
     Ok(abs)
 }
 
@@ -330,7 +398,8 @@ pub fn add_allowed_root(dir: &Path) -> Result<PathBuf> {
     if !roots.iter().any(|r| r == &canon) {
         roots.push(canon.clone());
         let body: String = roots.iter().map(|r| format!("{}\n", r.display())).collect();
-        fs::write(&path, body).with_context(|| format!("Failed to write {}", path.display()))?;
+        crate::fs_atomic::write_atomic(&path, body.as_bytes())
+            .with_context(|| format!("Failed to write {}", path.display()))?;
     }
     Ok(canon)
 }
@@ -374,13 +443,29 @@ pub fn is_denylisted(canonical: &Path) -> bool {
 
 /// Validate an external source path for `alf add`/export: canonicalize (resolving
 /// symlinks — the TOCTOU guard), require it to be a file under an allowed root,
-/// and reject denylisted paths. Returns the canonical path on success.
+/// enforce the per-entry size cap, and reject denylisted paths. Returns the
+/// canonical path on success.
+///
+/// The size cap runs at add-time AND at export-time re-validation (via
+/// [`external_entries_for_export`]), so a file that grows past the cap after
+/// being added becomes an export-time skip + warning, never an oversized
+/// archive member.
 pub fn validate_external_source(source: &Path, allowed_roots: &[PathBuf]) -> Result<PathBuf> {
     let canon = source
         .canonicalize()
         .with_context(|| format!("external file not found: {}", source.display()))?;
     if !canon.is_file() {
         bail!("external path is not a file: {}", canon.display());
+    }
+    let len = fs::metadata(&canon)
+        .with_context(|| format!("reading metadata for {}", canon.display()))?
+        .len();
+    if len > crate::MAX_RAW_ENTRY_BYTES {
+        bail!(
+            "{} is {len} bytes, over the {} byte per-file cap (a restore would reject it)",
+            canon.display(),
+            crate::MAX_RAW_ENTRY_BYTES
+        );
     }
     if is_denylisted(&canon) {
         bail!(
@@ -610,6 +695,26 @@ mod tests {
     }
 
     #[test]
+    fn safe_include_path_rejects_denylisted_entries() {
+        // MAJ-7 second line of defense: a restored/hand-edited list naming an
+        // in-workspace secret (hermes' workspace IS ~/.hermes, holding .env)
+        // must not pack — adapters skip+warn on this error.
+        let dir = ws();
+        for name in [".env", "server.pem", "signing.key"] {
+            fs::write(dir.path().join(name), "secret").unwrap();
+            let err = safe_include_path(dir.path(), name)
+                .expect_err("a denylisted stored entry must be rejected at export");
+            assert!(
+                format!("{err:#}").contains("denylist"),
+                "the rejection must name the denylist: {err:#}"
+            );
+        }
+        // Benign entries are unaffected.
+        fs::write(dir.path().join("notes.md"), "n").unwrap();
+        assert!(safe_include_path(dir.path(), "notes.md").is_ok());
+    }
+
+    #[test]
     fn safe_include_path_rejects_symlink_escape() {
         let dir = ws();
         let outside = dir.path().parent().unwrap().join("escape-target.txt");
@@ -711,6 +816,7 @@ mod tests {
             external: true,
             source: Some("/some/old/OLD.md".into()),
             verified: false,
+            extra: HashMap::new(),
         });
 
         let (packable, skipped) = external_entries_for_export(&list, &roots);
@@ -735,6 +841,158 @@ mod tests {
             list.files[0].verified,
             "missing verified must default to true"
         );
+    }
+
+    #[test]
+    fn save_leaves_no_temp_sibling() {
+        let dir = ws();
+        let mut list = IncludeList::default();
+        list.add("notes.txt");
+        list.save(dir.path()).unwrap();
+        // The atomic write must leave exactly the include file, no `.tmp.`.
+        let names: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![INCLUDE_FILE.to_string()]);
+        // And the saved list reloads.
+        assert_eq!(
+            IncludeList::load(dir.path()).unwrap().paths(),
+            vec!["notes.txt"]
+        );
+    }
+
+    #[test]
+    fn validate_external_rejects_oversize_file() {
+        let root = ws();
+        let big = root.path().join("huge.bin");
+        // Sparse file: instant to create, reports the oversize length.
+        let f = fs::File::create(&big).unwrap();
+        f.set_len(crate::MAX_RAW_ENTRY_BYTES + 1).unwrap();
+        drop(f);
+        let roots = vec![root.path().canonicalize().unwrap()];
+        let err = validate_external_source(&big, &roots)
+            .expect_err("a file over MAX_RAW_ENTRY_BYTES must be rejected");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("per-file cap"), "unexpected message: {msg}");
+        assert!(
+            msg.contains(&crate::MAX_RAW_ENTRY_BYTES.to_string()),
+            "message must name the cap: {msg}"
+        );
+        assert!(
+            msg.contains(&(crate::MAX_RAW_ENTRY_BYTES + 1).to_string()),
+            "message must name the size: {msg}"
+        );
+
+        // Exactly at the cap is still fine.
+        let ok = root.path().join("edge.bin");
+        let f = fs::File::create(&ok).unwrap();
+        f.set_len(crate::MAX_RAW_ENTRY_BYTES).unwrap();
+        drop(f);
+        assert!(validate_external_source(&ok, &roots).is_ok());
+    }
+
+    /// MIN-7: forward compatibility for the include list. `.alf-include.json`
+    /// is rewritten in place by routine operations — `mark_external_inert` on
+    /// EVERY restore/import (all four adapters) and `prune_and_log_missing` on
+    /// every sync — and it travels inside the archive, so a strip propagates to
+    /// the cloud and every other machine. Mixed versions are routine here (a
+    /// runtime image bakes `alf` at build time and lags the user's laptop), so
+    /// an older binary must round-trip fields it does not know: without this,
+    /// the older binary silently deletes a newer version's data on a plain
+    /// restore. This must ship BEFORE the first version that adds a field —
+    /// a deployed binary cannot be taught to preserve what it never knew.
+    #[test]
+    fn unknown_fields_survive_every_rewrite_path() {
+        let dir = ws();
+        fs::write(dir.path().join("kept.txt"), "k").unwrap();
+        // A list as a FUTURE alf would write it: unknown keys at both the entry
+        // and document level.
+        fs::write(
+            dir.path().join(INCLUDE_FILE),
+            r#"{"files":[
+                {"path":"kept.txt","added_at":"2026-01-01T00:00:00Z","pinned":true,
+                 "future_entry_field":{"nested":1}},
+                {"path":"aa-EXT.md","external":true,"source":"/proj/EXT.md",
+                 "verified":true,"pinned":false}
+            ],"future_doc_field":"kept"}"#,
+        )
+        .unwrap();
+
+        // Rewrite path 1: every restore/import.
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 1);
+        // Rewrite path 2: every sync.
+        prune_and_log_missing(dir.path()).unwrap();
+
+        let raw = fs::read_to_string(dir.path().join(INCLUDE_FILE)).unwrap();
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            doc["future_doc_field"], "kept",
+            "document-level unknown field stripped: {raw}"
+        );
+        let kept = &doc["files"][0];
+        assert_eq!(kept["pinned"], true, "entry unknown field stripped: {raw}");
+        assert_eq!(
+            kept["future_entry_field"]["nested"], 1,
+            "nested unknown value mangled: {raw}"
+        );
+        // The known fields still work — the external really was flipped inert.
+        let ext = doc["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["path"] == "aa-EXT.md")
+            .expect("external entry survived");
+        assert_eq!(ext["verified"], false, "known-field behavior regressed");
+        assert_eq!(
+            ext["pinned"], false,
+            "unknown field lost on the flipped entry"
+        );
+    }
+
+    #[test]
+    fn mark_external_inert_flips_only_verified_externals() {
+        let dir = ws();
+        let mut list = IncludeList::default();
+        list.add("in-workspace.txt"); // in-workspace: untouched
+        list.files.push(IncludeEntry {
+            path: "aa-EXT.md".into(),
+            added_at: None,
+            external: true,
+            source: Some("/proj/EXT.md".into()),
+            verified: true, // verified external: flipped
+            extra: HashMap::new(),
+        });
+        list.files.push(IncludeEntry {
+            path: "bb-OLD.md".into(),
+            added_at: None,
+            external: true,
+            source: Some("/proj/OLD.md".into()),
+            verified: false, // already inert: stays
+            extra: HashMap::new(),
+        });
+        list.save(dir.path()).unwrap();
+
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 1);
+        let after = IncludeList::load(dir.path()).unwrap();
+        assert!(
+            after.files.iter().all(|e| !e.external || !e.verified),
+            "every external entry must be inert"
+        );
+        let in_ws = after
+            .files
+            .iter()
+            .find(|e| e.path == "in-workspace.txt")
+            .unwrap();
+        assert!(in_ws.verified, "in-workspace entries must be untouched");
+
+        // Idempotent: a second pass changes nothing.
+        assert_eq!(mark_external_inert(dir.path()).unwrap(), 0);
+
+        // Missing include file is a no-op, not an error.
+        let empty = ws();
+        assert_eq!(mark_external_inert(empty.path()).unwrap(), 0);
     }
 
     #[test]

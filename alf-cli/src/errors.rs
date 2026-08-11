@@ -38,4 +38,21 @@ pub mod codes {
     pub const VAULT_ROTATE_FAILED: &str = "vault_rotate_failed";
     pub const VAULT_ROTATE_NO_DESTINATION: &str = "vault_rotate_no_destination";
     pub const VAULT_MIGRATION_BLOCKED: &str = "vault_migration_blocked";
+    // v1.1 MCP-train failure classes (manual §5): lock contention + the
+    // permanent-failure classes the watch loop must park on instead of
+    // retrying forever.
+    pub const AGENT_BUSY: &str = "agent_busy";
+    /// Another `alf` process held the cross-process config lock past the wait
+    /// (RF-013). The `config.toml` read-modify-write was not attempted, so the
+    /// file is unchanged; retrying is safe.
+    pub const CONFIG_BUSY: &str = "config_busy";
+    pub const AUTH_FAILED: &str = "auth_failed";
+    pub const SUBSCRIPTION_DENIED: &str = "subscription_denied";
+    pub const SYNC_BASE_UNREADABLE: &str = "sync_base_unreadable";
+    pub const WORKSPACE_MISSING: &str = "workspace_missing";
+    /// A prior head restore may have partially changed its workspace; syncing is unsafe until it is completed.
+    pub const RESTORE_INCOMPLETE: &str = "restore_incomplete";
+    /// `alf add`/`alf_track` refused: the path matches the non-overridable
+    /// sensitive-path denylist (MAJ-7 — secrets belong in the vault).
+    pub const PATH_DENYLISTED: &str = "path_denylisted";
 }

@@ -30,6 +30,13 @@ _PATTERNS: list[tuple[re.Pattern, str]] = [
         re.compile(r"(?im)^((?:ALF_API_KEY|RUNTIME_API_KEY|API_KEY)=).*$"),
         r"\1[REDACTED]",
     ),
+    # YAML-style key assignments (config.yaml — the hermes-mcp kit writes the
+    # runtime key as both an `ALF_API_KEY:` env entry and an `api_key:` service
+    # value; the TOML pattern above only covers `=` shapes).
+    (
+        re.compile(r"(?im)^(\s*(?:alf_api_key|api_key|runtime_api_key)\s*:\s*).+$"),
+        r"\1[REDACTED]",
+    ),
     # Connection-string passwords (postgres://user:pass@host).
     (re.compile(r"(?i)((?:postgres|postgresql|mysql)://[^:/\s@]+:)[^@\s]+@"), r"\1[REDACTED]@"),
     # AWS-style secrets, defensively.

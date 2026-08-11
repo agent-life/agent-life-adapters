@@ -46,6 +46,9 @@ TEST_DEFAULT_MODELS = {
     "zeroclaw": "us.amazon.nova-lite-v1:0",
     "hermes": "us.amazon.nova-lite-v1:0",
     "openclaw": "minimax.minimax-m2.5",
+    # hermes-mcp (WP-M4): the agent must CALL the mcp_alf_* tools — real tool use,
+    # like openclaw's MEMORY.md writes — so it needs a capable model, not nova-lite.
+    "hermes-mcp": "us.amazon.nova-lite-v1:0",
 }
 # For any framework not listed: the capable, known-good model (never the cheapest,
 # since an unswept framework may exercise tool use).

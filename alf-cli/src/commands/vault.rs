@@ -27,6 +27,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::Utc;
 use colored::Colorize;
+use schemars::JsonSchema;
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -216,8 +217,10 @@ pub fn encrypt(
 // add — encrypt a credential and append it to the agent's vault
 // ===========================================================================
 
-#[derive(Serialize)]
-struct AddResult {
+/// The `alf vault add` result. Also the `alf_vault_add` MCP tool result (hence
+/// `JsonSchema`).
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct AddResult {
     ok: bool,
     id: Uuid,
     service: String,
@@ -233,51 +236,24 @@ const SECRET_JSON_USERNAME_KEYS: &[&str] = &["username", "user", "email", "bot_u
 /// Keys in a `--secret-json` object treated as the account secret.
 const SECRET_JSON_SECRET_KEYS: &[&str] = &["secret", "password", "token", "bot_token", "api_key"];
 
-/// Add an account credential to the agent's vault.
-///
-/// Encrypts the secret under the resolved vault key and appends a
-/// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
-/// `CredentialsDocument`. The default target is the agent's vault at
-/// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
-/// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
-/// merge into the archive's Layer 4 on the next `alf sync`.
-#[allow(clippy::too_many_arguments)]
-pub fn add(
-    input: Option<&Path>,
-    service: &str,
-    credential_type: &str,
+/// Caller-supplied credential material, fully collected before a canonical
+/// vault mutation takes L3. This deliberately contains plaintext only while a
+/// request is executing; callers must not log it or retain it after the add.
+pub(crate) struct PreparedAddInput {
+    payload: VaultPayload,
+}
+
+/// Read and validate caller-owned credential input without touching the vault
+/// or key. Default-vault callers must run this before acquiring the advisory
+/// lock so a TTY prompt, FIFO, or slow caller-owned file cannot starve sync,
+/// restore, or other MCP tools that need the agent lock.
+pub(crate) fn prepare_add_input(
     username: Option<&str>,
     secret: Option<&str>,
     secret_file: Option<&Path>,
     secret_json: Option<&Path>,
-    label: Option<&str>,
-    description: Option<&str>,
-    tags: &[String],
     fields: &[String],
-    agent_id: Option<&str>,
-    scope: Option<Uuid>,
-    update: bool,
-    key_args: &VaultKeyArgs,
-    runtime: &str,
-) -> Result<()> {
-    // 1. Resolve the target vault file.
-    let target: PathBuf = match input {
-        Some(p) => p.to_path_buf(),
-        None => vault_key::default_vault_path(scope)?,
-    };
-    if target
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("alf"))
-        .unwrap_or(false)
-    {
-        bail!(
-            "Cannot add a credential into a .alf archive in place. \
-             Pass --in PATH to a credentials.json file."
-        );
-    }
-
-    // 2. Assemble the plaintext payload.
+) -> Result<PreparedAddInput> {
     let mut payload_username = username.map(str::to_string);
     let mut secret_value: Option<String> = None;
     let mut extra: std::collections::HashMap<String, serde_json::Value> =
@@ -319,7 +295,9 @@ pub fn add(
             fs::read_to_string(sf).with_context(|| format!("Failed to read {}", sf.display()))?;
         secret_value = Some(raw.trim().to_string());
     } else if secret_value.is_none() {
-        // Last resort: read the secret from stdin.
+        // Last resort: read the secret from stdin. This is intentionally before
+        // L3 for default-vault callers; an unattended prompt must not block the
+        // watch loop or every other MCP mutation for this agent.
         let buf = read_input(None)?;
         let s = String::from_utf8(buf)
             .map_err(|_| anyhow!("Secret read from stdin is not UTF-8 text"))?;
@@ -346,15 +324,101 @@ pub fn add(
     } else {
         "api_key"
     };
-    let payload = VaultPayload {
-        vault_payload_version: alf_core::VAULT_PAYLOAD_VERSION,
-        kind: kind.to_string(),
-        username: payload_username.clone(),
-        secret: secret_value,
-        extra,
-    };
+    Ok(PreparedAddInput {
+        payload: VaultPayload {
+            vault_payload_version: alf_core::VAULT_PAYLOAD_VERSION,
+            kind: kind.to_string(),
+            username: payload_username,
+            secret: secret_value,
+            extra,
+        },
+    })
+}
 
-    // 3. Encrypt under the resolved key.
+/// Add an account credential to the agent's vault.
+///
+/// Encrypts the secret under the resolved vault key and appends a
+/// `CredentialRecord` (tagged `alf-vault`) to a `credentials.json`
+/// `CredentialsDocument`. The default target is the agent's vault at
+/// `~/.alf/vault/{alf_agent_id}/credentials.json` (the legacy install-scoped
+/// `~/.alf/vault/credentials.json` on mapping-less hosts), which the adapters
+/// merge into the archive's Layer 4 on the next `alf sync`.
+/// Test-only compatibility seam that prepares caller input and then encrypts
+/// and upserts it without writing stdout. Production callers use
+/// [`prepare_add_input`] before L3 and [`add_prepared_core`] while holding it.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_core(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    username: Option<&str>,
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    secret_json: Option<&Path>,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    fields: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<AddResult> {
+    let prepared = prepare_add_input(username, secret, secret_file, secret_json, fields)?;
+    add_prepared_core(
+        input,
+        service,
+        credential_type,
+        prepared,
+        label,
+        description,
+        tags,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )
+}
+
+/// Add a credential whose caller-owned input has already been prepared. For a
+/// default target, callers hold the shared L3 guard before entering here.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_prepared_core(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    prepared: PreparedAddInput,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<AddResult> {
+    // 1. Resolve the target vault file.
+    let target: PathBuf = match input {
+        Some(p) => p.to_path_buf(),
+        None => vault_key::default_vault_path(scope)?,
+    };
+    if target
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.eq_ignore_ascii_case("alf"))
+        .unwrap_or(false)
+    {
+        bail!(
+            "Cannot add a credential into a .alf archive in place. \
+             Pass --in PATH to a credentials.json file."
+        );
+    }
+
+    // 2. Encrypt under the resolved key.
+    let payload = prepared.payload;
     let (key, source) = vault_key::resolve_required(key_args, runtime, scope)?;
     output::progress(&format!(
         "Encrypting with key from {} (fingerprint {})",
@@ -372,7 +436,7 @@ pub fn add(
     };
     let record_label = label
         .map(str::to_string)
-        .or_else(|| payload_username.clone());
+        .or_else(|| payload.username.clone());
 
     // Every agent-added record carries `alf-vault` — the discriminator the
     // OpenClaw adapter uses to route records back to this file on import.
@@ -399,7 +463,7 @@ pub fn add(
         extra: std::collections::HashMap::new(),
     };
 
-    // 4. Load the existing document (empty when the file is absent) and upsert.
+    // 3. Load the existing document (empty when the file is absent) and upsert.
     let mut doc = if target.is_file() {
         load_credentials_document(&target)?
     } else {
@@ -411,22 +475,33 @@ pub fn add(
 
     let mut updated = false;
     if update {
-        if let Some(new_label) = &record_label {
-            if let Some(pos) = doc
+        // Upsert by label (the documented CLI contract). A LABEL-LESS record —
+        // the shape a minimal `{service, secret}` add produces, since the
+        // effective label is `label ?? username` — has no label to match on,
+        // so it upserts against the same service's other label-less record
+        // instead (MIN-1). Without this, `update: true` appended a second copy
+        // and the duplicate guard's "pass update:true to replace it" advice
+        // was untrue for the commonest call shape.
+        let pos = match &record_label {
+            Some(new_label) => doc
                 .credentials
                 .iter()
-                .position(|c| c.label.as_deref() == Some(new_label.as_str()))
-            {
-                doc.credentials[pos] = record.clone();
-                updated = true;
-            }
+                .position(|c| c.label.as_deref() == Some(new_label.as_str())),
+            None => doc
+                .credentials
+                .iter()
+                .position(|c| c.label.is_none() && c.service == record.service),
+        };
+        if let Some(pos) = pos {
+            doc.credentials[pos] = record.clone();
+            updated = true;
         }
     }
     if !updated {
         doc.credentials.push(record.clone());
     }
 
-    // 5. Write back atomically with owner-only permissions (the file holds
+    // 4. Write back atomically with owner-only permissions (the file holds
     //    ciphertext, but tightening to 0600 matches the vault key file; the
     //    atomic temp+rename means a crash can never truncate the vault).
     if let Some(parent) = target.parent() {
@@ -440,29 +515,113 @@ pub fn add(
     write_private_atomic(&target, &serialized)
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
+    Ok(AddResult {
+        ok: true,
+        id: record.id,
+        service: record.service.clone(),
+        label: record.label.clone(),
+        updated,
+        written_to: target.display().to_string(),
+        total: doc.credentials.len(),
+    })
+}
+
+/// `alf vault add` — encrypt a credential and append it to the agent's vault.
+#[allow(clippy::too_many_arguments)]
+pub fn add(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    username: Option<&str>,
+    secret: Option<&str>,
+    secret_file: Option<&Path>,
+    secret_json: Option<&Path>,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    fields: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    // Preserve the caller-owned archive rejection before falling back to stdin:
+    // an invalid --in must not unexpectedly wait for a secret prompt.
+    if input.is_some_and(|path| {
+        path.extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("alf"))
+    }) {
+        bail!(
+            "Cannot add a credential into a .alf archive in place. \
+             Pass --in PATH to a credentials.json file."
+        );
+    }
+    let prepared = prepare_add_input(username, secret, secret_file, secret_json, fields)?;
+    add_prepared(
+        input,
+        service,
+        credential_type,
+        prepared,
+        label,
+        description,
+        tags,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )
+}
+
+/// Print the result of adding already-prepared caller input. Direct CLI default
+/// actions call this only after they have acquired L3.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn add_prepared(
+    input: Option<&Path>,
+    service: &str,
+    credential_type: &str,
+    prepared: PreparedAddInput,
+    label: Option<&str>,
+    description: Option<&str>,
+    tags: &[String],
+    agent_id: Option<&str>,
+    scope: Option<Uuid>,
+    update: bool,
+    key_args: &VaultKeyArgs,
+    runtime: &str,
+) -> Result<()> {
+    let result = add_prepared_core(
+        input,
+        service,
+        credential_type,
+        prepared,
+        label,
+        description,
+        tags,
+        agent_id,
+        scope,
+        update,
+        key_args,
+        runtime,
+    )?;
+
     if output::human_mode() {
         println!(
             "{} {} credential in vault",
             "✓".green().bold(),
-            if updated { "Updated" } else { "Added" }
+            if result.updated { "Updated" } else { "Added" }
         );
-        println!("  Record ID:  {}", record.id);
-        println!("  Service:    {}", record.service);
-        if let Some(l) = &record.label {
+        println!("  Record ID:  {}", result.id);
+        println!("  Service:    {}", result.service);
+        if let Some(l) = &result.label {
             println!("  Label:      {l}");
         }
-        println!("  Written to: {}", target.display());
-        println!("  Total:      {} credential(s)", doc.credentials.len());
+        println!("  Written to: {}", result.written_to);
+        println!("  Total:      {} credential(s)", result.total);
     } else {
-        output::json(&AddResult {
-            ok: true,
-            id: record.id,
-            service: record.service.clone(),
-            label: record.label.clone(),
-            updated,
-            written_to: target.display().to_string(),
-            total: doc.credentials.len(),
-        });
+        output::json(&result);
     }
 
     Ok(())
@@ -472,15 +631,16 @@ pub fn add(
 // list
 // ===========================================================================
 
-#[derive(Serialize)]
-struct ListResult {
+/// The `alf vault list` result. Also the `alf_vault_list` MCP tool result.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct ListResult {
     ok: bool,
     count: usize,
     credentials: Vec<DescriptorView>,
 }
 
-#[derive(Serialize)]
-struct DescriptorView {
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct DescriptorView {
     id: Uuid,
     service: String,
     credential_type: String,
@@ -489,19 +649,40 @@ struct DescriptorView {
     #[serde(skip_serializing_if = "Option::is_none")]
     label: Option<String>,
     algorithm: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    // Skipped when empty on a non-Option ⇒ `#[serde(default)]` (M2a §2).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
     created_at: chrono::DateTime<Utc>,
 }
 
-pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
+impl DescriptorView {
+    pub(crate) fn id(&self) -> Uuid {
+        self.id
+    }
+    pub(crate) fn service(&self) -> &str {
+        &self.service
+    }
+    pub(crate) fn label(&self) -> Option<&str> {
+        self.label.as_deref()
+    }
+}
+
+impl ListResult {
+    pub(crate) fn credentials(&self) -> &[DescriptorView] {
+        &self.credentials
+    }
+}
+
+/// Build the plaintext-descriptor listing — no key touched, no stdout. Shared by
+/// the CLI [`list`] and the MCP `alf_vault_list` tool.
+pub(crate) fn list_core(input: Option<&Path>, scope: Option<Uuid>) -> Result<ListResult> {
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
         None => vault_key::default_vault_path(scope)?,
     };
     let doc = load_credentials_document(&target)?;
 
-    let views: Vec<DescriptorView> = doc
+    let credentials: Vec<DescriptorView> = doc
         .credentials
         .iter()
         .map(|c| DescriptorView {
@@ -519,9 +700,20 @@ pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
         })
         .collect();
 
+    Ok(ListResult {
+        ok: true,
+        count: credentials.len(),
+        credentials,
+    })
+}
+
+pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
+    let result = list_core(input, scope)?;
+    let views = &result.credentials;
+
     if output::human_mode() {
         println!("{} {} credential(s)", "▸".blue().bold(), views.len());
-        for v in &views {
+        for v in views {
             println!();
             println!("  {} {}", "•".bold(), v.id);
             println!("    service:     {}", v.service);
@@ -538,11 +730,7 @@ pub fn list(input: Option<&Path>, scope: Option<Uuid>) -> Result<()> {
             }
         }
     } else {
-        output::json(&ListResult {
-            ok: true,
-            count: views.len(),
-            credentials: views,
-        });
+        output::json(&result);
     }
 
     Ok(())
@@ -626,8 +814,9 @@ pub fn decrypt(
 // delete — surgical, NO KEY REQUIRED
 // ===========================================================================
 
-#[derive(Serialize)]
-struct DeleteResult {
+/// The `alf vault delete` result. Also the `alf_vault_delete` MCP tool result.
+#[derive(Serialize, JsonSchema)]
+pub(crate) struct DeleteResult {
     ok: bool,
     removed_id: Uuid,
     service: String,
@@ -636,12 +825,16 @@ struct DeleteResult {
     written_to: Option<String>,
 }
 
-pub fn delete(
+/// Remove one record and write the updated document. Returns the removed record
+/// (its plaintext descriptors), the remaining count, and the file written — the
+/// removed record carries the `description` the CLI human view prints, which the
+/// [`DeleteResult`] does not.
+fn delete_work(
     input: Option<&Path>,
     selector: &Selector,
     out: Option<&Path>,
     scope: Option<Uuid>,
-) -> Result<()> {
+) -> Result<(CredentialRecord, usize, PathBuf)> {
     let target: PathBuf = match input {
         Some(p) => p.to_path_buf(),
         None => vault_key::default_vault_path(scope)?,
@@ -655,7 +848,7 @@ pub fn delete(
         .expect("target_id came from doc");
     let removed = doc.credentials.remove(removed_index);
 
-    let output_path = out.unwrap_or(&target);
+    let output_path = out.unwrap_or(&target).to_path_buf();
     let serialized = serde_json::to_string_pretty(&doc).context("Failed to serialize document")?;
 
     // If the input is a .alf archive, deletion mutates only the
@@ -675,8 +868,40 @@ pub fn delete(
         );
     }
 
-    fs::write(output_path, serialized)
+    // Atomic + 0600 like every other vault write (add_core, rotate): a crash
+    // mid-delete must never truncate the whole credentials document — this is
+    // now agent-invokable via alf_vault_delete (manual §3.10).
+    write_private_atomic(&output_path, &serialized)
         .with_context(|| format!("Failed to write {}", output_path.display()))?;
+
+    Ok((removed, doc.credentials.len(), output_path))
+}
+
+/// Surgical record delete (no key), returning the result — no stdout. Shared by
+/// the CLI [`delete`] and the MCP `alf_vault_delete` tool.
+pub(crate) fn delete_core(
+    input: Option<&Path>,
+    selector: &Selector,
+    out: Option<&Path>,
+    scope: Option<Uuid>,
+) -> Result<DeleteResult> {
+    let (removed, remaining, output_path) = delete_work(input, selector, out, scope)?;
+    Ok(DeleteResult {
+        ok: true,
+        removed_id: removed.id,
+        service: removed.service,
+        remaining,
+        written_to: Some(output_path.display().to_string()),
+    })
+}
+
+pub fn delete(
+    input: Option<&Path>,
+    selector: &Selector,
+    out: Option<&Path>,
+    scope: Option<Uuid>,
+) -> Result<()> {
+    let (removed, remaining, output_path) = delete_work(input, selector, out, scope)?;
 
     if output::human_mode() {
         println!("{} Deleted credential", "✓".green().bold());
@@ -685,14 +910,14 @@ pub fn delete(
         if let Some(d) = &removed.description {
             println!("  Description: {d}");
         }
-        println!("  Remaining:   {}", doc.credentials.len());
+        println!("  Remaining:   {remaining}");
         println!("  Written to:  {}", output_path.display());
     } else {
         output::json(&DeleteResult {
             ok: true,
             removed_id: removed.id,
             service: removed.service.clone(),
-            remaining: doc.credentials.len(),
+            remaining,
             written_to: Some(output_path.display().to_string()),
         });
     }
@@ -1163,7 +1388,7 @@ pub fn migrate(
         return Ok(());
     }
 
-    match vault_migrate::ensure_migrated(config, runtime, explicit)? {
+    match vault_migrate::ensure_migrated_locked(config, runtime, explicit)? {
         MigrationOutcome::NotNeeded => {
             print_migrate(&MigrateResult {
                 ok: true,
@@ -1238,10 +1463,10 @@ impl Selector {
             .filter(|o| o.is_some())
             .count();
         if count == 0 {
-            bail!("Pass exactly one of --id, --label, --service to select a record");
+            bail!("Pass exactly one selector (id, label, or service) to choose a record");
         }
         if count > 1 {
-            bail!("Pass only one of --id, --label, --service");
+            bail!("Pass only one selector (id, label, or service), not several");
         }
         Ok(())
     }
@@ -1250,7 +1475,9 @@ impl Selector {
 fn find_record<'a>(doc: &'a CredentialsDocument, sel: &Selector) -> Result<&'a CredentialRecord> {
     sel.validate()?;
     if let Some(id_str) = &sel.id {
-        let id = Uuid::parse_str(id_str).context("--id is not a valid UUID")?;
+        let id = Uuid::parse_str(id_str).context(
+            "id is not a valid UUID (expected e.g. 123e4567-e89b-12d3-a456-426614174000)",
+        )?;
         return doc
             .credentials
             .iter()
@@ -1369,6 +1596,92 @@ mod tests {
         path
     }
 
+    /// `add_core` against a scratch vault file with an explicit key.
+    /// (Named `add_scratch`, not `add`: the parent module already has an `add`
+    /// that other tests in here call.)
+    #[allow(clippy::too_many_arguments)]
+    fn add_scratch(
+        vault: &Path,
+        key_path: &Path,
+        service: &str,
+        username: Option<&str>,
+        label: Option<&str>,
+        secret: &str,
+        update: bool,
+    ) -> Result<AddResult> {
+        add_core(
+            Some(vault),
+            service,
+            "account",
+            username,
+            Some(secret),
+            None,
+            None,
+            label,
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            update,
+            &VaultKeyArgs {
+                key_file: Some(key_path.to_path_buf()),
+                key_env: None,
+            },
+            "generic",
+        )
+    }
+
+    /// MIN-1: `update: true` must upsert a LABEL-LESS record too. The effective
+    /// label is `label` ?? `username`, so a minimal `{service, secret}` add
+    /// produces `label: None`; the replace pass used to require `Some`, so
+    /// re-adding appended a second record and the "pass update:true to replace
+    /// it" advice was untrue for the commonest call shape.
+    #[test]
+    fn update_upserts_a_label_less_record_by_service() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let vault = dir.path().join("credentials.json");
+
+        let first = add_scratch(&vault, &key_path, "openai", None, None, "sk-one", false).unwrap();
+        assert_eq!(first.total, 1);
+        assert!(!first.updated);
+
+        let second = add_scratch(&vault, &key_path, "openai", None, None, "sk-two", true).unwrap();
+        assert!(
+            second.updated,
+            "a label-less re-add must replace, not append"
+        );
+        assert_eq!(second.total, 1, "still one record for the service");
+
+        // A DIFFERENT service is untouched by the label-less upsert.
+        let other =
+            add_scratch(&vault, &key_path, "anthropic", None, None, "sk-three", true).unwrap();
+        assert!(!other.updated, "a different service is a new record");
+        assert_eq!(other.total, 2);
+    }
+
+    /// Labeled upsert keeps its documented "upserts by label" behavior.
+    #[test]
+    fn update_still_upserts_by_label() {
+        let dir = TempDir::new().unwrap();
+        let (key_path, _key) = temp_key_file(&dir);
+        let vault = dir.path().join("credentials.json");
+
+        add_scratch(&vault, &key_path, "openai", None, Some("work"), "a", false).unwrap();
+        let again =
+            add_scratch(&vault, &key_path, "openai", None, Some("work"), "b", true).unwrap();
+        assert!(again.updated);
+        assert_eq!(again.total, 1);
+        // A label-less record does not collide with a labeled one.
+        let bare = add_scratch(&vault, &key_path, "openai", None, None, "c", true).unwrap();
+        assert!(
+            !bare.updated,
+            "label-less must not replace a labeled record"
+        );
+        assert_eq!(bare.total, 2);
+    }
+
     #[test]
     fn selector_requires_exactly_one() {
         assert!(Selector {
@@ -1485,6 +1798,21 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(after.credentials.len(), 1);
         assert_eq!(after.credentials[0].id, other_id);
+
+        // The rewrite is atomic + owner-only (manual §3.10): a crash mid-delete
+        // can never truncate the vault, and delete normalizes perms to 0600.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "delete must leave the vault owner-only");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp."))
+            .collect();
+        assert!(leftovers.is_empty(), "no temp sibling: {leftovers:?}");
     }
 
     #[test]

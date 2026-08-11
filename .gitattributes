@@ -1,0 +1,12 @@
+# The golden-corpus gate (adapter-openclaw/tests/golden_corpus.rs) does strict
+# byte comparison of LF-serialized output against committed goldens, and the
+# markdown parsers do no CRLF normalization — an autocrlf=true checkout would
+# turn fixture inputs and goldens CRLF and produce false "chunker drift"
+# failures. Pin the whole fixture tree to LF on every platform.
+adapter-openclaw/tests/fixtures/** text eol=lf
+scripts/fixtures/** text eol=lf
+# adapter-generic's toy fixture + golden gate need the same LF pinning. The
+# SQLite database is binary — mark it so it is never eol-converted (that rule
+# must come after the blanket `text` rule to win).
+adapter-generic/tests/fixtures/** text eol=lf
+adapter-generic/tests/fixtures/**/*.db binary

@@ -10,7 +10,6 @@
 //!    leaving every other agent's rows untouched. This runs independently of the
 //!    file half because `brain.db` is not a raw source.
 
-use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -18,6 +17,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 
 use alf_core::{AlfReader, ArchiveEnumeration, FileEntry, RestoreMode, VaultKey};
+mod structured_import;
 
 use crate::brain_db::{self, ArchivedAgent, BrainDbSchema, NativeRow};
 use crate::ImportReport;
@@ -38,6 +38,7 @@ pub fn import(
     workspace: &Path,
     vault_key: Option<&VaultKey>,
     mode: RestoreMode,
+    preview: bool,
 ) -> Result<ImportReport> {
     let file = std::fs::File::open(alf_file)
         .with_context(|| format!("Failed to open ALF file: {}", alf_file.display()))?;
@@ -50,28 +51,58 @@ pub fn import(
 
     let mut warnings = Vec::new();
 
-    // Ensure workspace directory structure
-    fs::create_dir_all(workspace)?;
-    fs::create_dir_all(workspace.join("memory"))?;
-
-    // Check for raw/zeroclaw/ sources
+    // A point-in-time preview must be fully contained in the supplied
+    // workspace. Head restores retain install-root discovery for flat,
+    // multi-agent, and legacy workspace layouts.
+    let install_root = if preview {
+        workspace.to_path_buf()
+    } else {
+        crate::export::zeroclaw_home(workspace)
+    };
     let file_names = alf.file_names();
     let raw_prefix = "raw/zeroclaw/";
     let has_raw = file_names.iter().any(|f| f.starts_with(raw_prefix));
-
+    let structured_plan = if has_raw {
+        None
+    } else {
+        Some(structured_import::build(&mut alf, workspace)?)
+    };
+    // The structured plan is complete before the first workspace or database
+    // mutation. Raw entries receive the RF-006 shared extraction writer.
+    fs::create_dir_all(workspace)?;
+    fs::create_dir_all(workspace.join("memory"))?;
     if has_raw {
-        restore_raw_sources(&mut alf, workspace, raw_prefix, &file_names)?;
+        restore_raw_sources(&mut alf, &install_root, raw_prefix, &file_names)?;
     } else {
         warnings.push(
             "No raw/zeroclaw/ sources in archive — reconstructing from structured data."
                 .to_string(),
         );
-        reconstruct_from_structured(&mut alf, workspace, &mut warnings)?;
+        structured_plan
+            .expect("structured plan exists when raw sources are absent")
+            .apply(workspace, &mut warnings)?;
     }
 
     // Write agent ID file
-    let id_file = workspace.join(".alf-agent-id");
-    let _ = fs::write(&id_file, agent_id.to_string());
+    alf_core::write_extracted_file(
+        workspace,
+        ".alf-agent-id",
+        agent_id.to_string().as_bytes(),
+        alf_core::ExtractWriteMode::Normal,
+    )?;
+
+    // Inert-on-restore (D3): the raw tree carries `.alf-include.json`, so
+    // external include entries come back unverified — a hostile/compromised
+    // archive's external entries are not packed on the next sync until the
+    // local user re-confirms them with `alf add --external`.
+    match alf_core::include::mark_external_inert(workspace) {
+        Ok(0) => {}
+        Ok(n) => warnings.push(format!(
+            "{n} external file entry(ies) imported as inert; re-add with \
+             `alf add --external` to include them in sync."
+        )),
+        Err(e) => warnings.push(format!("could not mark external entries inert: {e}")),
+    }
 
     // Count what we imported
     let identity = alf.read_identity()?;
@@ -95,7 +126,7 @@ pub fn import(
             .into_iter()
             .partition(|c| c.tags.iter().any(|t| t == "alf-vault"));
 
-        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace)?;
+        let vaulted = restore_agent_vault(vault_records, doc_extra, agent_id, workspace, preview)?;
         if vaulted > 0 {
             warnings.push(format!(
                 "Restored {vaulted} vaulted account(s) to the agent vault \
@@ -134,7 +165,6 @@ pub fn import(
     // carry ZeroClaw provenance (manifest.agent.extra.zeroclaw_alias); cross-
     // runtime archives fall through to the Markdown reconstruction path.
     if let Some(archived) = archived_agent(&manifest) {
-        let install_root = crate::export::zeroclaw_home(workspace);
         let db_path = crate::export::brain_db_path(&install_root);
         let rows: Vec<NativeRow> = all_memory
             .iter()
@@ -356,7 +386,7 @@ fn restore_credentials(
 
     let target = workspace.join("auth_profiles.json");
     let serialized = serde_json::to_string_pretty(&Value::Object(profiles))?;
-    fs::write(&target, serialized)
+    alf_core::write_private_extracted_target(&target, serialized.as_bytes())
         .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(restored)
@@ -377,6 +407,7 @@ fn restore_agent_vault(
     doc_extra: std::collections::HashMap<String, serde_json::Value>,
     agent_id: uuid::Uuid,
     workspace: &Path,
+    preview: bool,
 ) -> Result<usize> {
     if records.is_empty() {
         return Ok(0);
@@ -390,16 +421,24 @@ fn restore_agent_vault(
     // The ALF vault lives under ALF's own home (`~/.alf/vault/`), runtime-
     // neutral and deliberately separate from any runtime keystore. Falls back
     // to a workspace-local copy the user can move when HOME is unset.
-    let target = alf_core::home_dir()
-        .map(|h| alf_core::agent_vault_path(&h, agent_id))
-        .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"));
+    // A point-in-time PREVIEW must not touch the live vault: the restore is
+    // a full overwrite (D6), so writing the historical document to
+    // `~/.alf/vault/{id}/` would drop every credential added since that
+    // sequence and reinstate pre-rotation ciphertext — from a command
+    // documented as read-only. Keep it inside the preview tree instead.
+    let target = if preview {
+        workspace.join(".alf-restored-credentials.json")
+    } else {
+        alf_core::home_dir()
+            .map(|h| alf_core::agent_vault_path(&h, agent_id))
+            .unwrap_or_else(|| workspace.join(".alf-restored-credentials.json"))
+    };
 
-    if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let serialized = serde_json::to_string_pretty(&doc)?;
-    fs::write(&target, serialized)
-        .with_context(|| format!("Failed to write {}", target.display()))?;
+    alf_core::write_private_extracted_target(
+        &target,
+        serde_json::to_string_pretty(&doc)?.as_bytes(),
+    )
+    .with_context(|| format!("Failed to write {}", target.display()))?;
 
     Ok(count)
 }
@@ -410,15 +449,13 @@ fn restore_agent_vault(
 
 fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
     alf: &mut AlfReader<R>,
-    workspace: &Path,
+    install_root: &Path,
     prefix: &str,
     file_names: &[String],
 ) -> Result<()> {
     // Everything an export captured (config.toml, SOUL.md, memory/*, …) was
-    // taken relative to the install root; restore it back there. The install
-    // root is resolved from `workspace`, which may be a per-agent binding
-    // (`<root>/agents/<alias>/workspace`) or the root itself.
-    let install_root = crate::export::zeroclaw_home(workspace);
+    // taken relative to the install root; restore it back at the explicit root
+    // selected by the import boundary.
 
     let mut total_bytes: u64 = 0;
     for name in file_names {
@@ -435,7 +472,7 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
         // Reject path-traversal / absolute entry names relative to the install
         // root — a hostile or compromised-server archive must not escape it
         // (Zip Slip; see threat model A4.1/A1.1).
-        let target = alf_core::safe_extract_path(&install_root, relative)
+        let target = alf_core::safe_extract_path(install_root, relative)
             .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
 
         // The raw files (config.toml, SOUL.md, memory/*) live at the SHARED
@@ -458,11 +495,13 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
             );
         }
 
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, &data)
-            .with_context(|| format!("Failed to write {}", target.display()))?;
+        alf_core::write_extracted_file(
+            install_root,
+            relative,
+            &data,
+            alf_core::ExtractWriteMode::Normal,
+        )
+        .with_context(|| format!("refusing to extract archive entry {name:?}"))?;
     }
     Ok(())
 }
@@ -470,178 +509,6 @@ fn restore_raw_sources<R: std::io::Read + std::io::Seek>(
 // ---------------------------------------------------------------------------
 // Path 2: Cross-runtime reconstruction
 // ---------------------------------------------------------------------------
-
-fn reconstruct_from_structured<R: std::io::Read + std::io::Seek>(
-    alf: &mut AlfReader<R>,
-    workspace: &Path,
-    warnings: &mut Vec<String>,
-) -> Result<()> {
-    // Identity → SOUL.md (+ IDENTITY.md, AGENTS.md)
-    if let Some(identity) = alf.read_identity()? {
-        if let Some(ref prose) = identity.prose {
-            if let Some(ref soul) = prose.soul {
-                fs::write(workspace.join("SOUL.md"), soul)?;
-            }
-            if let Some(ref profile) = prose.identity_profile {
-                fs::write(workspace.join("IDENTITY.md"), profile)?;
-            }
-            if let Some(ref instructions) = prose.operating_instructions {
-                fs::write(workspace.join("AGENTS.md"), instructions)?;
-            }
-        } else if let Some(ref structured) = identity.structured {
-            // Synthesize a minimal SOUL.md
-            let name = structured
-                .names
-                .as_ref()
-                .map(|n| n.primary.as_str())
-                .unwrap_or("Agent");
-            let role = structured.role.as_deref().unwrap_or("AI Assistant");
-            let soul = format!("# {name}\n\n{role}\n");
-            fs::write(workspace.join("SOUL.md"), soul)?;
-        }
-
-        // If AIEOS raw source is present, write identity.json
-        if identity.source_format.as_deref() == Some("aieos") {
-            if let Some(ref raw) = identity.raw_source {
-                let json = serde_json::to_string_pretty(raw)?;
-                fs::write(workspace.join("identity.json"), json)?;
-            }
-        }
-    }
-
-    // Principals → USER.md
-    if let Some(principals) = alf.read_principals()? {
-        if let Some(principal) = principals.principals.first() {
-            if let Some(ref prose) = principal.profile.prose {
-                if let Some(ref user_profile) = prose.user_profile {
-                    fs::write(workspace.join("USER.md"), user_profile)?;
-                }
-            } else if let Some(ref structured) = principal.profile.structured {
-                let name = structured.name.as_deref().unwrap_or("User");
-                let mut content = format!("# {name}\n");
-                if let Some(ref tz) = structured.timezone {
-                    content.push_str(&format!("\n## Timezone\n\n{tz}\n"));
-                }
-                fs::write(workspace.join("USER.md"), content)?;
-            }
-        }
-    }
-
-    // Memory records → memory/YYYY-MM-DD.md files
-    let all_records = alf.read_all_memory()?;
-    if all_records.is_empty() {
-        return Ok(());
-    }
-
-    // Group by namespace/origin for reconstruction
-    let mut core_sections: Vec<String> = Vec::new();
-    let mut daily_groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    let mut other_files: BTreeMap<String, Vec<String>> = BTreeMap::new();
-
-    for record in &all_records {
-        // Skip tombstones/replaced records (WP4.1 §8.1) — ZeroClaw's brain.db
-        // extractor is the one adapter that actually emits `Superseded` rows
-        // (from `superseded_by`), so without this filter a cross-runtime
-        // restore resurrects them next to their replacements.
-        if !record.status.is_materialized() {
-            continue;
-        }
-        let origin_file = record.source.origin_file.as_deref().unwrap_or("");
-
-        match record.namespace.as_str() {
-            "core" => {
-                core_sections.push(record.content.clone());
-            }
-            "daily" => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else if let Some(observed) = record.temporal.observed_at {
-                    format!("memory/{}.md", observed.format("%Y-%m-%d"))
-                } else {
-                    format!(
-                        "memory/{}.md",
-                        record.temporal.created_at.format("%Y-%m-%d")
-                    )
-                };
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            "conversation" => {
-                // Conversation records grouped by date
-                let key = format!(
-                    "memory/{}.md",
-                    record.temporal.created_at.format("%Y-%m-%d")
-                );
-                daily_groups
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            "session" => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    let short_id = &record.id.to_string()[..8];
-                    format!("memory/session_{short_id}.md")
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-            _ => {
-                let key = if !origin_file.is_empty() {
-                    origin_file.to_string()
-                } else {
-                    format!("memory/{}.md", record.namespace)
-                };
-                other_files
-                    .entry(key)
-                    .or_default()
-                    .push(record.content.clone());
-            }
-        }
-    }
-
-    // Write core sections as a single file (ZeroClaw's memory_store Core)
-    if !core_sections.is_empty() {
-        let content = core_sections.join("\n\n");
-        let target = workspace.join("memory").join("core.md");
-        fs::write(&target, content)?;
-    }
-
-    // Write daily files
-    for (file_path, sections) in &daily_groups {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    // Write other memory files
-    for (file_path, sections) in &other_files {
-        let content = sections.join("\n\n");
-        let target = workspace.join(file_path);
-        if let Some(parent) = target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(&target, content)?;
-    }
-
-    if !all_records.is_empty() {
-        warnings.push(format!(
-            "Reconstructed {} memory record(s) as Markdown files. \
-             Run `zeroclaw` to ingest into SQLite if desired.",
-            all_records.len()
-        ));
-    }
-
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -742,7 +609,7 @@ mod tests {
         let target_dir = TempDir::new().unwrap();
         let target_ws = target_dir.path().join("workspace");
         fs::create_dir_all(&target_ws).unwrap();
-        import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
+        import(&alf_file, &target_ws, None, RestoreMode::Total, false).unwrap();
 
         let doc: alf_core::CredentialsDocument =
             serde_json::from_str(&fs::read_to_string(&vault).unwrap()).unwrap();
@@ -824,7 +691,7 @@ mod tests {
         let target_ws = target_dir.path().join("install");
         fs::create_dir_all(&target_ws).unwrap();
 
-        let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total).unwrap();
+        let import_report = import(&alf_file, &target_ws, None, RestoreMode::Total, false).unwrap();
         // Agent name round-trips as the per-agent alias (WP6 unique-name fix),
         // not the shared-install SOUL.md H1 "ZCBot".
         assert_eq!(import_report.agent_name, "agent_a");
@@ -869,9 +736,130 @@ mod tests {
 
         let target = TempDir::new().unwrap();
         let deep = target.path().join("deep/nested/workspace");
-        let report = import(&alf_file, &deep, None, RestoreMode::Total).unwrap();
+        let report = import(&alf_file, &deep, None, RestoreMode::Total, false).unwrap();
         assert_eq!(report.agent_name, "DirTest");
         assert!(deep.is_dir());
+    }
+
+    /// Capture every regular file below `root`, excluding `excluded` and its
+    /// descendants. The preview containment regression compares the ALF state
+    /// outside the preview tree before and after import.
+    fn snapshot_files_outside(root: &Path, excluded: &Path) -> Vec<(std::path::PathBuf, Vec<u8>)> {
+        let mut files = walkdir::WalkDir::new(root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_type().is_file() && !entry.path().starts_with(excluded))
+            .map(|entry| {
+                (
+                    entry.path().strip_prefix(root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        files.sort_by(|(left, _), (right, _)| left.cmp(right));
+        files
+    }
+
+    #[test]
+    fn preview_nested_below_alf_config_never_uses_ancestor_as_install_root() {
+        isolate_home();
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
+        let (source_dir, source_root) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
+                ("memory/2026-01-15.md", "## Entry\n\nArchived memory.\n"),
+            ],
+        );
+        create_test_db(&source_root);
+        let alf_file = source_dir.path().join("export.alf");
+        export::export(&source_root, &alf_file).unwrap();
+
+        let home = alf_core::home_dir().unwrap();
+        let alf_home = home.join(".alf");
+        let preview = alf_home
+            .join("preview")
+            .join(uuid::Uuid::new_v4().to_string())
+            .join("seq-7");
+        fs::create_dir_all(&preview).unwrap();
+        fs::write(
+            alf_home.join("config.toml"),
+            "service_url = \"https://example.test\"\n",
+        )
+        .unwrap();
+        let before = snapshot_files_outside(&alf_home, &preview);
+
+        import(&alf_file, &preview, None, RestoreMode::Total, true).unwrap();
+
+        assert!(preview.join("SOUL.md").is_file());
+        assert!(preview.join("memory/2026-01-15.md").is_file());
+        assert!(preview.join(".alf-agent-id").is_file());
+        let db = preview.join("data/memory/brain.db");
+        assert!(
+            db.is_file(),
+            "brain.db must be bootstrapped inside the preview"
+        );
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id=?1 AND key='pref_lang'",
+                [A_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the archived agent slice belongs in the preview DB");
+
+        assert_eq!(before, snapshot_files_outside(&alf_home, &preview));
+        assert!(
+            !alf_home.join("SOUL.md").exists(),
+            "raw restore escaped the preview into the ALF state directory"
+        );
+        assert!(
+            !alf_home.join("data/memory/brain.db").exists(),
+            "brain restore escaped the preview into the ALF state directory"
+        );
+    }
+
+    #[test]
+    fn head_restore_from_multi_agent_workspace_uses_shared_install_root() {
+        isolate_home();
+        let config = "[memory]\nbackend = \"sqlite\"\nembedding_provider = \"none\"";
+        let (source_dir, source_root) = create_zeroclaw_home(
+            config,
+            &[
+                ("SOUL.md", "# ZCBot\n\nA ZeroClaw assistant.\n"),
+                ("memory/2026-01-15.md", "## Entry\n\nArchived memory.\n"),
+            ],
+        );
+        create_test_db(&source_root);
+        let alf_file = source_dir.path().join("export.alf");
+        export::export(&source_root, &alf_file).unwrap();
+
+        let target = TempDir::new().unwrap();
+        let install = target.path().join("install");
+        let workspace = install.join("agents/agent_a/workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::write(install.join("config.toml"), config).unwrap();
+
+        import(&alf_file, &workspace, None, RestoreMode::Total, false).unwrap();
+
+        assert!(install.join("SOUL.md").is_file());
+        assert!(install.join("memory/2026-01-15.md").is_file());
+        let db = install.join("data/memory/brain.db");
+        assert!(db.is_file(), "brain.db belongs to the shared install root");
+        assert!(!workspace.join("SOUL.md").exists());
+        assert!(!workspace.join("data/memory/brain.db").exists());
+        let conn = Connection::open(&db).unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE agent_id=?1 AND key='pref_lang'",
+                [A_ID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "the archived agent slice belongs in the shared DB");
     }
 
     // -- Zip Slip / path-traversal regression (threat model A4.1/A1.1) ------
@@ -910,7 +898,7 @@ mod tests {
         // `../../` from `<root>/a/ws` lands at `<root>/PWNED.txt`.
         let escaped = root.path().join("PWNED.txt");
 
-        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total, false);
         assert!(
             result.is_err(),
             "import must reject a path-traversal archive"
@@ -935,7 +923,7 @@ mod tests {
         // Workspace nested so its parent (the ZeroClaw `config.toml` target)
         // also stays inside the sandbox.
         let workspace = root.path().join("home/ws");
-        let result = import(&alf_file, &workspace, None, RestoreMode::Total);
+        let result = import(&alf_file, &workspace, None, RestoreMode::Total, false);
         assert!(
             result.is_err(),
             "import must reject an absolute-path archive entry"

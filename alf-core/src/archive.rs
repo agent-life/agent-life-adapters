@@ -24,7 +24,7 @@ use crate::memory::MemoryRecord;
 use crate::partition::{PartitionReader, PartitionWriter};
 use crate::principals::PrincipalsDocument;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufReader, Cursor, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -147,6 +147,7 @@ pub struct AlfWriter<W: Write + Seek> {
     credentials_info: Option<CredentialsLayerInfo>,
     attachments_info: Option<AttachmentsLayerInfo>,
     memory_partitions: Vec<MemoryPartitionInfo>,
+    seen_record_ids: HashSet<uuid::Uuid>,
     total_memory_records: u64,
     has_embeddings: bool,
     has_raw_source: bool,
@@ -167,6 +168,7 @@ impl<W: Write + Seek> AlfWriter<W> {
             credentials_info: None,
             attachments_info: None,
             memory_partitions: Vec::new(),
+            seen_record_ids: HashSet::new(),
             total_memory_records: 0,
             has_embeddings: false,
             has_raw_source: false,
@@ -222,6 +224,22 @@ impl<W: Write + Seek> AlfWriter<W> {
         info: MemoryPartitionInfo,
         records: &[MemoryRecord],
     ) -> Result<(), ArchiveError> {
+        // Record ids must be unique across the whole archive: a duplicate is a
+        // producer bug (an id-preimage collision) that every by-id consumer
+        // (reconcile, indexer, dashboard) would silently resolve by shadowing
+        // all but one record. Fail the write rather than produce a corrupt
+        // archive. (Read-side validation only warns — spec §8.2 — so foreign
+        // archives stay readable; this guard is for our own writer.)
+        for record in records {
+            if !self.seen_record_ids.insert(record.id) {
+                return Err(ArchiveError::Invalid(format!(
+                    "duplicate memory record id {} in {}: record ids must be \
+                     unique within an archive (id-preimage collision in the \
+                     producing adapter?)",
+                    record.id, info.file
+                )));
+            }
+        }
         // Write JSONL to a buffer, then to the ZIP
         let mut buf = Vec::new();
         {
@@ -901,6 +919,70 @@ mod tests {
             .file_names()
             .iter()
             .any(|n| n == "raw/openclaw/../../escape.txt"));
+    }
+
+    // -- Record-id uniqueness (the writer-side identity invariant) ----------
+
+    fn q1_partition(record_count: u64) -> MemoryPartitionInfo {
+        MemoryPartitionInfo {
+            file: "memory/2026-Q1.jsonl".into(),
+            from: NaiveDate::from_ymd_opt(2026, 1, 1).unwrap(),
+            to: None,
+            record_count,
+            sealed: false,
+            extra: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn duplicate_record_id_within_a_partition_fails_the_writer() {
+        let rec = make_record("alpha");
+        let dup = MemoryRecord {
+            content: "beta".into(),
+            ..rec.clone()
+        };
+        let mut writer = AlfWriter::new(Cursor::new(Vec::new()), base_manifest()).unwrap();
+        let err = writer
+            .add_memory_partition(q1_partition(2), &[rec.clone(), dup])
+            .unwrap_err();
+        assert!(
+            format!("{err}").contains(&format!("duplicate memory record id {}", rec.id)),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn duplicate_record_id_across_partitions_fails_the_writer() {
+        let rec = make_record("alpha");
+        let mut writer = AlfWriter::new(Cursor::new(Vec::new()), base_manifest()).unwrap();
+        writer
+            .add_memory_partition(
+                MemoryPartitionInfo {
+                    file: "memory/2025-Q4.jsonl".into(),
+                    from: NaiveDate::from_ymd_opt(2025, 10, 1).unwrap(),
+                    to: Some(NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()),
+                    record_count: 1,
+                    sealed: true,
+                    extra: HashMap::new(),
+                },
+                std::slice::from_ref(&rec),
+            )
+            .unwrap();
+        assert!(writer
+            .add_memory_partition(q1_partition(1), &[rec])
+            .is_err());
+    }
+
+    #[test]
+    fn distinct_record_ids_pass_the_writer() {
+        let mut writer = AlfWriter::new(Cursor::new(Vec::new()), base_manifest()).unwrap();
+        writer
+            .add_memory_partition(
+                q1_partition(2),
+                &[make_record("alpha"), make_record("beta")],
+            )
+            .unwrap();
+        writer.finish().unwrap();
     }
 
     fn base_manifest() -> Manifest {

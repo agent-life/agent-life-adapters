@@ -6,7 +6,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
+import tempfile
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -68,14 +71,20 @@ def seed_home_from_image(image: str, src_path: str, host_dest: Path,
 
 
 class DockerContainer:
-    """One `sleep infinity` container; every stage is a `docker exec`."""
+    """One `sleep infinity` container; every stage is a `docker exec`.
+
+    `env_dir`: where per-exec `--env-file` files are written (the runner sets
+    `{run_dir}/env-files` — ephemeral, chmod-700 parent, gitignored). Secrets
+    NEVER travel as `-e K=V` argv elements (argv is world-readable via
+    /proc/*/cmdline and `ps`); every exec env goes through a 0600 env file."""
 
     def __init__(self, name: str, image: str, *, user: str = "agent",
-                 home: str = "/home/agent"):
+                 home: str = "/home/agent", env_dir: Optional[Path] = None):
         self.name = name
         self.image = image
         self.user = user
         self.home = home
+        self.env_dir = env_dir
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -107,14 +116,44 @@ class DockerContainer:
 
     # -- exec ----------------------------------------------------------------
 
+    def _env_args(self, env: Optional[dict]) -> list[str]:
+        """Write `env` to a fresh 0600 env file and return `["--env-file", path]`
+        (`[]` when there is nothing to pass). Never `-e K=V` — a secret on argv
+        leaks via /proc/*/cmdline and `ps`. Files are uuid-named per exec and NOT
+        deleted at close: the run dir is ephemeral + gitignored, and a live
+        `exec_stdio` session may outlast the call that spawned it."""
+        if not env:
+            return []
+        env_dir = self.env_dir
+        if env_dir is None:  # no runner wiring (e.g. teardown CLI): private tmp
+            env_dir = Path(tempfile.mkdtemp(prefix=f"alf-envfiles-{self.name}-"))
+            self.env_dir = env_dir
+        env_dir.mkdir(parents=True, exist_ok=True)
+        path = env_dir / f"exec-{uuid.uuid4().hex}.env"
+        body = "".join(f"{k}={v}\n" for k, v in env.items())
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(body)
+        return ["--env-file", str(path)]
+
+    def _exec_argv(self, argv: list[str], *, user: Optional[str] = None,
+                   env: Optional[dict] = None, stdio: bool = False) -> list[str]:
+        """The full `docker exec` argv for a one-shot (`exec`) or persistent
+        (`exec_stdio`, adds `-i`) invocation. Factored so tests can assert the
+        no-secrets-on-argv property without docker."""
+        cmd = ["docker", "exec"]
+        if stdio:
+            cmd.append("-i")
+        cmd += ["-u", user or self.user]
+        cmd += self._env_args(env)
+        cmd += [self.name] + argv
+        return cmd
+
     def exec(self, argv: list[str], *, user: Optional[str] = None,
              env: Optional[dict] = None, timeout: int = 300,
              check: bool = False) -> subprocess.CompletedProcess:
-        cmd = ["docker", "exec", "-u", user or self.user]
-        for k, v in (env or {}).items():
-            cmd += ["-e", f"{k}={v}"]
-        cmd += [self.name] + argv
-        return _run(cmd, timeout=timeout, check=check)
+        return _run(self._exec_argv(argv, user=user, env=env),
+                    timeout=timeout, check=check)
 
     def exec_json(self, argv: list[str], **kw) -> tuple[subprocess.CompletedProcess, Optional[dict]]:
         """Run a JSON-first CLI (ALF_HUMAN stays unset) and parse stdout."""
@@ -131,6 +170,20 @@ class DockerContainer:
     def sh(self, script: str, *, user: Optional[str] = None, timeout: int = 300,
            check: bool = False) -> subprocess.CompletedProcess:
         return self.exec(["sh", "-c", script], user=user, timeout=timeout, check=check)
+
+    def exec_stdio(self, argv: list[str], *, user: Optional[str] = None,
+                   env: Optional[dict] = None) -> "StdioSession":
+        """Start a PERSISTENT `docker exec -i` process and return a bidirectional
+        stdio handle to it — the primitive an MCP client needs (WP-M4 task 1b).
+
+        The plain `exec`/`exec_json` above are one-shot: they run to completion
+        and capture output. An MCP server is a long-lived subprocess the client
+        drives with request/response JSON-RPC over stdin/stdout, so it needs an
+        OPEN pipe, not `subprocess.run`. `-i` keeps stdin attached; stdout/stderr
+        are byte pipes. Secrets travel via a 0600 `--env-file` exactly as the
+        one-shot `exec` does (never `-e K=V` on argv) — for the MCP server that
+        is `ALF_API_KEY` / `ALF_AGENT`."""
+        return StdioSession(self._exec_argv(argv, user=user, env=env, stdio=True))
 
     # -- alf injection (D6) ---------------------------------------------------
 
@@ -154,3 +207,55 @@ class DockerContainer:
         text = ((proc.stdout or "") + (proc.stderr or "")).strip()
         ok = proc.returncode == 0 and text.startswith("alf ")
         return ok, text
+
+
+class StdioSession:
+    """A live child process exposing byte-pipe stdin/stdout/stderr — the
+    transport an `McpClient` drives. Backs both a `docker exec -i` MCP server
+    (in-container) and a bare local `alf mcp serve` (unit tests), so the client
+    is identical in CI and in the lifecycle container."""
+
+    def __init__(self, argv: list[str], *, env: Optional[dict] = None,
+                 cwd: Optional[str] = None):
+        self.argv = argv
+        self.proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, bufsize=0, env=env, cwd=cwd,
+        )
+
+    def alive(self) -> bool:
+        return self.proc.poll() is None
+
+    def close(self, timeout: int = 10) -> Optional[int]:
+        """Close stdin (EOF → the server exits, MCP-style), then reap and close
+        the read pipes (the process is dead, so the reader threads have hit EOF)."""
+        code = None
+        try:
+            if self.proc.stdin is not None:
+                try:
+                    self.proc.stdin.close()
+                except (BrokenPipeError, ValueError):
+                    pass
+            try:
+                code = self.proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                code = self.proc.wait(timeout=timeout)
+        except Exception:  # noqa: BLE001 — best-effort teardown
+            code = None
+        finally:
+            for pipe in (self.proc.stdout, self.proc.stderr):
+                if pipe is not None:
+                    try:
+                        pipe.close()
+                    except (OSError, ValueError):
+                        pass
+        return code
+
+
+def local_stdio_session(argv: list[str], *, env: Optional[dict] = None,
+                        cwd: Optional[str] = None) -> StdioSession:
+    """A local (no-docker) stdio session — `alf mcp serve` as a host subprocess.
+    Used by the harness self-tests so the MCP client + invoker mapping are
+    covered in the zero-secrets CI tier without a container."""
+    return StdioSession(argv, env=env, cwd=cwd)

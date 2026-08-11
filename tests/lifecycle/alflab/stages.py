@@ -17,10 +17,12 @@ archive.
 
 from __future__ import annotations
 
+import json
+import threading
 import time
 import tomllib
 
-from . import archives, scenario, snapshots, verify
+from . import archives, events, scenario, snapshots, verify
 from .contract import SkipStage
 from .report import Check, StageResult
 
@@ -31,6 +33,34 @@ from .report import Check, StageResult
 
 def _passfail(cond: bool, name: str, detail: str = "") -> Check:
     return Check(name=name, status="PASS" if cond else "FAIL", detail=detail)
+
+
+def _workspace_entries_from_placement(rows, primary: bool = True) -> list:
+    """Build a small workspace tree from placement rows (+ hermes defaults)."""
+    seen: dict = {}
+    defaults = [
+        {"path": "config.yaml", "kind": "file"},
+        {"path": "SOUL.md", "kind": "file"},
+        {"path": "memories/MEMORY.md", "kind": "file"},
+        {"path": "state.db", "kind": "db"},
+        {"path": "skills/", "kind": "dir"},
+    ]
+    if not primary:
+        defaults = [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+            {"path": "profiles/agent_b/memories/MEMORY.md", "kind": "file"},
+            {"path": "profiles/agent_b/state.db", "kind": "db"},
+        ]
+    for d in defaults:
+        seen[d["path"]] = d
+    for r in rows or []:
+        key = r.key if hasattr(r, "key") else (r.get("key") if isinstance(r, dict) else None)
+        if not key:
+            continue
+        kind = "db" if str(key).endswith(".db") else "file"
+        seen[str(key)] = {"path": str(key), "kind": kind}
+    return list(seen.values())
 
 
 def _alf_home_config(run) -> dict:
@@ -57,6 +87,12 @@ def z01_install_probe(run, result: StageResult):
         install actually declares — the work definition's Z3-nuance evidence.
     """)
     nar.flow(f"official installer ──▶ {kit.home_mount} (bind-mounted under the run dir)")
+    events.state("agentA", {
+        "born": True,
+        "slot": kit.agent_slots[0],
+        "activity": f"probing {kit.name} install…",
+        "installing": True,
+    }, stage_id="z01")
 
     probe = kit.install_probe(run.container)
     result.add(_passfail(
@@ -85,8 +121,18 @@ def z01_install_probe(run, result: StageResult):
         name="declared [agents.*] set recorded (Z3-nuance evidence)",
         status="PASS",
         detail=f"declared: {declared or '(none — implicit sole agent)'}"))
+    events.state("agentA", {
+        "activity": f"{kit.name} {probe.get('version')} · {len(actual)} files",
+        "installing": False,
+        "version": probe.get("version"),
+        "files": len(actual),
+        "declared_agents": declared,
+    }, stage_id="z01")
 
     if run.llm == "proxy":
+        events.state("agentA", {
+            "activity": "wiring LLM proxy into framework config…",
+        }, stage_id="z01")
         kit.wire_llm(run.container, run.creds)
         wired, cfg_text = kit.llm_wired()
         result.add(_passfail(wired, "LLM proxy provider wired"))
@@ -97,9 +143,21 @@ def z01_install_probe(run, result: StageResult):
             run.creds.runtime_api_key not in rendered,
             "no key echoed — central redaction covers the wired config"))
         nar.show_diff("framework config (wired, redacted)", rendered)
+        events.state("agentA", {
+            "activity": "LLM proxy wired — ready for agent turns",
+            "llm_wired": True,
+        }, stage_id="z01")
+        events.state("service", {
+            "llm_proxy": True,
+            "activity": "LLM proxy ready",
+        }, stage_id="z01")
     else:
         result.add(Check(name="LLM wiring", status="SKIP",
                          detail="tier --llm none (CI tier has zero secrets)"))
+        events.state("agentA", {
+            "activity": "install probe done (no LLM tier)",
+            "llm_wired": False,
+        }, stage_id="z01")
 
     nar.show_data("install probe", {
         "version": probe.get("version"),
@@ -121,6 +179,14 @@ def z02_seed_markers(run, result: StageResult):
     kit, nar = run.kit, run.narrator
     slot = kit.agent_slots[0]
     turns = scenario.turns(slot, round=1)
+    events.state("agentA", {
+        "born": True,
+        "slot": slot,
+        "activity": "seeding marked memories…",
+        "markers": [],
+        "records": 0,
+        "turns": [],
+    }, stage_id="z02")
 
     if run.llm == "proxy":
         nar.explain("""
@@ -130,13 +196,81 @@ def z02_seed_markers(run, result: StageResult):
             irrelevant.
         """)
         nar.flow(f"prompts ──framework──▶ LLM proxy ──▶ real store ({kit.memory_store_label})")
-        for turn in turns:
-            log = kit.llm_turn(run.container, slot, turn)
+        markers_so_far: list = []
+        turns_log: list = []
+        for i, turn in enumerate(turns, start=1):
             from .redact import redact
+            prompt_head = redact(turn.prompt)[:220]
+            events.state("agentA", {
+                "activity": f"LLM turn {i}/{len(turns)} · {turn.turn_type} →",
+                "last_turn": {
+                    "n": i, "of": len(turns), "type": turn.turn_type,
+                    "marker": turn.marker, "phase": "prompt",
+                    "prompt": prompt_head,
+                },
+                "packet": "llm-prompt",
+            }, stage_id="z02")
+            events.emit("data", stage_id="z02", label="llm prompt", data={
+                "turn": i, "of": len(turns), "type": turn.turn_type,
+                "marker": turn.marker, "prompt": prompt_head,
+            })
+            events.state("service", {
+                "llm_proxy": True,
+                "activity": f"proxy · {turn.turn_type} turn",
+                "packet": "llm-prompt",
+                "llm": {
+                    "phase": "prompt",
+                    "turn": i, "of": len(turns),
+                    "type": turn.turn_type,
+                    "marker": turn.marker,
+                    "prompt": prompt_head,
+                    "response": None,
+                },
+            }, stage_id="z02")
+
+            log = kit.llm_turn(run.container, slot, turn)
             # Redact BEFORE truncation: a sliced key fragment no longer
             # matches the pattern shapes.
+            reply = redact(log.response_tail)[:240]
             result.add(_passfail(log.ok, f"turn {turn.turn_type} ({turn.marker})",
-                                 redact(log.response_tail)[:80]))
+                                 reply[:80]))
+            markers_so_far.append(turn.marker)
+            turn_rec = {
+                "n": i, "type": turn.turn_type, "marker": turn.marker,
+                "ok": log.ok, "prompt": prompt_head, "response": reply,
+            }
+            turns_log.append(turn_rec)
+            events.state("service", {
+                "llm_proxy": True,
+                "activity": f"proxy replied · {turn.turn_type}",
+                "packet": "llm-response",
+                "llm": {
+                    "phase": "response",
+                    "turn": i, "of": len(turns),
+                    "type": turn.turn_type,
+                    "marker": turn.marker,
+                    "prompt": prompt_head,
+                    "response": reply,
+                },
+            }, stage_id="z02")
+            events.state("agentA", {
+                "activity": f"stored {turn.turn_type} · {turn.marker}",
+                "markers": list(markers_so_far),
+                "records": len(markers_so_far),
+                "turns": list(turns_log),
+                "last_turn": {**turn_rec, "phase": "response"},
+                "packet": "llm-response",
+                "mutations": [
+                    {"path": "memories/MEMORY.md", "op": turn.turn_type[:4],
+                     "note": f"{turn.turn_type} · {turn.marker}"},
+                    {"path": "state.db", "op": "session",
+                     "note": f"session row · {turn.marker}"},
+                ],
+            }, stage_id="z02")
+            events.emit("data", stage_id="z02", label="llm response", data={
+                "turn": i, "of": len(turns), "type": turn.turn_type,
+                "marker": turn.marker, "ok": log.ok, "response": reply,
+            })
         stats = kit.native_memory_stats(run.container, slot)
         count = stats.get("count", 0)
         result.add(_passfail(count >= 4, "framework memory stats count >= 4",
@@ -144,6 +278,9 @@ def z02_seed_markers(run, result: StageResult):
     else:
         nar.explain(kit.seed_narrative())
         nar.flow(kit.seed_flow())
+        events.state("agentA", {
+            "activity": f"deterministic seed into {kit.memory_store_label}",
+        }, stage_id="z02")
         kit.seed_markers(run.container, slot, round=1)
         result.add(Check(name=f"{kit.memory_store_label} seeded with 4 round-1 markers",
                          status="PASS"))
@@ -163,6 +300,20 @@ def z02_seed_markers(run, result: StageResult):
                                     "key": row.key, "content": row.head})
     result.add(_passfail(len(rows) >= 4, "placement rows recorded (category/key per marker)",
                          f"{len(rows)} rows"))
+    markers = [m for m in scenario.markers(slot, 1)]
+    events.state("agentA", {
+        "born": True,
+        "slot": slot,
+        "markers": markers,
+        "records": max(4, len(rows)),
+        "placement": [{"category": r.category, "key": r.key} for r in rows[:8]],
+        "activity": f"coverage {verdict.coverage} · isolation {verdict.isolation}",
+        "mutations": [
+            {"path": r.key, "op": r.category, "note": r.head[:40]}
+            for r in rows[:6]
+        ],
+        "workspace": _workspace_entries_from_placement(rows, primary=True),
+    }, stage_id="z02")
 
 
 # ---------------------------------------------------------------------------
@@ -185,23 +336,26 @@ def z03_alf_check(run, result: StageResult):
     result.add(_passfail(run.state["alf_sha_container"] == run.state["alf_sha_host"],
                          "injected alf sha256 == host binary sha256",
                          run.state["alf_sha_host"][:16] + "…"))
-    proc = run.container.exec(["alf", "--version"])
+    # `--version` has no MCP tool; the invoker runs it on the CLI either way.
+    proc = run.alf.exec(["--version"])
     got = (proc.stdout or "").strip()
     result.add(_passfail(got == run.expected_alf_version,
                          f"alf --version == {run.expected_alf_version!r} (workspace v1.0.0)",
                          f"got {got!r}"))
 
     # Belt-and-braces config pre-write; ALF_API_URL/ALF_API_KEY arrive via the
-    # container env-file as well (D10 removes the pre-write seam).
+    # container env-file as well (D10 removes the pre-write seam). A kit may pin
+    # extra `[defaults]` (generic pins `workspace` so its CLI-fallback ops resolve).
     api_url = run.creds.alf_api_url if run.creds else run.sentinel_api_url
+    defaults_extra = "".join(f'{k} = "{v}"\n' for k, v in kit.config_defaults().items())
     (run.paths.alf_home / "config.toml").write_text(
         "# Written by the lifecycle harness (belt-and-braces; the container env\n"
         "# carries ALF_API_URL/ALF_API_KEY — D10 makes this file optional).\n"
-        f'[service]\napi_url = "{api_url}"\n\n[defaults]\nruntime = "{kit.name}"\n',
+        f'[service]\napi_url = "{api_url}"\n\n[defaults]\nruntime = "{kit.name}"\n{defaults_extra}',
         encoding="utf-8")
 
     before = snapshots.snapshot(run.paths.home)
-    proc, check = run.container.exec_json(["alf", "check", "-r", kit.name])
+    proc, check = run.alf.json(["check", "-r", kit.name])
     after = snapshots.snapshot(run.paths.home)
 
     result.add(_passfail(check is not None, "alf check emits one JSON object on stdout"))
@@ -360,6 +514,27 @@ def z04_first_sync(run, result: StageResult):
         nar.show_data("export entries", names[:12])
     else:
         result.add(_passfail(False, "alf export copy-out readable on the host"))
+    events.state("agentA", {
+        "agent_id": agent_id,
+        "seq": run.state.get("sequence", 0),
+        "synced": True,
+        "activity": f"synced · seq {run.state.get('sequence', 0)}",
+        "mutations": [],
+    }, stage_id="z04")
+    events.state("service", {
+        "registered": True,
+        "agent_id": agent_id,
+        "latest_sequence": run.state.get("sequence", 0),
+        "snapshot": True,
+        "deltas": 0,
+        "packet": "snapshot",
+        "activity": f"agent A registered · seq {run.state.get('sequence', 0)}",
+        "agents": {
+            "A": {"registered": True, "id": agent_id,
+                  "seq": run.state.get("sequence", 0), "snapshot": True, "deltas": 0},
+        },
+    }, stage_id="z04")
+    events.state("mcp", {"role": "cli-sync", "last": "snapshot"}, stage_id="z04")
 
 
 # ---------------------------------------------------------------------------
@@ -441,6 +616,28 @@ def z06_vault(run, result: StageResult):
     body = (dec.stdout or "") + (dec.stderr or "")
     result.add(_passfail(secret in body, "alf vault decrypt returns the stored secret (get)",
                          "matched" if secret in body else "not found"))
+    events.state("agentA", {
+        "vault": ["vault-z6"],
+        "vault_key": key_path,
+        "activity": "vault-z6 encrypted under per-agent key",
+        "mutations": [
+            {"path": "state/<id>/.alf-vault-key", "op": "keygen", "note": "0600 local key"},
+            {"path": "credentials.json (vault)", "op": "add", "note": "vault-z6 ciphertext"},
+        ],
+        "workspace": [
+            {"path": "config.yaml", "kind": "file"},
+            {"path": "SOUL.md", "kind": "file"},
+            {"path": "memories/MEMORY.md", "kind": "file"},
+            {"path": "state.db", "kind": "db"},
+            {"path": "state/<id>/.alf-vault-key", "kind": "file"},
+            {"path": "credentials.json (vault)", "kind": "file"},
+            {"path": "skills/", "kind": "dir"},
+        ],
+    }, stage_id="z06")
+    events.state("service", {
+        "activity": "agent A vault · 1 key",
+        "agents": {"A": {"vault_keys": 1, "vault_labels": ["vault-z6"]}},
+    }, stage_id="z06")
 
 
 # ---------------------------------------------------------------------------
@@ -460,9 +657,10 @@ def z07_delta_sync(run, result: StageResult):
     """)
     nar.flow("alf sync ──▶ PUT delta (round-2 only) ──▶ S3 + Neon ⊙")
     proc, res = run.container.exec_json(["alf", "sync", "-r", kit.name], timeout=300)
-    result.add(_passfail(bool(res) and res.get("ok") is True and res.get("delta") is True,
-                         "alf sync ok + delta path (not a full snapshot)",
-                         f"sequence={res.get('sequence') if res else '?'}"))
+    ok = bool(res) and res.get("ok") is True and res.get("delta") is True
+    detail = (f"sequence={res.get('sequence')}" if ok else
+              f"sync failed: {(res or {}).get('error') or (proc.stderr or proc.stdout or '')[:240]!r}")
+    result.add(_passfail(ok, "alf sync ok + delta path (not a full snapshot)", detail))
     seq = res.get("sequence", 0) if res else 0
     result.add(_passfail(seq > run.state.get("sequence", 0),
                          "⊙ sequence advanced past the snapshot", f"seq={seq}"))
@@ -482,6 +680,25 @@ def z07_delta_sync(run, result: StageResult):
         result.add(_passfail("credentials.json" in names,
                              "vault ciphertext present in the agent's Layer 4",
                              f"{len(names)} entries"))
+    events.state("agentA", {
+        "seq": seq,
+        "vault_synced": True,
+        "activity": f"delta synced · seq {seq}",
+        "mutations": [
+            {"path": "state/<id>/.alf-vault-key", "op": "vault", "note": "Layer-4 ciphertext"},
+        ],
+    }, stage_id="z07")
+    events.state("service", {
+        "latest_sequence": seq,
+        "deltas": len(rbody.get("deltas") or []),
+        "packet": "delta",
+        "activity": f"agent A · seq {seq}",
+        "agents": {
+            "A": {"seq": seq, "deltas": len(rbody.get("deltas") or []), "snapshot": True,
+                  "vault_keys": 1, "vault_labels": ["vault-z6"]},
+        },
+    }, stage_id="z07")
+    events.state("mcp", {"role": "cli-sync", "last": "delta"}, stage_id="z07")
 
 
 # ---------------------------------------------------------------------------
@@ -499,6 +716,24 @@ def z08_second_agent(run, result: StageResult):
     result.add(_passfail(kit.agent_declared(run.container, slot_b),
                          "framework config declares the second agent", slot_b))
     run.state["slot_b"] = slot_b
+    events.state("agentB", {
+        "born": True,
+        "slot": slot_b,
+        "records": 0,
+        "activity": "profile created — empty store",
+        "workspace": [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+        ],
+        "mutations": [
+            {"path": "profiles/agent_b/", "op": "create", "note": "framework profile"},
+            {"path": "profiles/agent_b/config.yaml", "op": "write", "note": "declared in config"},
+        ],
+    }, stage_id="z08")
+    events.state("service", {
+        "activity": "awaiting agent B first sync",
+        "agents": {"B": {"visible": True, "registered": False}},
+    }, stage_id="z08")
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +824,41 @@ def z10_agent_b_isolation(run, result: StageResult):
         result.add(_passfail(b_found == 4 and a_leak == 0,
                              "agent b's archive carries only b's markers",
                              f"b={b_found}/4 a_leak={a_leak}"))
+    rows = _mapping_rows(run)
+    b_id = next((str(r.get("alf_agent_id")) for r in rows
+                 if r.get("runtime_agent") == slot_b), "")
+    seq_b = 0
+    if b_id:
+        rb = run.api.get(f"/agents/{b_id}")
+        if rb.status_code == 200:
+            seq_b = int((rb.json() or {}).get("latest_sequence") or 0)
+    events.state("agentB", {
+        "synced": True,
+        "seq": seq_b,
+        "markers": scenario.markers(slot_b, 1),
+        "records": 4,
+        "isolation": "clean",
+        "activity": "synced · isolation clean",
+        "workspace": [
+            {"path": "profiles/agent_b/", "kind": "dir"},
+            {"path": "profiles/agent_b/config.yaml", "kind": "file"},
+            {"path": "profiles/agent_b/memories/MEMORY.md", "kind": "file"},
+            {"path": "profiles/agent_b/state.db", "kind": "db"},
+        ],
+        "mutations": [
+            {"path": "profiles/agent_b/memories/MEMORY.md", "op": "seed", "note": "4 markers"},
+            {"path": "profiles/agent_b/state.db", "op": "seed", "note": "session rows"},
+        ],
+    }, stage_id="z10")
+    events.state("service", {
+        "agent_b_registered": True,
+        "packet": "snapshot",
+        "activity": "agent B registered",
+        "agents": {
+            "B": {"visible": True, "registered": True, "snapshot": True,
+                  "seq": seq_b, "deltas": 0},
+        },
+    }, stage_id="z10")
 
 
 # ---------------------------------------------------------------------------
@@ -633,6 +903,22 @@ def z11_vault_b_isolation(run, result: StageResult):
     result.add(_passfail(dec_x.returncode != 0 or secret not in body,
                          "a's key fails CLOSED on b's vault (AEAD)",
                          f"exit={dec_x.returncode}"))
+    events.state("agentB", {
+        "vault": ["vault-b"],
+        "activity": "vault-b encrypted under b's key",
+        "mutations": [
+            {"path": "profiles/agent_b/…/.alf-vault-key", "op": "keygen",
+             "note": "0600 local key"},
+            {"path": "credentials.json (vault)", "op": "add", "note": "vault-b ciphertext"},
+        ],
+    }, stage_id="z11")
+    events.state("service", {
+        "activity": "agent B vault · 1 key (A cannot open)",
+        "agents": {
+            "B": {"visible": True, "registered": True,
+                  "vault_keys": 1, "vault_labels": ["vault-b"]},
+        },
+    }, stage_id="z11")
 
 
 # ---------------------------------------------------------------------------
@@ -678,8 +964,8 @@ def z13_idle_resync(run, result: StageResult):
         r0 = run.api.get(f"/agents/{agent_id}")
         base_seq = ((r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0))
                     if r0.status_code == 200 else run.state.get("sequence", 0))
-        proc, res = run.container.exec_json(
-            ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+        proc, res = run.alf.json(
+            ["sync", "-r", kit.name, "--agent", slot], timeout=300)
         result.add(_passfail(bool(res) and res.get("no_changes") is True,
                              "idle re-sync: no_changes == true"))
         r = run.api.get(f"/agents/{agent_id}")
@@ -706,8 +992,11 @@ def z13_idle_resync(run, result: StageResult):
         paths = []
         for i in (1, 2):
             ctr_path = f"/home/agent/.alf/z13-export-{i}.alf"
-            run.container.exec(
-                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+            # `export` copy-out has no MCP tool (export is a CLI/human op, design
+            # §6); the invoker runs it on the CLI (generic pins `[defaults].
+            # workspace` so it resolves without -w).
+            run.alf.exec(
+                ["export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
                 timeout=300)
             host = run.paths.alf_home / f"z13-export-{i}.alf"
             if not host.is_file():
@@ -731,6 +1020,27 @@ def z13_idle_resync(run, result: StageResult):
         if mapped:
             result.add(_passfail(m1.get("agent", {}).get("id") == mapped,
                                  "Z13': exported agent id == mapping id (stability)"))
+
+        # Identity integrity (the BLK-1 class). EXTERNAL oracles, deliberately:
+        # a deterministic id collision is self-consistent, so the byte-equality
+        # checks above pass right through it. (1) ids unique across the whole
+        # archive; (2) where the kit can enumerate exact store contents, each
+        # must live in exactly ONE structured record.
+        ident = archives.record_identity(paths[0])
+        result.add(_passfail(
+            not ident["duplicates"],
+            "Z13': record ids unique across the archive",
+            f"{ident['total']} records / {ident['unique']} ids"
+            if not ident["duplicates"]
+            else f"colliding: {sorted(ident['duplicates'].items())[:3]}"))
+        probes = getattr(kit, "identity_probe_contents", lambda: [])()
+        if probes:
+            off = {p: n for p, n in
+                   archives.marker_record_counts(paths[0], probes).items() if n != 1}
+            result.add(_passfail(
+                not off,
+                "Z13': each identity probe maps to exactly one record",
+                f"{len(probes)} probes 1:1" if not off else f"off: {off}"))
 
 
 # ---------------------------------------------------------------------------
@@ -757,8 +1067,11 @@ def z14_curated_memory(run, result: StageResult):
         agent_id = run.state.get("alf_agent_id", "")
 
         def sync_json():
-            _, res = run.container.exec_json(
-                ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+            # Through the invoker seam (WP-M4): CliInvoker → terminal `alf sync`
+            # (openclaw); McpInvoker → the `alf_sync` MCP tool (generic-mcp), so
+            # Z14's curation deltas are exercised over `alf mcp serve`.
+            _, res = run.alf.json(
+                ["sync", "-r", kit.name, "--agent", slot], timeout=300)
             return res or {}
 
         def mem_changes(res):
@@ -769,10 +1082,16 @@ def z14_curated_memory(run, result: StageResult):
         # and sync it, so the measured ops below are independent of whatever a
         # real LLM left in the file. pre_seq is captured AFTER this baseline.
         kit.curate_memory(run.container, slot, "reset")
-        sync_json()
-        r0 = run.api.get(f"/agents/{agent_id}")
+        first = sync_json()
+        # A focused Z14 run (stages without the Z4 first-sync) learns its agent id
+        # from this reset sync's own registration; the full lifecycle set it in Z4.
+        if not agent_id:
+            agent_id = (first.get("agent") or {}).get("alf_agent_id") or ""
+            if agent_id:
+                run.state["alf_agent_id"] = agent_id
+        r0 = run.api.get(f"/agents/{agent_id}") if agent_id else None
         pre_seq = (r0.json() or {}).get("latest_sequence", run.state.get("sequence", 0)) \
-            if r0.status_code == 200 else run.state.get("sequence", 0)
+            if (r0 is not None and r0.status_code == 200) else run.state.get("sequence", 0)
 
         kit.curate_memory(run.container, slot, "touch")
         res = sync_json()
@@ -837,8 +1156,10 @@ def z14_curated_memory(run, result: StageResult):
 
         def export_by_id(tag: str) -> dict:
             ctr_path = f"/home/agent/.alf/z14-export-{tag}.alf"
-            run.container.exec(
-                ["alf", "export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
+            # `export` has no MCP tool (copy-out is a CLI/human op, design §6), so
+            # the McpInvoker falls back to the terminal here; CliInvoker is direct.
+            run.alf.exec(
+                ["export", "-r", kit.name, "--agent", slot, "-o", ctr_path],
                 timeout=300)
             host = run.paths.alf_home / f"z14-export-{tag}.alf"
             if not host.is_file():
@@ -877,6 +1198,663 @@ def z14_curated_memory(run, result: StageResult):
 
 
 # ---------------------------------------------------------------------------
+# Z15 — MCP LLM-in-the-loop gate (WP-M4): the agent drives sync/vault via tools
+# ---------------------------------------------------------------------------
+
+def z15_mcp_llm_gate(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not kit.mcp_llm_mode:
+        raise SkipStage(
+            f"{kit.name}: the MCP LLM gate runs on the hermes-mcp host tier only",
+            wp="WP-M4")
+    if run.backend != "real":
+        raise SkipStage("Z15 needs --backend real (the ⊙ lanes prove the sync effect)")
+    nar.explain("""
+        The release gate: a REAL agent (Hermes host, LLM proxy) drives sync and
+        vault by calling the `mcp_alf_*` tools its host spawned from
+        `alf mcp serve` — the terminal is never used for these ops. The harness
+        asserts the sync/vault EFFECT through the ⊙ backend lanes and an MCP-path
+        marker (the harness itself issues zero `alf sync` calls this tier).
+    """)
+    nar.flow("agent turn ──▶ mcp_alf_alf_sync / mcp_alf_alf_vault_add ──▶ alf mcp serve ──▶ S3 + Neon ⊙")
+    events.state("mcp", {
+        "role": "stdio-server",
+        "tools": ["mcp_alf_alf_sync", "mcp_alf_alf_vault_add", "mcp_alf_alf_vault_list"],
+        "active": True,
+    }, stage_id="z15")
+    kit.mcp_llm_gate(run, result)
+    events.state("mcp", {
+        "last": "tool-driven-sync",
+        "packet": "tool-call",
+        "activity": "mcp_alf_* tools invoked by agent",
+    }, stage_id="z15")
+    # (5) The agent drives a vault add by calling the tool — count from list.
+    #     PINNED to the agent Z15 pinned into config.yaml. On the full ladder Z08
+    #     has already enabled a SECOND hermes agent, and an unpinned read is then
+    #     (correctly) refused with `agent_selection_ambiguous` — the vault is
+    #     per-agent, so alf will not guess which one to open.
+    agent_id = run.state.get("alf_agent_id", "")
+    _, lstj = run.container.exec_json(
+        ["alf", "vault", "list", "-r", kit.name, "--agent", agent_id])
+    # A failed READ is not an absent CREDENTIAL. `(lstj or {}).get("credentials")`
+    # alone turns `{"ok":false,…}` into `[]`, which then reads as "the tool-driven
+    # vault add did not land" — blaming the product for a harness fault. That
+    # exact misattribution cost a live run on 2026-07-29 (unpinned read after
+    # Z08). Separate the two verdicts.
+    vault_read_ok = bool(lstj) and lstj.get("ok") is not False
+    labels = [c.get("label") for c in (lstj or {}).get("credentials", []) if c.get("label")]
+    # MIN-19: report what the vault ACTUALLY holds. This used to inject "z15"
+    # when it was absent, so a failed tool-driven vault add still rendered as a
+    # success in the viz (and in the baked customer artifact) while report.md
+    # said FAIL — two contradictory accounts of the same run.
+    vault_landed = vault_read_ok and "z15" in labels
+    if not vault_read_ok:
+        result.add(Check(
+            name="⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
+            status="FAIL",
+            detail="vault READ failed — cannot judge whether the add landed: "
+                   f"{(lstj or {}).get('code') or 'no JSON from alf vault list'}"
+                   f" ({(lstj or {}).get('error', '')[:120]}) [agent={agent_id or 'UNSET'}]"))
+    else:
+        result.add(_passfail(
+            vault_landed,
+            "⊙ Z15 vault: the agent's mcp_alf_alf_vault_add landed in the vault",
+            f"labels={labels}"))
+    events.state("service", {
+        "packet": "mcp-sync",
+        "activity": "MCP tool-driven sync landed",
+        "agents": {"A": {"snapshot": True, "vault_keys": len(labels),
+                         "vault_labels": labels}},
+    }, stage_id="z15")
+    events.state("agentA", {
+        "activity": "synced via mcp_alf_* (no terminal alf sync)",
+        "synced": True,
+        "vault": ["z15"] if vault_landed else [],
+        "mutations": [
+            {"path": "memories/MEMORY.md", "op": "sync", "note": "tool-driven export"},
+            {"path": "state.db", "op": "sync", "note": "tool-driven export"},
+            *([{"path": "credentials.json (vault)", "op": "add",
+                "note": "z15 via mcp_alf_*"}] if vault_landed else []),
+        ],
+    }, stage_id="z15")
+
+
+# ---------------------------------------------------------------------------
+# Z16 — watch loop auto-sync: mutate on a timer, assert the deltas landed
+# ---------------------------------------------------------------------------
+
+def z16_watch_autosync(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not getattr(kit, "watch_autosync_mode", False):
+        raise SkipStage(
+            f"{kit.name}: the watch auto-sync gate runs on the hermes-mcp tier only",
+            wp="Z16")
+    if run.backend != "real":
+        raise SkipStage("Z16 needs --backend real (it asserts backend deltas)")
+    slot = kit.agent_slots[0]
+    nar.explain("""
+        Z16: a PERSISTENT `alf mcp serve` runs the watch loop at a ~1s test cadence
+        (ALF_WATCH_* env overrides — production stays 60s/3s). The harness mutates
+        a watched memory FILE and the watched sqlite `state.db` every 3s for ~17s;
+        the loop must auto-upload each change as a delta with ZERO tool/LLM calls.
+        In v1 `state.db` rides the RAW BYTE channel (no backend row extraction),
+        so the sqlite lane is verified locally — rc-checked mutations + a row
+        count — plus the combined delta count across the two watched channels.
+    """)
+    nar.flow("mutate file+db every 3s ──▶ watch loop (1s) ──▶ N deltas ⊙")
+
+    # 1. Register (idempotent first sync) + learn the agent id + the base sequence.
+    _, first = run.container.exec_json(
+        ["alf", "sync", "-r", kit.name, "--agent", slot], timeout=300)
+    agent_id = run.state.get("alf_agent_id") \
+        or ((first or {}).get("agent") or {}).get("alf_agent_id") or ""
+    if not agent_id:
+        result.add(_passfail(False, "Z16: agent registered before watch starts",
+                             "no alf_agent_id from the first sync"))
+        return
+    run.state["alf_agent_id"] = agent_id
+    if agent_id not in run.manifest.lifecycle_agents:
+        run.manifest.lifecycle_agents.append(agent_id)
+        run.manifest.save(run.paths.manifest)
+
+    def latest_seq() -> int:
+        r = run.api.get(f"/agents/{agent_id}")
+        return (r.json() or {}).get("latest_sequence", 0) if r.status_code == 200 else 0
+
+    base_seq = latest_seq()
+
+    # 2. Start the persistent watch-loop server. stdin stays OPEN (the loop runs
+    #    until EOF); the env overrides make the cadence ~1s (test-only, gated).
+    #    ALF_AGENT is PINNED: after Z8 the mapping has two enabled hermes agents,
+    #    so an unpinned loop cannot resolve one and never syncs (like the Z15
+    #    server, which pins it in config.yaml).
+    serve_env = {
+        "ALF_API_KEY": run.creds.runtime_api_key,
+        "ALF_API_URL": run.creds.alf_api_url,
+        "ALF_AGENT": agent_id,
+        "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+        "ALF_WATCH_QUIESCE_MS": "1000",
+        "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+        "ALF_WATCH_TICK_MS": "1000",  # poll/rescan cadence (else 5s — too coarse)
+    }
+    argv = ["alf", "mcp", "serve", "-r", kit.name, "-w", kit._container_profile(slot)]
+    sess = run.container.exec_stdio(argv, env=serve_env)
+    # Drain the server's stderr concurrently — both to diagnose (watch-loop
+    # active/not-started + sync events) and so a full stderr pipe never blocks the
+    # loop mid-run.
+    serve_err: list = []
+
+    def _drain():
+        try:
+            for line in iter(sess.proc.stderr.readline, b""):
+                serve_err.append(line.decode(errors="replace"))
+        except Exception:  # noqa: BLE001 — best-effort diagnostics
+            pass
+
+    drainer = threading.Thread(target=_drain, daemon=True)
+    drainer.start()
+    markers: list = []
+    try:
+        time.sleep(2)  # boot + the (no-op) catch-up-on-start
+        if not sess.alive():
+            # MIN-22: stop here. Continuing drove ~40 s of mutations, polls and
+            # backend assertions against a dead server, burning live-tier time
+            # and stacking cascading FAILs that bury this root cause.
+            result.add(_passfail(False, "Z16: watch server stayed up",
+                                 ("".join(serve_err)[-300:]) or "serve exited at startup"))
+            return
+        # 3. Mutate a watched file + the sqlite store every 3s over ~17s.
+        #    After each quiesce window, poll the backend so the viz can show
+        #    sequence climbing one delta at a time (not a single 1→N jump).
+        ticks = 6
+        prev_seq = base_seq
+        for i in range(ticks):
+            marker = kit.mutate_watched(run.container, slot, i)
+            markers.append(marker)
+            events.state("agentA", {
+                "activity": f"watch mutate {i + 1}/{ticks} · {marker}",
+                "mutations": [
+                    {"path": "memories/MEMORY.md", "op": "append", "note": marker},
+                    {"path": "state.db", "op": "insert", "note": f"z16_watch · {marker}"},
+                ],
+                "packet": "watch-delta",
+            }, stage_id="z16")
+            time.sleep(3)
+            tick_seq = latest_seq()
+            if tick_seq > prev_seq:
+                events.state("mcp", {
+                    "role": "watch-loop",
+                    "active": True,
+                    "watch_sources": 8,
+                    "packet": "watch-delta",
+                    "activity": f"watch sync · seq {prev_seq}→{tick_seq}",
+                    "last": "watch-delta",
+                }, stage_id="z16")
+                events.state("service", {
+                    "latest_sequence": tick_seq,
+                    "packet": "watch-delta",
+                    "activity": f"agent A · seq {tick_seq}",
+                    "agents": {
+                        "A": {
+                            "seq": tick_seq,
+                            "deltas": tick_seq - base_seq,
+                            "snapshot": True,
+                        },
+                    },
+                }, stage_id="z16")
+                events.state("agentA", {
+                    "seq": tick_seq,
+                    "activity": f"watch synced · seq {tick_seq}",
+                    "synced": True,
+                    "packet": "watch-delta",
+                }, stage_id="z16")
+                prev_seq = tick_seq
+        time.sleep(3)  # let the final change quiesce (~1s) + upload
+        # 4a. The sqlite lane, verified where it can be: state.db syncs as raw
+        #     bytes in v1 (no backend row extraction), so assert locally that
+        #     every rc-checked INSERT actually landed — one row per tick.
+        prof = kit._container_profile(slot)
+        cnt = run.container.exec(
+            ["sqlite3", f"{prof}/state.db", "SELECT COUNT(*) FROM z16_watch;"],
+            user="agent", timeout=60)
+        rows = (cnt.stdout or "").strip()
+        result.add(_passfail(
+            cnt.returncode == 0 and rows == str(ticks),
+            "sqlite lane: z16_watch row count == mutation ticks (local; raw-byte channel in v1)",
+            f"rows={rows or '(query failed: ' + (cnt.stderr or '').strip()[:80] + ')'}"
+            f" expected={ticks}"))
+        # 4b. The loop must have auto-uploaded multiple deltas carrying the content.
+        rd = run.api.get(f"/agents/{agent_id}/deltas?since={base_seq}")
+        deltas = (rd.json() or {}).get("deltas", []) if rd.status_code == 200 else []
+        result.add(_passfail(
+            len(deltas) >= 4,
+            "⊙ ≥4 deltas across the two watched channels",
+            f"{len(deltas)} deltas since seq {base_seq} ({ticks} mutation ticks over ~17s)"))
+        result.add(_passfail(
+            latest_seq() > base_seq,
+            "⊙ backend sequence advanced under the watch loop (no tool/LLM calls)",
+            f"seq {base_seq} → {latest_seq()}"))
+        end_seq = latest_seq()
+        events.state("mcp", {
+            "role": "watch-loop",
+            "active": True,
+            "watch_sources": 8,
+            "packet": "watch-delta",
+            "activity": f"watch-sync · {len(deltas)} deltas",
+        }, stage_id="z16")
+        events.state("service", {
+            "latest_sequence": end_seq,
+            "deltas_since": len(deltas),
+            "seq_from": base_seq,
+            "seq_to": end_seq,
+            "packet": "watch-delta",
+            "activity": f"agent A · seq {base_seq}→{end_seq}",
+            "agents": {
+                "A": {"seq": end_seq, "deltas": len(deltas), "snapshot": True},
+            },
+        }, stage_id="z16")
+        events.state("agentA", {
+            "seq": end_seq,
+            "watch_markers": len(markers),
+            "activity": f"watch done · seq {end_seq}",
+            "mutations": [
+                {"path": "memories/MEMORY.md", "op": "watch", "note": f"{len(markers)} entries"},
+                {"path": "state.db", "op": "watch", "note": f"{len(markers)} rows"},
+            ],
+        }, stage_id="z16")
+        # content: the deltas carried the markers as memory RECORDS (MEMORY.md
+        # §-entries). Memory indexing is ON-DEMAND (an async job), so trigger it
+        # and poll the delta-correct browser until the delta-borne records land.
+        run.api.post_json(f"/agents/{agent_id}/index", {})
+        present = 0
+        for _ in range(15):
+            time.sleep(1)
+            rm = run.api.get(f"/agents/{agent_id}/memory?limit=100")
+            if rm.status_code == 200:
+                recs = json.dumps((rm.json() or {}).get("records") or [])
+                present = sum(1 for m in markers if m in recs)
+                if present >= len(markers):
+                    break
+        # MIN-20: every marker must be present, not 4 of 6. Each watch sync is a
+        # full-export diff against the last synced base, so every earlier marker
+        # rides ANY later delta — after the final sync + index the whole set is
+        # in head memory or content was genuinely lost. (Delta COUNT may
+        # legitimately coalesce; that is the separate check above.)
+        result.add(_passfail(
+            present == len(markers),
+            "⊙ delta content: markers indexed into head memory (POST /index → GET /memory)",
+            f"{present}/{len(markers)} markers after on-demand indexing"))
+    finally:
+        sess.close()
+        drainer.join(timeout=3)
+        stderr_text = "".join(serve_err)
+        try:
+            (run.paths.run_dir / "z16-serve-stderr.log").write_text(stderr_text, encoding="utf-8")
+        except Exception:  # noqa: BLE001
+            pass
+        loop_line = next((ln.strip() for ln in serve_err if "watch loop" in ln),
+                         "(no 'watch loop' line in the server stderr)")
+        syncs = sum(1 for ln in serve_err if "watch sync ok" in ln)
+        errs = next((ln.strip() for ln in serve_err if "watch sync error" in ln
+                     or "not started" in ln), "")
+        result.add(Check(
+            name="  Z16 serve: watch-loop diagnostics (informational)",
+            status="SKIP",
+            detail=f"{loop_line} | watch-sync-ok={syncs}"
+                   + (f" | {errs}" if errs else "")))
+
+
+# ---------------------------------------------------------------------------
+# Z17 — multi-agent watch loop: TWO servers watch BOTH workspaces for ~20s,
+#        auto-syncing 3 file updates + a vault update (backend round-trip)
+# ---------------------------------------------------------------------------
+
+def z17_multiagent_watch_vault(run, result: StageResult):
+    kit, nar = run.kit, run.narrator
+    if not getattr(kit, "watch_autosync_mode", False):
+        raise SkipStage(
+            f"{kit.name}: the multi-agent watch+vault gate runs on the "
+            "hermes-mcp tier only", wp="Z17")
+    if run.backend != "real":
+        raise SkipStage(
+            "Z17 needs --backend real (it asserts backend deltas on both agents "
+            "and a vault round-trip through the cloud)")
+    slot_a = kit.agent_slots[0]
+    slot_b = run.state.get("slot_b", "agent_b")
+    agent_id_a = run.state.get("alf_agent_id", "")
+    rows = _mapping_rows(run)
+    agent_id_b = next(
+        (str(r.get("alf_agent_id")) for r in rows
+         if r.get("runtime_agent") == slot_b), "")
+    if not agent_id_a or not agent_id_b:
+        raise SkipStage(
+            "Z17 needs BOTH agents registered in the backend — run the "
+            "multi-agent stages first (Z8 creates + Z9 enables + Z10 registers "
+            "agent b), e.g. --stages Z1-Z12,Z17", wp="Z17")
+
+    nar.explain("""
+        Z17: the REAL multi-agent watch posture — each Hermes profile runs its
+        OWN `alf mcp serve`, so TWO persistent watch loops (~1s test cadence)
+        watch BOTH agent workspaces at once, each pinned to its own agent (a loop
+        binds exactly one agent — resolve_loop_context). Over ~20s the harness
+        makes 3 watched-FILE edits (agent A, agent B, agent A) plus a vault add on
+        A; each loop must auto-upload its own changes as deltas with ZERO tool/LLM
+        calls, and NEITHER may cross into the other's archive. The vault lives at
+        ~/.alf/vault/<id>/ (NOT a watched path), so it rides A's next file-
+        triggered sync (the loop syncs a FULL export → the delta carries Layer 4).
+        The vault proof is a backend ROUND-TRIP: delete A's local ciphertext, then
+        `alf restore` (re-imports Layer 4 from the cloud) + `alf vault decrypt` —
+        which can only succeed if the watch loop truly pushed it to the backend.
+    """)
+    nar.flow("2× alf mcp serve (A,B) ──▶ 3 file edits + 1 vault ──▶ per-agent deltas ⊙ ──▶ restore+decrypt ⊙")
+
+    def latest_seq(aid: str) -> int:
+        r = run.api.get(f"/agents/{aid}")
+        return (r.json() or {}).get("latest_sequence", 0) if r.status_code == 200 else 0
+
+    base_a, base_b = latest_seq(agent_id_a), latest_seq(agent_id_b)
+    for aid in (agent_id_a, agent_id_b):
+        if aid not in run.manifest.lifecycle_agents:
+            run.manifest.lifecycle_agents.append(aid)
+    run.manifest.save(run.paths.manifest)
+
+    # Agent A carries the vault — ensure its per-agent key exists (Z6 makes it;
+    # this is defensive so a Z1-Z12,Z17 subset that somehow skipped it still runs).
+    a_key = f"{kit.home_mount}/state/{agent_id_a}/.alf-vault-key"
+    run.container.sh(
+        f"mkdir -p {kit.home_mount}/state/{agent_id_a}; "
+        f"test -f {a_key} || alf vault keygen --out {a_key} >/dev/null 2>&1",
+        user="agent")
+
+    # Start ONE persistent watch-loop server per agent. Each pins its own
+    # ALF_AGENT + watches its own profile (-w); the per-agent advisory lock
+    # (state/<id>.lock) means the two loops never contend. Test-cadence env
+    # overrides make each ~1s (gated; production stays 60s/3s — see Z16).
+    def _serve(slot: str, aid: str):
+        env = {
+            "ALF_API_KEY": run.creds.runtime_api_key,
+            "ALF_API_URL": run.creds.alf_api_url,
+            "ALF_AGENT": aid,
+            "ALF_WATCH_DELTA_FLOOR_MS": "1000",
+            "ALF_WATCH_QUIESCE_MS": "1000",
+            "ALF_WATCH_DEFAULT_INTERVAL_MS": "1000",
+            "ALF_WATCH_TICK_MS": "1000",
+        }
+        argv = ["alf", "mcp", "serve", "-r", kit.name, "-w", kit._container_profile(slot)]
+        sess = run.container.exec_stdio(argv, env=env)
+        errs: list = []
+
+        def _drain():
+            try:
+                for line in iter(sess.proc.stderr.readline, b""):
+                    errs.append(line.decode(errors="replace"))
+            except Exception:  # noqa: BLE001 — best-effort diagnostics
+                pass
+
+        th = threading.Thread(target=_drain, daemon=True)
+        th.start()
+        return sess, errs, th
+
+    sess_a, err_a, dr_a = _serve(slot_a, agent_id_a)
+    sess_b, err_b, dr_b = _serve(slot_b, agent_id_b)
+    markers_a: list = []
+    markers_b: list = []
+    vault_label = "vault-z17"
+    vault_secret = scenario.marker_for(slot_a, "secret", 2)  # a fresh FAKE value
+    try:
+        time.sleep(2)  # boot both loops + the (no-op) catch-up-on-start
+        result.add(_passfail(
+            sess_a.alive() and sess_b.alive(),
+            "Z17: both watch servers stayed up (one per agent workspace)",
+            f"A={'up' if sess_a.alive() else 'DOWN: ' + ''.join(err_a)[-160:]} "
+            f"B={'up' if sess_b.alive() else 'DOWN: ' + ''.join(err_b)[-160:]}"))
+
+        # --- ~20s timeline: 3 file edits (A, B, A) + a vault add on A ----------
+        # t≈2s: file #1 → agent A
+        markers_a.append(kit.mutate_watched_file(run.container, slot_a, 1))
+        events.state("agentA", {
+            "activity": f"watch edit 1/3 · {markers_a[-1]}",
+            "mutations": [{"path": "memories/MEMORY.md", "op": "append", "note": markers_a[-1]}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(5)
+        seq_a = latest_seq(agent_id_a)
+        if seq_a > base_a:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"A watch sync · seq {seq_a}",
+            }, stage_id="z17")
+            events.state("agentA", {
+                "seq": seq_a, "synced": True,
+                "activity": f"watch synced · seq {seq_a}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+            events.state("service", {
+                "activity": f"agent A · seq {seq_a}",
+                "agents": {"A": {"seq": seq_a, "deltas": seq_a - base_a, "snapshot": True}},
+            }, stage_id="z17")
+        # t≈7s: file #2 → agent B (proves the OTHER loop syncs independently)
+        markers_b.append(kit.mutate_watched_file(run.container, slot_b, 2))
+        events.state("agentB", {
+            "activity": f"watch edit 2/3 · {markers_b[-1]}",
+            "mutations": [{"path": "profiles/agent_b/memories/MEMORY.md", "op": "append",
+                           "note": markers_b[-1]}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(4)
+        seq_b = latest_seq(agent_id_b)
+        if seq_b > base_b:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"B watch sync · seq {seq_b}",
+            }, stage_id="z17")
+            events.state("agentB", {
+                "seq": seq_b, "synced": True,
+                "activity": f"watch synced · seq {seq_b}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+            events.state("service", {
+                "activity": f"agent B · seq {seq_b}",
+                "agents": {"B": {"seq": seq_b, "deltas": seq_b - base_b,
+                                 "snapshot": True, "visible": True, "registered": True}},
+            }, stage_id="z17")
+        # t≈11s: vault add → agent A. Writes ~/.alf/vault/<id>/credentials.json,
+        # which is NOT a watched path, so on its own it does not fire the loop —
+        # it rides file #3 below (the next full-export sync carries Layer 4).
+        add, addj = run.container.exec_json(
+            ["alf", "vault", "add", "-r", kit.name, "--agent", slot_a,
+             "--service", "email", "--type", "account", "--label", vault_label,
+             "--secret", f"{vault_secret}-DO-NOT-USE"])
+        result.add(_passfail(
+            bool(addj) and addj.get("ok") is True,
+            "Z17: vault add on agent A ok (Layer-4 ciphertext, awaiting the next sync)",
+            (add.stderr or "")[:140] if add.returncode else vault_label))
+        events.state("agentA", {
+            "vault": [vault_label],
+            "activity": f"vault add {vault_label} (rides file #3)",
+            "mutations": [{"path": "credentials.json (vault)", "op": "add",
+                           "note": f"{vault_label} ciphertext"}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        _, lst_a = run.container.exec_json(
+            ["alf", "vault", "list", "-r", kit.name, "--agent", slot_a])
+        labels_a = [c.get("label") for c in (lst_a or {}).get("credentials", [])
+                    if c.get("label")]
+        events.state("service", {
+            "activity": f"agent A vault · {len(labels_a)} key"
+                        f"{'' if len(labels_a) == 1 else 's'}",
+            "agents": {"A": {"vault_keys": len(labels_a), "vault_labels": labels_a}},
+        }, stage_id="z17")
+        time.sleep(2)
+        # t≈13s: file #3 → agent A. This fires A's loop, whose FULL-export sync
+        # now carries BOTH file #3 and the fresh vault ciphertext in one delta.
+        markers_a.append(kit.mutate_watched_file(run.container, slot_a, 3))
+        events.state("agentA", {
+            "activity": f"watch edit 3/3 · {markers_a[-1]} (+ vault rides this sync)",
+            "mutations": [{"path": "memories/MEMORY.md", "op": "append", "note": markers_a[-1]},
+                          {"path": "credentials.json (vault)", "op": "watch",
+                           "note": f"{vault_label} ↑ backend"}],
+            "packet": "watch-delta",
+        }, stage_id="z17")
+        time.sleep(7)  # settle to ~20s: let A's final change quiesce + upload
+        seq_a2 = latest_seq(agent_id_a)
+        if seq_a2 > seq_a:
+            events.state("mcp", {
+                "role": "watch-loop", "active": True, "watch_sources": 8,
+                "packet": "watch-delta", "last": "watch-delta",
+                "activity": f"A watch sync · seq {seq_a2} (+ vault)",
+            }, stage_id="z17")
+            events.state("agentA", {
+                "seq": seq_a2, "synced": True,
+                "activity": f"watch synced · seq {seq_a2}",
+                "packet": "watch-delta",
+            }, stage_id="z17")
+
+        # --- backend deltas: each loop advanced ONLY its own agent ------------
+        end_a, end_b = latest_seq(agent_id_a), latest_seq(agent_id_b)
+        rda = run.api.get(f"/agents/{agent_id_a}/deltas?since={base_a}")
+        deltas_a = (rda.json() or {}).get("deltas", []) if rda.status_code == 200 else []
+        rdb = run.api.get(f"/agents/{agent_id_b}/deltas?since={base_b}")
+        deltas_b = (rdb.json() or {}).get("deltas", []) if rdb.status_code == 200 else []
+        result.add(_passfail(
+            end_a > base_a and len(deltas_a) >= 2,
+            "⊙ agent A: watch loop auto-synced ≥2 deltas (file #1; file #3 + vault)",
+            f"seq {base_a}→{end_a}, {len(deltas_a)} deltas (no tool/LLM calls)"))
+        result.add(_passfail(
+            end_b > base_b and len(deltas_b) >= 1,
+            "⊙ agent B: the OTHER watch loop auto-synced ≥1 delta (file #2)",
+            f"seq {base_b}→{end_b}, {len(deltas_b)} deltas"))
+        events.state("agentA", {"seq": end_a, "synced": True}, stage_id="z17")
+        events.state("agentB", {"seq": end_b, "synced": True}, stage_id="z17")
+        events.state("service", {
+            "latest_sequence": end_a,
+            "activity": f"A seq {base_a}→{end_a} · B seq {base_b}→{end_b}",
+            "agents": {
+                "A": {"seq": end_a, "deltas": len(deltas_a), "snapshot": True},
+                "B": {"seq": end_b, "deltas": len(deltas_b), "snapshot": True,
+                      "visible": True, "registered": True},
+            },
+        }, stage_id="z17")
+
+        # --- content: each agent's file markers reached ITS OWN head memory,
+        #     and NOT the other's (isolation). Memory indexing is on-demand.
+        run.api.post_json(f"/agents/{agent_id_a}/index", {})
+        run.api.post_json(f"/agents/{agent_id_b}/index", {})
+
+        def _present(aid: str, want: list, foreign: list) -> tuple:
+            got = 0
+            leaked = 0
+            for _ in range(15):
+                time.sleep(1)
+                rm = run.api.get(f"/agents/{aid}/memory?limit=100")
+                if rm.status_code != 200:
+                    continue
+                recs = json.dumps((rm.json() or {}).get("records") or [])
+                got = sum(1 for m in want if m in recs)
+                leaked = sum(1 for m in foreign if m in recs)
+                if got >= len(want):
+                    break
+            return got, leaked
+
+        got_a, leak_a = _present(agent_id_a, markers_a, markers_b)
+        got_b, leak_b = _present(agent_id_b, markers_b, markers_a)
+        result.add(_passfail(
+            got_a >= len(markers_a) and leak_a == 0,
+            "⊙ agent A: its 2 file markers indexed into head memory, none of B's leaked in",
+            f"{got_a}/{len(markers_a)} present, {leak_a} foreign"))
+        result.add(_passfail(
+            got_b >= len(markers_b) and leak_b == 0,
+            "⊙ agent B: its file marker indexed into head memory, none of A's leaked in",
+            f"{got_b}/{len(markers_b)} present, {leak_b} foreign"))
+    finally:
+        sess_a.close()
+        sess_b.close()
+        dr_a.join(timeout=3)
+        dr_b.join(timeout=3)
+        for name, errs in (("z17-serve-A", err_a), ("z17-serve-B", err_b)):
+            try:
+                (run.paths.run_dir / f"{name}-stderr.log").write_text(
+                    "".join(errs), encoding="utf-8")
+            except Exception:  # noqa: BLE001
+                pass
+        # Server-side proof — the loop's OWN voice, promoted from informational
+        # to a real gate. Per server: (1) the loop went active; (2) it bound the
+        # agent it was PINNED to — source-side isolation, complementary to the
+        # destination-side no-leak check above and the one signal that catches a
+        # loop happily syncing into the WRONG agent's archive; (3) it completed
+        # ≥1 autonomous sync. `expect` is that server's pinned ALF_AGENT.
+        for who, errs, expect in (("A", err_a, agent_id_a), ("B", err_b, agent_id_b)):
+            w = kit.parse_watch_stderr(errs)
+            result.add(_passfail(
+                w["active"] is True,
+                f"⊙ Z17 serve {who}: watch loop went active (autonomous, no tool/LLM calls)",
+                f"{w['sync_ok']} syncs" if w["active"] is True else
+                f"NOT active: {w['error'] or '(no watch-loop banner in stderr)'}"))
+            result.add(_passfail(
+                w["bound_agent"] == expect,
+                f"⊙ Z17 serve {who}: loop bound its OWN pinned agent (server-side isolation)",
+                f"bound {w['bound_agent']} == pinned {expect}"
+                if w["bound_agent"] == expect else
+                f"bound {w['bound_agent']} != pinned {expect}"))
+            result.add(_passfail(
+                w["sync_ok"] >= 1,
+                f"⊙ Z17 serve {who}: ≥1 successful autonomous watch-loop sync",
+                f"watch-sync-ok={w['sync_ok']}"
+                + (f" | last error: {w['error']}" if w["error"] else "")))
+
+    # --- vault backend round-trip (servers stopped → no lock contention) ------
+    # Delete EVERY local copy of A's vault ciphertext (per-agent + legacy
+    # install-scoped), then restore A from the cloud (re-imports Layer 4) and
+    # decrypt vault-z17. With no local copy left, a successful decrypt PROVES the
+    # ciphertext came BACK from the backend — i.e. the watch loop truly pushed it.
+    # (A's key at .hermes/state/<id>/ is allowlist-excluded, so it survives the
+    # restore and still opens the restored vault.)
+    # MIN-21: the whole proof rests on the local ciphertext being GONE — an
+    # unverified `rm -f` exits 0 having deleted nothing if the vault path ever
+    # drifts, and the later decrypt would silently read the untouched local copy.
+    # So: require at least one copy to exist, delete, then confirm none remain.
+    vault_paths = [
+        f"/home/agent/.alf/vault/{agent_id_a}/credentials.json",
+        "/home/agent/.alf/vault/credentials.json",
+    ]
+    listed = run.container.sh(
+        "ls -1 " + " ".join(vault_paths) + " 2>/dev/null || true", user="agent")
+    existed = [p for p in vault_paths if p in (listed.stdout or "")]
+    result.add(_passfail(
+        bool(existed),
+        "Z17 vault round-trip precondition: a local ciphertext copy exists to delete",
+        f"found={existed or 'NONE — the vault path drifted; the proof below would be vacuous'}"))
+    run.container.sh("rm -f " + " ".join(vault_paths), user="agent")
+    still = run.container.sh(
+        "ls -1 " + " ".join(vault_paths) + " 2>/dev/null || true", user="agent")
+    remaining = [p for p in vault_paths if p in (still.stdout or "")]
+    result.add(_passfail(
+        not remaining,
+        "Z17 vault round-trip precondition: every local ciphertext copy deleted",
+        f"remaining={remaining}" if remaining else "none left locally"))
+    rest = run.container.exec(
+        ["alf", "restore", "-r", kit.name, "--agent", slot_a], timeout=300)
+    dec = run.container.exec(
+        ["alf", "vault", "decrypt", "-r", kit.name, "--agent", slot_a,
+         "--label", vault_label, "--yes-insecure"])
+    body = (dec.stdout or "") + (dec.stderr or "")
+    result.add(_passfail(
+        vault_secret in body,
+        "⊙ vault round-trip: watch-synced vault-z17 restored from the BACKEND + decrypts",
+        "matched (local ciphertext was deleted first — it came from the cloud)"
+        if vault_secret in body else
+        f"not found (restore rc={rest.returncode}, decrypt rc={dec.returncode}): "
+        f"{(dec.stderr or rest.stderr or '').strip()[:160]}"))
+    events.state("agentA", {
+        "activity": f"vault {vault_label} round-tripped via restore",
+        "vault_synced": True,
+        "packet": "restore",
+    }, stage_id="z17")
+
+
+# ---------------------------------------------------------------------------
 # Registry — (stage_id, title, uses_alf, fn)
 # ---------------------------------------------------------------------------
 
@@ -896,6 +1874,12 @@ REGISTRY = [
     ("z13", "Idle re-sync — no changes / Z13' determinism ⊙", True, z13_idle_resync),
     ("z14", "Curated in-place memory — reconcile delta shapes (WP4.1)", True,
      z14_curated_memory),
+    ("z15", "MCP LLM gate — agent drives sync/vault via mcp_alf_* (WP-M4)", True,
+     z15_mcp_llm_gate),
+    ("z16", "Watch loop auto-sync — timed file+db mutations → backend deltas ⊙", True,
+     z16_watch_autosync),
+    ("z17", "Multi-agent watch — 2 loops, both workspaces, 3 file edits + vault ⊙", True,
+     z17_multiagent_watch_vault),
 ]
 
 STAGE_IDS = [sid for sid, *_ in REGISTRY]

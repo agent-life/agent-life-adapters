@@ -381,7 +381,10 @@ def step_cleanup(cfg: iw.Config, ctx: iw.RunContext, db: iw.DbClient,
     print(f"  S3 objects before purge: {before}")
     iw.flow("alf purge ──▶ DELETE /agents/:id ──▶ Neon CASCADE + S3 emptied + local cursor removed")
 
-    proc, _ = iw.run_cli(ctx, ["purge", "-r", ctx.runtime, "-w", str(ctx.ws), "-a", str(WS_AGENT_ID)])
+    proc, _ = iw.run_cli(ctx, [
+        "purge", "-r", ctx.runtime, "-w", str(ctx.ws),
+        "--agent", str(WS_AGENT_ID),
+    ])
     if proc.returncode != 0:
         report.add(iw.StepResult("Cleanup", False, 0,
                                  error=(proc.stderr or proc.stdout or "")[:200]))

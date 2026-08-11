@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RF-025 — Pinned Schema Integration</title>
+</head>
+<body>
+<style>
+  :root {
+    --ground: #F2F5F7;
+    --panel: #FBFCFD;
+    --panel-2: #EAEFF2;
+    --ink: #1B2733;
+    --ink-soft: #46565f;
+    --ink-faint: #6d7d86;
+    --line: #cdd8dd;
+    --accent: #0C6B70;
+    --accent-soft: #d7e8e8;
+    --ok: #2E7D46;
+    --warn: #A06E12;
+    --fail: #B3402E;
+    --fail-soft: #f5e2dd;
+    --ok-soft: #ddeee2;
+    --mono-bg: #e6edf0;
+    --shadow: 0 1px 2px rgba(27,39,51,.06), 0 4px 14px rgba(27,39,51,.05);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0F1517;
+      --panel: #161E21;
+      --panel-2: #1c2629;
+      --ink: #DCE5E4;
+      --ink-soft: #a7b6b6;
+      --ink-faint: #7d8d8d;
+      --line: #2c393d;
+      --accent: #4FC1B7;
+      --accent-soft: #17383a;
+      --ok: #5BBF7E;
+      --warn: #D9A84E;
+      --fail: #E07B66;
+      --fail-soft: #3a221d;
+      --ok-soft: #1c3226;
+      --mono-bg: #101a1c;
+      --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0F1517;
+    --panel: #161E21;
+    --panel-2: #1c2629;
+    --ink: #DCE5E4;
+    --ink-soft: #a7b6b6;
+    --ink-faint: #7d8d8d;
+    --line: #2c393d;
+    --accent: #4FC1B7;
+    --accent-soft: #17383a;
+    --ok: #5BBF7E;
+    --warn: #D9A84E;
+    --fail: #E07B66;
+    --fail-soft: #3a221d;
+    --ok-soft: #1c3226;
+    --mono-bg: #101a1c;
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 4px 14px rgba(0,0,0,.3);
+  }
+  :root[data-theme="light"] {
+    --ground: #F2F5F7;
+    --panel: #FBFCFD;
+    --panel-2: #EAEFF2;
+    --ink: #1B2733;
+    --ink-soft: #46565f;
+    --ink-faint: #6d7d86;
+    --line: #cdd8dd;
+    --accent: #0C6B70;
+    --accent-soft: #d7e8e8;
+    --ok: #2E7D46;
+    --warn: #A06E12;
+    --fail: #B3402E;
+    --fail-soft: #f5e2dd;
+    --ok-soft: #ddeee2;
+    --mono-bg: #e6edf0;
+    --shadow: 0 1px 2px rgba(27,39,51,.06), 0 4px 14px rgba(27,39,51,.05);
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--ground);
+    color: var(--ink);
+    font-family: "Avenir Next", "Segoe UI", system-ui, -apple-system, sans-serif;
+    line-height: 1.55;
+    font-size: 16px;
+  }
+  .wrap { max-width: 1060px; margin: 0 auto; padding: 48px 28px 80px; }
+
+  code, .mono {
+    font-family: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    font-size: .86em;
+  }
+  code {
+    background: var(--mono-bg);
+    padding: .12em .4em;
+    border-radius: 4px;
+    white-space: nowrap;
+  }
+
+  /* ---------- header ---------- */
+  .eyebrow {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    letter-spacing: .14em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 10px;
+  }
+  h1 {
+    font-size: clamp(28px, 4.5vw, 42px);
+    line-height: 1.12;
+    margin: 0 0 14px;
+    font-weight: 700;
+    letter-spacing: -.015em;
+    text-wrap: balance;
+  }
+  .thesis {
+    font-size: 18px;
+    color: var(--ink-soft);
+    max-width: 62ch;
+    margin: 0 0 8px;
+  }
+  .thesis strong { color: var(--ink); }
+  .formula {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 20px;
+    padding: 12px 16px;
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px;
+  }
+  .formula .op { color: var(--ink-faint); }
+  .formula .in { color: var(--ink); }
+  .formula .out { color: var(--accent); font-weight: 700; }
+
+  /* ---------- sections ---------- */
+  section { margin-top: 64px; }
+  .sec-label {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    margin-bottom: 6px;
+  }
+  .sec-label .kicker {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    letter-spacing: .12em;
+    text-transform: uppercase;
+    color: var(--accent);
+  }
+  h2 {
+    font-size: 24px;
+    margin: 0 0 6px;
+    letter-spacing: -.01em;
+    text-wrap: balance;
+  }
+  .sec-intro { color: var(--ink-soft); max-width: 68ch; margin: 0 0 24px; }
+  .sec-intro code { white-space: normal; }
+
+  /* ---------- lock file card ---------- */
+  .authority { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+  .filecard {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .filecard .tab {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 9px 14px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel-2);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    color: var(--ink-soft);
+  }
+  .filecard .tab .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .filecard pre {
+    margin: 0;
+    padding: 16px 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.8px;
+    line-height: 1.9;
+    overflow-x: auto;
+  }
+  .filecard .k { color: var(--accent); font-weight: 600; }
+  .filecard .v { color: var(--ink); }
+  .filecard .c { color: var(--ink-faint); }
+  .keynotes { display: flex; flex-direction: column; gap: 0; }
+  .keynote {
+    padding: 11px 0;
+    border-bottom: 1px solid var(--line);
+    display: grid;
+    grid-template-columns: 190px minmax(0,1fr);
+    gap: 14px;
+    font-size: 14px;
+  }
+  .keynote:last-child { border-bottom: none; }
+  .keynote .term {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    color: var(--accent);
+    font-weight: 600;
+    padding-top: 2px;
+    overflow-wrap: break-word;
+  }
+  .keynote .def { color: var(--ink-soft); }
+  .keynote .def strong { color: var(--ink); font-weight: 600; }
+
+  .demoted {
+    margin-top: 20px;
+    padding: 13px 16px;
+    border-left: 3px solid var(--warn);
+    background: var(--panel);
+    border-radius: 0 8px 8px 0;
+    font-size: 14px;
+    color: var(--ink-soft);
+  }
+  .demoted strong { color: var(--ink); }
+
+  /* ---------- mode cards ---------- */
+  .modes { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 16px; }
+  .mode {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 18px 18px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .mode .flag {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .mode h3 { margin: 0; font-size: 16px; }
+  .mode p { margin: 0; font-size: 14px; color: var(--ink-soft); }
+  .mode ul { margin: 0; padding-left: 18px; font-size: 13.5px; color: var(--ink-soft); display: flex; flex-direction: column; gap: 5px; }
+  .mode li::marker { color: var(--accent); }
+  .netbadge {
+    align-self: flex-start;
+    margin-top: auto;
+    font-size: 11.5px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    text-transform: uppercase;
+    padding: 3px 9px;
+    border-radius: 99px;
+  }
+  .net-yes { background: var(--accent-soft); color: var(--accent); }
+  .net-no  { background: var(--ok-soft); color: var(--ok); }
+
+  /* ---------- pipeline diagram ---------- */
+  .runbox { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(0, 1fr); gap: 0 36px; align-items: stretch; position: relative; }
+  .tempzone {
+    border: 2px dashed var(--accent);
+    border-radius: 14px;
+    padding: 20px 22px 22px;
+    position: relative;
+    background: color-mix(in srgb, var(--accent) 3%, transparent);
+  }
+  .tempzone > .zonelabel {
+    position: absolute;
+    top: -11px;
+    left: 18px;
+    background: var(--ground);
+    padding: 0 10px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--accent);
+    letter-spacing: .04em;
+  }
+  .steps { list-style: none; margin: 8px 0 0; padding: 0; position: relative; }
+  .steps::before {
+    content: "";
+    position: absolute;
+    left: 15px; top: 18px; bottom: 18px;
+    width: 2px;
+    background: var(--line);
+  }
+  .step {
+    position: relative;
+    padding: 0 0 22px 46px;
+  }
+  .step:last-child { padding-bottom: 0; }
+  .step .num {
+    position: absolute;
+    left: 0; top: 0;
+    width: 32px; height: 32px;
+    border-radius: 50%;
+    background: var(--panel);
+    border: 2px solid var(--accent);
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .step h4 { margin: 4px 0 4px; font-size: 15.5px; }
+  .step p { margin: 0; font-size: 13.8px; color: var(--ink-soft); max-width: 56ch; }
+  .step p code { white-space: normal; }
+  .step .gate {
+    display: inline-block;
+    margin-top: 7px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--fail);
+    background: var(--fail-soft);
+    border-radius: 5px;
+    padding: 3px 9px;
+  }
+
+  .repozone { display: flex; flex-direction: column; gap: 14px; justify-content: center; }
+  .repozone .zonetitle {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: .04em;
+    color: var(--ink-faint);
+    text-transform: uppercase;
+  }
+  .artifact {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-left: 4px solid var(--warn);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+    padding: 13px 16px;
+  }
+  .artifact .path {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 12.5px;
+    font-weight: 700;
+    color: var(--ink);
+    overflow-wrap: break-word;
+  }
+  .artifact p { margin: 5px 0 0; font-size: 13px; color: var(--ink-soft); }
+  .crossing {
+    border-radius: 8px;
+    padding: 11px 14px;
+    font-size: 13px;
+  }
+  .crossing .arrow {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-weight: 700;
+    font-size: 12.5px;
+  }
+  .crossing.allowed { background: var(--ok-soft); color: var(--ok); }
+  .crossing.blocked { background: var(--fail-soft); color: var(--fail); }
+  .crossing span.rest { color: var(--ink-soft); }
+  .together {
+    font-size: 13px;
+    color: var(--ink-soft);
+    border-top: 1px solid var(--line);
+    padding-top: 12px;
+  }
+  .together strong { color: var(--ink); }
+
+  /* ---------- maintenance ---------- */
+  .maint { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 16px; }
+  .maintcard {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    padding: 18px;
+  }
+  .maintcard .flag {
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13.5px;
+    font-weight: 700;
+    color: var(--accent);
+  }
+  .maintcard h3 { margin: 6px 0 8px; font-size: 16px; }
+  .maintcard p { margin: 0 0 10px; font-size: 14px; color: var(--ink-soft); }
+  .verdicts { display: flex; flex-direction: column; gap: 7px; font-size: 13.5px; }
+  .verdict { display: flex; gap: 9px; align-items: baseline; }
+  .verdict .pill {
+    flex: none;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 8px;
+    border-radius: 99px;
+  }
+  .pill-ok { background: var(--ok-soft); color: var(--ok); }
+  .pill-fail { background: var(--fail-soft); color: var(--fail); }
+  .verdict span:last-child { color: var(--ink-soft); }
+
+  /* ---------- guarantees ---------- */
+  .guarantees { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 12px 28px; margin: 0; padding: 0; list-style: none; }
+  .guarantees li {
+    position: relative;
+    padding: 2px 0 2px 30px;
+    font-size: 14.5px;
+    color: var(--ink-soft);
+  }
+  .guarantees li strong { color: var(--ink); }
+  .guarantees li::before {
+    content: "✓";
+    position: absolute;
+    left: 0; top: 1px;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    background: var(--ok-soft);
+    color: var(--ok);
+    font-size: 12px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+
+  /* ---------- release gate footer ---------- */
+  .gatebox {
+    background: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: var(--shadow);
+    overflow: hidden;
+  }
+  .gatebox .head {
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--line);
+    background: var(--panel-2);
+    font-size: 14px;
+    color: var(--ink-soft);
+  }
+  .gatebox .head strong { color: var(--ink); }
+  .gatebox pre {
+    margin: 0;
+    padding: 16px 18px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px;
+    line-height: 1.9;
+    overflow-x: auto;
+    color: var(--ink);
+  }
+  .gatebox pre .cmt { color: var(--ink-faint); }
+  .gatebox .foot {
+    padding: 11px 18px;
+    border-top: 1px solid var(--line);
+    font-size: 13px;
+    color: var(--fail);
+    font-weight: 600;
+  }
+
+  footer.colophon {
+    margin-top: 56px;
+    font-size: 12.5px;
+    color: var(--ink-faint);
+    border-top: 1px solid var(--line);
+    padding-top: 16px;
+  }
+
+  @media (max-width: 860px) {
+    .authority, .runbox, .maint { grid-template-columns: 1fr; }
+    .modes { grid-template-columns: 1fr; }
+    .guarantees { grid-template-columns: 1fr; }
+    .repozone { margin-top: 26px; }
+    .keynote { grid-template-columns: 1fr; gap: 2px; }
+  }
+  @media (prefers-reduced-motion: no-preference) {
+    .mode, .maintcard, .artifact { transition: transform .15s ease; }
+  }
+</style>
+
+
+<div class="wrap">
+  <header>
+    <p class="eyebrow">agent-life-adapters · RF-025 · scripts/run_integration_tests.sh</p>
+    <h1>The integration fixture, made reproducible</h1>
+    <p class="thesis">
+      The old gate followed a moving branch, generated random bytes, and wrote them into tracked files.
+      The fix inverts every one of those: <strong>the fixture is a reviewed compatibility artifact</strong>,
+      and the test command can only read it, regenerate it in a sandbox, and compare.
+    </p>
+    <div class="formula" role="img" aria-label="Determinism formula: schema commit plus seed plus format version plus the locked Python environment and PYTHONHASHSEED yields the same SHA-256 every run">
+      <span class="in">SCHEMA_COMMIT</span><span class="op">+</span>
+      <span class="in">FIXTURE_SEED</span><span class="op">+</span>
+      <span class="in">ALF&nbsp;1.0.0</span><span class="op">+</span>
+      <span class="in">locked&nbsp;Python&nbsp;env&nbsp;+&nbsp;hash&nbsp;seed</span>
+      <span class="op">⇒</span>
+      <span class="out">identical SHA-256, every run, every machine</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="sec-label"><span class="kicker">01 · Authority</span></div>
+    <h2>One lock file decides everything</h2>
+    <p class="sec-intro">
+      <code>scripts/integration-fixture.lock</code> is the sole schema-revision authority.
+      Changing format compatibility is a reviewed lock-file diff — never an implicit update from
+      <code>main</code> or a latest tag.
+    </p>
+    <div class="authority">
+      <div class="filecard">
+        <div class="tab"><span class="dot"></span>scripts/integration-fixture.lock</div>
+        <pre><span class="c"># Reviewed inputs — every value is a release-owner decision</span>
+<span class="k">SCHEMA_REPOSITORY</span><span class="v">=https://github.com/agent-life/…-data-format.git</span>
+<span class="k">SCHEMA_COMMIT</span><span class="v">=a46bd2ada6c800dd17ca02939b481e283277217a</span>
+<span class="k">FIXTURE_ALF_FORMAT_VERSION</span><span class="v">=1.0.0</span>
+<span class="k">FIXTURE_SEED</span><span class="v">=20260730</span>
+<span class="k">GENERATOR_PYTHON_MINOR</span><span class="v">=3.14</span>
+<span class="k">GENERATOR_REQUIREMENTS_LOCK</span><span class="v">=scripts/…-requirements.lock</span></pre>
+      </div>
+      <div class="keynotes">
+        <div class="keynote">
+          <span class="term">SCHEMA_COMMIT</span>
+          <span class="def">A <strong>full 40-char SHA</strong>, fetched by commit and detached. No branch, no tag, no <code>git pull</code>, no shared <code>/tmp</code> checkout.</span>
+        </div>
+        <div class="keynote">
+          <span class="term">FIXTURE_ALF_FORMAT_VERSION</span>
+          <span class="def"><strong>1.0.0</strong> — the ALF <em>format</em> version every shipping adapter writes. Not the CLI release version (v1.1.0).</span>
+        </div>
+        <div class="keynote">
+          <span class="term">FIXTURE_SEED</span>
+          <span class="def">Seeds <code>random</code>, Faker, and JSF; the generator also freezes the clock at <code>2026-01-01T00:00:00Z</code>.</span>
+        </div>
+        <div class="keynote">
+          <span class="term">GENERATOR_PYTHON_MINOR + …REQUIREMENTS_LOCK</span>
+          <span class="def">Byte-determinism holds <strong>per interpreter minor + exact wheel set + <code>PYTHONHASHSEED=0</code></strong>. The runner accepts <code>ALF_INTEGRATION_PYTHON</code>, otherwise prefers <code>python3.14</code> before a compatible <code>python3</code>. Wheels are hash-pinned and installed with <code>pip --require-hashes</code>; the env verifier refuses any other environment.</span>
+        </div>
+      </div>
+    </div>
+    <div class="demoted">
+      <strong><code>alf-cli/fixtures/schema_version.txt</code> is demoted to generated metadata.</strong>
+      The regeneration workflow writes the locked commit into it; <code>--check</code> compares it against the lock.
+      It is never an input, and nothing selects a schema revision from it.
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-label"><span class="kicker">02 · Modes</span></div>
+    <h2>Three ways to obtain the pinned schemas</h2>
+    <p class="sec-intro">Every mode ends at the same place: a checkout verified to be exactly <code>SCHEMA_COMMIT</code> with a clean <code>schemas/</code> tree. They differ only in how it gets there and what they may touch.</p>
+    <div class="modes">
+      <div class="mode">
+        <span class="flag">default</span>
+        <h3>Fetch the pin</h3>
+        <ul>
+          <li><code>mktemp -d</code> owns the checkout</li>
+          <li><code>git fetch --depth=1 origin $SCHEMA_COMMIT</code>, then detach at <code>FETCH_HEAD</code></li>
+          <li>Installs the hash-pinned wheels only if the env verifier fails</li>
+        </ul>
+        <span class="netbadge net-yes">network allowed</span>
+      </div>
+      <div class="mode">
+        <span class="flag">--schema-dir &lt;checkout&gt;</span>
+        <h3>Use your sibling checkout</h3>
+        <ul>
+          <li><code>HEAD</code> must equal <code>SCHEMA_COMMIT</code> — mismatch fails, names both revisions</li>
+          <li><code>schemas/</code> must be porcelain-clean — a dirty schema tree is rejected</li>
+          <li>A bare <code>schemas/</code> dir is not accepted: no provenance</li>
+        </ul>
+        <span class="netbadge net-yes">network allowed</span>
+      </div>
+      <div class="mode">
+        <span class="flag">--offline --schema-dir</span>
+        <h3>Air-gapped run</h3>
+        <ul>
+          <li>No pip, no git remotes, no clone/fetch/pull</li>
+          <li>Environment must already match the lock, or fail with setup guidance</li>
+          <li>Same pin + cleanliness verification as above</li>
+        </ul>
+        <span class="netbadge net-no">zero network</span>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-label"><span class="kicker">03 · The run</span></div>
+    <h2>Everything happens inside the sandbox</h2>
+    <p class="sec-intro">
+      A normal run — including the release gate — creates one temporary directory and never writes
+      outside it. The worktree stays byte-for-byte untouched. Exactly one command may cross the boundary.
+    </p>
+    <div class="runbox">
+      <div class="tempzone">
+        <span class="zonelabel">mktemp -d · temporary, isolated</span>
+        <ol class="steps">
+          <li class="step">
+            <span class="num">1</span>
+            <h4>Verify the generator environment</h4>
+            <p>Interpreter minor <em>and</em> every locked package version must match. Online mode may install the pinned wheels first; offline mode must already be correct.</p>
+            <span class="gate">mismatch → fail before generating</span>
+          </li>
+          <li class="step">
+            <span class="num">2</span>
+            <h4>Obtain + verify the schema checkout</h4>
+            <p><code>HEAD == SCHEMA_COMMIT</code>, clean <code>schemas/</code>. The verified checkout is the only schema source from here on.</p>
+            <span class="gate">wrong commit or dirty tree → fail</span>
+          </li>
+          <li class="step">
+            <span class="num">3</span>
+            <h4>Generate the canonical archive</h4>
+            <p>Seeded RNG, frozen clock, deterministic record IDs. Canonical JSON: sorted keys, LF, trailing newline. ZIP members in sorted order, DOS-epoch timestamps, fixed <code>0644</code>, <code>ZIP_STORED</code> — no zlib variation.</p>
+          </li>
+          <li class="step">
+            <span class="num">4</span>
+            <h4>Validate against the pinned schemas</h4>
+            <p>Every member — including each JSONL memory record — validates against the Draft 2020-12 schemas from the verified checkout, before anything else consumes it.</p>
+            <span class="gate">schema violation → fail, names the revision</span>
+          </li>
+          <li class="step">
+            <span class="num">5</span>
+            <h4>Prove it with the real binary</h4>
+            <p><code>cargo test</code> runs <code>alf validate</code> against the <em>temporary</em> fixture (path passed via env vars) and writes a report under the sandbox: adapter commit, schema commit, Python + lock SHA, fixture SHA-256, verdict. With <code>--test-fixture-tools</code> — used by <code>test.sh integration</code> — the fixture-tooling regressions then run in this same locked temporary environment.</p>
+          </li>
+        </ol>
+      </div>
+      <div class="repozone">
+        <span class="zonetitle">Repository worktree — tracked</span>
+        <div class="artifact">
+          <span class="path">alf-cli/fixtures/synthetic-agent.alf</span>
+          <p>The reviewed compatibility artifact. Fallback for plain <code>cargo test</code>.</p>
+        </div>
+        <div class="artifact">
+          <span class="path">alf-cli/fixtures/schema_version.txt</span>
+          <p>Generated metadata: the locked full commit, written at regeneration time.</p>
+        </div>
+        <div class="crossing blocked">
+          <span class="arrow">default · --check · --offline&nbsp;</span>
+          <span class="rest">— read-only. May compare, never write.</span>
+        </div>
+        <div class="crossing allowed">
+          <span class="arrow">--regenerate-fixture&nbsp;</span>
+          <span class="rest">— the <em>only</em> writer. Both files are staged and mode-normalized before replacement, after full validation passes; each same-directory replacement is atomic.</span>
+        </div>
+        <div class="together">
+          <strong>Review invariant:</strong> the two artifacts must be committed together.
+          A commit that updates one without the other cannot pass <code>--check</code>. The final replacements are sequential; an I/O failure between them can leave a partial worktree update for the maintainer to discard or repair.
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-label"><span class="kicker">04 · Maintenance</span></div>
+    <h2>Checking is not regenerating</h2>
+    <p class="sec-intro">Two explicitly separate workflows. The release gate uses the first; only a deliberate maintainer action uses the second.</p>
+    <div class="maint">
+      <div class="maintcard">
+        <span class="flag">--check</span>
+        <h3>Is the committed fixture current?</h3>
+        <p>Regenerates into the sandbox, then byte-compares both tracked artifacts against the fresh output.</p>
+        <div class="verdicts">
+          <div class="verdict"><span class="pill pill-ok">PASS</span><span>Both files byte-identical — evidence is reproducible from HEAD.</span></div>
+          <div class="verdict"><span class="pill pill-fail">STALE</span><span>Nonzero exit; prints the locked revision and both SHA-256 values so the diff is reviewable.</span></div>
+        </div>
+      </div>
+      <div class="maintcard">
+        <span class="flag">--regenerate-fixture</span>
+        <h3>Deliberately update the artifact</h3>
+        <p>Completes generation, schema validation, and the Cargo proof in the sandbox <em>first</em>. Only then stages and sequentially replaces both tracked files — showing changed paths and hashes — and never touches unrelated worktree changes.</p>
+        <div class="verdicts">
+          <div class="verdict"><span class="pill pill-fail">POLICY</span><span>Use only after a reviewed lock-file change. This is release-owner discipline, not a condition the script enforces; it is never the release gate.</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="sec-label"><span class="kicker">05 · Guarantees</span></div>
+    <h2>What the design promises</h2>
+    <ul class="guarantees">
+      <li><strong>Byte-identical output</strong> for identical inputs — provable by running twice and comparing SHA-256.</li>
+      <li><strong>No moving refs, ever:</strong> no <code>git pull</code>, no <code>main</code>, no latest tag, no mutable shared <code>/tmp</code> checkout.</li>
+      <li><strong>Normal runs leave the worktree untouched</strong> — reports and archives live only in the sandbox.</li>
+      <li><strong>Offline means offline:</strong> zero network, git-remote, or package-manager calls.</li>
+      <li><strong>Wrong pin fails loudly</strong> — expected and actual revisions are named before anything is generated.</li>
+      <li><strong>Every report carries provenance:</strong> adapter commit, schema commit, environment pins, archive hash.</li>
+    </ul>
+  </section>
+
+  <section>
+    <div class="sec-label"><span class="kicker">06 · The release gate</span></div>
+    <h2>What the release owner actually runs</h2>
+    <div class="gatebox">
+      <div class="head">Valid once the sibling checkout sits exactly at the pin and the locked Python env is installed. <strong>Record the output — both commits and the archive hash — with the candidate evidence.</strong></div>
+      <pre><span class="cmt"># 1 · generate + validate + prove, sandboxed</span>
+./scripts/run_integration_tests.sh --offline --schema-dir ../agent-life-data-format
+
+<span class="cmt"># 2 · confirm the committed fixture matches what HEAD reproduces</span>
+./scripts/run_integration_tests.sh --check --offline --schema-dir ../agent-life-data-format</pre>
+      <div class="foot">The gate is these two read-only commands — never --regenerate-fixture.</div>
+    </div>
+  </section>
+
+  <footer class="colophon">
+    RF-025 · implemented in commits 2d05037b–256bfb1d · release-findings-July-30.md · agent-life-adapters
+  </footer>
+</div>
+</body>
+</html>

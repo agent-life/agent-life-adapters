@@ -35,6 +35,7 @@ pub mod identity_parser;
 pub mod import;
 pub mod memory_parser;
 pub mod principals_parser;
+pub mod watch;
 
 // Dry-run enumeration entry points.
 pub use export::{enumerate, enumerate_workspace, EnumerationResult};
@@ -77,7 +78,7 @@ impl Adapter for OpenClawAdapter {
         workspace: &Path,
         options: ImportOptions<'_>,
     ) -> Result<ImportReport> {
-        import::import(alf_file, workspace, options.vault_key)
+        import::import(alf_file, workspace, options.vault_key, options.preview)
     }
 
     fn enumerate_workspace(&self, workspace: &Path) -> Result<WorkspaceEnumeration> {
@@ -90,6 +91,12 @@ impl Adapter for OpenClawAdapter {
 
     fn resolve_agent_id(&self, workspace: &Path) -> Result<Uuid> {
         export::resolve_agent_id_readonly(workspace)
+    }
+
+    /// WP-M5/RF-010: a broad workspace source, tracked-file channel, tracked
+    /// controls, and `~/.openclaw/openclaw.json` compose the MCP watch surface.
+    fn watch_paths(&self, workspace: &Path) -> Vec<alf_core::WatchSpec> {
+        watch::watch_paths(workspace)
     }
 
     /// WP4: enumerate agents from `openclaw.json` `agents.list[]`, one

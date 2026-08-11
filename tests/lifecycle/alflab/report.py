@@ -10,9 +10,12 @@ import json
 from dataclasses import dataclass, field, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, TYPE_CHECKING
 
 from .redact import redact, redact_obj
+
+if TYPE_CHECKING:
+    from .provenance import Provenance
 
 STATUS_ICON = {"PASS": "✅", "FAIL": "❌", "SKIP": "⊙", "XFAIL": "⊘", "XPASS": "‼️"}
 
@@ -56,6 +59,7 @@ class RunReport:
     run_dir: str = ""
     alf_version: str = ""
     exit_code: int = 0
+    provenance: "Optional[Provenance]" = None   # RF-024 reproducibility stamp
 
     # -- aggregation ---------------------------------------------------------
 
@@ -80,13 +84,56 @@ class RunReport:
         c = self.counts()
         ran = [s for s in self.stages if s.status != "SKIP" or s.checks]
         passed = sum(1 for s in ran if s.status in ("PASS", "XFAIL", "XPASS"))
+        # Bare-skipped stages (SKIP with no checks) are invisible in passed/ran;
+        # always emit their count so a run that silently skipped work can't
+        # read as a full pass at a glance.
+        skipped = len(self.stages) - len(ran)
         stages = ",".join(s.stage_id.upper() for s in self.stages)
         line = (f"<!-- LIFECYCLE framework={self.framework} tier={self.tier} "
-                f"stages={stages} passed={passed}/{len(ran)} xfail={c['XFAIL']}")
+                f"stages={stages} passed={passed}/{len(ran)} skipped={skipped} "
+                f"xfail={c['XFAIL']}")
         if c["XPASS"]:
             line += f" xpass={c['XPASS']}"
-        line += f" coverage={self.coverage} isolation={self.isolation} -->"
+        line += f" coverage={self.coverage} isolation={self.isolation}"
+        # RF-024: fold the release-evidence verdict into the machine marker so
+        # run_all's parser reads it rather than re-deriving.
+        if self.provenance is not None:
+            line += (" release_evidence="
+                     f"{'true' if self.provenance.release_evidence else 'false'}")
+        line += " -->"
         return line
+
+    # -- provenance rendering (RF-024) ---------------------------------------
+
+    def _non_release_reasons(self) -> str:
+        p = self.provenance
+        reasons = []
+        if p.adapters_dirty:
+            reasons.append("dirty tree")
+        if p.adapters_commit in ("", "unknown"):
+            reasons.append("unknown commit")
+        if not p.binary_sha256:
+            reasons.append("missing binary digest")
+        if p.service_dirty:
+            reasons.append("service dirty")
+        return "; ".join(reasons) if reasons else "not reproducible"
+
+    def _provenance_md(self) -> list:
+        p = self.provenance
+        backend = self.tier.split("/")[-1] if "/" in self.tier else self.tier
+        block = [
+            f"**Source commit:** `{p.adapters_commit}`"
+            + (" _(dirty)_" if p.adapters_dirty else "") + "  ",
+            f"**Binary:** `{p.binary_version}` · sha256 `{p.binary_sha256 or '(none)'}`  ",
+            f"**Command:** `{p.command}`  ",
+            f"**Backend:** {backend}  ",
+            f"**Release evidence:** {'yes' if p.release_evidence else 'NO'}  ",
+        ]
+        if p.service_commit:
+            block.append(
+                f"**Service commit:** `{p.service_commit}`"
+                + (" _(dirty)_" if p.service_dirty else "") + "  ")
+        return block
 
     # -- output --------------------------------------------------------------
 
@@ -98,6 +145,10 @@ class RunReport:
             f"**Date:** {self.started_at}  ",
             f"**Run dir:** `{self.run_dir}`  ",
             f"**alf under test:** `{self.alf_version}`  ",
+        ]
+        if self.provenance is not None:
+            lines += self._provenance_md()
+        lines += [
             "",
             "## Summary",
             "",
@@ -128,6 +179,11 @@ class RunReport:
                 lines.append(f"- `{rung}`: {status}")
             lines.append("")
         lines += ["", self.verdict_line(), ""]
+        # RF-024: a run that cannot be release evidence is labelled loudly, as
+        # the very first line, so it can never be mistaken for a release report.
+        if self.provenance is not None and not self.provenance.release_evidence:
+            banner = f"> ⚠️ **NON-RELEASE EVIDENCE** — {self._non_release_reasons()}"
+            lines = [banner, ""] + lines
         return redact("\n".join(lines))
 
     def write(self, run_dir: Path):

@@ -1,0 +1,1841 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Agent Life — MCP Lifecycle Visualization</title>
+<style>
+  :root {
+    --bg: #0b1020;
+    --bg2: #121a2f;
+    --panel: #161f38;
+    --panel2: #1c2744;
+    --border: #2a3658;
+    --text: #e8eefc;
+    --muted: #8b9bb8;
+    --accent: #5b8cff;
+    --agentA: #3dd6c6;
+    --agentB: #c084fc;
+    --mcp: #fbbf24;
+    --service: #60a5fa;
+    --pass: #34d399;
+    --fail: #f87171;
+    --skip: #94a3b8;
+    --packet-register: #60a5fa;
+    --packet-snapshot: #34d399;
+    --packet-delta: #fbbf24;
+    --packet-vault: #c084fc;
+    --packet-watch: #3dd6c6;
+    --packet-tool: #fb923c;
+    --shadow: 0 12px 40px rgba(0,0,0,.45);
+    --radius: 14px;
+    font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text); }
+  body {
+    display: grid;
+    grid-template-rows: auto 1fr auto;
+    min-height: 100vh;
+    background:
+      radial-gradient(1200px 600px at 10% -10%, rgba(61,214,198,.12), transparent 60%),
+      radial-gradient(900px 500px at 90% 0%, rgba(192,132,252,.10), transparent 55%),
+      radial-gradient(800px 500px at 50% 100%, rgba(91,140,255,.10), transparent 50%),
+      var(--bg);
+  }
+  .topbar {
+    display: grid; gap: 6px;
+    padding: 8px 16px 6px;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 0; border-bottom: none;
+  }
+  .brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+  .logo {
+    width: 28px; height: 28px; border-radius: 8px;
+    background: linear-gradient(135deg, var(--agentA), var(--accent));
+    display: grid; place-items: center; font-weight: 800; color: #061018; font-size: 12px;
+    box-shadow: 0 0 18px rgba(61,214,198,.3); flex: 0 0 auto;
+  }
+  .brand h1 { margin: 0; font-size: 14px; font-weight: 650; letter-spacing: .2px;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .brand h1 .phase {
+    font-weight: 500; color: var(--accent); margin-left: 6px;
+  }
+  .brand h1 .phase::before { content: "— "; color: var(--muted); font-weight: 400; }
+  .brand p { margin: 1px 0 0; color: var(--muted); font-size: 11px; }
+  .badges { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; flex: 0 0 auto; }
+  .badge {
+    font-size: 10px; font-weight: 600; letter-spacing: .4px; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--panel); color: var(--muted);
+  }
+  .badge.live { color: #061018; background: var(--pass); border-color: transparent; animation: pulse 1.4s infinite; }
+  .badge.replay { color: var(--accent); border-color: rgba(91,140,255,.4); }
+  @keyframes pulse { 0%,100%{ opacity:1 } 50%{ opacity:.55 } }
+
+  .readout {
+    display: grid; grid-template-columns: repeat(5, minmax(0,1fr)); gap: 6px;
+    padding: 0;
+  }
+  .stat {
+    background: rgba(22,31,56,.85); border: 1px solid var(--border); border-radius: 8px;
+    padding: 4px 8px; backdrop-filter: blur(8px);
+    display: flex; align-items: baseline; gap: 8px;
+  }
+  .stat .k { color: var(--muted); font-size: 10px; text-transform: uppercase; letter-spacing: .4px; flex: 0 0 auto; }
+  .stat .v { margin-top: 0; font-size: 13px; font-weight: 650; font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .stat .v.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+
+  main {
+    position: relative; margin: 0 12px; border: 1px solid var(--border); border-radius: 14px;
+    background: linear-gradient(180deg, rgba(18,26,47,.9), rgba(11,16,32,.95));
+    box-shadow: var(--shadow); overflow: hidden; min-height: 0;
+  }
+  #stage {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+  }
+  .card {
+    position: absolute; width: 260px; min-height: 168px; border-radius: var(--radius);
+    background: linear-gradient(180deg, var(--panel2), var(--panel));
+    border: 1px solid var(--border); padding: 14px 14px 12px; cursor: pointer;
+    transition: transform .2s ease, box-shadow .2s ease, opacity .35s ease, border-color .2s;
+    box-shadow: 0 8px 28px rgba(0,0,0,.28);
+  }
+  .card.wide { width: 300px; }
+  .card.service-card {
+    width: max-content;
+    max-width: calc(100% - 680px); /* leave gutters for Agent A/B cards */
+    min-width: 0;
+    min-height: 0;
+  }
+  .card:hover { transform: translateY(-2px); box-shadow: 0 14px 36px rgba(0,0,0,.4); }
+  .card.service-card:hover { transform: translateX(-50%) translateY(-2px); }
+  .card.active { border-color: rgba(255,255,255,.28); }
+  .card.dim { opacity: .28; filter: grayscale(.4); pointer-events: none; }
+  .card.born { opacity: 1; filter: none; pointer-events: auto; animation: birth .6s ease; }
+  @keyframes birth {
+    from { opacity: 0; transform: scale(.92) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+  .card h2 {
+    margin: 0 0 2px; font-size: 13px; font-weight: 700; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 8px;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+  .card .sub { color: var(--muted); font-size: 11px; margin-bottom: 8px; }
+  .card .activity {
+    font-size: 11px; color: var(--accent); min-height: 2.4em; margin-bottom: 8px;
+    line-height: 1.3;
+  }
+  .metrics { display: grid; gap: 6px; }
+  .metric {
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 12px; padding: 5px 8px; border-radius: 8px; background: rgba(0,0,0,.18);
+  }
+  .metric span:first-child { color: var(--muted); }
+  .metric span:last-child { font-weight: 650; font-variant-numeric: tabular-nums; }
+  .chips { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 8px; }
+  .chip {
+    font-size: 10px; padding: 2px 7px; border-radius: 999px;
+    background: rgba(255,255,255,.06); color: var(--muted); border: 1px solid var(--border);
+    max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .ws-tree {
+    margin-top: 10px; padding: 8px 8px 6px; border-radius: 10px;
+    background: rgba(0,0,0,.22); border: 1px solid rgba(42,54,88,.8);
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 10.5px; line-height: 1.45; color: var(--muted);
+  }
+  .ws-tree .ws-title {
+    font-family: inherit; font-size: 10px; text-transform: uppercase;
+    letter-spacing: .4px; color: var(--muted); margin-bottom: 4px;
+    font-weight: 650;
+  }
+  .ws-row {
+    display: flex; align-items: baseline; gap: 6px; padding: 1px 4px;
+    border-radius: 4px; white-space: nowrap; overflow: hidden;
+  }
+  .ws-row .glyph { color: #5a6a8a; flex: 0 0 auto; }
+  .ws-row .path { overflow: hidden; text-overflow: ellipsis; }
+  .ws-row.hot {
+    background: rgba(251,191,36,.14); color: #fde68a;
+    animation: mutPulse 1.1s ease;
+  }
+  .ws-row.hot .glyph { color: #fbbf24; }
+  .ws-row.mutated {
+    /* static annotation after the pulse — no animation */
+    color: #e8d9a0;
+  }
+  .ws-row.mutated .glyph { color: #fbbf24; }
+  .ws-row .mut {
+    margin-left: auto; flex: 0 0 auto; font-size: 9px; font-weight: 700;
+    color: #fbbf24; text-transform: uppercase; letter-spacing: .3px;
+  }
+  @keyframes mutPulse {
+    0% { background: rgba(251,191,36,.35); }
+    100% { background: rgba(251,191,36,.14); }
+  }
+  .agent-panels { display: contents; }
+  .agent-panel {
+    padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,.2);
+    border: 1px solid var(--border);
+    flex: 0 1 auto;
+    width: max-content;
+    max-width: 220px;
+    min-width: 132px;
+  }
+  .agent-panel.hidden { display: none; }
+  .agent-panel h3 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 700; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .agent-panel.a h3 .dot { background: var(--agentA); }
+  .agent-panel.b h3 .dot { background: var(--agentB); }
+  .agent-panel .panel-metrics { display: grid; gap: 4px; }
+  .agent-panel .panel-metrics .metric {
+    padding: 3px 6px; font-size: 11px; white-space: nowrap; gap: 10px;
+  }
+  .agent-panel .panel-metrics .metric.flash {
+    animation: metricFlash .85s ease;
+  }
+  @keyframes metricFlash {
+    0% { background: rgba(96,165,250,.45); box-shadow: 0 0 0 1px rgba(96,165,250,.5); }
+    100% { background: rgba(0,0,0,.18); box-shadow: none; }
+  }
+
+  /* Content-sized row: each child is only as wide as its content needs. */
+  .service-body {
+    display: flex;
+    flex-direction: row;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    gap: 8px;
+    margin-top: 10px;
+    width: max-content;
+    max-width: 100%;
+  }
+  .service-body .llm-proxy {
+    margin-top: 0;
+    flex: 0 1 auto;
+    width: max-content;
+    min-width: 120px;
+    max-width: 180px; /* idle / meta-only */
+  }
+  .service-body .llm-proxy.hot {
+    max-width: 300px; /* room for prompt/reply bubbles */
+  }
+
+  /* Layout: Service top-center, width from content; Agents left/right. */
+  #service {
+    left: 50%;
+    right: auto;
+    transform: translateX(-50%);
+    top: 3%;
+    border-top: 3px solid var(--service);
+  }
+  #service.born { animation: none; }
+  #mcp {
+    left: calc(50% - 110px); top: 64%;
+    border-top: 3px solid var(--mcp);
+  }
+  #agentA { left: 2%; top: 28%; border-top: 3px solid var(--agentA); }
+  #agentB { right: 2%; top: 28%; border-top: 3px solid var(--agentB); }
+  #agentA .dot { background: var(--agentA); }
+  #mcp .dot { background: var(--mcp); }
+  #service .dot { background: var(--service); }
+  #agentB .dot { background: var(--agentB); }
+
+  .edge-label {
+    position: absolute; z-index: 4; pointer-events: none;
+    transform: translate(-50%, -50%);
+    max-width: 260px; text-align: left;
+    padding: 6px 9px; border-radius: 8px;
+    background: rgba(12,18,34,.92); border: 1px solid var(--border);
+    font-size: 10px; line-height: 1.3; color: var(--muted);
+    opacity: 0; transition: opacity .2s ease;
+    backdrop-filter: blur(6px);
+  }
+  .edge-label.visible { opacity: 1; }
+  .edge-label .route {
+    display: block; font-weight: 700; color: var(--text); letter-spacing: .2px;
+    margin-bottom: 2px; text-align: center;
+  }
+  .edge-label .msg { display: block; color: var(--accent); font-weight: 600; text-align: center; }
+  .edge-label .snippet {
+    display: block; margin-top: 5px; padding-top: 5px;
+    border-top: 1px solid rgba(255,255,255,.08);
+    color: #c5d0e6; font-weight: 500; font-size: 10px; line-height: 1.35;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 4.2em; overflow: hidden;
+  }
+  .edge-label.flash {
+    animation: labelFlash .9s ease;
+    border-color: rgba(91,140,255,.55);
+  }
+  .llm-proxy {
+    padding: 8px 10px; border-radius: 10px;
+    background: rgba(96,165,250,.08); border: 1px solid rgba(96,165,250,.35);
+  }
+  .llm-proxy.dim { opacity: .55; border-color: var(--border); background: rgba(0,0,0,.18); }
+  .llm-proxy.hot {
+    border-color: rgba(96,165,250,.7);
+    box-shadow: 0 0 0 1px rgba(96,165,250,.2);
+  }
+  .llm-proxy h3 {
+    margin: 0 0 6px; font-size: 11px; font-weight: 700; letter-spacing: .3px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .llm-proxy h3 .dot { background: #60a5fa; }
+  .llm-proxy .llm-meta {
+    font-size: 10px; color: var(--muted); margin-bottom: 0;
+    font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    max-width: 100%;
+  }
+  .llm-proxy.hot .llm-meta { margin-bottom: 6px; white-space: normal; }
+  .llm-bubble {
+    font-size: 10.5px; line-height: 1.35; padding: 6px 8px; border-radius: 8px;
+    margin-top: 5px; white-space: pre-wrap; word-break: break-word;
+    max-height: 3.6em; overflow: hidden;
+  }
+  .llm-bubble.out {
+    background: rgba(251,146,60,.12); border: 1px solid rgba(251,146,60,.35); color: #fdba74;
+  }
+  .llm-bubble.in {
+    background: rgba(61,214,198,.1); border: 1px solid rgba(61,214,198,.35); color: #99f6e4;
+  }
+  .llm-bubble .who {
+    display: block; font-size: 9px; font-weight: 700; letter-spacing: .3px;
+    text-transform: uppercase; opacity: .85; margin-bottom: 2px;
+  }
+  @keyframes labelFlash {
+    0% { box-shadow: 0 0 0 0 rgba(91,140,255,.0); }
+    40% { box-shadow: 0 0 0 4px rgba(91,140,255,.25); }
+    100% { box-shadow: 0 0 0 0 rgba(91,140,255,.0); }
+  }
+
+  .packet {
+    position: absolute; z-index: 5; pointer-events: none;
+    padding: 3px 8px; border-radius: 999px; font-size: 10px; font-weight: 700;
+    letter-spacing: .3px; color: #061018; white-space: nowrap;
+    box-shadow: 0 4px 16px rgba(0,0,0,.35);
+    animation: fly linear forwards;
+  }
+  @keyframes fly {
+    0% { opacity: 0; transform: translate(-50%,-50%) scale(.7); }
+    12% { opacity: 1; transform: translate(-50%,-50%) scale(1); }
+    88% { opacity: 1; }
+    100% { opacity: 0; transform: translate(-50%,-50%) scale(.85); }
+  }
+
+  .event-toast {
+    justify-self: center; align-self: center;
+    max-width: min(720px, 70%); padding: 4px 12px; border-radius: 8px;
+    background: rgba(12,18,34,.88); border: 1px solid var(--border);
+    color: var(--muted); font-size: 11px; line-height: 1.35;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    text-align: center; z-index: 2; pointer-events: none;
+  }
+  .event-toast:empty, .event-toast[hidden] {
+    visibility: hidden;
+  }
+  .event-toast strong { color: var(--text); }
+
+  aside.drawer {
+    position: fixed; top: 0; right: 0; width: min(420px, 100vw); height: 100vh;
+    background: var(--bg2); border-left: 1px solid var(--border);
+    transform: translateX(105%); transition: transform .28s ease; z-index: 40;
+    display: flex; flex-direction: column; box-shadow: -20px 0 60px rgba(0,0,0,.4);
+  }
+  aside.drawer.open { transform: translateX(0); }
+  .drawer header {
+    padding: 16px 18px; border-bottom: 1px solid var(--border);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .drawer header h3 { margin: 0; font-size: 15px; }
+  .drawer .body { padding: 14px 18px; overflow: auto; flex: 1; }
+  .drawer pre, .drawer .block {
+    background: rgba(0,0,0,.25); border: 1px solid var(--border); border-radius: 10px;
+    padding: 10px 12px; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+    color: #c9d4ea; font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .drawer .section { margin-bottom: 16px; }
+  .drawer .section h4 {
+    margin: 0 0 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .5px; color: var(--muted);
+  }
+  .icon-btn {
+    background: transparent; border: 1px solid var(--border); color: var(--text);
+    border-radius: 8px; width: 32px; height: 32px; cursor: pointer;
+  }
+  .icon-btn:hover { border-color: var(--accent); }
+
+  footer.transport {
+    padding: 6px 14px 8px; display: grid; gap: 6px;
+  }
+  .controls {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  }
+  .controls button, .controls select {
+    background: var(--panel); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  .controls button:hover { border-color: var(--accent); }
+  .controls button.primary {
+    background: linear-gradient(135deg, var(--accent), #7aa2ff); color: #061018;
+    border: none; font-weight: 700;
+  }
+  .controls .spacer { flex: 1; }
+  .timeline-wrap {
+    background: rgba(22,31,56,.7); border: 1px solid var(--border); border-radius: 10px;
+    padding: 6px 10px 6px;
+  }
+  .timeline-meta {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    align-items: center; gap: 10px;
+    color: var(--muted); font-size: 10px;
+    margin-bottom: 4px; font-variant-numeric: tabular-nums;
+    min-height: 24px;
+  }
+  .timeline-meta #tlStart { justify-self: start; }
+  .timeline-meta #tlEnd { justify-self: end; }
+  .timeline {
+    position: relative; height: 28px; user-select: none; cursor: pointer;
+  }
+  .timeline .track {
+    position: absolute; left: 0; right: 0; top: 12px; height: 3px;
+    background: #243152; border-radius: 999px; overflow: hidden;
+  }
+  .timeline .fill {
+    height: 100%; width: 0%; background: linear-gradient(90deg, var(--agentA), var(--accent));
+  }
+  .timeline .ticks { position: absolute; inset: 0; }
+  .timeline .tick {
+    position: absolute; top: 8px; width: 2px; height: 10px; background: rgba(255,255,255,.18);
+    transform: translateX(-1px);
+  }
+  .timeline .tick.stage {
+    top: 4px; height: 18px; width: 3px; background: rgba(91,140,255,.55); border-radius: 2px;
+  }
+  .timeline .tick.pass { background: var(--pass); }
+  .timeline .tick.fail { background: var(--fail); }
+  .timeline .tick.skip { background: var(--skip); }
+  .timeline .playhead {
+    position: absolute; top: 2px; width: 10px; height: 22px; margin-left: -5px;
+    border-radius: 5px; background: white; box-shadow: 0 0 0 2px rgba(91,140,255,.35);
+    pointer-events: none;
+  }
+  .stage-rail {
+    display: flex; gap: 3px; overflow-x: auto; padding: 4px 0 0;
+  }
+  .stage-pill {
+    flex: 0 0 auto; font-size: 10px; padding: 2px 7px; border-radius: 6px;
+    border: 1px solid var(--border); color: var(--muted); background: transparent; cursor: pointer;
+  }
+  .stage-pill.current { color: #061018; background: var(--accent); border-color: transparent; font-weight: 700; }
+  .stage-pill.pass { border-color: rgba(52,211,153,.4); }
+  .stage-pill.fail { border-color: rgba(248,113,113,.5); color: var(--fail); }
+  .stage-pill.skip { opacity: .55; }
+  .hint { color: var(--muted); font-size: 11px; }
+  .empty {
+    position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted);
+    text-align: center; padding: 24px; z-index: 2;
+  }
+  /* Author `display:grid` otherwise beats the UA [hidden] rule and the overlay sticks. */
+  .empty[hidden] { display: none !important; }
+  .empty code { color: var(--agentA); }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <header>
+    <div class="brand">
+      <div class="logo">AL</div>
+      <div>
+        <h1>MCP Lifecycle Visualization<span class="phase" id="titlePhase">waiting</span></h1>
+        <p id="runMeta">Loading run…</p>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge" id="modeBadge">REPLAY</span>
+      <span class="badge" id="frameworkBadge">—</span>
+      <span class="badge" id="tierBadge">—</span>
+    </div>
+  </header>
+
+  <section class="readout" aria-label="Playback position">
+    <div class="stat"><div class="k">Event</div><div class="v mono" id="statEvent">— / —</div></div>
+    <div class="stat"><div class="k">Stage</div><div class="v" id="statStage">—</div></div>
+    <div class="stat"><div class="k">Timestamp</div><div class="v mono" id="statTime">—</div></div>
+    <div class="stat"><div class="k">Elapsed</div><div class="v mono" id="statElapsed">+00:00</div></div>
+    <div class="stat"><div class="k">Total</div><div class="v mono" id="statTotal">00:00</div></div>
+  </section>
+</div>
+
+<main id="main">
+  <div class="empty" id="emptyState">
+    <div>
+      <div style="font-size:18px;font-weight:650;color:var(--text);margin-bottom:8px">Waiting for events</div>
+      Serve this run directory and open <code>visualization.html</code>:<br/>
+      <code style="display:inline-block;margin-top:10px">python3 -m http.server</code>
+    </div>
+  </div>
+  <svg id="stage" xmlns="http://www.w3.org/2000/svg"></svg>
+
+  <div class="card wide dim" id="agentA" data-sub="agentA">
+    <h2><span class="dot"></span>Agent A</h2>
+    <div class="sub">default profile · workspace</div>
+    <div class="activity" id="aActivity">waiting…</div>
+    <div class="metrics">
+      <div class="metric"><span>Records</span><span id="aRecords">0</span></div>
+      <div class="metric"><span>Sequence</span><span id="aSeq">—</span></div>
+      <div class="metric"><span>Synced</span><span id="aSynced">no</span></div>
+    </div>
+    <div class="chips" id="aChips"></div>
+    <div class="ws-tree" id="aWs"></div>
+  </div>
+
+  <div class="card" id="mcp" data-sub="mcp">
+    <h2><span class="dot"></span>MCP Server</h2>
+    <div class="sub">alf mcp serve · stdio + watch</div>
+    <div class="activity" id="mActivity">idle</div>
+    <div class="metrics">
+      <div class="metric"><span>Role</span><span id="mRole">idle</span></div>
+      <div class="metric"><span>Watch</span><span id="mWatch">off</span></div>
+      <div class="metric"><span>Last</span><span id="mLast">—</span></div>
+    </div>
+    <div class="chips" id="mChips"></div>
+  </div>
+
+  <div class="card service-card" id="service" data-sub="service">
+    <h2><span class="dot"></span>Agent Life Service</h2>
+    <div class="sub">API · S3 · Neon · LLM proxy · indexer</div>
+    <div class="activity" id="sActivity">idle</div>
+    <div class="service-body">
+      <div class="llm-proxy dim" id="svcLlm">
+        <h3><span class="dot"></span>LLM proxy</h3>
+        <div class="llm-meta" id="sLlmMeta">not wired</div>
+        <div id="sLlmPrompt" class="llm-bubble out" hidden></div>
+        <div id="sLlmReply" class="llm-bubble in" hidden></div>
+      </div>
+      <div class="agent-panels">
+        <div class="agent-panel a" id="svcPanelA">
+          <h3><span class="dot"></span>Agent A</h3>
+          <div class="panel-metrics">
+            <div class="metric"><span>Registered</span><span id="sAReg">no</span></div>
+            <div class="metric"><span>Sequence</span><span id="sASeq">—</span></div>
+            <div class="metric"><span>Snapshot / Δ</span><span id="sASnap">—</span></div>
+            <div class="metric"><span>Vault</span><span id="sAVault">0</span></div>
+          </div>
+        </div>
+        <div class="agent-panel b hidden" id="svcPanelB">
+          <h3><span class="dot"></span>Agent B</h3>
+          <div class="panel-metrics">
+            <div class="metric"><span>Registered</span><span id="sBReg">no</span></div>
+            <div class="metric"><span>Sequence</span><span id="sBSeq">—</span></div>
+            <div class="metric"><span>Snapshot / Δ</span><span id="sBSnap">—</span></div>
+            <div class="metric"><span>Vault</span><span id="sBVault">0</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div class="chips" id="sChips"></div>
+  </div>
+
+  <div class="card wide dim" id="agentB" data-sub="agentB">
+    <h2><span class="dot"></span>Agent B</h2>
+    <div class="sub">profiles/agent_b · isolated</div>
+    <div class="activity" id="bActivity">not created yet</div>
+    <div class="metrics">
+      <div class="metric"><span>Records</span><span id="bRecords">0</span></div>
+      <div class="metric"><span>Sequence</span><span id="bSeq">—</span></div>
+      <div class="metric"><span>Synced</span><span id="bSynced">no</span></div>
+      <div class="metric"><span>Isolation</span><span id="bIso">—</span></div>
+    </div>
+    <div class="chips" id="bChips"></div>
+    <div class="ws-tree" id="bWs"></div>
+  </div>
+
+  <div class="edge-label" id="label-a-m" data-edge="a-m"></div>
+  <div class="edge-label" id="label-b-m" data-edge="b-m"></div>
+  <div class="edge-label" id="label-m-s" data-edge="m-s"></div>
+  <div class="edge-label" id="label-a-s" data-edge="a-s"></div>
+</main>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <header>
+    <h3 id="drawerTitle">Details</h3>
+    <button class="icon-btn" id="drawerClose" title="Close">✕</button>
+  </header>
+  <div class="body" id="drawerBody"></div>
+</aside>
+
+<footer class="transport">
+  <div class="controls">
+    <button id="btnBack" title="Previous event (←)">⟵ Step</button>
+    <button class="primary" id="btnPlay" title="Play / Pause (Space)">▶ Play</button>
+    <button id="btnFwd" title="Next event (→)">Step ⟶</button>
+    <label class="hint">Speed
+      <select id="speed">
+        <option value="0.5">0.5×</option>
+        <option value="1" selected>1×</option>
+        <option value="2">2×</option>
+        <option value="4">4×</option>
+        <option value="8">8×</option>
+      </select>
+    </label>
+    <div class="spacer"></div>
+    <span class="hint">← → step · Space play/pause · click timeline or stage to jump</span>
+  </div>
+  <div class="timeline-wrap">
+    <div class="timeline-meta">
+      <span id="tlStart">00:00</span>
+      <div class="event-toast" id="toast" hidden></div>
+      <span id="tlEnd">00:00</span>
+    </div>
+    <div class="timeline" id="timeline" role="slider" aria-valuemin="0" aria-valuemax="0" aria-valuenow="0">
+      <div class="track"><div class="fill" id="tlFill"></div></div>
+      <div class="ticks" id="tlTicks"></div>
+      <div class="playhead" id="tlHead"></div>
+    </div>
+    <div class="stage-rail" id="stageRail"></div>
+  </div>
+</footer>
+
+<script>
+(() => {
+  const BAKED = window.__ALF_VIZ_DATA__ || null;
+
+  const NODE_LABEL = {
+    agentA: "Agent A", agentB: "Agent B", mcp: "MCP Server", service: "Service",
+  };
+
+  // Short “what this stage tests” copy for the title phase line.
+  const STAGE_BLURB = {
+    z01: "Z01 · Install probe + LLM wiring",
+    z02: "Z02 · Seed marked memories in the real store",
+    z03: "Z03 · alf check — mapping + lazy registration",
+    z04: "Z04 · First sync — register + snapshot + parity",
+    z05: "Z05 · Round-2 memories (append-shaped)",
+    z06: "Z06 · Vault add / decrypt / list (key-file)",
+    z07: "Z07 · Delta sync — round-2 + Layer-4 ciphertext",
+    z08: "Z08 · Create second agent via framework CLI",
+    z09: "Z09 · Discover + enable agent B",
+    z10: "Z10 · Agent B sync — isolation both ways",
+    z11: "Z11 · Vault B + cross-agent AEAD fail-closed",
+    z12: "Z12 · Restore agent B — others byte-identical",
+    z13: "Z13 · Idle re-sync / export determinism",
+    z14: "Z14 · Curated in-place memory delta shapes",
+    z15: "Z15 · MCP LLM gate — agent drives sync/vault",
+    z16: "Z16 · Watch loop auto-sync → backend deltas",
+    z17: "Z17 · Multi-agent watch — both loops + vault round-trip",
+  };
+
+  const WS_DEFAULT_A = [
+    { path: "config.yaml", kind: "file" },
+    { path: "SOUL.md", kind: "file" },
+    { path: "memories/MEMORY.md", kind: "file" },
+    { path: "memories/USER.md", kind: "file" },
+    { path: "state.db", kind: "db" },
+    { path: "skills/", kind: "dir" },
+  ];
+  const WS_DEFAULT_B = [
+    { path: "profiles/agent_b/", kind: "dir" },
+    { path: "profiles/agent_b/config.yaml", kind: "file" },
+    { path: "profiles/agent_b/memories/MEMORY.md", kind: "file" },
+    { path: "profiles/agent_b/state.db", kind: "db" },
+  ];
+
+  const state0 = () => ({
+    agentA: { born: false, records: 0, seq: null, synced: false, markers: [], vault: [],
+              activity: "waiting…", turns: [], last_turn: null,
+              workspace: WS_DEFAULT_A.map(x => ({ ...x })),
+              mutations: [], root: "~/.hermes" },
+    agentB: { born: false, records: 0, seq: null, synced: false, markers: [], vault: [],
+              isolation: "—", activity: "not created yet",
+              workspace: WS_DEFAULT_B.map(x => ({ ...x })),
+              mutations: [], root: "profiles/agent_b" },
+    mcp: { role: "idle", active: false, watch_sources: 0, last: "—", tools: [],
+           activity: "idle" },
+    service: {
+      registered: false, latest_sequence: null, deltas: 0, snapshot: false,
+      agent_id: null, activity: "idle", llm_proxy: false, agent_b_registered: false,
+      llm: { phase: null, turn: null, of: null, type: null, marker: null,
+             prompt: null, response: null },
+      agents: {
+        A: { registered: false, seq: null, snapshot: false, deltas: 0, id: null,
+             vault_keys: 0, vault_labels: [] },
+        B: { registered: false, seq: null, snapshot: false, deltas: 0, id: null,
+             visible: false, vault_keys: 0, vault_labels: [] },
+      },
+    },
+  });
+
+  const S = {
+    events: [],
+    report: null,
+    artifacts: {},
+    index: -1,          // last applied event index (-1 = before first)
+    playing: false,
+    live: false,
+    followLive: false,  // when true, new polled events snap the playhead to the tip
+    speed: 1,
+    timer: null,
+    poll: null,
+    runStartMs: null,
+    runEndMs: null,
+    subsystems: state0(),
+    stageStatus: {},
+    currentStage: "",
+    stageTitles: {},    // stage_id → title from events/report
+    edgeLabels: {},     // edgeId → { route, msg, snippet } currently shown
+    llmClearTimer: null,
+  };
+
+  const LLM_CONTENT_MS = 10000; // drop bulky LLM text so the schematic stays readable
+
+  const $ = (id) => document.getElementById(id);
+  const els = {
+    runMeta: $("runMeta"), titlePhase: $("titlePhase"),
+    modeBadge: $("modeBadge"), frameworkBadge: $("frameworkBadge"),
+    tierBadge: $("tierBadge"), empty: $("emptyState"), toast: $("toast"),
+    stage: $("stage"), main: $("main"),
+    statEvent: $("statEvent"), statStage: $("statStage"), statTime: $("statTime"),
+    statElapsed: $("statElapsed"), statTotal: $("statTotal"),
+    btnPlay: $("btnPlay"), btnBack: $("btnBack"), btnFwd: $("btnFwd"), speed: $("speed"),
+    timeline: $("timeline"), tlFill: $("tlFill"), tlTicks: $("tlTicks"), tlHead: $("tlHead"),
+    tlStart: $("tlStart"), tlEnd: $("tlEnd"), stageRail: $("stageRail"),
+    drawer: $("drawer"), drawerTitle: $("drawerTitle"), drawerBody: $("drawerBody"),
+  };
+
+  function parseTs(t) {
+    if (!t) return null;
+    const d = Date.parse(t);
+    return Number.isFinite(d) ? d : null;
+  }
+  function fmtClock(ms) {
+    if (ms == null || !Number.isFinite(ms)) return "—";
+    return new Date(ms).toISOString().replace("T", " ").replace("Z", "Z").slice(0, 23) + "Z";
+  }
+  function fmtDur(ms) {
+    if (ms == null || !Number.isFinite(ms) || ms < 0) return "00:00";
+    const s = Math.floor(ms / 1000);
+    const m = Math.floor(s / 60);
+    const h = Math.floor(m / 60);
+    const ss = String(s % 60).padStart(2, "0");
+    const mm = String(m % 60).padStart(2, "0");
+    return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+  }
+  function fmtElapsed(ms) {
+    return "+" + fmtDur(ms);
+  }
+
+  function cardCenter(id) {
+    const el = $(id);
+    const main = els.main.getBoundingClientRect();
+    const r = el.getBoundingClientRect();
+    return { x: r.left - main.left + r.width / 2, y: r.top - main.top + r.height / 2 };
+  }
+
+  function edgeIdFor(fromId, toId) {
+    const pair = [fromId, toId].sort().join("|");
+    if (pair === "agentA|mcp") return "a-m";
+    if (pair === "agentB|mcp") return "b-m";
+    if (pair === "mcp|service") return "m-s";
+    if (pair === "agentA|service") return "a-s";
+    return null;
+  }
+
+  function edgeMidpoint(fromId, toId) {
+    const a = cardCenter(fromId), b = cardCenter(toId);
+    // Match the quadratic control point used in drawEdges (bow toward center).
+    const midX = (a.x + b.x) / 2;
+    const midY = (a.y + b.y) / 2;
+    // Pull label slightly off the chord so it sits on the curve.
+    const dx = b.x - a.x, dy = b.y - a.y;
+    const len = Math.hypot(dx, dy) || 1;
+    const nx = -dy / len, ny = dx / len;
+    // Prefer labels toward the visual center of the canvas.
+    const cx = els.main.clientWidth / 2, cy = els.main.clientHeight / 2;
+    const toward = ((cx - midX) * nx + (cy - midY) * ny) >= 0 ? 1 : -1;
+    return { x: midX + nx * 18 * toward, y: midY + ny * 18 * toward };
+  }
+
+  function clipText(s, n) {
+    if (!s) return "";
+    const t = String(s).replace(/\s+/g, " ").trim();
+    return t.length <= n ? t : t.slice(0, n - 1) + "…";
+  }
+
+  function cancelLlmContentClear() {
+    if (S.llmClearTimer) {
+      clearTimeout(S.llmClearTimer);
+      S.llmClearTimer = null;
+    }
+  }
+
+  function clearLlmAnnotationContent() {
+    cancelLlmContentClear();
+    // Strip conversation blobs from edges; drop whole label if it was an LLM hop.
+    for (const [edgeId, data] of Object.entries({ ...S.edgeLabels })) {
+      const isLlm = !!(data.snippet) || /^LLM\b/i.test(data.msg || "");
+      if (!isLlm) continue;
+      delete S.edgeLabels[edgeId];
+      const el = document.getElementById("label-" + edgeId);
+      if (el) {
+        el.classList.remove("visible", "flash");
+        el.innerHTML = "";
+      }
+    }
+    const llm = S.subsystems.service.llm;
+    if (llm && (llm.prompt || llm.response)) {
+      llm.prompt = null;
+      llm.response = null;
+      // Keep meta (wired / last turn type) — only the bulky bubbles go away.
+      renderLlmProxyPanel();
+    }
+  }
+
+  function scheduleLlmContentClear() {
+    cancelLlmContentClear();
+    S.llmClearTimer = setTimeout(clearLlmAnnotationContent, LLM_CONTENT_MS);
+  }
+
+  function setEdgeLabel(edgeId, route, msg, flash, snippet) {
+    const el = document.getElementById("label-" + edgeId);
+    if (!el) return;
+    S.edgeLabels[edgeId] = { route, msg, snippet: snippet || "" };
+    let html = `<span class="route">${escapeHtml(route)}</span><span class="msg">${escapeHtml(msg)}</span>`;
+    if (snippet) html += `<span class="snippet">${escapeHtml(snippet)}</span>`;
+    el.innerHTML = html;
+    el.classList.add("visible");
+    if (flash) {
+      el.classList.remove("flash");
+      void el.offsetWidth;
+      el.classList.add("flash");
+    }
+    if (snippet || /^LLM\b/i.test(msg || "")) scheduleLlmContentClear();
+  }
+
+  function clearEdgeLabels() {
+    cancelLlmContentClear();
+    S.edgeLabels = {};
+    document.querySelectorAll(".edge-label").forEach(el => {
+      el.classList.remove("visible", "flash");
+      el.innerHTML = "";
+    });
+  }
+
+  function positionEdgeLabels() {
+    for (const [edgeId, data] of Object.entries(S.edgeLabels)) {
+      const el = document.getElementById("label-" + edgeId);
+      if (!el || !data) continue;
+      const ends = {
+        "a-m": ["agentA", "mcp"],
+        "b-m": ["agentB", "mcp"],
+        "m-s": ["mcp", "service"],
+        "a-s": ["agentA", "service"],
+      }[edgeId];
+      if (!ends) continue;
+      const mid = edgeMidpoint(ends[0], ends[1]);
+      // Nudge LLM labels slightly toward open space so the taller bubble fits.
+      const dy = edgeId === "a-s" ? -18 : 0;
+      el.style.left = mid.x + "px";
+      el.style.top = (mid.y + dy) + "px";
+    }
+  }
+
+  function annotateHop(fromId, toId, msg, flash, snippet) {
+    const edgeId = edgeIdFor(fromId, toId);
+    if (!edgeId) return;
+    const isLlm = !!(snippet) || /^LLM\b/i.test(msg || "");
+    // Non-LLM hops shouldn't leave a stale LLM blob on a-s forever.
+    if (!isLlm) {
+      for (const [id, data] of Object.entries({ ...S.edgeLabels })) {
+        if (data.snippet || /^LLM\b/i.test(data.msg || "")) {
+          delete S.edgeLabels[id];
+          const el = document.getElementById("label-" + id);
+          if (el) {
+            el.classList.remove("visible", "flash");
+            el.innerHTML = "";
+          }
+        }
+      }
+      const llm = S.subsystems.service.llm;
+      if (llm && (llm.prompt || llm.response)) {
+        cancelLlmContentClear();
+        llm.prompt = null;
+        llm.response = null;
+        renderLlmProxyPanel();
+      }
+    }
+    const src = NODE_LABEL[fromId] || fromId;
+    const dst = NODE_LABEL[toId] || toId;
+    setEdgeLabel(edgeId, `${src} → ${dst}`, msg, flash, snippet);
+    positionEdgeLabels();
+  }
+
+  function stageBlurb(stageId) {
+    if (!stageId) return "waiting";
+    const sid = String(stageId).toLowerCase();
+    if (STAGE_BLURB[sid]) return STAGE_BLURB[sid];
+    const title = S.stageTitles[sid]
+      || (S.report?.stages || []).find(s => s.stage_id === sid)?.title
+      || sid;
+    return `${sid.toUpperCase()} · ${title}`;
+  }
+
+  function updateTitlePhase(stageId) {
+    if (!els.titlePhase) return;
+    els.titlePhase.textContent = stageBlurb(stageId);
+  }
+
+  function drawEdges() {
+    const svg = els.stage;
+    const w = els.main.clientWidth, h = els.main.clientHeight;
+    svg.setAttribute("viewBox", `0 0 ${w} ${h}`);
+    const a = cardCenter("agentA"), m = cardCenter("mcp"),
+          s = cardCenter("service"), b = cardCenter("agentB");
+    // Curves bow toward the open space so labels stay readable.
+    // a-s is the direct Agent A ↔ Service (LLM proxy) path used in Z02.
+    const paths = [
+      ["a-m", a, m, "#3dd6c6", 0, -40],
+      ["b-m", b, m, "#c084fc", 0, -40],
+      ["m-s", m, s, "#fbbf24", 0, 0],
+      ["a-s", a, s, "#60a5fa", 40, -20],
+    ];
+    svg.innerHTML = paths.map(([id, p1, p2, color, cdx, cdy]) => {
+      const midX = (p1.x + p2.x) / 2 + cdx;
+      const midY = (p1.y + p2.y) / 2 + cdy;
+      return `<path id="edge-${id}" d="M ${p1.x} ${p1.y} Q ${midX} ${midY} ${p2.x} ${p2.y}"
+        fill="none" stroke="${color}" stroke-width="2" stroke-opacity="0.4"
+        stroke-dasharray="6 6"/>`;
+    }).join("");
+    positionEdgeLabels();
+  }
+
+  function spawnPacket(fromId, toId, label, color, durationMs, snippet) {
+    annotateHop(fromId, toId, label, true, snippet);
+    const a = cardCenter(fromId), b = cardCenter(toId);
+    const el = document.createElement("div");
+    el.className = "packet";
+    el.textContent = label;
+    el.style.background = color;
+    el.style.left = a.x + "px";
+    el.style.top = a.y + "px";
+    const dx = b.x - a.x, dy = b.y - a.y;
+    el.animate([
+      { transform: "translate(-50%,-50%)", offset: 0 },
+      { transform: `translate(calc(-50% + ${dx * 0.5}px), calc(-50% + ${dy * 0.5 - 20}px))`, offset: 0.5 },
+      { transform: `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`, offset: 1 },
+    ], { duration: durationMs, easing: "ease-in-out", fill: "forwards" });
+    els.main.appendChild(el);
+    setTimeout(() => el.remove(), durationMs + 40);
+  }
+
+  function llmSnippetFrom(ev) {
+    const patch = ev.patch || {};
+    const llm = patch.llm || {};
+    const lt = patch.last_turn || {};
+    const data = ev.data || {};
+    if (llm.prompt || llm.response) {
+      if (llm.phase === "response" || llm.response) return clipText(llm.response || llm.prompt, 140);
+      return clipText(llm.prompt, 140);
+    }
+    if (lt.prompt || lt.response) {
+      if (lt.phase === "response" || lt.response) return clipText(lt.response || lt.prompt, 140);
+      return clipText(lt.prompt, 140);
+    }
+    if (data.prompt) return clipText(data.prompt, 140);
+    if (data.response) return clipText(data.response, 140);
+    return "";
+  }
+
+  function llmLabelFrom(ev, fallback) {
+    const patch = ev.patch || {};
+    const llm = patch.llm || {};
+    const lt = patch.last_turn || {};
+    const data = ev.data || {};
+    const typ = llm.type || lt.type || data.type || "";
+    const n = llm.turn || lt.n || data.turn;
+    const of = llm.of || lt.of || data.of;
+    const marker = llm.marker || lt.marker || data.marker || "";
+    const phase = llm.phase || lt.phase || (data.response ? "response" : (data.prompt ? "prompt" : ""));
+    const head = phase === "response" ? "LLM reply" : "LLM prompt";
+    const bits = [head];
+    if (typ) bits.push(typ);
+    if (n != null && of != null) bits.push(`${n}/${of}`);
+    else if (n != null) bits.push(`#${n}`);
+    if (marker) bits.push(marker);
+    return bits.length > 1 ? bits.join(" · ") : (fallback || head);
+  }
+
+  function packetFor(ev) {
+    const patch = ev.patch || {};
+    const kind = patch.packet || "";
+    const snip = llmSnippetFrom(ev);
+    const watchHop = (fromId) => ({
+      from: fromId, to: "mcp", label: "watch Δ", color: "var(--packet-watch)",
+      next: { from: "mcp", to: "service", label: "auto sync", color: "var(--packet-delta)" },
+    });
+    const map = {
+      snapshot: { from: "mcp", to: "service", label: "PUT snapshot", color: "var(--packet-snapshot)" },
+      delta: { from: "mcp", to: "service", label: "PUT delta", color: "var(--packet-delta)" },
+      "tool-call": { from: "agentA", to: "mcp", label: "mcp_alf_*", color: "var(--packet-tool)", next: { from: "mcp", to: "service", label: "sync", color: "var(--packet-snapshot)" } },
+      "mcp-sync": { from: "mcp", to: "service", label: "MCP sync", color: "var(--packet-tool)" },
+      register: { from: "mcp", to: "service", label: "POST /agents", color: "var(--packet-register)" },
+      "llm-prompt": {
+        from: "agentA", to: "service",
+        label: llmLabelFrom(ev, "LLM prompt"),
+        color: "var(--packet-tool)",
+        snippet: snip,
+      },
+      "llm-response": {
+        from: "service", to: "agentA",
+        label: llmLabelFrom(ev, "LLM reply"),
+        color: "var(--packet-watch)",
+        snippet: snip,
+      },
+    };
+    if (kind === "watch-delta") {
+      if (ev.subsystem === "agentB") return watchHop("agentB");
+      if (ev.subsystem === "agentA") return watchHop("agentA");
+      // mcp/service summaries: only the uplink, don't invent an Agent A source
+      return { from: "mcp", to: "service", label: "auto sync", color: "var(--packet-delta)" };
+    }
+    if (kind && map[kind]) return map[kind];
+    if (ev.kind === "flow") {
+      const a = (ev.arrows || "").toLowerCase();
+      if (a.includes("2×") || a.includes("both") || (a.includes("a,b") && a.includes("watch"))) {
+        // Multi-agent watch intro — no single hop
+        return null;
+      }
+      if (a.includes("watch")) return watchHop("agentA");
+      if (a.includes("mcp_alf") || a.includes("mcp serve")) return map["tool-call"];
+      if (a.includes("llm proxy") || a.includes("prompts")) return map["llm-prompt"];
+      if (a.includes("snapshot") || a.includes("post /v1/agents")) return map.snapshot;
+      if (a.includes("delta")) return map.delta;
+      if (a.includes("alf sync")) return { from: "agentA", to: "mcp", label: "alf sync", color: "var(--packet-delta)", next: { from: "mcp", to: "service", label: "upload", color: "var(--packet-snapshot)" } };
+    }
+    if (ev.kind === "data" && /llm prompt/i.test(ev.label || "")) {
+      return {
+        from: "agentA", to: "service",
+        label: llmLabelFrom(ev, "LLM prompt"),
+        color: "var(--packet-tool)",
+        snippet: snip,
+      };
+    }
+    if (ev.kind === "data" && /llm response/i.test(ev.label || "")) {
+      return {
+        from: "service", to: "agentA",
+        label: llmLabelFrom(ev, "LLM reply"),
+        color: "var(--packet-watch)",
+        snippet: snip,
+      };
+    }
+    if (ev.kind === "state" && ev.subsystem === "agentB" && patch.born) {
+      return null;
+    }
+    if (ev.kind === "state" && ev.subsystem === "service" && patch.registered) {
+      return map.register;
+    }
+    return null;
+  }
+
+  function mergePatch(target, patch) {
+    for (const [k, v] of Object.entries(patch || {})) {
+      if (v && typeof v === "object" && !Array.isArray(v) && typeof target[k] === "object" && target[k]) {
+        mergePatch(target[k], v);
+      } else {
+        target[k] = v;
+      }
+    }
+  }
+
+  function recompute(uptoInclusive) {
+    S.subsystems = state0();
+    S.stageStatus = {};
+    S.currentStage = "";
+    clearEdgeLabels();
+    for (let i = 0; i <= uptoInclusive; i++) {
+      applyEvent(S.events[i], false);
+    }
+    // After a seek/rewind, show the most recent hop(s) on the connectors
+    // without replaying every packet animation.
+    let lastPkt = null;
+    for (let i = uptoInclusive; i >= 0; i--) {
+      const pkt = packetFor(S.events[i]);
+      if (pkt) {
+        lastPkt = pkt;
+        annotateHop(pkt.from, pkt.to, pkt.label, false, pkt.snippet);
+        if (pkt.next) annotateHop(pkt.next.from, pkt.next.to, pkt.next.label, false, pkt.next.snippet);
+        break;
+      }
+    }
+    // Don't leave Z02 conversation text stuck on the Service card after later stages.
+    const onLlm = !!(lastPkt && (lastPkt.snippet || /^LLM\b/i.test(lastPkt.label || "")));
+    if (!onLlm) {
+      cancelLlmContentClear();
+      const llm = S.subsystems.service.llm;
+      if (llm) { llm.prompt = null; llm.response = null; }
+    }
+    renderSubsystems(false);
+    updateTitlePhase(S.currentStage);
+    if (onLlm) scheduleLlmContentClear();
+  }
+
+  function applyEvent(ev, animate) {
+    if (!ev) return;
+    if (ev.stage_id) S.currentStage = ev.stage_id;
+    if (ev.kind === "stage_start") {
+      if (ev.stage_id && ev.title) S.stageTitles[ev.stage_id] = ev.title;
+      updateTitlePhase(ev.stage_id || S.currentStage);
+    }
+    if (ev.kind === "stage_end") {
+      S.stageStatus[ev.stage_id || S.currentStage] = ev.status || "PASS";
+    }
+    if (ev.kind === "state" && ev.subsystem) {
+      const sub = S.subsystems[ev.subsystem];
+      if (sub) mergePatch(sub, ev.patch || {});
+      // Keep Service per-agent panels in sync with top-level registration fields.
+      if (ev.subsystem === "service") {
+        const p = ev.patch || {};
+        const agents = S.subsystems.service.agents || (S.subsystems.service.agents = { A: {}, B: {} });
+        if (!agents.A) agents.A = {};
+        if (!agents.B) agents.B = {};
+        if (p.registered != null) agents.A.registered = p.registered;
+        if (p.agent_id) agents.A.id = p.agent_id;
+        if (p.latest_sequence != null) agents.A.seq = p.latest_sequence;
+        if (p.snapshot != null) agents.A.snapshot = p.snapshot;
+        if (p.deltas != null) agents.A.deltas = p.deltas;
+        if (p.agent_b_registered) {
+          agents.B.visible = true;
+          agents.B.registered = true;
+          if (p.packet === "snapshot") agents.B.snapshot = true;
+        }
+        if (p.agents) {
+          const prevVault = {
+            A: { labels: [...((agents.A && agents.A.vault_labels) || [])],
+                 keys: (agents.A && agents.A.vault_keys) || 0 },
+            B: { labels: [...((agents.B && agents.B.vault_labels) || [])],
+                 keys: (agents.B && agents.B.vault_keys) || 0 },
+          };
+          mergePatch(agents, p.agents);
+          // Keep Agent A/B cards' Sequence in sync when only the Service
+          // panel was patched (final Z17 summary, older event streams).
+          if (p.agents.A && p.agents.A.seq != null) S.subsystems.agentA.seq = p.agents.A.seq;
+          if (p.agents.B && p.agents.B.seq != null) S.subsystems.agentB.seq = p.agents.B.seq;
+          for (const k of ["A", "B"]) {
+            const ap = p.agents[k];
+            if (!ap || !agents[k]) continue;
+            const labels = [...new Set([
+              ...prevVault[k].labels,
+              ...(Array.isArray(ap.vault_labels) ? ap.vault_labels : []),
+              ...(Array.isArray(agents[k].vault_labels) ? agents[k].vault_labels : []),
+            ])];
+            if (labels.length) agents[k].vault_labels = labels;
+            agents[k].vault_keys = Math.max(
+              prevVault[k].keys,
+              ap.vault_keys != null ? ap.vault_keys : 0,
+              labels.length);
+          }
+        }
+      }
+      // Mirror Agent A turn text into the Service LLM proxy panel when the
+      // service patch didn't carry an explicit llm blob (older / backfilled runs).
+      if (ev.subsystem === "agentA" || ev.subsystem === "agentB") {
+        const p = ev.patch || {};
+        if (Array.isArray(p.vault) && p.vault.length) {
+          const key = ev.subsystem === "agentB" ? "B" : "A";
+          const agents = S.subsystems.service.agents || (S.subsystems.service.agents = { A: {}, B: {} });
+          if (!agents[key]) agents[key] = {};
+          const labels = [...new Set([...(agents[key].vault_labels || []), ...p.vault])];
+          agents[key].vault_labels = labels;
+          agents[key].vault_keys = Math.max(agents[key].vault_keys || 0, labels.length);
+          if (key === "B") agents[key].visible = true;
+        }
+      }
+      if (ev.subsystem === "agentA") {
+        const lt = (ev.patch || {}).last_turn;
+        if (lt && (lt.prompt || lt.response)) {
+          const svc = S.subsystems.service;
+          svc.llm_proxy = true;
+          mergePatch(svc.llm || (svc.llm = {}), {
+            phase: lt.phase || (lt.response ? "response" : "prompt"),
+            turn: lt.n, of: lt.of, type: lt.type, marker: lt.marker,
+            prompt: lt.prompt || null,
+            response: lt.response || null,
+          });
+        }
+      }
+      if (animate) {
+        const pkt = packetFor(ev);
+        if (pkt) {
+          const dur = 900 / S.speed;
+          spawnPacket(pkt.from, pkt.to, pkt.label, pkt.color, dur, pkt.snippet);
+          if (pkt.next) setTimeout(() => spawnPacket(pkt.next.from, pkt.next.to, pkt.next.label, pkt.next.color, dur, pkt.next.snippet), dur * 0.55);
+        }
+      }
+    }
+    if (ev.kind === "data" && /llm/i.test(ev.label || "")) {
+      const d = ev.data || {};
+      const svc = S.subsystems.service;
+      svc.llm_proxy = true;
+      mergePatch(svc.llm || (svc.llm = {}), {
+        phase: d.response ? "response" : "prompt",
+        turn: d.turn, of: d.of, type: d.type, marker: d.marker,
+        prompt: d.prompt || (svc.llm && svc.llm.prompt) || null,
+        response: d.response || null,
+      });
+      if (animate) {
+        const pkt = packetFor(ev);
+        if (pkt) {
+          const dur = 900 / S.speed;
+          spawnPacket(pkt.from, pkt.to, pkt.label, pkt.color, dur, pkt.snippet);
+        }
+      }
+    }
+    if (ev.kind === "flow" && animate) {
+      const pkt = packetFor(ev);
+      if (pkt) {
+        const dur = 900 / S.speed;
+        spawnPacket(pkt.from, pkt.to, pkt.label, pkt.color, dur, pkt.snippet);
+        if (pkt.next) setTimeout(() => spawnPacket(pkt.next.from, pkt.next.to, pkt.next.label, pkt.next.color, dur, pkt.next.snippet), dur * 0.55);
+      }
+    }
+    if (ev.kind === "run_start") {
+      els.frameworkBadge.textContent = ev.framework || "—";
+      els.tierBadge.textContent = ev.tier || "—";
+      els.runMeta.textContent = `${ev.framework || "run"} · ${ev.alf_version || ""} · ${ev.tier || ""}`;
+    }
+  }
+
+  function matchMutation(path, muts) {
+    if (muts.has(path)) return muts.get(path);
+    // Prefix / suffix soft-match so "state/<id>/.alf-vault-key" still lights a row.
+    for (const [mp, m] of muts) {
+      if (path.endsWith(mp) || mp.endsWith(path) || path.includes(mp) || mp.includes(path)) return m;
+    }
+    return null;
+  }
+
+  function renderWorkspace(elId, agent, flashMuts) {
+    const el = $(elId);
+    if (!el) return;
+    const root = agent.root || "workspace";
+    const files = [...(agent.workspace || [])];
+    const mutList = agent.mutations || [];
+    const muts = new Map(mutList.map(m => [m.path, m]));
+    const seen = new Set(files.map(f => f.path));
+    for (const m of mutList) {
+      if (m.path && !seen.has(m.path) && ![...seen].some(p => matchMutation(p, new Map([[m.path, m]])))) {
+        const kind = String(m.path).endsWith(".db") ? "db" : (String(m.path).endsWith("/") ? "dir" : "file");
+        files.push({ path: m.path, kind });
+        seen.add(m.path);
+      }
+    }
+    // Only pulse when this step actually changed the mutation set — sticky
+    // SEED/WATCH annotations must not re-animate on every later hop.
+    const sig = JSON.stringify(mutList.map(m => [m.path, m.op, m.note]));
+    const changed = sig !== (agent._mutSig || "");
+    agent._mutSig = sig;
+    const pulse = !!(flashMuts && changed && mutList.length);
+    const rows = files.map(f => {
+      const mut = matchMutation(f.path, muts);
+      const glyph = f.kind === "dir" ? "📁" : (f.kind === "db" ? "🗄" : "📄");
+      let cls = "ws-row";
+      if (mut) cls += pulse ? " hot" : " mutated";
+      const tag = mut ? `<span class="mut">${escapeHtml(mut.op || "write")}</span>` : "";
+      return `<div class="${cls}" title="${escapeHtml(mut?.note || f.path)}">` +
+             `<span class="glyph">${glyph}</span>` +
+             `<span class="path">${escapeHtml(f.path)}</span>${tag}</div>`;
+    }).join("");
+    el.innerHTML = `<div class="ws-title">${escapeHtml(root)}</div>${rows ||
+      `<div class="ws-row"><span class="path">(empty)</span></div>`}`;
+    if (pulse) {
+      el.querySelectorAll(".ws-row.hot").forEach(row => {
+        const onEnd = () => {
+          row.classList.remove("hot");
+          row.classList.add("mutated");
+          row.removeEventListener("animationend", onEnd);
+        };
+        row.addEventListener("animationend", onEnd);
+      });
+    }
+  }
+
+  function renderSubsystems(flashMetrics) {
+    const doFlash = !!flashMetrics;
+    const A = S.subsystems.agentA, B = S.subsystems.agentB, M = S.subsystems.mcp, Sv = S.subsystems.service;
+    const aCard = $("agentA"), bCard = $("agentB");
+    aCard.classList.toggle("dim", !A.born);
+    aCard.classList.toggle("born", !!A.born);
+    bCard.classList.toggle("dim", !B.born);
+    bCard.classList.toggle("born", !!B.born);
+    $("aActivity").textContent = A.activity || (A.born ? "ready" : "waiting…");
+    $("aRecords").textContent = A.records ?? 0;
+    $("aSeq").textContent = A.seq == null ? "—" : A.seq;
+    $("aSynced").textContent = A.synced ? "yes" : "no";
+    $("aChips").innerHTML = (A.markers || []).slice(0, 4).map(m => `<span class="chip">${m}</span>`).join("");
+    renderWorkspace("aWs", A, doFlash);
+    $("bActivity").textContent = B.activity || (B.born ? "ready" : "not created yet");
+    $("bRecords").textContent = B.records ?? 0;
+    $("bSeq").textContent = B.seq == null ? "—" : B.seq;
+    $("bSynced").textContent = B.synced ? "yes" : "no";
+    $("bIso").textContent = B.isolation || "—";
+    $("bChips").innerHTML = (B.markers || []).slice(0, 4).map(m => `<span class="chip">${m}</span>`).join("");
+    renderWorkspace("bWs", B, doFlash);
+    $("mActivity").textContent = M.activity || M.role || "idle";
+    $("mRole").textContent = M.role || "idle";
+    $("mWatch").textContent = M.active ? `on (${M.watch_sources || 0})` : "off";
+    $("mLast").textContent = M.last || "—";
+    $("mChips").innerHTML = (M.tools || []).slice(0, 3).map(t => `<span class="chip">${t}</span>`).join("");
+
+    // Service per-agent panels
+    const aP = (Sv.agents && Sv.agents.A) || {};
+    const bP = (Sv.agents && Sv.agents.B) || {};
+    $("sActivity").textContent = Sv.activity || (Sv.llm_proxy ? "LLM proxy ready" : "idle");
+    setMetric("sAReg", (aP.registered || Sv.registered) ? "yes" : "no", doFlash);
+    setMetric("sASeq", (aP.seq != null ? aP.seq : Sv.latest_sequence) ?? "—", doFlash);
+    const aSnap = aP.snapshot || Sv.snapshot;
+    const aDeltas = aP.deltas != null ? aP.deltas : (Sv.deltas ?? 0);
+    setMetric("sASnap", aSnap ? `snap + ${aDeltas}Δ` : (aDeltas ? `${aDeltas}Δ` : "—"), doFlash);
+    setMetric("sAVault", fmtVaultKeys(aP.vault_keys), doFlash);
+    const showB = !!(bP.visible || Sv.agent_b_registered || B.born);
+    $("svcPanelB").classList.toggle("hidden", !showB);
+    setMetric("sBReg", (bP.registered || Sv.agent_b_registered) ? "yes" : "no", doFlash);
+    setMetric("sBSeq", bP.seq != null ? bP.seq : "—", doFlash);
+    setMetric("sBSnap", bP.snapshot ? `snap + ${bP.deltas || 0}Δ` : (bP.deltas ? `${bP.deltas}Δ` : "—"), doFlash);
+    setMetric("sBVault", fmtVaultKeys(bP.vault_keys), doFlash);
+
+    // LLM proxy panel — conversation content lives here, not only on the edge.
+    renderLlmProxyPanel();
+
+    const schips = [];
+    if (aP.id || Sv.agent_id) schips.push(`A ${(aP.id || Sv.agent_id || "").toString().slice(0, 8)}…`);
+    if (showB && bP.id) schips.push(`B ${String(bP.id).slice(0, 8)}…`);
+    $("sChips").innerHTML = schips.map(t => `<span class="chip">${t}</span>`).join("");
+    renderStageRail();
+    // Service card width follows content — redraw connectors after layout settles.
+    requestAnimationFrame(() => drawEdges());
+  }
+
+  function clearMetricFlashes() {
+    document.querySelectorAll(".agent-panel .metric.flash").forEach(row => {
+      row.classList.remove("flash");
+    });
+  }
+
+  function fmtVaultKeys(n) {
+    const c = n == null ? 0 : Number(n) || 0;
+    if (c <= 0) return "0";
+    return c === 1 ? "1 key" : `${c} keys`;
+  }
+
+  function setMetric(id, next, doFlash) {
+    const el = $(id);
+    if (!el) return;
+    const text = next == null ? "—" : String(next);
+    const prev = el.textContent;
+    if (prev === text) return;
+    el.textContent = text;
+    const row = el.closest(".metric");
+    if (!row || !doFlash) {
+      if (row) row.classList.remove("flash");
+      return;
+    }
+    row.classList.remove("flash");
+    void row.offsetWidth;
+    row.classList.add("flash");
+    const onEnd = (ev) => {
+      if (ev.target !== row) return;
+      row.classList.remove("flash");
+      row.removeEventListener("animationend", onEnd);
+    };
+    row.addEventListener("animationend", onEnd);
+  }
+
+  function renderLlmProxyPanel() {
+    const Sv = S.subsystems.service;
+    const llmBox = $("svcLlm");
+    const llm = Sv.llm || {};
+    const hasLlm = !!(Sv.llm_proxy || llm.prompt || llm.response || llm.phase || llm.type);
+    llmBox.classList.toggle("dim", !hasLlm);
+    llmBox.classList.toggle("hot", !!(llm.prompt || llm.response));
+    const metaBits = [];
+    if (!hasLlm) metaBits.push("not wired");
+    else {
+      if (llm.type) metaBits.push(llm.type);
+      if (llm.turn != null) metaBits.push(`turn ${llm.turn}${llm.of != null ? "/" + llm.of : ""}`);
+      if (llm.marker) metaBits.push(llm.marker);
+      if (llm.prompt || llm.response) metaBits.push(llm.phase || "live");
+      else if (Sv.llm_proxy) metaBits.push("ready");
+      if (!metaBits.length) metaBits.push("ready");
+    }
+    $("sLlmMeta").textContent = metaBits.join(" · ");
+    const promptEl = $("sLlmPrompt");
+    const replyEl = $("sLlmReply");
+    if (llm.prompt) {
+      promptEl.hidden = false;
+      promptEl.innerHTML = `<span class="who">prompt → proxy</span>${escapeHtml(clipText(llm.prompt, 220))}`;
+    } else {
+      promptEl.hidden = true;
+      promptEl.innerHTML = "";
+    }
+    if (llm.response) {
+      replyEl.hidden = false;
+      replyEl.innerHTML = `<span class="who">reply ← proxy</span>${escapeHtml(clipText(llm.response, 220))}`;
+    } else {
+      replyEl.hidden = true;
+      replyEl.innerHTML = "";
+    }
+    if (llm.prompt || llm.response) scheduleLlmContentClear();
+  }
+
+  function renderStageRail() {
+    const stages = [];
+    const seen = new Set();
+    for (const ev of S.events) {
+      if (ev.kind === "stage_start" && ev.stage_id && !seen.has(ev.stage_id)) {
+        seen.add(ev.stage_id);
+        stages.push({ id: ev.stage_id, title: ev.title || ev.stage_id });
+      }
+    }
+    if (!stages.length && S.report?.stages) {
+      for (const s of S.report.stages) stages.push({ id: s.stage_id, title: s.title });
+    }
+    els.stageRail.innerHTML = stages.map(s => {
+      const st = (S.stageStatus[s.id] || (S.report?.stages || []).find(x => x.stage_id === s.id)?.status || "").toLowerCase();
+      const cur = S.currentStage === s.id ? " current" : "";
+      return `<button class="stage-pill ${st}${cur}" data-stage="${s.id}">${s.id.toUpperCase()}</button>`;
+    }).join("");
+  }
+
+  function renderTimeline() {
+    const n = S.events.length;
+    const start = S.runStartMs, end = S.runEndMs || start;
+    const span = Math.max(1, (end || 0) - (start || 0));
+    els.tlStart.textContent = "0:00";
+    els.tlEnd.textContent = fmtDur(span);
+    els.statTotal.textContent = fmtDur(span);
+    els.timeline.setAttribute("aria-valuemax", String(Math.max(0, n - 1)));
+
+    const ticks = [];
+    for (let i = 0; i < n; i++) {
+      const ev = S.events[i];
+      const t = parseTs(ev.t);
+      const pct = start != null && t != null ? ((t - start) / span) * 100 : (n <= 1 ? 0 : (i / (n - 1)) * 100);
+      let cls = "tick";
+      if (ev.kind === "stage_start") cls += " stage";
+      if (ev.kind === "stage_end") {
+        const st = (ev.status || "").toLowerCase();
+        if (st === "pass") cls += " pass";
+        else if (st === "fail") cls += " fail";
+        else if (st === "skip") cls += " skip";
+      }
+      ticks.push(`<div class="${cls}" style="left:${pct}%" title="${ev.kind} ${ev.stage_id || ""}"></div>`);
+    }
+    els.tlTicks.innerHTML = ticks.join("");
+    updatePlayhead();
+  }
+
+  function updatePlayhead() {
+    const n = S.events.length;
+    const idx = S.index;
+    const start = S.runStartMs, end = S.runEndMs || start;
+    const span = Math.max(1, (end || 0) - (start || 0));
+    let pct = 0;
+    let tMs = start;
+    let stage = "—";
+    let evStageId = "";
+    let abs = "—";
+    let elapsed = 0;
+    if (idx >= 0 && n) {
+      const ev = S.events[idx];
+      tMs = parseTs(ev.t) ?? start;
+      pct = start != null && tMs != null ? ((tMs - start) / span) * 100 : (n <= 1 ? 0 : (idx / (n - 1)) * 100);
+      evStageId = ev.stage_id || S.currentStage || "";
+      stage = (evStageId || "—").toUpperCase();
+      abs = ev.t || fmtClock(tMs);
+      elapsed = (tMs ?? start) - (start || 0);
+      showToast(ev);
+    } else {
+      els.toast.hidden = true;
+    }
+    els.tlFill.style.width = `${pct}%`;
+    els.tlHead.style.left = `${pct}%`;
+    els.statEvent.textContent = n ? `${Math.max(0, idx + 1)} / ${n}` : "— / —";
+    els.statStage.textContent = stage;
+    els.statTime.textContent = abs;
+    els.statElapsed.textContent = fmtElapsed(elapsed);
+    els.timeline.setAttribute("aria-valuenow", String(Math.max(0, idx)));
+    updateTitlePhase(evStageId || S.currentStage);
+    renderStageRail();
+  }
+
+  function showToast(ev) {
+    const bits = [`<strong>${ev.kind}</strong>`];
+    if (ev.stage_id) bits.push(ev.stage_id.toUpperCase());
+    if (ev.title) bits.push(ev.title);
+    if (ev.arrows) bits.push(ev.arrows);
+    if (ev.name) bits.push(`${ev.status || ""} ${ev.name}`.trim());
+    if (ev.subsystem) {
+      const p = ev.patch || {};
+      if (p.activity) bits.push(p.activity);
+      else if (p.last_turn) {
+        const lt = p.last_turn;
+        bits.push(`${lt.type || ""} ${lt.phase || ""} · ${lt.marker || ""}`.trim());
+        if (lt.prompt) bits.push(`prompt: ${lt.prompt.slice(0, 80)}…`);
+        if (lt.response) bits.push(`reply: ${lt.response.slice(0, 80)}…`);
+      } else {
+        bits.push(`${ev.subsystem}`);
+      }
+    }
+    if (ev.kind === "data" && /llm/i.test(ev.label || "")) {
+      const d = ev.data || {};
+      bits.push(`${ev.label}: ${d.type || ""} ${d.marker || ""}`);
+      if (d.prompt) bits.push(d.prompt.slice(0, 100));
+      if (d.response) bits.push(d.response.slice(0, 100));
+    }
+    const pkt = packetFor(ev);
+    if (pkt) {
+      bits.push(`${NODE_LABEL[pkt.from] || pkt.from} → ${NODE_LABEL[pkt.to] || pkt.to}`);
+    }
+    els.toast.innerHTML = bits.join(" · ");
+    els.toast.hidden = false;
+  }
+
+  function seek(index, animate) {
+    const n = S.events.length;
+    const clamped = Math.max(-1, Math.min(n - 1, index));
+    if (clamped === S.index && !animate) {
+      updatePlayhead();
+      return;
+    }
+    // Rewind / jump: recompute exact state from [0..clamped]
+    if (clamped < S.index || clamped - S.index > 1 || !animate) {
+      S.index = clamped;
+      clearMetricFlashes();
+      if (clamped < 0) {
+        S.subsystems = state0();
+        S.stageStatus = {};
+        S.currentStage = "";
+        clearEdgeLabels();
+        renderSubsystems(false);
+        updateTitlePhase("");
+      } else {
+        recompute(clamped);
+      }
+      updatePlayhead();
+      return;
+    }
+    // Single step forward with animation — flash only fields that change on this hop.
+    S.index = clamped;
+    applyEvent(S.events[clamped], true);
+    renderSubsystems(true);
+    updatePlayhead();
+  }
+
+  function step(delta) {
+    // Manual scrubbing leaves live-follow; Play (or catching up to the tip) resumes it.
+    S.followLive = false;
+    pause();
+    seek(S.index + delta, delta === 1);
+    if (S.live && S.index >= S.events.length - 1) {
+      S.followLive = true;
+    }
+  }
+
+  function play() {
+    if (!S.events.length) return;
+    if (S.live) {
+      // Live "play" = resume following the tip (not timed replay of history).
+      S.followLive = true;
+      S.playing = false;
+      els.btnPlay.textContent = "⏸ Pause";
+      seek(S.events.length - 1, true);
+      return;
+    }
+    S.playing = true;
+    els.btnPlay.textContent = "⏸ Pause";
+    scheduleNext();
+  }
+  function pause() {
+    S.playing = false;
+    if (S.live) S.followLive = false;
+    els.btnPlay.textContent = "▶ Play";
+    if (S.timer) { clearTimeout(S.timer); S.timer = null; }
+  }
+  function scheduleNext() {
+    if (!S.playing) return;
+    if (S.index >= S.events.length - 1) {
+      if (S.live) {
+        S.timer = setTimeout(scheduleNext, 400 / S.speed);
+        return;
+      }
+      pause();
+      return;
+    }
+    const cur = S.events[S.index] || S.events[0];
+    const next = S.events[S.index + 1];
+    let wait = 450;
+    if (cur && next) {
+      const a = parseTs(cur.t), b = parseTs(next.t);
+      if (a != null && b != null) wait = Math.min(2500, Math.max(120, (b - a) / S.speed));
+      else wait = 450 / S.speed;
+    } else wait = 450 / S.speed;
+    S.timer = setTimeout(() => {
+      seek(S.index + 1, true);
+      scheduleNext();
+    }, wait);
+  }
+
+  function jumpToStage(stageId) {
+    S.followLive = false;
+    pause();
+    const i = S.events.findIndex(e => e.kind === "stage_start" && e.stage_id === stageId);
+    if (i >= 0) seek(i, false);
+  }
+
+  function timelineClick(ev) {
+    const rect = els.timeline.getBoundingClientRect();
+    const pct = Math.min(1, Math.max(0, (ev.clientX - rect.left) / rect.width));
+    const start = S.runStartMs, end = S.runEndMs || start;
+    const span = Math.max(1, (end || 0) - (start || 0));
+    const target = (start || 0) + pct * span;
+    let best = 0, bestDist = Infinity;
+    S.events.forEach((e, i) => {
+      const t = parseTs(e.t);
+      const dist = t == null ? Math.abs(i / Math.max(1, S.events.length - 1) - pct) * span
+                             : Math.abs(t - target);
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    });
+    S.followLive = false;
+    pause();
+    seek(best, false);
+    if (S.live && best >= S.events.length - 1) S.followLive = true;
+  }
+
+  // ---- Drawer (hybrid expand) ----
+  async function openDrawer(kind, key) {
+    els.drawer.classList.add("open");
+    els.drawer.setAttribute("aria-hidden", "false");
+    els.drawerTitle.textContent = kind === "subsystem" ? subsystemTitle(key) : (key || "").toUpperCase();
+    els.drawerBody.innerHTML = `<div class="section"><div class="block">Loading…</div></div>`;
+    const html = kind === "subsystem" ? await renderSubsystemDrawer(key) : await renderStageDrawer(key);
+    els.drawerBody.innerHTML = html;
+  }
+  function subsystemTitle(id) {
+    return ({ agentA: "Agent A", agentB: "Agent B", mcp: "MCP Server", service: "Agent Life Service" })[id] || id;
+  }
+  async function fetchText(path) {
+    if (BAKED?.artifacts?.[path] != null) return BAKED.artifacts[path];
+    if (S.artifacts[path] != null) return S.artifacts[path];
+    try {
+      const r = await fetch(path);
+      if (!r.ok) return null;
+      const t = await r.text();
+      S.artifacts[path] = t;
+      return t;
+    } catch { return null; }
+  }
+  function section(title, body) {
+    return `<div class="section"><h4>${title}</h4><div class="block">${escapeHtml(body || "(unavailable)")}</div></div>`;
+  }
+  function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+  }
+  async function renderSubsystemDrawer(id) {
+    const snap = S.subsystems[id] || {};
+    let parts = [section("Live state", JSON.stringify(snap, null, 2))];
+    if (id === "agentA") {
+      const turns = snap.turns || [];
+      if (turns.length) {
+        const transcript = turns.map(t =>
+          `── turn ${t.n} · ${t.type} · ${t.marker} ${t.ok === false ? "FAIL" : "OK"} ──\n` +
+          `PROMPT:\n${t.prompt || ""}\n\nREPLY:\n${t.response || ""}`
+        ).join("\n\n");
+        parts.push(section("LLM conversation (this run)", transcript));
+      } else {
+        const llmData = S.events.filter(e => e.kind === "data" && /llm/i.test(e.label || ""));
+        if (llmData.length) {
+          parts.push(section("LLM events", JSON.stringify(llmData, null, 2)));
+        }
+      }
+      parts.push(section("config.yaml (head)", (await fetchText("home/config.yaml"))?.slice(0, 4000)));
+      parts.push(section("MEMORY.md (head)", (await fetchText("home/memories/MEMORY.md"))?.slice(0, 4000)));
+    } else if (id === "agentB") {
+      parts.push(section("agent_b config (head)", (await fetchText("home/profiles/agent_b/config.yaml"))?.slice(0, 4000)
+        || (await fetchText("home/profiles/agent_b/SOUL.md"))?.slice(0, 2000)));
+    } else if (id === "mcp") {
+      parts.push(section("mcp-interactions.log", await fetchText("mcp-interactions.log")));
+      parts.push(section("z16-serve-stderr.log (tail)", (await fetchText("z16-serve-stderr.log"))?.slice(-5000)));
+    } else if (id === "service") {
+      const dataEvents = S.events.filter(e => e.kind === "data" && /export|install|alf check|llm/i.test(e.label || ""));
+      parts.push(section("Captured data events", JSON.stringify(dataEvents.slice(-20), null, 2)));
+      parts.push(section("run-manifest.json", await fetchText("run-manifest.json")));
+    }
+    const checks = (S.report?.stages || []).flatMap(s => (s.checks || []).map(c => ({ stage: s.stage_id, ...c })));
+    parts.push(section("Recent checks", JSON.stringify(checks.slice(-20), null, 2)));
+    return parts.join("");
+  }
+  async function renderStageDrawer(stageId) {
+    const stage = (S.report?.stages || []).find(s => s.stage_id === stageId);
+    const evs = S.events.filter(e => e.stage_id === stageId);
+    const parts = [];
+    if (stage) parts.push(section("Stage result", JSON.stringify(stage, null, 2)));
+    parts.push(section("Events in stage", JSON.stringify(evs, null, 2)));
+    return parts.join("");
+  }
+
+  // ---- Loading ----
+  function ingest(events) {
+    const prevLen = S.events.length;
+    const prevIndex = S.index;
+    S.events = events;
+    if (!events.length) return;
+    S.runStartMs = parseTs(events[0].t);
+    S.runEndMs = parseTs(events[events.length - 1].t);
+    els.empty.hidden = true;
+    renderTimeline();
+
+    if (S.live && S.followLive) {
+      // Live auto-follow: jump to the newest event as the file grows.
+      const animate = events.length > prevLen && prevIndex >= 0;
+      seek(events.length - 1, animate);
+      return;
+    }
+    if (S.index < 0 && !S.live) {
+      // Replay default: start before the first event so the user can step.
+      seek(-1, false);
+      return;
+    }
+    if (S.index >= events.length) {
+      seek(events.length - 1, false);
+      return;
+    }
+    updatePlayhead();
+  }
+
+  function parseNdjson(text) {
+    return text.split("\n").map(l => l.trim()).filter(Boolean).map(l => {
+      try { return JSON.parse(l); } catch { return null; }
+    }).filter(Boolean);
+  }
+
+  async function loadReport() {
+    if (BAKED?.report) { S.report = BAKED.report; return; }
+    try {
+      const r = await fetch("report.json");
+      if (r.ok) S.report = await r.json();
+    } catch { /* optional */ }
+  }
+
+  async function loadEventsOnce() {
+    if (BAKED?.events) {
+      S.live = false;
+      S.followLive = false;
+      ingest(BAKED.events);
+      setModeBadge();
+      return;
+    }
+    const r = await fetch("events.ndjson", { cache: "no-store" });
+    if (!r.ok) throw new Error("events.ndjson missing");
+    const text = await r.text();
+    const evs = parseNdjson(text);
+    const hasEnd = evs.some(e => e.kind === "run_end");
+    // Set live/follow BEFORE ingest so the first paint lands on the tip.
+    S.live = !hasEnd;
+    S.followLive = S.live;
+    lastSize = text.length;
+    ingest(evs);
+    setModeBadge();
+    if (S.live) {
+      els.btnPlay.textContent = "⏸ Pause";
+      startPolling();
+    }
+  }
+
+  function setModeBadge() {
+    els.modeBadge.textContent = S.live ? "LIVE" : "REPLAY";
+    els.modeBadge.className = "badge " + (S.live ? "live" : "replay");
+  }
+
+  let lastSize = 0;
+  function startPolling() {
+    if (S.poll) return;
+    S.poll = setInterval(async () => {
+      try {
+        const r = await fetch("events.ndjson", { cache: "no-store" });
+        if (!r.ok) return;
+        const text = await r.text();
+        if (text.length === lastSize) return;
+        lastSize = text.length;
+        const evs = parseNdjson(text);
+        ingest(evs);
+        if (evs.some(e => e.kind === "run_end")) {
+          S.live = false;
+          S.followLive = false;
+          setModeBadge();
+          els.btnPlay.textContent = "▶ Play";
+          clearInterval(S.poll); S.poll = null;
+        }
+      } catch { /* keep trying */ }
+    }, 1000);
+  }
+
+  // ---- Wire UI ----
+  els.btnPlay.addEventListener("click", () => S.playing ? pause() : play());
+  els.btnBack.addEventListener("click", () => step(-1));
+  els.btnFwd.addEventListener("click", () => step(1));
+  els.speed.addEventListener("change", () => { S.speed = parseFloat(els.speed.value) || 1; });
+  els.timeline.addEventListener("click", timelineClick);
+  els.stageRail.addEventListener("click", (e) => {
+    const btn = e.target.closest("[data-stage]");
+    if (btn) jumpToStage(btn.dataset.stage);
+  });
+  document.querySelectorAll(".card").forEach(card => {
+    card.addEventListener("click", () => openDrawer("subsystem", card.dataset.sub));
+  });
+  $("drawerClose").addEventListener("click", () => {
+    els.drawer.classList.remove("open");
+    els.drawer.setAttribute("aria-hidden", "true");
+  });
+  window.addEventListener("keydown", (e) => {
+    if (e.target.matches("input,textarea,select")) return;
+    if (e.key === "ArrowRight") { e.preventDefault(); step(1); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); step(-1); }
+    else if (e.key === " ") { e.preventDefault(); S.playing ? pause() : play(); }
+    else if (e.key === "Escape") {
+      els.drawer.classList.remove("open");
+    }
+  });
+  window.addEventListener("resize", () => { drawEdges(); renderTimeline(); });
+
+  // Double-click stage rail already jumps; also allow opening drawer from pills via context
+  els.stageRail.addEventListener("dblclick", (e) => {
+    const btn = e.target.closest("[data-stage]");
+    if (btn) openDrawer("stage", btn.dataset.stage);
+  });
+
+  (async function boot() {
+    await loadReport();
+    try {
+      await loadEventsOnce();
+    } catch (err) {
+      els.empty.querySelector("div").innerHTML =
+        `<div style="font-size:18px;font-weight:650;color:var(--text);margin-bottom:8px">No events yet</div>
+         Place this page next to <code>events.ndjson</code> and serve the run dir.<br/>
+         <code style="display:inline-block;margin-top:10px">${escapeHtml(String(err.message || err))}</code>`;
+    }
+    drawEdges();
+    // If report exists but we are in replay at -1, show stage rail from report
+    renderStageRail();
+  })();
+})();
+</script>
+</body>
+</html>

@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 /// Which input won the selector precedence.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum SelectorSource {
     Flag,
@@ -274,7 +274,7 @@ fn lazy_init(
     }
     let outcome = discovery::discover_and_reconcile(config, adapter, runtime, install)?;
     if install.is_dir() {
-        discovery::persist(config, &outcome)?;
+        discovery::persist_first_contact(config, &outcome, runtime)?;
     } else {
         for row in &outcome.rows {
             if row.status == discovery::RowStatus::New {

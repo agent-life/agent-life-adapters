@@ -1,8 +1,13 @@
 """Mint → run.env/manifest → teardown ladder → leak scan (plan §4, D5).
 
-Mint: ONE provision-test-runtime.sh call per driver invocation. Its stdout
-(the only place the raw runtime key ever exists outside ~/.alf memory) goes
-to a chmod-600 tmpfile inside the run dir, is parsed, and is deleted.
+Mint: ONE mint per driver invocation. We invoke the service checkout's `e2e`
+cargo binary (`provision_test_runtime`) DIRECTLY — not its `provision-test-
+runtime.sh` wrapper — because the wrapper loads `service/.env` and would let
+that repo's config override our backend targets (the prod-API-in-a-test-run
+bug). All configuration comes from `cfg.subprocess_env()`, built solely from
+adapters/.env; the service checkout supplies only the binary. The bin's stdout
+(the only place the raw runtime key ever exists outside ~/.alf memory) goes to
+a chmod-600 tmpfile inside the run dir, is parsed, and is deleted.
 
 Teardown: a manifest-driven ladder, idempotent and ledger-recorded, runnable
 after a hard abort via `driver.py --teardown <run-dir>`. The lazily-registered
@@ -57,6 +62,10 @@ class Manifest:
     runtime_id: str = ""
     alf_api_url: str = ""
     llm_model_id: str = ""
+    # RF-024 identity trio — binds this manifest to the candidate that made it.
+    source_commit: str = ""
+    dirty: bool = False
+    binary_sha256: str = ""
     lifecycle_agents: list = field(default_factory=list)
     teardown: dict = field(default_factory=dict)   # rung -> "ok"|"skipped"|error text
 
@@ -76,21 +85,32 @@ def _parse_block(text: str, key: str) -> str:
 
 
 def mint(service_repo: Path, variant: str, run_dir: Path,
-         model: Optional[str] = None) -> RuntimeCreds:
-    """One provisioner call; stdout parsed via a 600 tmpfile then deleted."""
+         model: Optional[str] = None, env: Optional[dict] = None) -> RuntimeCreds:
+    """One mint via the `e2e` provision_test_runtime bin; stdout parsed via a
+    600 tmpfile then deleted. `env` is the subprocess environment built from
+    adapters/.env (HarnessConfig.subprocess_env); when omitted it is built from
+    this repo's .env here, so the service checkout's .env is never consulted."""
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
     tmp = run_dir / ".provision-out.tmp"
     tmp.touch()
     os.chmod(tmp, 0o600)
-    argv = ["bash", "scripts/provision-test-runtime.sh", "test", "--variant", variant]
+    # Invoke the cargo bin directly (NOT scripts/provision-test-runtime.sh):
+    # the wrapper loads service/.env and would override our adapters/.env
+    # targets. `env` is the sole config source; the bin runs no dotenvy.
+    argv = ["cargo", "run", "-p", "e2e", "--bin", "provision_test_runtime",
+            "--", "--variant", variant]
     if model:
         argv += ["--llm-model", model]
     try:
         with tmp.open("w") as out:
             proc = subprocess.run(argv, cwd=service_repo, stdout=out,
-                                  stderr=subprocess.PIPE, text=True, timeout=600)
+                                  stderr=subprocess.PIPE, text=True, timeout=600,
+                                  env=env)
         if proc.returncode != 0:
             raise RuntimeError(
-                f"provision-test-runtime.sh failed (exit {proc.returncode}):\n"
+                f"provision_test_runtime failed (exit {proc.returncode}):\n"
                 f"{(proc.stderr or '')[-2000:]}"
             )
         text = tmp.read_text(encoding="utf-8")
@@ -147,37 +167,60 @@ def load_run_env(run_dir: Path) -> dict:
 # Teardown ladder (§4) — idempotent, ledger-driven
 # ---------------------------------------------------------------------------
 
-def _scavenge(service_repo: Path, args: list[str]) -> subprocess.CompletedProcess:
-    script = service_repo / "scripts" / "scavenge-test-runtimes.sh"
-    if not script.is_file():
+def _scavenge(service_repo: Path, args: list[str],
+              env: Optional[dict] = None) -> subprocess.CompletedProcess:
+    # Invoke the `e2e` scavenge bin directly (NOT scripts/scavenge-test-
+    # runtimes.sh) so cleanup uses adapters/.env, never service/.env.
+    crate = service_repo / "tests" / "e2e" / "Cargo.toml"
+    if not crate.is_file():
         # A clear ledger entry beats a FileNotFoundError traceback mid-ladder.
         return subprocess.CompletedProcess(
-            args=["scavenge-test-runtimes.sh", *args], returncode=127, stdout="",
-            stderr=f"service checkout not found: {script} (set ALF_SERVICE_REPO)")
+            args=["scavenge_test_runtimes", *args], returncode=127, stdout="",
+            stderr=f"service e2e crate not found: {crate} (set ALF_SERVICE_REPO)")
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
     return subprocess.run(
-        ["bash", "scripts/scavenge-test-runtimes.sh", "test", *args],
-        cwd=service_repo, capture_output=True, text=True, timeout=600,
+        ["cargo", "run", "-p", "e2e", "--bin", "scavenge_test_runtimes",
+         "--", *args],
+        cwd=service_repo, capture_output=True, text=True, timeout=600, env=env,
     )
 
 
 def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
-                    service_repo: Path, runtime: str) -> bool:
+                    service_repo: Path, runtime: str,
+                    env: Optional[dict] = None) -> bool:
     """Rungs 1–6. `api` = ApiClient with the run's key (may be None if the key
-    is already dead), `container` = DockerContainer or None. Records each rung
-    in the manifest ledger; returns overall success."""
+    is already dead), `container` = DockerContainer or None. `env` is the
+    adapters/.env-derived subprocess env for the scavenge bin (built here when
+    omitted). Records each rung in the manifest ledger; returns overall success."""
     ok_all = True
+    if env is None:
+        from .config import HarnessConfig
+        env = HarnessConfig.from_env().subprocess_env()
 
     def record(rung: str, status: str):
         manifest.teardown[rung] = status
         manifest.save(manifest_path)
 
+    # Every per-agent rung records ONE line naming EVERY agent it touched.
+    # These loops used to call record() per iteration, so the dict entry kept
+    # only the LAST agent: a two-agent run showed one id, and — worse — a failed
+    # purge/scavenge on agent A followed by a success on B was overwritten into a
+    # clean "ok". The ledger is the forensic record of what teardown actually
+    # did; it must not be able to omit an agent or a failure (2026-07-29).
+    def record_per_agent(rung: str, results: list, empty: str):
+        record(rung, "; ".join(results) if results else empty)
+
     # Rung 1 — product path: in-container `alf purge` per lifecycle agent.
     if container is not None and container.alive() and manifest.lifecycle_agents:
+        results = []
         for agent_id in manifest.lifecycle_agents:
             proc = container.exec(["alf", "purge", "-r", runtime, "--agent", agent_id],
                                   timeout=120)
-            status = "ok" if proc.returncode == 0 else f"best-effort (exit {proc.returncode})"
-            record("rung1-alf-purge", status)
+            results.append(f"{agent_id}: " + ("ok" if proc.returncode == 0
+                                              else f"best-effort (exit {proc.returncode})"))
+        record_per_agent("rung1-alf-purge", results, "no lifecycle agents")
     else:
         record("rung1-alf-purge", "skipped (no container/agents)")
 
@@ -185,17 +228,22 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
     # Transport errors (API unreachable, DNS, Lambda alias drift) must NOT
     # abort the ladder: the direct-DB rungs 4/4b below still work without it.
     if api is not None:
+        results = []
         try:
             for agent_id in manifest.lifecycle_agents:
                 r = api.get(f"/agents/{agent_id}")
                 if r.status_code == 200:
                     d = api.delete(f"/agents/{agent_id}")
-                    record("rung2-api-delete", f"{agent_id}: {d.status_code}")
+                    results.append(f"{agent_id}: {d.status_code}")
                 else:
-                    record("rung2-api-delete", f"{agent_id}: already gone ({r.status_code})")
+                    results.append(f"{agent_id}: already gone ({r.status_code})")
+            record_per_agent("rung2-api-delete", results, "no lifecycle agents")
         except Exception as e:  # noqa: BLE001
             ok_all = False
-            record("rung2-api-delete", f"API unreachable ({type(e).__name__}) — "
+            # Keep whatever was already disposed of — the agents BEFORE the
+            # failure are exactly the ones a human must not re-hunt.
+            done = ("; ".join(results) + " | ") if results else ""
+            record("rung2-api-delete", f"{done}API unreachable ({type(e).__name__}) — "
                                        "continuing with direct-DB rungs")
             api = None  # rung 3 can't verify either; 4b covers the agents
     else:
@@ -213,8 +261,14 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
             if leftovers:
                 ok_all = False
                 record("rung3-verify-404", f"LEFTOVER: {leftovers}")
+            elif manifest.lifecycle_agents:
+                record("rung3-verify-404",
+                       f"ok ({len(manifest.lifecycle_agents)} agent(s) verified 404)")
             else:
-                record("rung3-verify-404", "ok")
+                # A bare "ok" here claimed a verification that never happened —
+                # zero agents means nothing was checked, not that all is well.
+                record("rung3-verify-404",
+                       "no lifecycle agents to verify (none were registered)")
         except Exception as e:  # noqa: BLE001
             ok_all = False
             record("rung3-verify-404", f"API unreachable ({type(e).__name__})")
@@ -224,7 +278,7 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
 
     # Rung 4 — scavenge the seed agent (cascades runtime row + api key + S3).
     if manifest.seed_agent_id:
-        proc = _scavenge(service_repo, ["--agent", manifest.seed_agent_id, "--delete"])
+        proc = _scavenge(service_repo, ["--agent", manifest.seed_agent_id, "--delete"], env)
         if proc.returncode == 0:
             record("rung4-scavenge-seed", "ok")
         else:
@@ -234,21 +288,22 @@ def teardown_ladder(manifest: Manifest, manifest_path: Path, api, container,
         # targeted scavenge per lifecycle agent id. A failure here is a REAL
         # leak (these agents are invisible to batch scavenge) — never "ok".
         if api is None:
+            results = []
             for agent_id in manifest.lifecycle_agents:
-                proc = _scavenge(service_repo, ["--agent", agent_id, "--delete"])
+                proc = _scavenge(service_repo, ["--agent", agent_id, "--delete"], env)
                 if proc.returncode == 0:
-                    record("rung4b-scavenge-lifecycle", f"{agent_id}: ok")
+                    results.append(f"{agent_id}: ok")
                 else:
                     ok_all = False
-                    record("rung4b-scavenge-lifecycle",
-                           f"{agent_id}: FAILED exit {proc.returncode}: "
-                           f"{(proc.stderr or proc.stdout or '')[-200:]}")
+                    results.append(f"{agent_id}: FAILED exit {proc.returncode}: "
+                                   f"{(proc.stderr or proc.stdout or '')[-200:]}")
+            record_per_agent("rung4b-scavenge-lifecycle", results, "no lifecycle agents")
     else:
         record("rung4-scavenge-seed", "skipped (no seed agent)")
 
     # Rung 5 — leak check: scavenge dry-run; warn on any 'Local %' rows.
     # A dry-run that itself failed proves nothing — record that honestly.
-    proc = _scavenge(service_repo, [])
+    proc = _scavenge(service_repo, [], env)
     combined = (proc.stdout or "") + (proc.stderr or "")
     if proc.returncode != 0:
         ok_all = False
@@ -281,6 +336,7 @@ def leak_scan(db, manifests_glob: list[Path]) -> list[dict]:
                 known.add(m.seed_agent_id)
         except (OSError, json.JSONDecodeError, TypeError):
             continue
+    assert_scan_sees_everything(db)
     rows = db.query(
         "SELECT a.id::text AS id, a.name, a.created_at::text AS created_at "
         "FROM agents a JOIN tenants t ON t.id = a.tenant_id "
@@ -288,6 +344,42 @@ def leak_scan(db, manifests_glob: list[Path]) -> list[dict]:
         "AND a.name NOT LIKE 'Local %'"
     )
     return [r for r in rows if r["id"] not in known]
+
+
+class ScanUntrustworthy(RuntimeError):
+    """The leak scan cannot see the whole table, so a clean result would be a
+    lie. Raised instead of returning a possibly-partial answer."""
+
+
+def assert_scan_sees_everything(db) -> None:
+    """A leak scan is an audit: it must see EVERY tenant's agents.
+
+    `agents` has row-level security keyed on `current_setting('app.current_tenant')`
+    (service migrations 002/012). The harness normally connects as an owner role
+    that bypasses RLS, but nothing guaranteed it: a non-bypassing role with the
+    tenant GUC set — trivially possible on a POOLED endpoint, where a session is
+    reused with whatever the previous borrower left behind — would silently
+    return that tenant's subset, and the scan would report "clean" while other
+    tenants' agents leaked. That silent-subset case is the dangerous one; the
+    loud variant (an EMPTY GUC, `""::uuid`) is what crashed this tool on
+    2026-07-28 with a raw traceback.
+
+    Fail loudly instead: an audit that cannot prove it saw everything must not
+    return a verdict."""
+    row = db.query(
+        "SELECT current_user AS role, "
+        "coalesce((SELECT rolbypassrls FROM pg_roles WHERE rolname = current_user), false) "
+        "AS bypass, "
+        "coalesce(current_setting('app.current_tenant', true), '') AS tenant"
+    )[0]
+    if row["bypass"]:
+        return  # RLS does not apply — the scan sees the whole table
+    raise ScanUntrustworthy(
+        f"connected as {row['role']!r}, which does NOT bypass row-level security"
+        + (f" and has app.current_tenant={row['tenant']!r}" if row["tenant"] else "")
+        + " — the scan would see one tenant's rows at most and could report "
+          "'clean' while agents leak. Point NEON_DATABASE_URL at the owner role."
+    )
 
 
 def utc_ts() -> str:

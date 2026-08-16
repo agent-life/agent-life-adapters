@@ -1,3 +1,31 @@
+## [1.1.1] — 2026-08-16
+
+### Fixed
+
+- **`alf check` no longer reports OpenClaw-shaped resource warnings on other runtimes.**
+  `workspace_empty`, `no_soul_md`, `no_memory_content`, and `memory_dir_empty` assert an
+  OpenClaw workspace layout (root `SOUL.md` / `MEMORY.md` / `memory/` daily logs), but were
+  emitted for every runtime — so a valid ZeroClaw, Hermes, or generic workspace was told
+  "Nothing to sync — agent has no memories yet" while `alf export --dry-run` on the same
+  workspace packed its memories. Since `alf check` output is parsed by agents to decide
+  whether to sync, the wrong advice could stop a sync. The four codes are now emitted for
+  `openclaw` only; OpenClaw behavior is unchanged. Pre-existing for hermes/zeroclaw since
+  their adapters landed, inherited by `generic` in 1.1.0. The `alf_check` MCP tool shares
+  the same code path and is fixed with it. (RF-031)
+
+### Documentation
+
+- `docs/cli-reference.md` — the four codes are marked *(openclaw only)* in the **Issue
+  Codes** table, with a note on where each runtime actually keeps its memories. This file
+  is `include_str!`'d into the binary, so the `alf_docs` MCP tool serves the correction too.
+- `skills/agent-life/SKILL.md` — the `no_memory_content` row is qualified and no longer
+  reads as an instruction to skip the sync (skill 2.0.0 → 2.0.1).
+
+### Version bumps
+
+- `alf-cli` 1.1.0 → 1.1.1. No `alf-core` or adapter-crate change; the service's `alf-core`
+  pin is untouched.
+
 ## [1.1.0] — 2026-08-10
 
 First feature train after 1.0.0: **ALF for MCP-capable agent runtimes**. Additive on the wire — no wire-format, backend, or web changes; the openclaw/zeroclaw/hermes export/import/sync happy paths and the archive bytes they produce are unchanged (goal c). **Not additive at every contract**: a handful of CLI behaviors and error codes changed deliberately — most as security fixes carried under the documented security exception in `RELEASING.md` — see **Changed** below and the Rust source-compatibility note under **Version bumps**. See `docs/alf-mcp-server-design.md`.

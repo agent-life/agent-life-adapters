@@ -1,7 +1,7 @@
 ---
 name: agent-life
 description: Backup, sync, and restore agent memory and state to the cloud using the Agent Life Format (ALF). Use when asked to back up agent data, sync memory to the cloud, restore from cloud, or migrate agent state.
-version: 2.0.0
+version: 2.0.1
 metadata:
   openclaw:
     requires:
@@ -252,7 +252,7 @@ Inspect the effect with `alf export --dry-run` — the `excluded_by_alfignore` c
 | --- | --- | --- |
 | `no_api_key` | No API key configured | `alf login --key <key>` |
 | `workspace_not_found` | Workspace directory doesn't exist | Pass correct path: `alf check -r <runtime> -w /correct/path` |
-| `no_memory_content` | No MEMORY.md and no memory/ directory | Agent has no memories yet — nothing to sync |
+| `no_memory_content` | *(openclaw only)* No MEMORY.md and no memory/ directory | Confirm with `alf export --dry-run` before concluding there is nothing to sync |
 | `service_unreachable` | API endpoint not responding | Check network; verify `api_url` in `~/.alf/config.toml` |
 | HTTP 401 Unauthorized | Bad or revoked API key | `alf login --key <new-key>` |
 | HTTP 409 Conflict | Sequence mismatch during sync | `alf restore --dry-run` to inspect, then `alf restore` and sync again |

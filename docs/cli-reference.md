@@ -4,7 +4,7 @@
 > Agent-optimized: every command documents its JSON output schema,
 > error codes, and common workflows.
 >
-> Version: 1.1.0 | Updated: 2026-08-09
+> Version: 1.1.1 | Updated: 2026-08-16
 > HTML: <https://agent-life.ai/docs/cli>
 > Markdown: <https://agent-life.ai/docs/cli.md>
 
@@ -142,7 +142,7 @@ The `workspace.source` field in the output reports which method was used: `"flag
 
     {
       "ok": true,
-      "version": "1.1.0",
+      "version": "1.1.1",
       "runtime": "openclaw",
       "ready_to_sync": true,
       "workspace": {
@@ -222,10 +222,10 @@ Field notes:
 |---|---|---|---|
 | `workspace_not_found` | error | Workspace directory doesn't exist | Pass correct `-w` path |
 | `workspace_not_writable` | warning | Workspace exists but isn't writable | Check permissions |
-| `workspace_empty` | warning | No `.md` files in workspace root | Workspace may not be initialized |
-| `no_soul_md` | warning | `SOUL.md` not found | Agent has no persona file; display name still comes from `IDENTITY.md` `Name` when present, else the workspace folder name |
-| `no_memory_content` | warning | No `MEMORY.md` and no `memory/` directory | Nothing to sync yet |
-| `memory_dir_empty` | warning | `memory/` exists but has no `.md` files | No daily logs yet |
+| `workspace_empty` | warning | *(openclaw only)* No `.md` files in workspace root | Workspace may not be initialized |
+| `no_soul_md` | warning | *(openclaw only)* `SOUL.md` not found | Agent has no persona file; display name still comes from `IDENTITY.md` `Name` when present, else the workspace folder name |
+| `no_memory_content` | warning | *(openclaw only)* No `MEMORY.md` and no `memory/` directory | Nothing to sync yet |
+| `memory_dir_empty` | warning | *(openclaw only)* `memory/` exists but has no `.md` files | No daily logs yet |
 | `no_api_key` | error | No API key in `~/.alf/config.toml` | `alf login --key <key>` |
 | `service_unreachable` | error | API endpoint not responding | Check network, API URL |
 | `openclaw_config_not_found` | info | `~/.openclaw/openclaw.json` not found | OpenClaw may not be installed |
@@ -238,6 +238,8 @@ Field notes:
 | `agent_discovery_failed` | warning | The adapter's agent discovery errored | See message; check install layout |
 | `vault_migration_failed` | warning | Legacy→per-agent vault migration failed | See message; `alf vault migrate` |
 | `vault_not_synced` | warning | Local vault count ≠ service count | `alf sync --recover` (credential self-heal) |
+
+The four codes marked *(openclaw only)* assert an OpenClaw workspace layout — a root `SOUL.md` / `MEMORY.md` and a `memory/` directory of daily logs. Other runtimes keep their memories elsewhere (ZeroClaw in `data/memory/brain.db`, Hermes in `memories/`, generic wherever `.alf-map.json` points), so `alf check` does not emit these for `zeroclaw`, `hermes`, or `generic`. Use `alf export --dry-run` to see what any runtime would actually pack.
 
 ---
 

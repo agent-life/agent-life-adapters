@@ -863,6 +863,77 @@ fn check_reports_drift_json() {
     );
 }
 
+/// RF-031: `check` and `export --dry-run` must never contradict each other on
+/// the same workspace. A generic workspace whose `.alf-map.json` declares a
+/// memory source used to be told "Nothing to sync — agent has no memories yet"
+/// while `export --dry-run` packed its memories. Both halves are asserted here
+/// so the two commands can't silently diverge again.
+#[test]
+fn generic_workspace_with_memories_is_not_reported_empty() {
+    let tmp = TempDir::new().unwrap();
+    let home = tmp.path().join("home");
+    fs::create_dir_all(&home).unwrap();
+    let ws = tmp.path().join("ws");
+    fs::create_dir_all(ws.join("memories")).unwrap();
+    fs::write(
+        ws.join(".alf-map.json"),
+        r#"{"version":1,"memory_sources":[{"id":"journal","glob":"memories/**/*.md",
+            "memory_type":"episodic","namespace":"journal","chunking":"per_file"}]}"#,
+    )
+    .unwrap();
+    fs::write(
+        ws.join("memories").join("2026-08-16.md"),
+        "Shipped the 1.1.1 patch.",
+    )
+    .unwrap();
+
+    // Half 1: check does not claim the workspace is empty or memory-less.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("check")
+        .arg("-r")
+        .arg("generic")
+        .arg("-w")
+        .arg(&ws)
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    let codes: Vec<&str> = v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["code"].as_str().unwrap())
+        .collect();
+    for code in [
+        "workspace_empty",
+        "no_soul_md",
+        "no_memory_content",
+        "memory_dir_empty",
+    ] {
+        assert!(
+            !codes.contains(&code),
+            "generic must not emit OpenClaw-shaped {code}; got {codes:?}"
+        );
+    }
+
+    // Half 2: the same workspace does have memories to sync.
+    let assert = alf_cmd()
+        .env("HOME", &home)
+        .arg("export")
+        .arg("--dry-run")
+        .arg("-r")
+        .arg("generic")
+        .arg("-w")
+        .arg(&ws)
+        .assert()
+        .success();
+    let v = json_stdout(&assert);
+    assert!(
+        v["memory_records"].as_u64().unwrap() > 0,
+        "export --dry-run must find the declared memories: {v}"
+    );
+}
+
 /// DoD 4: sync fails closed on identity drift, before any network call, with
 /// a coded error naming both ids and the exact heal command.
 #[test]

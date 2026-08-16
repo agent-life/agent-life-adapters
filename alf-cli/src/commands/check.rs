@@ -506,50 +506,60 @@ fn collect_issues(
         });
     }
 
-    // Check if workspace is essentially empty (no .md files in root)
-    let has_any_md = resources.soul_md
-        || resources.identity_md
-        || resources.agents_md
-        || resources.user_md
-        || resources.memory_md;
-    if !has_any_md {
-        issues.push(Issue {
-            severity: "warning".into(),
-            code: "workspace_empty".into(),
-            message: "No markdown files found in workspace root".into(),
-            suggestion: "Workspace may not be initialized — check the path".into(),
-        });
-    }
+    // RF-031: these four resource diagnostics assert an OpenClaw workspace
+    // layout — `ResourceInfo` is a literal model of one (root SOUL.md /
+    // MEMORY.md / memory/ daily logs). Asserting it against zeroclaw, hermes,
+    // or generic produced warnings that contradict `export --dry-run` on the
+    // same workspace: a valid agent with memories was told "Nothing to sync".
+    // Since agents parse this output to decide whether to sync, that wrong
+    // advice could stop a sync. Runtime-appropriate equivalents need the
+    // adapter to declare its own expected resources — 1.2 work, not a patch.
+    if runtime == "openclaw" {
+        // Check if workspace is essentially empty (no .md files in root)
+        let has_any_md = resources.soul_md
+            || resources.identity_md
+            || resources.agents_md
+            || resources.user_md
+            || resources.memory_md;
+        if !has_any_md {
+            issues.push(Issue {
+                severity: "warning".into(),
+                code: "workspace_empty".into(),
+                message: "No markdown files found in workspace root".into(),
+                suggestion: "Workspace may not be initialized — check the path".into(),
+            });
+        }
 
-    if !resources.soul_md {
-        issues.push(Issue {
-            severity: "warning".into(),
-            code: "no_soul_md".into(),
-            message: "SOUL.md not found in workspace".into(),
-            suggestion: "Agent has no persona file; export will use a fallback name".into(),
-        });
-    }
+        if !resources.soul_md {
+            issues.push(Issue {
+                severity: "warning".into(),
+                code: "no_soul_md".into(),
+                message: "SOUL.md not found in workspace".into(),
+                suggestion: "Agent has no persona file; export will use a fallback name".into(),
+            });
+        }
 
-    let has_memory_content = resources.memory_md
-        || resources.memory_dir && resources.daily_logs.as_ref().is_some_and(|d| d.count > 0);
-    if !has_memory_content {
-        issues.push(Issue {
-            severity: "warning".into(),
-            code: "no_memory_content".into(),
-            message: "No MEMORY.md and no daily logs in memory/ directory".into(),
-            suggestion: "Nothing to sync — agent has no memories yet".into(),
-        });
-    }
+        let has_memory_content = resources.memory_md
+            || resources.memory_dir && resources.daily_logs.as_ref().is_some_and(|d| d.count > 0);
+        if !has_memory_content {
+            issues.push(Issue {
+                severity: "warning".into(),
+                code: "no_memory_content".into(),
+                message: "No MEMORY.md and no daily logs in memory/ directory".into(),
+                suggestion: "Nothing to sync — agent has no memories yet".into(),
+            });
+        }
 
-    if resources.memory_dir {
-        if let Some(ref dl) = resources.daily_logs {
-            if dl.count == 0 {
-                issues.push(Issue {
-                    severity: "warning".into(),
-                    code: "memory_dir_empty".into(),
-                    message: "memory/ directory exists but has no daily log files".into(),
-                    suggestion: "No daily logs yet — memories will accumulate over time".into(),
-                });
+        if resources.memory_dir {
+            if let Some(ref dl) = resources.daily_logs {
+                if dl.count == 0 {
+                    issues.push(Issue {
+                        severity: "warning".into(),
+                        code: "memory_dir_empty".into(),
+                        message: "memory/ directory exists but has no daily log files".into(),
+                        suggestion: "No daily logs yet — memories will accumulate over time".into(),
+                    });
+                }
             }
         }
     }
@@ -1648,6 +1658,121 @@ mod tests {
         assert!(!resources.memory_dir);
         assert!(resources.daily_logs.is_none());
         assert!(resources.agent_id.is_none());
+    }
+
+    // --- RF-031: OpenClaw-shaped resource diagnostics are gated by runtime ---
+
+    /// The four diagnostics that assert an OpenClaw workspace layout.
+    const RF031_OPENCLAW_CODES: [&str; 4] = [
+        "workspace_empty",
+        "no_soul_md",
+        "no_memory_content",
+        "memory_dir_empty",
+    ];
+
+    /// Run `collect_issues` over `ws` as `runtime` and return the codes.
+    /// Everything except `runtime` is held constant, and the `alf` side is
+    /// configured/reachable so `no_api_key` and `service_unreachable` stay out
+    /// of the way.
+    fn issue_codes_for(ws: &Path, runtime: &str) -> Vec<String> {
+        let workspace_info = WorkspaceInfo {
+            path: ws.to_string_lossy().into(),
+            source: "flag".into(),
+            exists: true,
+            writable: true,
+        };
+        let alf_info = AlfInfo {
+            config_exists: true,
+            api_key_set: true,
+            agent_tracked: false,
+            last_synced_sequence: None,
+            last_synced_at: None,
+            service_reachable: true,
+        };
+        let resolved = ResolvedWorkspace {
+            path: ws.to_path_buf(),
+            source: "flag".into(),
+            runtime_configured_path: None,
+        };
+        collect_issues(
+            &workspace_info,
+            &check_resources(ws),
+            &alf_info,
+            &resolved,
+            runtime,
+        )
+        .into_iter()
+        .map(|i| i.code)
+        .collect()
+    }
+
+    /// The one workspace shape that trips all four at once: no root `.md`
+    /// files, plus a `memory/` directory holding no daily logs.
+    fn bare_openclaw_shaped_workspace(tmp: &TempDir) -> PathBuf {
+        let ws = tmp.path().join("ws");
+        fs::create_dir_all(ws.join("memory")).unwrap();
+        ws
+    }
+
+    /// RF-031 regression guard: OpenClaw still emits all four. If this fails,
+    /// the runtime gate silently disabled OpenClaw's own diagnostics.
+    #[test]
+    fn openclaw_resource_diagnostics_still_emitted() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let ws = bare_openclaw_shaped_workspace(&tmp);
+        let codes = issue_codes_for(&ws, "openclaw");
+
+        restore_var("HOME", prev_home);
+
+        for code in RF031_OPENCLAW_CODES {
+            assert!(
+                codes.iter().any(|c| c == code),
+                "openclaw must still emit {code}; got {codes:?}"
+            );
+        }
+    }
+
+    /// RF-031: the *same* workspace, checked as any other runtime, must not be
+    /// told it is empty or memory-less — `ResourceInfo` models an OpenClaw
+    /// layout, so those warnings contradict what `export --dry-run` finds.
+    /// Only `runtime` differs from the test above.
+    #[test]
+    fn resource_diagnostics_gated_off_other_runtimes() {
+        let _guard = crate::context::tests::HOME_LOCK.lock().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let tmp = TempDir::new().unwrap();
+        std::env::set_var("HOME", tmp.path());
+
+        let ws = bare_openclaw_shaped_workspace(&tmp);
+        let zeroclaw = issue_codes_for(&ws, "zeroclaw");
+        let hermes = issue_codes_for(&ws, "hermes");
+        let generic = issue_codes_for(&ws, "generic");
+
+        restore_var("HOME", prev_home);
+
+        for (runtime, codes) in [
+            ("zeroclaw", zeroclaw.as_slice()),
+            ("hermes", hermes.as_slice()),
+            ("generic", generic.as_slice()),
+        ] {
+            for code in RF031_OPENCLAW_CODES {
+                assert!(
+                    !codes.iter().any(|c| c == code),
+                    "{runtime} must not emit OpenClaw-shaped {code}; got {codes:?}"
+                );
+            }
+        }
+
+        // The gate covers the four resource codes only — a runtime's own
+        // diagnostics must still fire.
+        assert!(
+            zeroclaw.iter().any(|c| c == "zeroclaw_config_not_found"),
+            "zeroclaw's own config diagnostic must survive the gate: {zeroclaw:?}"
+        );
     }
 
     #[test]
